@@ -79,12 +79,9 @@ impl ComputerUseBackend for CuaBackend {
         command.args(&self.args);
         command.kill_on_drop(true);
 
-        let transport = TokioChildProcess::new(command)
-            .context("failed to spawn Cua MCP backend process")?;
-        let service = ()
-            .serve(transport)
-            .await
-            .context("failed to initialize Cua MCP backend")?;
+        let transport =
+            TokioChildProcess::new(command).context("failed to spawn Cua MCP backend process")?;
+        let service = ().serve(transport).await.context("failed to initialize Cua MCP backend")?;
 
         *slot = Some(service);
         Ok(())
