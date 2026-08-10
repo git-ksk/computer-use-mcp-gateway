@@ -44,10 +44,8 @@ async fn main() -> Result<()> {
     let backend_command = config.backend_command.clone();
     let backend_args = config.backend_args();
     let backend_arg_count = backend_args.len();
-    let backend: Arc<dyn ComputerUseBackend> = Arc::new(CuaBackend::new(
-        backend_command.clone(),
-        backend_args,
-    ));
+    let backend: Arc<dyn ComputerUseBackend> =
+        Arc::new(CuaBackend::new(backend_command.clone(), backend_args));
 
     info!(
         event = "backend_connect",
