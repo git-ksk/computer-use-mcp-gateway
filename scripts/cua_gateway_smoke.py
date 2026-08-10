@@ -23,10 +23,12 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TextIO
 
 HOST = "127.0.0.1"
 PORT = 18100
@@ -102,12 +104,23 @@ def list_tools() -> list[dict]:
     return tools
 
 
-def wait_ready(proc: subprocess.Popen[str], timeout: float = 60.0) -> None:
+def read_gateway_log(log_file: TextIO) -> str:
+    log_file.flush()
+    current = log_file.tell()
+    log_file.seek(0)
+    output = log_file.read()
+    log_file.seek(current)
+    return output
+
+
+def wait_ready(
+    proc: subprocess.Popen[str], log_file: TextIO, timeout: float = 60.0
+) -> None:
     deadline = time.time() + timeout
     last_error: Exception | None = None
     while time.time() < deadline:
         if proc.poll() is not None:
-            output = proc.stdout.read() if proc.stdout else ""
+            output = read_gateway_log(log_file)
             raise RuntimeError(
                 f"gateway exited before readiness with code {proc.returncode}\n{output}"
             )
@@ -121,7 +134,7 @@ def wait_ready(proc: subprocess.Popen[str], timeout: float = 60.0) -> None:
     raise RuntimeError(f"gateway did not become ready: {last_error}")
 
 
-def start_gateway(deny_tool: str | None = None) -> subprocess.Popen[str]:
+def start_gateway(deny_tool: str | None = None) -> tuple[subprocess.Popen[str], TextIO]:
     env = os.environ.copy()
     env.update(
         {
@@ -129,7 +142,8 @@ def start_gateway(deny_tool: str | None = None) -> subprocess.Popen[str]:
             "CUMG_MCP_PATH": "/mcp",
             "CUMG_BACKEND_COMMAND": "cua-driver",
             "CUMG_BACKEND_ARGS": backend_args(),
-            "RUST_LOG": "info",
+            # Keep gateway audit logs while suppressing verbose rmcp peer dumps.
+            "RUST_LOG": "warn,computer_use_mcp_gateway=info",
         }
     )
     if deny_tool:
@@ -137,35 +151,40 @@ def start_gateway(deny_tool: str | None = None) -> subprocess.Popen[str]:
     else:
         env.pop("CUMG_DENY_TOOLS", None)
 
+    # Do not capture child output with PIPE here. Windows anonymous pipes have a
+    # small buffer and verbose protocol logs can block the gateway before the
+    # test drains stdout. A temporary file preserves diagnostics without
+    # back-pressuring the process.
+    log_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
     proc = subprocess.Popen(
         [str(gateway_binary())],
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         text=True,
     )
-    wait_ready(proc)
-    return proc
+    wait_ready(proc, log_file)
+    return proc, log_file
 
 
-def stop_gateway(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
+def stop_gateway(proc: subprocess.Popen[str], log_file: TextIO) -> None:
     try:
-        if os.name == "nt":
-            proc.terminate()
-        else:
-            proc.send_signal(signal.SIGINT)
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        if proc.poll() is None:
+            if os.name == "nt":
+                proc.terminate()
+            else:
+                proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
     finally:
-        if proc.stdout:
-            output = proc.stdout.read()
-            if output:
-                print("--- gateway log ---")
-                print(output[-8000:])
+        output = read_gateway_log(log_file)
+        if output:
+            print("--- gateway log ---")
+            print(output[-8000:])
+        log_file.close()
 
 
 def assert_blocked(tool_name: str) -> None:
@@ -190,7 +209,7 @@ def main() -> int:
     ).stdout.strip()
     print(f"backend={version}")
 
-    first = start_gateway()
+    first, first_log = start_gateway()
     try:
         init = initialize()
         negotiated = init.get("protocolVersion")
@@ -207,9 +226,9 @@ def main() -> int:
         denied = names[0]
         print(f"discovered_tools={len(names)} policy_probe={denied}")
     finally:
-        stop_gateway(first)
+        stop_gateway(first, first_log)
 
-    second = start_gateway(deny_tool=denied)
+    second, second_log = start_gateway(deny_tool=denied)
     try:
         initialize()
         filtered_names = [
@@ -224,7 +243,7 @@ def main() -> int:
             f"PASS real Cua MCP smoke: tools={len(names)} filtered={len(filtered_names)} denied={denied}"
         )
     finally:
-        stop_gateway(second)
+        stop_gateway(second, second_log)
 
     return 0
 
