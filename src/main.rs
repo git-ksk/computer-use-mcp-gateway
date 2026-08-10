@@ -43,15 +43,16 @@ async fn main() -> Result<()> {
 
     let backend_command = config.backend_command.clone();
     let backend_args = config.backend_args();
+    let backend_arg_count = backend_args.len();
     let backend: Arc<dyn ComputerUseBackend> = Arc::new(CuaBackend::new(
         backend_command.clone(),
-        backend_args.clone(),
+        backend_args,
     ));
 
     info!(
         event = "backend_connect",
         backend_command = %backend_command,
-        backend_args = ?backend_args,
+        backend_arg_count,
         "connecting computer-use MCP backend"
     );
     backend
