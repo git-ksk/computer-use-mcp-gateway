@@ -78,7 +78,15 @@ jobs:
         run: |
           $installer = Invoke-RestMethod https://cua.ai/driver/install.ps1
           & ([scriptblock]::Create($installer)) -NoAutoStart
-          "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $bin = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin"
+          if (-not (Test-Path "$bin\cua-driver.exe")) {
+            throw "Cua Driver installer completed without cua-driver.exe"
+          }
+          # The upstream installer may leave LASTEXITCODE from a best-effort
+          # native probe even after a successful install. The binary check
+          # above is the authoritative CI condition.
+          $global:LASTEXITCODE = 0
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Verify Cua Driver and disable telemetry
         shell: bash
