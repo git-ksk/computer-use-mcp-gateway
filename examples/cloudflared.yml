@@ -1,0 +1,10 @@
+# Example only. Keep the gateway bound to 127.0.0.1.
+# Protect the public hostname with Cloudflare Access.
+
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /path/to/YOUR_TUNNEL_ID.json
+
+ingress:
+  - hostname: computer.example.com
+    service: http://127.0.0.1:8100
+  - service: http_status:404
