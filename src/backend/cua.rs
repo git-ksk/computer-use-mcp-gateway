@@ -28,7 +28,7 @@ impl std::fmt::Debug for CuaBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CuaBackend")
             .field("command", &self.command)
-            .field("args", &self.args)
+            .field("arg_count", &self.args.len())
             .finish_non_exhaustive()
     }
 }
