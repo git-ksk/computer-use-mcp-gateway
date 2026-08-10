@@ -2,27 +2,20 @@ pub mod cua;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
+use rmcp::model::{CallToolResult, JsonObject, Tool};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendHealth {
-    Starting,
     Ready,
-    Unhealthy(String),
+    Unhealthy,
     Stopped,
-}
-
-#[derive(Debug, Clone)]
-pub struct BackendTool {
-    pub name: String,
-    pub description: Option<String>,
-    pub input_schema: Value,
 }
 
 #[async_trait]
 pub trait ComputerUseBackend: Send + Sync {
+    async fn connect(&self) -> Result<()>;
     async fn health(&self) -> BackendHealth;
-    async fn list_tools(&self) -> Result<Vec<BackendTool>>;
-    async fn call_tool(&self, name: &str, arguments: Option<Value>) -> Result<Value>;
+    async fn list_tools(&self) -> Result<Vec<Tool>>;
+    async fn call_tool(&self, name: &str, arguments: Option<JsonObject>) -> Result<CallToolResult>;
     async fn shutdown(&self) -> Result<()>;
 }
