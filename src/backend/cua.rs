@@ -1,20 +1,36 @@
-//! Cua Driver backend boundary.
+//! Cua Driver MCP backend.
 //!
-//! The real MCP adapter is intentionally isolated here. V1 will connect to
-//! `cua-driver mcp` through rmcp's child-process transport and translate the
-//! returned MCP Tool/CallToolResult models into the backend-neutral types.
+//! V1 deliberately treats Cua as an MCP server and forwards its tool surface
+//! rather than reimplementing desktop automation in the gateway.
 //!
-//! On macOS, do not bypass Cua's documented TCC/process-identity lifecycle.
+//! On macOS, `cua-driver mcp` may proxy through the supported CuaDriver.app
+//! daemon. Do not replace that lifecycle with a raw `cua-driver serve` spawn.
 
-use super::{BackendHealth, BackendTool, ComputerUseBackend};
-use anyhow::{Result, bail};
+use super::{BackendHealth, ComputerUseBackend};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use serde_json::Value;
+use rmcp::{
+    model::{CallToolRequestParams, CallToolResult, JsonObject, Tool},
+    service::{RoleClient, RunningService, ServiceExt},
+    transport::TokioChildProcess,
+};
+use std::sync::Arc;
+use tokio::{process::Command, sync::Mutex};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CuaBackend {
     command: String,
     args: Vec<String>,
+    service: Arc<Mutex<Option<RunningService<RoleClient, ()>>>>,
+}
+
+impl std::fmt::Debug for CuaBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CuaBackend")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CuaBackend {
@@ -22,6 +38,7 @@ impl CuaBackend {
         Self {
             command: command.into(),
             args,
+            service: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -32,23 +49,85 @@ impl CuaBackend {
     pub fn args(&self) -> &[String] {
         &self.args
     }
+
+    async fn peer(&self) -> Result<rmcp::service::Peer<RoleClient>> {
+        let service = self.service.lock().await;
+        let service = service
+            .as_ref()
+            .context("Cua MCP backend is not connected")?;
+
+        if service.is_closed() || service.peer().is_transport_closed() {
+            bail!("Cua MCP backend transport is closed");
+        }
+
+        Ok(service.peer().clone())
+    }
 }
 
 #[async_trait]
 impl ComputerUseBackend for CuaBackend {
+    async fn connect(&self) -> Result<()> {
+        let mut slot = self.service.lock().await;
+        if let Some(service) = slot.as_ref()
+            && !service.is_closed()
+            && !service.peer().is_transport_closed()
+        {
+            return Ok(());
+        }
+
+        let mut command = Command::new(&self.command);
+        command.args(&self.args);
+        command.kill_on_drop(true);
+
+        let transport = TokioChildProcess::new(command)
+            .context("failed to spawn Cua MCP backend process")?;
+        let service = ()
+            .serve(transport)
+            .await
+            .context("failed to initialize Cua MCP backend")?;
+
+        *slot = Some(service);
+        Ok(())
+    }
+
     async fn health(&self) -> BackendHealth {
-        BackendHealth::Starting
+        let slot = self.service.lock().await;
+        match slot.as_ref() {
+            None => BackendHealth::Stopped,
+            Some(service) if service.is_closed() || service.peer().is_transport_closed() => {
+                BackendHealth::Unhealthy
+            }
+            Some(_) => BackendHealth::Ready,
+        }
     }
 
-    async fn list_tools(&self) -> Result<Vec<BackendTool>> {
-        bail!("Cua MCP adapter not wired yet; roadmap milestone M1")
+    async fn list_tools(&self) -> Result<Vec<Tool>> {
+        let peer = self.peer().await?;
+        peer.list_all_tools()
+            .await
+            .context("failed to list Cua MCP tools")
     }
 
-    async fn call_tool(&self, _name: &str, _arguments: Option<Value>) -> Result<Value> {
-        bail!("Cua MCP adapter not wired yet; roadmap milestone M1")
+    async fn call_tool(&self, name: &str, arguments: Option<JsonObject>) -> Result<CallToolResult> {
+        let peer = self.peer().await?;
+        let mut request = CallToolRequestParams::new(name.to_owned());
+        if let Some(arguments) = arguments {
+            request = request.with_arguments(arguments);
+        }
+
+        peer.call_tool(request)
+            .await
+            .context("Cua MCP tool call failed")
     }
 
     async fn shutdown(&self) -> Result<()> {
+        let service = self.service.lock().await.take();
+        if let Some(mut service) = service {
+            service
+                .close()
+                .await
+                .context("failed to join Cua MCP service during shutdown")?;
+        }
         Ok(())
     }
 }
