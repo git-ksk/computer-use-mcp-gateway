@@ -83,8 +83,7 @@ impl ServerHandler for Gateway {
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult {
             tools: self.tools.as_ref().clone(),
-            next_cursor: None,
-            meta: None,
+            ..Default::default()
         })
     }
 
