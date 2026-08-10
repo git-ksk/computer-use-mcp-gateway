@@ -114,11 +114,7 @@ impl ServerHandler for Gateway {
             return Ok(Self::blocked_result());
         }
 
-        match self
-            .backend
-            .call_tool(&tool_name, request.arguments)
-            .await
-        {
+        match self.backend.call_tool(&tool_name, request.arguments).await {
             Ok(result) => {
                 info!(
                     event = "mcp_tool_call",
