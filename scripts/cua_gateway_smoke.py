@@ -7,8 +7,13 @@ actual integration boundary:
 
   gateway -> cua-driver mcp -> MCP initialize/tools/list
 
-It then restarts the gateway with a dynamic deny rule and confirms that the
-chosen backend tool disappears and is blocked before reaching Cua.
+On GitHub-hosted macOS the smoke test uses `cua-driver mcp --direct` so the
+fresh runner does not depend on persistent CuaDriver.app TCC grants. Production
+macOS remains free to use the gateway default (`cua-driver mcp`), which proxies
+through the signed app identity.
+
+The test then restarts the gateway with a dynamic deny rule and confirms that
+the chosen backend tool disappears and is blocked before reaching Cua.
 """
 
 from __future__ import annotations
@@ -39,6 +44,10 @@ def gateway_binary() -> Path:
     return path.resolve()
 
 
+def backend_args() -> str:
+    return "mcp --direct" if sys.platform == "darwin" else "mcp"
+
+
 def http_json(url: str, payload: dict | None = None, timeout: float = 10.0) -> dict:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {
@@ -56,8 +65,6 @@ def http_json(url: str, payload: dict | None = None, timeout: float = 10.0) -> d
     if "application/json" in content_type:
         return json.loads(body)
 
-    # Defensive SSE support even though the gateway currently requests JSON
-    # responses from rmcp.
     for line in body.splitlines():
         if line.startswith("data:"):
             return json.loads(line.removeprefix("data:").strip())
@@ -95,7 +102,7 @@ def list_tools() -> list[dict]:
     return tools
 
 
-def wait_ready(proc: subprocess.Popen[str], timeout: float = 45.0) -> None:
+def wait_ready(proc: subprocess.Popen[str], timeout: float = 60.0) -> None:
     deadline = time.time() + timeout
     last_error: Exception | None = None
     while time.time() < deadline:
@@ -121,7 +128,7 @@ def start_gateway(deny_tool: str | None = None) -> subprocess.Popen[str]:
             "CUMG_BIND": f"{HOST}:{PORT}",
             "CUMG_MCP_PATH": "/mcp",
             "CUMG_BACKEND_COMMAND": "cua-driver",
-            "CUMG_BACKEND_ARGS": "mcp",
+            "CUMG_BACKEND_ARGS": backend_args(),
             "RUST_LOG": "info",
         }
     )
@@ -172,7 +179,9 @@ def assert_blocked(tool_name: str) -> None:
 
 
 def main() -> int:
-    print(f"platform={sys.platform} python={sys.version.split()[0]}")
+    print(
+        f"platform={sys.platform} python={sys.version.split()[0]} backend_args={backend_args()}"
+    )
     version = subprocess.run(
         ["cua-driver", "--version"],
         check=True,
