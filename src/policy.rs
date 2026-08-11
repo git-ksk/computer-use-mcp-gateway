@@ -20,10 +20,7 @@ pub struct ToolPolicy {
 impl ToolPolicy {
     pub fn new(allowed: Vec<String>, denied: Vec<String>) -> Self {
         let allow_all = allowed.iter().any(|tool| tool == "*");
-        let allowed = allowed
-            .into_iter()
-            .filter(|tool| tool != "*")
-            .collect();
+        let allowed = allowed.into_iter().filter(|tool| tool != "*").collect();
 
         Self {
             allowed,
@@ -51,10 +48,7 @@ mod tests {
 
     #[test]
     fn explicit_deny_wins() {
-        let policy = ToolPolicy::new(
-            vec!["*".into(), "screenshot".into()],
-            vec!["shell".into()],
-        );
+        let policy = ToolPolicy::new(vec!["*".into(), "screenshot".into()], vec!["shell".into()]);
         assert_eq!(policy.evaluate("shell"), PolicyDecision::Deny);
         assert_eq!(policy.evaluate("screenshot"), PolicyDecision::Allow);
     }
