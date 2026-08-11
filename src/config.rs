@@ -37,6 +37,14 @@ pub struct Config {
     #[arg(long, env = "CUMG_ALLOWED_ORIGINS", default_value = "")]
     pub allowed_origins: String,
 
+    /// Maximum concurrent northbound MCP HTTP requests before excess requests fail with HTTP 503.
+    #[arg(long, env = "CUMG_MAX_HTTP_CONCURRENCY", default_value_t = 16)]
+    pub max_http_concurrency: usize,
+
+    /// Include backend PID/CPU/RSS metadata in /healthz. Disabled by default.
+    #[arg(long, env = "CUMG_HEALTH_DETAILS", default_value_t = false)]
+    pub health_details: bool,
+
     /// Timeout for backend MCP connection establishment.
     #[arg(long, env = "CUMG_CONNECT_TIMEOUT_SECS", default_value_t = 15)]
     pub connect_timeout_secs: u64,
@@ -126,5 +134,19 @@ mod tests {
                 "http://127.0.0.1:8100".to_owned()
             ]
         );
+        assert_eq!(config.max_http_concurrency, 16);
+        assert!(!config.health_details);
+    }
+
+    #[test]
+    fn parses_http_hardening_options() {
+        let config = Config::parse_from([
+            "computer-use-mcp-gateway",
+            "--max-http-concurrency",
+            "3",
+            "--health-details",
+        ]);
+        assert_eq!(config.max_http_concurrency, 3);
+        assert!(config.health_details);
     }
 }
