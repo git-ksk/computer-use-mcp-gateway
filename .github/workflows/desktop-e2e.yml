@@ -1,0 +1,42 @@
+name: Desktop E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-desktop:
+    # Never run untrusted PR code on a TCC-granted self-hosted desktop.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, cua-desktop-e2e]
+    timeout-minutes: 15
+    env:
+      CUMG_DESKTOP_E2E_ACK: "1"
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Verify preconfigured Cua Driver
+        shell: bash
+        run: |
+          cua-driver --version
+          cua-driver permissions status
+
+      - name: Build locked gateway
+        shell: bash
+        run: cargo build --locked
+
+      - name: Real desktop screenshot click type verify
+        shell: bash
+        run: python3 scripts/cua_desktop_e2e.py

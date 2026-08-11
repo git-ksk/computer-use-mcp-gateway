@@ -14,7 +14,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -33,6 +33,14 @@ async fn main() -> Result<()> {
         config.mcp_path.starts_with('/'),
         "CUMG_MCP_PATH must start with '/'"
     );
+    ensure!(
+        config.connect_timeout_secs > 0,
+        "CUMG_CONNECT_TIMEOUT_SECS must be greater than zero"
+    );
+    ensure!(
+        config.tool_timeout_secs > 0,
+        "CUMG_TOOL_TIMEOUT_SECS must be greater than zero"
+    );
 
     if !config.bind.ip().is_loopback() {
         warn!(
@@ -44,8 +52,14 @@ async fn main() -> Result<()> {
     let backend_command = config.backend_command.clone();
     let backend_args = config.backend_args();
     let backend_arg_count = backend_args.len();
-    let backend: Arc<dyn ComputerUseBackend> =
-        Arc::new(CuaBackend::new(backend_command.clone(), backend_args));
+    let backend: Arc<dyn ComputerUseBackend> = Arc::new(CuaBackend::new(
+        backend_command.clone(),
+        backend_args,
+        Duration::from_secs(config.connect_timeout_secs),
+        Duration::from_secs(config.tool_timeout_secs),
+        config.reconnect_attempts,
+        Duration::from_millis(config.reconnect_backoff_ms),
+    ));
 
     info!(
         event = "backend_connect",
@@ -63,9 +77,13 @@ async fn main() -> Result<()> {
         .await
         .context("gateway tool discovery failed")?;
 
+    let allowed_hosts = config.allowed_hosts();
+    let allowed_origins = config.allowed_origins();
     let http_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
-        .with_json_response(true);
+        .with_json_response(true)
+        .with_allowed_hosts(allowed_hosts.iter().cloned())
+        .with_allowed_origins(allowed_origins.iter().cloned());
     let service = StreamableHttpService::new(
         {
             let gateway = gateway.clone();
@@ -96,6 +114,8 @@ async fn main() -> Result<()> {
         bind = %config.bind,
         mcp_path = %config.mcp_path,
         health_path = "/healthz",
+        allowed_host_count = allowed_hosts.len(),
+        allowed_origin_count = allowed_origins.len(),
         "computer-use MCP gateway ready"
     );
 
