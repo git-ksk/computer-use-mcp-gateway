@@ -167,13 +167,16 @@ impl CuaBackend {
         }
     }
 
-    async fn notify_cancelled(peer: &Peer<RoleClient>, request_id: rmcp::model::RequestId, reason: &str) {
+    async fn notify_cancelled(
+        peer: &Peer<RoleClient>,
+        request_id: rmcp::model::RequestId,
+        reason: &str,
+    ) {
         let _ = peer
-            .notify_cancelled(CancelledNotificationParam {
-                request_id: Some(request_id),
-                reason: Some(reason.to_owned()),
-                meta: None,
-            })
+            .notify_cancelled(CancelledNotificationParam::new(
+                Some(request_id),
+                Some(reason.to_owned()),
+            ))
             .await;
     }
 }
@@ -226,11 +229,7 @@ impl ComputerUseBackend for CuaBackend {
 
         let handle = peer
             .send_cancellable_request(
-                ClientRequest::CallToolRequest(CallToolRequest {
-                    method: Default::default(),
-                    params,
-                    extensions: Default::default(),
-                }),
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
                 PeerRequestOptions::no_options(),
             )
             .await
