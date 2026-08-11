@@ -8,7 +8,7 @@ A lightweight Rust gateway that exposes a local computer-use MCP backend through
 
 New to the project? Follow **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** from top to bottom. It covers:
 
-1. installing the CI-tested Cua Driver version on macOS, Windows, or Linux;
+1. installing Git/Rust and the CI-tested Cua Driver version on macOS, Windows, or Linux;
 2. configuring platform permissions;
 3. verifying Cua independently;
 4. building and starting the gateway;
@@ -20,7 +20,7 @@ If setup fails, use **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** ins
 
 ### Short local path
 
-Assuming Rust 1.88+ and a working Cua Driver 0.19.3 are already installed:
+Assuming Git, Rust 1.88+, and a working Cua Driver 0.19.3 are already installed:
 
 ```bash
 git clone https://github.com/git-ksk/computer-use-mcp-gateway.git
@@ -154,21 +154,22 @@ cargo fmt --check
 cargo check --locked --all-targets
 cargo test --locked
 python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py
+python3 scripts/check_docs.py
 ```
 
-Normal CI independently verifies the pinned Cua installer SHA-256, the platform release payload SHA-256, and the installed `cua-driver` executable identity before running real gateway/Cua smoke tests on Linux, macOS, and Windows against both exercised MCP lifecycles. It also verifies malicious Host and Origin rejection.
+Normal CI independently verifies the pinned Cua installer SHA-256, the platform release payload SHA-256, and the installed `cua-driver` executable identity before running real gateway/Cua smoke tests on Linux, macOS, and Windows against both exercised MCP lifecycles. It also verifies malicious Host and Origin rejection. The separate read-only Docs workflow checks repository-local Markdown links without making external network requests.
 
 See [`docs/TESTING.md`](docs/TESTING.md) for what the CI proves and what still requires a trusted desktop runner.
 
 ## Documentation
 
-- **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** — install-to-first-working-local-connection guide
+- **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** — clean-machine install-to-first-working-local-connection guide
 - **[`docs/CLIENTS.md`](docs/CLIENTS.md)** — MCP client configuration, including local and authenticated remote examples
 - **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** — symptom-based setup/debugging guide
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — localhost-first remote deployment and reverse-proxy requirements
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, and the gated V2 candidate boundary
 - [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, policy, CI supply chain, and desktop-runner safety
-- [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, compatibility smoke scope, and desktop E2E
+- [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, compatibility smoke scope, docs validation, and desktop E2E
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — repository implementation snapshot and V2 GO/NO-GO gate; the project design report remains canonical
 
 ## Security model
