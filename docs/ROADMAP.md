@@ -125,11 +125,15 @@ Candidate PoC evidence:
 Trust/protocol design required before GO:
 
 - [ ] device identity and enrollment model
-- [ ] Hub↔Agent authentication and key-rotation model
+- [ ] separate MCP client→Hub authentication/authorization from Hub↔Agent authentication and key rotation, so the control plane can answer who may use which capability on which device
 - [ ] typed, versioned command/result schema independent of transport and backend
-- [ ] capability advertisement/negotiation model
+- [ ] capability advertisement/negotiation model that includes `backend`, `backend_version`, `platform`, and `capability_schema_version`
+- [ ] capability revision/generation semantics so the Hub can detect stale discovery after Agent reconnects, backend upgrades, or policy-surface changes
+- [ ] fail-closed handling for capabilities not explicitly understood by the Hub/Agent contract
+- [ ] backend-adapter conformance tests that normalize backend/platform-specific tool behavior without leaking Cua-specific names or transport semantics into the Hub↔Agent protocol
 - [ ] short-lived grant format, expiry, revocation, and replay rules
 - [ ] operation IDs and lease ownership semantics
+- [ ] bounded backpressure across Hub global limits, per-device queue/lease ownership, and Agent single-operation execution
 - [ ] cancellation and reconnect semantics
 - [ ] audit identifiers and policy-decision evidence
 - [ ] threat model covering compromised Hub, Agent, backend, and MCP client
@@ -143,20 +147,24 @@ Only after V2-M0 GO:
 - [ ] outbound Agent connection
 - [ ] heartbeat/reconnect with bounded backoff
 - [ ] one-device routing
+- [ ] versioned capability advertisement with revision/generation tracking
 - [ ] per-device operation lease / serialization ownership
+- [ ] bounded per-device queueing/load shedding before work reaches the Agent
 - [ ] short-lived capability-grant validation
-- [ ] fail-closed stale/offline-agent behavior
+- [ ] fail-closed stale/offline-agent and stale-capability behavior
 - [ ] clean cancellation/disconnect semantics
-- [ ] Cua adapter behind the backend capability contract
+- [ ] Cua adapter behind the backend capability contract with adapter conformance coverage
 
 ### V2-M2: multi-machine Hub
 
 - [ ] machine registry
 - [ ] explicit machine selection/routing
 - [ ] per-machine policy and capability ceiling
+- [ ] client identity → device → capability authorization at the Hub boundary
 - [ ] concurrent execution across independent machines while retaining per-machine serialization
-- [ ] stale/offline device handling that fails closed
-- [ ] backend-neutral capability discovery
+- [ ] global Hub concurrency/rate limits plus bounded per-device queues
+- [ ] stale/offline device and stale-capability-generation handling that fails closed
+- [ ] backend-neutral capability discovery including backend/platform/version metadata
 - [ ] audit trail without raw screenshots/arguments/results by default
 
 ### V2-M3: delegated approvals
