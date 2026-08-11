@@ -1,104 +1,123 @@
 # computer-use-mcp-gateway
 
-A lightweight Rust gateway that exposes a local computer-use MCP backend through a policy-controlled remote MCP endpoint.
+A lightweight Rust gateway that exposes a local computer-use MCP backend through a policy-controlled MCP Streamable HTTP endpoint.
 
-> Status: **V1 hardened / pre-alpha**. The gateway connects to Cua over MCP stdio, applies a fail-closed capability boundary, and exposes it through MCP Streamable HTTP.
+> Status: **V1 hardened / pre-alpha**. The gateway connects to Cua over MCP stdio, applies a fail-closed capability boundary, and keeps the network listener on localhost by default.
+
+## Start here
+
+New to the project? Follow **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** from top to bottom. It covers:
+
+1. installing the CI-tested Cua Driver version on macOS, Windows, or Linux;
+2. configuring platform permissions;
+3. verifying Cua independently;
+4. building and starting the gateway;
+5. checking `/healthz`;
+6. connecting a local MCP client;
+7. adding remote access only after the local path works.
+
+If setup fails, use **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** instead of opening the security boundary until it works.
+
+### Short local path
+
+Assuming Rust 1.88+ and a working Cua Driver 0.19.3 are already installed:
+
+```bash
+git clone https://github.com/git-ksk/computer-use-mcp-gateway.git
+cd computer-use-mcp-gateway
+cargo build --locked
+cargo run --locked -- --allow-tools list_apps,list_windows,get_accessibility_tree,get_screen_size
+```
+
+Then check:
+
+```bash
+curl --fail http://127.0.0.1:8100/healthz
+```
+
+Expected ready response:
+
+```json
+{"status":"ok","backend":"ready"}
+```
+
+The starter allowlist is non-mutating but **not non-sensitive**: application/window names and accessibility text can contain private information.
+
+Local MCP endpoint:
+
+```text
+http://127.0.0.1:8100/mcp
+```
+
+For Codex CLI/IDE, ChatGPT desktop, ChatGPT web, and generic Streamable HTTP clients, see [`docs/CLIENTS.md`](docs/CLIENTS.md).
 
 ## Architecture
 
 ```text
-ChatGPT / Claude / Codex / any MCP client
-                 |
-          authenticated TLS proxy
-                 |
-          MCP Streamable HTTP
-                 |
-                 v
-      computer-use-mcp-gateway
-          (Rust, localhost)
-       policy + transport guards
-        audit + serialization
-                 |
-             MCP stdio
-                 |
-                 v
-          cua-driver mcp
-                 |
-       macOS / Windows / Linux
+MCP client
+    |
+    | local Streamable HTTP
+    | or authenticated TLS proxy for remote use
+    v
++-----------------------------+
+| computer-use-mcp-gateway    |
+|                             |
+| Host / Origin guards        |
+| deny-by-default tool policy |
+| audit / timeout / reconnect |
+| serialized backend access   |
++-------------|---------------+
+              |
+              | MCP stdio
+              v
+         cua-driver mcp
+              |
+      macOS / Windows / Linux
 ```
 
-The gateway owns the network and policy boundary. Cua owns desktop automation and OS-specific permissions.
+The gateway owns the MCP network/policy boundary. Cua owns desktop automation and OS-specific permissions.
 
-## V1
-
-Implemented V1 capabilities:
+## V1 capabilities
 
 - MCP Streamable HTTP endpoint at `/mcp`
-- Legacy `2025-11-25` and stateless `2026-07-28` MCP lifecycle compatibility smoke coverage
-- Localhost-only binding by default (`127.0.0.1:8100`)
+- compatibility smoke coverage for `2025-11-25` and stateless `2026-07-28` MCP lifecycles
+- localhost-only binding by default (`127.0.0.1:8100`)
 - Host validation and browser Origin validation on the MCP endpoint
 - `cua-driver mcp` child process over MCP stdio
-- Dynamic backend tool rediscovery without a gateway restart
-- **Deny-by-default** tool policy; `*` is an explicit opt-in to every discovered tool
-- Denylist overrides allowlist
-- Backend connect/tool timeouts and bounded exponential reconnect
-- Failed tool calls are never replayed automatically because their side effects may be unknown
-- Serialized backend operations so independent clients cannot interleave actions on one physical desktop
-- Tool name, policy decision, outcome, and duration audit fields without raw tool arguments/results
+- dynamic backend tool rediscovery without a gateway restart
+- **deny-by-default** tool policy; `*` is an explicit opt-in to every discovered tool
+- denylist overrides allowlist
+- backend connect/tool timeouts and bounded exponential reconnect
+- failed tool calls are never replayed automatically because their side effects may be unknown
+- serialized backend operations so independent clients cannot interleave actions on one physical desktop
+- tool name, policy decision, outcome, and duration audit fields without raw tool arguments/results
 - `/healthz` backend readiness endpoint
-- Graceful HTTP/backend shutdown
-- Optional Cua policy layer for argument-level defense in depth
-- Real-Cua CI smoke coverage on Linux, macOS, and Windows
-- Manual, trusted self-hosted macOS desktop E2E lane for screenshot → click → type → independent readback
+- graceful HTTP/backend shutdown
+- optional Cua policy layer for argument-level defense in depth
+- real-Cua CI smoke coverage on Linux, macOS, and Windows
+- manual trusted self-hosted macOS desktop E2E lane for screenshot → click → type → independent readback
 
-The dual-protocol smoke suite verifies compatibility with the exercised lifecycles; it is **not** an MCP conformance certification. Official conformance-runner integration remains a roadmap item.
+The dual-protocol smoke suite is a compatibility check, **not** an MCP conformance certification. Official conformance-runner integration remains a roadmap item.
 
-V1 intentionally does **not** implement multi-machine routing, a custom computer-use engine, a cloud control plane, or a custom Hub-to-Agent protocol.
-
-## V2 direction
-
-```text
-LLM --MCP--> Hub --typed RPC/WebSocket--> Agent --MCP/native--> CUA/backend
-                                      |--> Agent (Windows)
-                                      |--> Agent (Linux)
-```
-
-V2 can move the device-side process behind an outbound Agent while keeping MCP as the northbound client API. The Hub-to-Agent command model should remain transport-neutral so its transport can evolve independently.
+V1 intentionally does **not** provide built-in public authentication/TLS, multi-machine routing, per-user desktop isolation, a custom computer-use engine, or a cloud control plane.
 
 ## Backend
 
-The initial backend is [Cua Driver](https://github.com/trycua/cua), connected via:
+The initial backend is [Cua Driver](https://github.com/trycua/cua):
 
 ```bash
 cua-driver mcp
 ```
 
-On macOS, keep Cua's supported application/TCC process lifecycle intact. The gateway does not replace Cua's OS automation implementation.
+The repository CI currently pins Cua Driver **0.19.3** as its reviewed compatibility input. Newer Cua releases may work, but should not be treated as tested until the CI pin is deliberately updated.
 
-For an additional backend-side capability ceiling, start from [`examples/cua-policy.yaml`](examples/cua-policy.yaml) and set `CUA_DRIVER_POLICY_FILE` to the reviewed policy path.
+On macOS, keep Cua's supported application/TCC lifecycle intact. The gateway does not replace Cua's OS automation implementation.
 
-## Run
+For an additional backend-side capability ceiling, review [`examples/cua-policy.yaml`](examples/cua-policy.yaml) and configure `CUA_DRIVER_POLICY_FILE`.
 
-Requirements:
+## Configuration
 
-- Rust 1.88+
-- `cua-driver` available on `PATH`
-- Cua permissions configured for the target OS
-
-```bash
-cp .env.example .env
-set -a; source .env; set +a
-cargo run --locked
-```
-
-Default endpoints:
-
-```text
-MCP     http://127.0.0.1:8100/mcp
-Health  http://127.0.0.1:8100/healthz
-```
-
-### Configuration
+All settings are available through CLI/environment configuration. Run `cargo run --locked -- --help` for CLI flags. `.env.example` provides a persistent environment template.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -116,13 +135,17 @@ Health  http://127.0.0.1:8100/healthz
 | `CUMG_RECONNECT_BACKOFF_MS` | `250` | Initial exponential reconnect delay |
 | `RUST_LOG` | `info` | Logging filter |
 
-The binary itself fails closed when `CUMG_ALLOW_TOOLS` is empty. `.env.example` contains a small inspection-oriented starter allowlist. Use `CUMG_ALLOW_TOOLS=*` only when full backend exposure is intentional.
+The binary itself fails closed when `CUMG_ALLOW_TOOLS` is empty. Use `CUMG_ALLOW_TOOLS=*` only when full backend exposure is intentional and reviewed.
 
-### Reverse proxy
+V1 splits `CUMG_BACKEND_ARGS` on ASCII whitespace and does not implement shell-style quoting for embedded spaces. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-Keep `CUMG_BIND` on loopback. For a public hostname behind Cloudflare Access/Tunnel or another authenticated TLS proxy, either preserve/rewrite the origin `Host` to an allowed loopback authority or explicitly add the public authority to `CUMG_ALLOWED_HOSTS`. If browser-originated MCP requests are expected, explicitly add their exact HTTPS origin to `CUMG_ALLOWED_ORIGINS`; do not disable the checks globally.
+## Remote access
 
-The gateway does **not** provide public authentication itself in V1. Authentication and TLS are a required upstream deployment boundary for remote use. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) before exposing the gateway through a tunnel or proxy.
+Do **not** bind directly to `0.0.0.0` just to make the gateway remote.
+
+Keep the gateway on loopback and place an authenticated TLS reverse proxy/tunnel in front of it. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) includes a Cloudflare Access/Tunnel path and explains the Host/Origin guard configuration.
+
+The gateway does not provide public authentication itself in V1.
 
 ## Development
 
@@ -133,22 +156,19 @@ cargo test --locked
 python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py
 ```
 
-Normal CI independently verifies the pinned Cua installer SHA-256, the platform release payload SHA-256, and the installed `cua-driver` executable identity before running the real gateway/Cua smoke on Linux, macOS, and Windows against both MCP protocol lifecycles. It also verifies that malicious Host and Origin values are rejected.
+Normal CI independently verifies the pinned Cua installer SHA-256, the platform release payload SHA-256, and the installed `cua-driver` executable identity before running real gateway/Cua smoke tests on Linux, macOS, and Windows against both exercised MCP lifecycles. It also verifies malicious Host and Origin rejection.
 
-See [`docs/TESTING.md`](docs/TESTING.md) for the CI matrix, what the smoke tests prove, and what still requires a trusted desktop runner.
-
-### Desktop E2E
-
-`.github/workflows/desktop-e2e.yml` is deliberately `workflow_dispatch`-only, main-branch-only, and targets a dedicated runner labelled `cua-desktop-e2e`. The runner must be a logged-in macOS desktop with the CuaDriver application identity already granted Accessibility and Screen Recording permissions.
-
-Do **not** attach a daily-use Mac as an unrestricted self-hosted runner to this public repository, and never enable this desktop workflow for pull-request events. The E2E fixture opens a fresh TextEdit instance through the gateway, obtains screenshot evidence, clicks the editor, types a unique marker, and independently verifies the resulting accessibility state.
+See [`docs/TESTING.md`](docs/TESTING.md) for what the CI proves and what still requires a trusted desktop runner.
 
 ## Documentation
 
+- **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** — install-to-first-working-local-connection guide
+- **[`docs/CLIENTS.md`](docs/CLIENTS.md)** — MCP client configuration, including local and authenticated remote examples
+- **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** — symptom-based setup/debugging guide
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — localhost-first remote deployment and reverse-proxy requirements
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, and failure model
 - [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, policy, CI supply chain, and desktop-runner safety
-- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — localhost-first deployment and reverse-proxy requirements
-- [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, smoke scope, and desktop E2E
+- [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, compatibility smoke scope, and desktop E2E
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — repository implementation snapshot; the project design report remains canonical
 
 ## Security model
@@ -163,11 +183,17 @@ Do **not** attach a daily-use Mac as an unrestricted self-hosted runner to this 
 8. Do not log MCP tool arguments, results, screenshots, or credentials by default.
 9. Use Cua's own policy engine as a second, narrower enforcement layer where practical.
 
-See [`docs/SECURITY.md`](docs/SECURITY.md) for the security notes.
+See [`docs/SECURITY.md`](docs/SECURITY.md) before using the gateway on a sensitive or remotely reachable desktop.
 
-## Roadmap
+## V2 direction
 
-The canonical roadmap is maintained in the project design report. The repository's [`docs/ROADMAP.md`](docs/ROADMAP.md) is a supporting implementation snapshot, not a replacement for that report.
+```text
+LLM --MCP--> Hub --typed RPC/WebSocket--> Agent --MCP/native--> backend
+                                      |--> Agent (Windows)
+                                      |--> Agent (Linux)
+```
+
+V2 can move the device-side process behind an outbound Agent while keeping MCP as the northbound client API. The Hub-to-Agent command model should remain transport-neutral so its transport can evolve independently.
 
 ## License
 
