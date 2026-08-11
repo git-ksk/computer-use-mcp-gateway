@@ -166,10 +166,10 @@ See [`docs/TESTING.md`](docs/TESTING.md) for what the CI proves and what still r
 - **[`docs/CLIENTS.md`](docs/CLIENTS.md)** — MCP client configuration, including local and authenticated remote examples
 - **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** — symptom-based setup/debugging guide
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — localhost-first remote deployment and reverse-proxy requirements
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, and failure model
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, and the gated V2 candidate boundary
 - [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, policy, CI supply chain, and desktop-runner safety
 - [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, compatibility smoke scope, and desktop E2E
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — repository implementation snapshot; the project design report remains canonical
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — repository implementation snapshot and V2 GO/NO-GO gate; the project design report remains canonical
 
 ## Security model
 
@@ -185,15 +185,19 @@ See [`docs/TESTING.md`](docs/TESTING.md) for what the CI proves and what still r
 
 See [`docs/SECURITY.md`](docs/SECURITY.md) before using the gateway on a sensitive or remotely reachable desktop.
 
-## V2 direction
+## V2 candidate
+
+V2 is **not** automatically a generic Hub + Agent / multi-machine expansion. The roadmap now gates major V2 work on a competitor-gap PoC and an explicit GO/NO-GO decision.
+
+The candidate direction is a **secure delegated device capability control plane**:
 
 ```text
-LLM --MCP--> Hub --typed RPC/WebSocket--> Agent --MCP/native--> backend
-                                      |--> Agent (Windows)
-                                      |--> Agent (Linux)
+MCP client --MCP--> Hub --authenticated typed command/grant protocol--> outbound Agent --> backend
 ```
 
-V2 can move the device-side process behind an outbound Agent while keeping MCP as the northbound client API. The Hub-to-Agent command model should remain transport-neutral so its transport can evolve independently.
+The intended differentiation is capability-control semantics—device identity, short-lived grants, operation leases, replay/cancellation safety, and policy evidence—not another screenshot/input engine or remote-desktop transport.
+
+Cua remains the first backend, but the Hub-to-Agent contract must remain backend- and transport-neutral. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## License
 
