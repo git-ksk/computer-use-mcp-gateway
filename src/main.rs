@@ -109,12 +109,13 @@ async fn main() -> Result<()> {
 
     let mcp_path = config.mcp_path.clone();
     let max_http_concurrency = config.max_http_concurrency;
-    let mcp_router = Router::new()
-        .nest_service(&mcp_path, service)
-        .layer(middleware::from_fn_with_state(
-            Arc::new(Semaphore::new(max_http_concurrency)),
-            mcp_concurrency_guard,
-        ));
+    let mcp_router =
+        Router::new()
+            .nest_service(&mcp_path, service)
+            .layer(middleware::from_fn_with_state(
+                Arc::new(Semaphore::new(max_http_concurrency)),
+                mcp_concurrency_guard,
+            ));
 
     let health_backend = backend.clone();
     let health_details = config.health_details;
