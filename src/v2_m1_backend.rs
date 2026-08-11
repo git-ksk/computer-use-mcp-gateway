@@ -14,7 +14,7 @@ use crate::v2_m0::{
 use crate::v2_m0_transport::CancellationDisposition;
 use anyhow::Error as AnyError;
 use rmcp::model::{CallToolResult, JsonObject};
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
 use tokio::sync::watch;

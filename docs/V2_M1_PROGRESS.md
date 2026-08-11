@@ -16,9 +16,10 @@ The current `v2-m1-secure-agent` implementation adds these M1 building blocks wh
 - append-only checkpoint files with bounded size, `create_new`, flush/fsync, symlink rejection, and restrictive Unix directory/file permission checks;
 - restart conversion of queued/pre-dispatch work to `cancelled` and dispatched/cancel-requested work to `indeterminate`, so process restart never makes ambiguous work runnable again;
 - an asynchronous Cua MCP semantic adapter that reuses the V1 request-level cancellation path, normalizes `list_apps`/`get_screen_size`, and classifies propagated cancellation or timeout as `indeterminate` rather than claiming the desktop action definitely stopped;
-- Hub-side device quarantine for `indeterminate` operations: a different operation on the same device is rejected until an explicit resolution records the ambiguous operation as confirmed completed or confirmed not executed.
+- Hub-side device quarantine for `indeterminate` operations: a different operation on the same device is rejected until an explicit resolution records the ambiguous operation as confirmed completed or confirmed not executed;
+- a separate key-material boundary for Agent device, Hub transport, and grant-signing Ed25519 secrets plus public trust anchors: secret files are created with restrictive permissions, symlinks and weak permissions fail closed, and TLS root material is loaded separately from replay checkpoints.
 
-The persisted checkpoint intentionally contains **no private signing keys**. Hub transport, Agent device, grant-signing, and TLS private key material still require an explicit production secret-storage/provisioning design. Persisting public trust and replay state is necessary for fail-closed restart semantics, but is not a substitute for private-key custody.
+The persisted replay/trust checkpoint intentionally contains **no private signing keys**. File-based key provisioning is now defined and tested, but a production deployment may still choose an OS keychain, HSM/KMS, or another reviewed secret store instead of filesystem secrets. Persisting public trust and replay state is necessary for fail-closed restart semantics, but is not a substitute for private-key custody.
 
 ## Evidence currently covered by tests
 
@@ -29,7 +30,7 @@ The existing M0 live-Cua PoC continues to prove the semantic path from an author
 ## Still required before V2-M1 acceptance
 
 - package the reusable lifecycle into an operator-facing long-lived Agent process/service and wire heartbeat-timeout detection to that service lifecycle; the lifecycle runner and two-session encrypted reconnect/generation test are implemented;
-- define production certificate/private-key provisioning and rotation without committing secrets to repository state;
+- integrate the file-based key boundary with the operator-facing Agent/Hub services and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;
 - integrate a real northbound authenticated identity source with `AuthenticatedClientPrincipal` rather than constructing the principal inside a PoC;
 - run cancellation acceptance against real Cua desktop operations; the deterministic MCP fixture already proves exact-request propagation and indeterminate quarantine, but it cannot prove a real desktop action stopped;
 - add deployment-level connection/rate limits and operational observability for the M1 service boundary.

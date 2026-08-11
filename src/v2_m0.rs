@@ -100,6 +100,16 @@ impl DeviceIdentity {
         }
     }
 
+    pub fn from_secret_key_bytes(secret_key: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&secret_key),
+        }
+    }
+
+    pub(crate) fn secret_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     pub fn public_key(&self) -> Vec<u8> {
         self.signing_key.verifying_key().to_bytes().to_vec()
     }
@@ -383,6 +393,16 @@ impl GrantAuthority {
         Self {
             signing_key: SigningKey::generate(&mut OsRng),
         }
+    }
+
+    pub fn from_secret_key_bytes(secret_key: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&secret_key),
+        }
+    }
+
+    pub(crate) fn secret_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
     }
 
     pub fn verifier(&self) -> VerifyingKey {

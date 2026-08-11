@@ -15,7 +15,6 @@ use crate::v2_m0_execution::{
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use ed25519_dalek::VerifyingKey;
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -250,7 +249,7 @@ fn read_secure_json<T: DeserializeOwned>(path: &Path) -> Result<T, PersistenceEr
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(PersistenceError::UnsafePermissions);
     }
-    let mut file = File::open(path).map_err(PersistenceError::Io)?;
+    let file = File::open(path).map_err(PersistenceError::Io)?;
     let mut payload = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.take(MAX_CHECKPOINT_BYTES + 1)
         .read_to_end(&mut payload)
@@ -309,6 +308,7 @@ mod tests {
     use crate::v2_m0::{CapabilityClass, DeviceIdentity, GrantAuthority};
     use crate::v2_m0_execution::{AdmissionDecision, OperationRef};
     use crate::v2_m0_transport::HubIdentity;
+    use rand::{RngCore, rngs::OsRng};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_directory(name: &str) -> PathBuf {

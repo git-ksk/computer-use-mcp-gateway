@@ -33,6 +33,16 @@ impl HubIdentity {
         }
     }
 
+    pub fn from_secret_key_bytes(secret_key: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&secret_key),
+        }
+    }
+
+    pub(crate) fn secret_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     pub fn verifier(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
     }

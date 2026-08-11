@@ -153,6 +153,8 @@ Only after V2-M0 GO:
 - [x] outbound Agent connection over the accepted encrypted M1 channel
 - [x] reusable outbound lifecycle and encrypted multi-session reconnect acceptance
 - [ ] operator-facing long-lived Agent process/service lifecycle
+- [x] separate file-based key/trust-anchor provisioning boundary with fail-closed filesystem checks
+- [ ] production secret-store/certificate rotation integration for the deployed service
 - [x] heartbeat/reconnect semantics with bounded backoff
 - [x] one-device routing
 - [x] versioned capability advertisement with revision/generation tracking
