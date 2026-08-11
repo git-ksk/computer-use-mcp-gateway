@@ -36,7 +36,9 @@ MCP client
 - backend lifecycle
 - dynamic tool discovery and cached policy-filtered snapshot
 - request forwarding
-- deny-by-default policy enforcement
+- deny-by-default exact-name policy enforcement
+- semantic tool risk classification for audit/inspection
+- upstream cancellation forwarding
 - health and audit metadata
 
 **Backend adapter**
@@ -44,7 +46,9 @@ MCP client
 - connection and operation timeouts
 - bounded reconnect/backoff
 - serialization of operations against one physical desktop
-- no automatic replay of failed state-changing calls
+- downstream MCP cancellation using the actual in-flight request ID
+- no automatic replay of failed or cancelled state-changing calls
+- gateway-owned backend child PID/CPU/RSS telemetry where the platform supports it
 
 **Cua backend**
 - screenshots
@@ -61,8 +65,9 @@ V1 starts with Cua but does not hard-code Cua semantics into the public gateway 
 Backend
   connect()
   health()
+  resource_metrics()
   list_tools()
-  call_tool()
+  call_tool(..., cancellation)
   shutdown()
 ```
 
@@ -74,15 +79,52 @@ MCP `2026-07-28` removes protocol-level HTTP sessions. Public request handlers t
 
 Application-level state is independent of MCP transport sessions:
 
-- `Gateway` owns the policy and a shared, policy-filtered tool snapshot.
-- `CuaBackend` owns the current MCP client service and synchronization locks.
+- `Gateway` owns the exact-name policy, semantic classifier, and a shared policy-filtered tool snapshot.
+- `CuaBackend` owns the current MCP client service, its direct child PID, and synchronization locks.
 - `tools/list` refreshes backend discovery; if refresh fails it may serve the last policy-filtered cached snapshot.
 - a policy-allowed `tools/call` missing from the current snapshot triggers one refresh and fails closed if discovery still cannot confirm the tool.
 - backend operations are serialized because cursor/focus/UI snapshot state is shared mutable desktop state.
 
-## Failure model
+## Tool classification
+
+V1 keeps authorization and semantic classification separate.
+
+Exact tool names remain the enforcement boundary through `CUMG_ALLOW_TOOLS` / `CUMG_DENY_TOOLS`. Independently, discovered/called tools are classified as:
+
+- `observe`;
+- `interact`;
+- `system`;
+- `dangerous`.
+
+Known Cua-compatible names are mapped explicitly. Unknown/new backend tool names are classified as `dangerous` until reviewed. The classification is included in audit metadata and discovery counts; it does **not** silently broaden the exact-name allowlist.
+
+## Failure and cancellation model
 
 Read-only tool discovery can reconnect and retry after a transport failure. State-changing computer-use calls cannot be safely replayed because the desktop may already have partially applied the action. A failed call is therefore returned as an error after recovery is attempted for the next request.
+
+When the northbound MCP request is cancelled, the gateway forwards that signal into `CuaBackend`. The backend creates the downstream call through rmcp's cancellable-request API, retains its actual downstream request ID, and sends `notifications/cancelled` with that ID. The cancelled call is returned as an error and is not replayed.
+
+The per-call timeout follows the same no-replay safety rule: the backend sends a downstream cancellation notification for the in-flight request, then repairs the connection for a later request when possible.
+
+## Health and resource telemetry
+
+`/healthz` reports backend readiness plus an optional `backend_resources` snapshot for the backend child process directly owned by the gateway:
+
+```json
+{
+  "status": "ok",
+  "backend": "ready",
+  "backend_resources": {
+    "pid": 12345,
+    "cpu_seconds": 0.12,
+    "rss_bytes": 17817600
+  }
+}
+```
+
+`cpu_seconds` is cumulative process CPU time; `rss_bytes` is resident memory. If a platform/process lookup cannot provide a snapshot, `backend_resources` may be `null` without changing the readiness decision.
+
+On macOS, Cua may proxy through its supported application/daemon lifecycle, so these metrics describe the direct child the gateway owns, not aggregate resource use across every Cua process.
 
 ## Security boundary
 
