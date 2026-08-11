@@ -1,2 +1,0 @@
-This placeholder avoids creating CI files before the project can be compiled locally.
-Remove it when .github/workflows/ci.yml is added after the first successful cargo check.

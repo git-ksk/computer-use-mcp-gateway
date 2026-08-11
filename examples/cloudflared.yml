@@ -1,5 +1,14 @@
 # Example only. Keep the gateway bound to 127.0.0.1.
 # Protect the public hostname with Cloudflare Access.
+#
+# IMPORTANT: cloudflared normally forwards the public hostname in the Host
+# authority. Configure the gateway with:
+#   CUMG_ALLOWED_HOSTS=computer.example.com
+# If a browser-originated MCP client is expected, also allow its exact HTTPS
+# origin with CUMG_ALLOWED_ORIGINS. Do not disable Host/Origin validation.
+#
+# Replace all placeholders below. Never commit a real tunnel ID, credential
+# file path containing private information, Access token, or production host.
 
 tunnel: YOUR_TUNNEL_ID
 credentials-file: /path/to/YOUR_TUNNEL_ID.json
