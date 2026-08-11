@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -34,8 +35,12 @@ def emit(message: dict) -> None:
 
 
 def touch(path: str | None, text: str) -> None:
-    if path:
-        Path(path).write_text(text, encoding="utf-8")
+    if not path:
+        return
+    marker = Path(path)
+    temporary = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(marker)
 
 
 def result(request_id: object, payload: dict) -> None:
