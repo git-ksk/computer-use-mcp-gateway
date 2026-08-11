@@ -258,12 +258,16 @@ fn parse_ps_cpu_time(value: &str) -> Option<f64> {
         None => (0.0, value),
     };
     let parts: Vec<&str> = clock.split(':').collect();
-    let (hours, minutes, seconds) = match parts.as_slice() {
-        [minutes, seconds] => (0.0, minutes.parse().ok()?, seconds.parse().ok()?),
+    let (hours, minutes, seconds): (f64, f64, f64) = match parts.as_slice() {
+        [minutes, seconds] => (
+            0.0,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
         [hours, minutes, seconds] => (
-            hours.parse().ok()?,
-            minutes.parse().ok()?,
-            seconds.parse().ok()?,
+            hours.parse::<f64>().ok()?,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
         ),
         _ => return None,
     };
