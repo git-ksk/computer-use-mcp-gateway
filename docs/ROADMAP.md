@@ -104,7 +104,7 @@ Cua remains an important backend. Cua-specific tool names or transport behavior 
 
 ### V2-M0: competitor-gap PoC + trust model — GO/NO-GO gate
 
-> **V2-M0 implementation note (2026-08-11):** the first transport-independent control-plane prototype is now in `src/v2_m0.rs`, with a one-device live-Cua runner in `src/bin/v2_m0_poc.rs`. It proves cryptographic enrollment, short-lived semantic grants, replay/revocation/expiry rejection, generation-bound leases, stale capability/generation rejection, and content-minimizing audit evidence. The GO/NO-GO decision remains **PENDING** until outbound authenticated Hub↔Agent connectivity and the remaining trust-model items are proven. See [`V2_M0_POC.md`](V2_M0_POC.md).
+> **V2-M0 implementation note (2026-08-11):** the transport-independent control plane in `src/v2_m0.rs` now has an isolated outbound Hub↔Agent network slice in `src/v2_m0_transport.rs`, exercised by `src/bin/v2_m0_network_poc.rs`. The PoCs prove cryptographic enrollment, mutually authenticated outbound Agent connectivity on loopback, bounded versioned framing, typed backend-neutral command/results, Agent-side short-lived grant validation, replay/revocation/expiry rejection, generation-bound leases, stale capability/generation rejection, and content-minimizing audit evidence. The GO/NO-GO decision remains **PENDING** until the remaining trust-model and production remote-transport requirements are resolved. See [`V2_M0_POC.md`](V2_M0_POC.md).
 
 Before building a general Hub or multi-machine router:
 
@@ -116,7 +116,7 @@ Before building a general Hub or multi-machine router:
 Candidate PoC evidence:
 
 1. [x] enroll one device with a cryptographic device identity;
-2. [ ] Agent establishes outbound-only authenticated connectivity where practical;
+2. [x] Agent establishes outbound-only authenticated connectivity where practical;
 3. [x] issue a short-lived `observe` capability grant;
 4. [x] reject an `interact` action until a separate grant/approval exists;
 5. [x] hold one operation lease so conflicting control of the same desktop fails closed;
@@ -128,7 +128,7 @@ Trust/protocol design required before GO:
 
 - [x] device identity and enrollment model
 - [ ] separate MCP client→Hub authentication/authorization from Hub↔Agent authentication and key rotation, so the control plane can answer who may use which capability on which device
-- [ ] typed, versioned command/result schema independent of transport and backend
+- [x] typed, versioned command/result schema independent of transport and backend
 - [x] capability advertisement/negotiation model that includes `backend`, `backend_version`, `platform`, and `capability_schema_version`
 - [x] capability revision/generation semantics so the Hub can detect stale discovery after Agent reconnects, backend upgrades, or policy-surface changes
 - [x] fail-closed handling for capabilities not explicitly understood by the Hub/Agent contract

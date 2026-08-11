@@ -34,10 +34,24 @@ Primary references reviewed on 2026-08-11:
 - exact semantic capability enforcement (`observe` does not authorize `interact`);
 - per-device operation leases tied to device generation;
 - reconnect generation changes that do not transfer an existing lease;
-- typed backend-neutral command envelopes;
+- typed backend-neutral command envelopes and typed result envelopes;
 - audit evidence containing IDs, policy outcome, and reason but no raw command/result/screenshot fields.
 
 The unit tests are intentionally transport-independent so these semantics survive a later WebSocket, QUIC, gRPC, or other transport choice.
+
+`src/v2_m0_transport.rs` adds a separate transport-facing PoC layer with:
+
+- Agent-initiated outbound connectivity with no Agent listener;
+- a pinned Ed25519 Hub identity authenticated by the Agent;
+- proof of the enrolled Ed25519 device identity authenticated by the Hub;
+- fresh Agent/Hub nonces that bind each handshake transcript and reject proof replay;
+- signed session acceptance, commands, and results bound to those connection nonces, so post-handshake payload tampering fails closed;
+- a grant-signing key that is separate from the Hub transport identity;
+- bounded 64 KiB length-prefixed JSON frames;
+- versioned typed Hub↔Agent messages;
+- Agent-side short-lived grant validation before backend execution.
+
+The network PoC deliberately binds only to loopback TCP. It proves the outbound authentication and application-message integrity semantics, not production remote confidentiality. A remote implementation must add authenticated TLS or an equivalently reviewed secure tunnel without changing the backend-neutral command/grant contract.
 
 ## One-device live backend proof
 
@@ -63,18 +77,30 @@ The PoC:
 12. reconnects the same device with a new generation and proves it cannot take over a still-live lease from the old generation;
 13. emits only summary/audit evidence, never the backend's raw app list.
 
+## Outbound authenticated Agent proof
+
+Run:
+
+```bash
+CUMG_BACKEND_COMMAND="$HOME/.local/bin/cua-driver" cargo run --locked --bin v2_m0_network_poc
+```
+
+This slice starts a loopback Hub listener, then starts an Agent that initiates the connection outbound. The Agent does not expose a listening socket. The peers perform a fresh-nonce mutual Ed25519 handshake: the Agent verifies a pre-pinned Hub identity, and the Hub verifies the already-enrolled device identity. The Hub then signs the accepted session and each command against the connection nonces, while the Agent signs each result against the same connection context. Only after those checks does the Hub establish the device generation, issue a short-lived `observe` grant, acquire the operation lease, and send a typed `ListApplications` command. The Agent validates the session and grant locally before executing the real Cua backend call and returning only a typed application count.
+
+The frame codec rejects payloads over 64 KiB before allocation of the declared payload, and the PoC emits no raw backend app list, screenshots, arguments, or result bodies.
+
 ## What this PoC does not prove yet
 
-The local PoC does **not** yet satisfy the complete V2-M0 GO gate. In particular, it does not yet implement or prove:
+These PoCs do **not** yet satisfy the complete V2-M0 GO gate. In particular, it does not yet implement or prove:
 
-- outbound-only authenticated Hub↔Agent network connectivity;
+- production remote transport confidentiality/integrity beyond the loopback-only authenticated TCP PoC;
 - Hub identity/key rotation and Agent credential rotation;
 - MCP-client→Hub authorization mapping to device/capability grants;
 - distributed cancellation/backpressure behavior across a real transport;
 - compromised-Hub/Agent/backend/client threat-model analysis;
 - backend-adapter conformance across more than Cua on this one machine.
 
-Until those are designed and the outbound Agent slice is proven, the V2-M0 decision remains **PENDING**, not GO.
+Until those remaining items are designed and reviewed, the V2-M0 decision remains **PENDING**, not GO.
 
 ## Recorded local run — 2026-08-11
 
@@ -89,3 +115,19 @@ The first operator-controlled run passed on macOS arm64 against Cua Driver 0.19.
 - reconnect generation attempting to take a live prior-generation lease: REJECTED.
 
 This is evidence for the local control semantics only. It does not change the V2-M0 GO/NO-GO state from **PENDING**.
+
+## Recorded outbound network run — 2026-08-11
+
+The first outbound network run passed on the same macOS arm64 machine against Cua Driver 0.19.3. The Agent initiated a loopback TCP connection to the Hub, authenticated the pinned Hub identity, proved the enrolled device identity back to the Hub, validated a short-lived `observe` grant locally, and executed a real `ListApplications` command. The typed result reported an application count of 77; the raw application list was not logged or returned by the PoC.
+
+Additional transport tests confirmed:
+
+- unpinned Hub identity: REJECTED;
+- forged Agent proof: REJECTED;
+- Agent proof replay against a fresh Hub nonce: REJECTED;
+- signed command payload tampering: REJECTED;
+- signed result payload tampering: REJECTED;
+- oversized declared frame: REJECTED before payload allocation/read;
+- bounded typed frame round-trip: PASS.
+
+This proves the outbound authenticated control hop on loopback only. It does not claim encrypted remote transport or change the V2-M0 GO/NO-GO state from **PENDING**.

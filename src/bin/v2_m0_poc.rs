@@ -1,8 +1,8 @@
 use computer_use_mcp_gateway::v2_m0::{
     AuditEvidence, AuditLog, AuditReason, CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION,
     CapabilityAdvertisement, CapabilityClass, CommandEnvelope, ControlError, DeviceCapability,
-    DeviceIdentity, DeviceRegistry, GrantAuthority, GrantLedger, LeaseManager, PolicyOutcome,
-    validate_command_session,
+    DeviceCommand, DeviceIdentity, DeviceRegistry, GrantAuthority, GrantLedger, LeaseManager,
+    PolicyOutcome, validate_command_session,
 };
 use serde_json::json;
 use std::{
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device_generation: first_session.generation,
         capability_revision: caps.revision,
         operation_id: "poc-observe-list-apps".into(),
-        command: DeviceCapability::ListApplications,
+        command: DeviceCommand::ListApplications,
     };
     validate_command_session(&observe, &first_session)?;
     grants.authorize_once(
@@ -98,7 +98,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         authority.issue(&device_id, CapabilityClass::Observe, start + 3, 60_000)?;
     let interact = CommandEnvelope {
         operation_id: "poc-interact-denied".into(),
-        command: DeviceCapability::PointerClick,
+        command: DeviceCommand::PointerClick {
+            x: 10,
+            y: 10,
+            button: computer_use_mcp_gateway::v2_m0::PointerButton::Left,
+        },
         ..observe.clone()
     };
     validate_command_session(&interact, &first_session)?;

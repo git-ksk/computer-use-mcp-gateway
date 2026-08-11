@@ -38,6 +38,40 @@ impl DeviceCapability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DeviceCommand {
+    ListApplications,
+    ScreenGeometry,
+    PointerClick {
+        x: i32,
+        y: i32,
+        button: PointerButton,
+    },
+}
+
+impl DeviceCommand {
+    pub fn capability(&self) -> DeviceCapability {
+        match self {
+            Self::ListApplications => DeviceCapability::ListApplications,
+            Self::ScreenGeometry => DeviceCapability::ScreenGeometry,
+            Self::PointerClick { .. } => DeviceCapability::PointerClick,
+        }
+    }
+
+    pub fn class(&self) -> CapabilityClass {
+        self.capability().class()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityAdvertisement {
     pub backend: String,
@@ -72,6 +106,10 @@ impl DeviceIdentity {
 
     pub fn enrollment_proof(&self, challenge: &[u8]) -> Vec<u8> {
         self.signing_key.sign(challenge).to_bytes().to_vec()
+    }
+
+    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(message).to_bytes().to_vec()
     }
 }
 
@@ -134,6 +172,29 @@ impl DeviceRegistry {
 
     pub fn revoke_device(&mut self, device_id: &str) {
         self.revoked.insert(device_id.to_owned());
+    }
+
+    pub fn verify_device_signature(
+        &self,
+        device_id: &str,
+        message: &[u8],
+        proof: &[u8],
+    ) -> Result<(), ControlError> {
+        if self.revoked.contains(device_id) {
+            return Err(ControlError::DeviceRevoked);
+        }
+        let device = self
+            .devices
+            .get(device_id)
+            .ok_or(ControlError::UnknownDevice)?;
+        let sig_bytes: [u8; 64] = proof
+            .try_into()
+            .map_err(|_| ControlError::InvalidDeviceSignature)?;
+        let signature = Signature::from_bytes(&sig_bytes);
+        device
+            .verifying_key
+            .verify(message, &signature)
+            .map_err(|_| ControlError::InvalidDeviceSignature)
     }
 
     pub fn connect(
@@ -319,7 +380,7 @@ pub struct CommandEnvelope {
     pub device_generation: u64,
     pub capability_revision: u64,
     pub operation_id: String,
-    pub command: DeviceCapability,
+    pub command: DeviceCommand,
 }
 
 impl CommandEnvelope {
@@ -352,8 +413,76 @@ pub fn validate_command_session(
             got: command.capability_revision,
         });
     }
-    if !session.capabilities.supports(command.command) {
-        return Err(ControlError::UnsupportedDeviceCapability(command.command));
+    let required_capability = command.command.capability();
+    if !session.capabilities.supports(required_capability) {
+        return Err(ControlError::UnsupportedDeviceCapability(
+            required_capability,
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DeviceResult {
+    Applications {
+        count: u64,
+    },
+    ScreenGeometry {
+        width_points: u32,
+        height_points: u32,
+        scale_factor_milli: u32,
+    },
+    PointerClickCompleted,
+}
+
+impl DeviceResult {
+    fn matches_command(&self, command: &DeviceCommand) -> bool {
+        matches!(
+            (self, command),
+            (Self::Applications { .. }, DeviceCommand::ListApplications)
+                | (Self::ScreenGeometry { .. }, DeviceCommand::ScreenGeometry)
+                | (
+                    Self::PointerClickCompleted,
+                    DeviceCommand::PointerClick { .. }
+                )
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandResultEnvelope {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub capability_revision: u64,
+    pub operation_id: String,
+    pub result: DeviceResult,
+}
+
+pub fn validate_command_result(
+    command: &CommandEnvelope,
+    result: &CommandResultEnvelope,
+) -> Result<(), ControlError> {
+    if result.schema_version != CONTROL_SCHEMA_VERSION {
+        return Err(ControlError::UnsupportedControlSchema {
+            got: result.schema_version,
+        });
+    }
+    if result.device_id != command.device_id {
+        return Err(ControlError::ResultDeviceMismatch);
+    }
+    if result.device_generation != command.device_generation {
+        return Err(ControlError::ResultGenerationMismatch);
+    }
+    if result.capability_revision != command.capability_revision {
+        return Err(ControlError::ResultCapabilityRevisionMismatch);
+    }
+    if result.operation_id != command.operation_id {
+        return Err(ControlError::ResultOperationMismatch);
+    }
+    if !result.result.matches_command(&command.command) {
+        return Err(ControlError::ResultTypeMismatch);
     }
     Ok(())
 }
@@ -480,6 +609,7 @@ impl AuditLog {
 pub enum ControlError {
     InvalidDeviceIdentity,
     InvalidEnrollmentProof,
+    InvalidDeviceSignature,
     UnknownDevice,
     DeviceRevoked,
     DeviceOffline,
@@ -510,6 +640,11 @@ pub enum ControlError {
         got: u64,
     },
     UnsupportedDeviceCapability(DeviceCapability),
+    ResultDeviceMismatch,
+    ResultGenerationMismatch,
+    ResultCapabilityRevisionMismatch,
+    ResultOperationMismatch,
+    ResultTypeMismatch,
     InvalidLeaseLifetime,
     LeaseConflict {
         owner_operation_id: String,
@@ -601,7 +736,11 @@ mod tests {
             device_generation: session.generation,
             capability_revision: 7,
             operation_id: "op-interact".into(),
-            command: DeviceCapability::PointerClick,
+            command: DeviceCommand::PointerClick {
+                x: 10,
+                y: 20,
+                button: PointerButton::Left,
+            },
         };
         validate_command_session(&interact, &session).unwrap();
         assert!(matches!(
@@ -610,7 +749,7 @@ mod tests {
         ));
 
         let observe = CommandEnvelope {
-            command: DeviceCapability::ListApplications,
+            command: DeviceCommand::ListApplications,
             operation_id: "op-observe".into(),
             ..interact
         };
@@ -698,7 +837,7 @@ mod tests {
             device_generation: first.generation,
             capability_revision: second.capabilities.revision,
             operation_id: "op-stale-generation".into(),
-            command: DeviceCapability::ListApplications,
+            command: DeviceCommand::ListApplications,
         };
         assert!(matches!(
             validate_command_session(&stale_generation, &second),
@@ -715,6 +854,36 @@ mod tests {
             validate_command_session(&stale_revision, &second),
             Err(ControlError::StaleCapabilityRevision { .. })
         ));
+    }
+
+    #[test]
+    fn typed_results_must_match_the_command_envelope() {
+        let command = CommandEnvelope {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            device_id: "dev-test".into(),
+            device_generation: 3,
+            capability_revision: 9,
+            operation_id: "op-test".into(),
+            command: DeviceCommand::ListApplications,
+        };
+        let result = CommandResultEnvelope {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            device_id: command.device_id.clone(),
+            device_generation: command.device_generation,
+            capability_revision: command.capability_revision,
+            operation_id: command.operation_id.clone(),
+            result: DeviceResult::Applications { count: 7 },
+        };
+        validate_command_result(&command, &result).unwrap();
+
+        let mismatched = CommandResultEnvelope {
+            result: DeviceResult::PointerClickCompleted,
+            ..result
+        };
+        assert_eq!(
+            validate_command_result(&command, &mismatched),
+            Err(ControlError::ResultTypeMismatch)
+        );
     }
 
     #[test]
