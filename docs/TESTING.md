@@ -61,6 +61,22 @@ GitHub-hosted macOS runners are not a substitute for a persistent logged-in desk
 
 The dual-protocol smoke suite is also **not** an MCP conformance certification. Integration of the official MCP conformance requirement runner remains tracked in `docs/ROADMAP.md`.
 
+## Updating the Cua compatibility pin
+
+Treat a Cua Driver version bump as a reviewed compatibility change, not a blind dependency refresh.
+
+When changing the CI pin:
+
+1. select the exact upstream release version;
+2. update the versioned installer SHA-256;
+3. update every platform release-payload SHA-256 used by the matrix;
+4. verify the asset names/architectures still match the workflow assumptions;
+5. let CI independently compare the installed executable to the verified payload executable;
+6. require all three OS jobs and both protocol lifecycle smokes to pass before merge;
+7. review newly discovered Cua tools against the gateway and optional backend policy before widening any production allowlist.
+
+Do not replace the pinned release URLs with a mutable `latest` or convenience installer URL in normal CI.
+
 ## Desktop E2E
 
 `.github/workflows/desktop-e2e.yml` is intentionally:
