@@ -8,25 +8,26 @@ pub enum PolicyDecision {
 
 /// Tool policy applied before a backend call is forwarded.
 ///
-/// Deny entries always win. When an allowlist is configured, tools not present
-/// in it are denied. An empty allowlist means all discovered backend tools are
-/// eligible unless explicitly denied.
+/// V1 is deny-by-default. Operators must explicitly allow tools by name or use
+/// `*` to opt in to every discovered backend tool. Deny entries always win.
 #[derive(Debug, Clone, Default)]
 pub struct ToolPolicy {
-    allowed: Option<HashSet<String>>,
+    allowed: HashSet<String>,
+    allow_all: bool,
     denied: HashSet<String>,
 }
 
 impl ToolPolicy {
     pub fn new(allowed: Vec<String>, denied: Vec<String>) -> Self {
-        let allowed = if allowed.is_empty() {
-            None
-        } else {
-            Some(allowed.into_iter().collect())
-        };
+        let allow_all = allowed.iter().any(|tool| tool == "*");
+        let allowed = allowed
+            .into_iter()
+            .filter(|tool| tool != "*")
+            .collect();
 
         Self {
             allowed,
+            allow_all,
             denied: denied.into_iter().collect(),
         }
     }
@@ -36,9 +37,10 @@ impl ToolPolicy {
             return PolicyDecision::Deny;
         }
 
-        match &self.allowed {
-            Some(allowed) if !allowed.contains(tool_name) => PolicyDecision::Deny,
-            _ => PolicyDecision::Allow,
+        if self.allow_all || self.allowed.contains(tool_name) {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny
         }
     }
 }
@@ -50,7 +52,7 @@ mod tests {
     #[test]
     fn explicit_deny_wins() {
         let policy = ToolPolicy::new(
-            vec!["shell".into(), "screenshot".into()],
+            vec!["*".into(), "screenshot".into()],
             vec!["shell".into()],
         );
         assert_eq!(policy.evaluate("shell"), PolicyDecision::Deny);
@@ -58,15 +60,22 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_is_fail_closed_when_present() {
+    fn explicit_allowlist_is_fail_closed() {
         let policy = ToolPolicy::new(vec!["screenshot".into()], vec![]);
         assert_eq!(policy.evaluate("screenshot"), PolicyDecision::Allow);
         assert_eq!(policy.evaluate("click"), PolicyDecision::Deny);
     }
 
     #[test]
-    fn empty_allowlist_allows_discovered_tools() {
+    fn empty_allowlist_denies_everything() {
         let policy = ToolPolicy::new(vec![], vec![]);
+        assert_eq!(policy.evaluate("click"), PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn wildcard_requires_explicit_opt_in() {
+        let policy = ToolPolicy::new(vec!["*".into()], vec![]);
         assert_eq!(policy.evaluate("click"), PolicyDecision::Allow);
+        assert_eq!(policy.evaluate("future_tool"), PolicyDecision::Allow);
     }
 }
