@@ -38,7 +38,7 @@ Until those categories exist, configure exact tool names and review backend upgr
 
 `/mcp` uses rmcp's Streamable HTTP Host and Origin guards. The default accepted Host authorities are loopback-only. The default browser origins are derived from the configured loopback bind port.
 
-For a reverse proxy, prefer preserving a loopback origin Host where possible. If the proxy forwards a public Host, add that exact authority to `CUMG_ALLOWED_HOSTS`. Add browser origins to `CUMG_ALLOWED_ORIGINS` only when they are actually needed. Do not solve a deployment mismatch by disabling Host or Origin validation globally.
+For a reverse proxy, prefer preserving or rewriting the origin Host to an allowed loopback authority where practical. If the proxy forwards a public Host, add that exact authority to `CUMG_ALLOWED_HOSTS`. Add browser origins to `CUMG_ALLOWED_ORIGINS` only when they are actually needed. Do not solve a deployment mismatch by disabling Host or Origin validation globally.
 
 `/healthz` is intentionally non-sensitive readiness metadata. Authentication still belongs at the reverse proxy for all remotely reachable routes.
 
@@ -66,6 +66,8 @@ Cua stdio
 
 Do not bind directly to `0.0.0.0` merely because Cloudflare Tunnel is present. Access authentication and TLS are upstream requirements; the V1 gateway does not implement public authentication itself.
 
+If Cloudflare forwards the public hostname in `Host`, set `CUMG_ALLOWED_HOSTS` to that exact hostname (and port if applicable). See [`DEPLOYMENT.md`](DEPLOYMENT.md) and [`../examples/cloudflared.yml`](../examples/cloudflared.yml).
+
 ## Self-hosted desktop E2E
 
 A TCC-granted desktop runner is a high-trust machine. `.github/workflows/desktop-e2e.yml` is therefore deliberately manual-only, limited to `main`, and requires a dedicated `cua-desktop-e2e` runner label. It must never run for public pull requests or arbitrary fork code.
@@ -74,4 +76,26 @@ Use a dedicated test Mac rather than a daily-use workstation. The runner must al
 
 ## CI supply chain
 
-Normal CI pins the Cua Driver compatibility target and downloads the versioned release installer rather than a mutable convenience URL. The installer file's SHA-256 is verified before execution. Rust dependency resolution is locked for normal builds after `Cargo.lock` is committed, and CI uses `--locked` so dependency changes require an explicit repository update.
+Normal CI uses read-only repository permissions and locked Rust dependency resolution.
+
+For the Cua compatibility target, CI verifies the chain before any real-Cua smoke test:
+
+1. Pin a specific Cua Driver version.
+2. Download the versioned installer and verify its SHA-256.
+3. Download the platform-specific release payload and verify its pinned SHA-256 independently of the installer.
+4. Extract the expected `cua-driver` executable from that verified payload and record its SHA-256.
+5. Run the verified installer.
+6. Resolve the installed `cua-driver` from `PATH` and require its executable SHA-256 to match the executable extracted from the verified release payload.
+7. Only then build the gateway with `cargo build --locked` and run real-Cua protocol smoke tests.
+
+This protects CI from a mutable convenience installer and also detects an installer that would install bytes different from the independently verified release payload. It does not make a broader claim that the upstream release itself is trustworthy; the pinned hashes are the repository's reviewed compatibility inputs.
+
+## Secrets and logs
+
+Do not commit tunnel credentials, Access tokens, private hostnames, personal filesystem paths, screenshots, or desktop artifacts. `.env` and `.env.*` are ignored except for `.env.example`.
+
+Gateway audit logs intentionally record coarse metadata such as tool name, policy decision, outcome, and duration. Do not add raw arguments/results to normal logs. Failure logs from the backend should likewise avoid user content where possible.
+
+## Reporting vulnerabilities
+
+For security-sensitive findings, avoid posting credentials, screenshots, or exploit material containing private data in a public issue. Use GitHub's private vulnerability reporting feature when it is enabled for the repository; otherwise contact the maintainer through a private channel before publishing sensitive details.
