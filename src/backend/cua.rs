@@ -118,8 +118,10 @@ impl CuaBackend {
                 Err(error) => {
                     last_error = Some(error);
                     if attempt + 1 < self.reconnect_attempts {
-                        let factor = 2_u64.saturating_pow(attempt);
-                        sleep(self.reconnect_backoff.saturating_mul(factor as u32)).await;
+                        let factor = 1_u32
+                            .checked_shl(attempt.min(31))
+                            .unwrap_or(u32::MAX);
+                        sleep(self.reconnect_backoff.saturating_mul(factor)).await;
                     }
                 }
             }
