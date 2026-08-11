@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """Cross-platform smoke test for a real cua-driver MCP backend.
 
-The test intentionally avoids GUI actions so it can run on GitHub-hosted
+This test intentionally avoids GUI actions so it can run on GitHub-hosted
 Linux, macOS, and Windows runners without desktop/TCC grants. It verifies the
-actual integration boundary:
+real integration boundary and both supported MCP lifecycles:
 
-  gateway -> cua-driver mcp -> MCP initialize/tools/list
+  gateway -> cua-driver mcp -> MCP discovery/tools/list/policy
 
-On GitHub-hosted macOS the smoke test uses `cua-driver mcp --direct` so the
-fresh runner does not depend on persistent CuaDriver.app TCC grants. Production
-macOS remains free to use the gateway default (`cua-driver mcp`), which proxies
-through the signed app identity.
-
-The test then restarts the gateway with a dynamic deny rule and confirms that
-the chosen backend tool disappears and is blocked before reaching Cua.
+Set MCP_PROTOCOL_VERSION to 2025-11-25 for the legacy initialize lifecycle or
+2026-07-28 for the stateless per-request metadata lifecycle.
 """
 
 from __future__ import annotations
@@ -35,7 +30,9 @@ PORT = 18100
 BASE_URL = f"http://{HOST}:{PORT}"
 MCP_URL = f"{BASE_URL}/mcp"
 HEALTH_URL = f"{BASE_URL}/healthz"
-PROTOCOL_VERSION = "2025-11-25"
+PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-11-25")
+MODERN_PROTOCOL = PROTOCOL_VERSION == "2026-07-28"
+CLIENT_INFO = {"name": "cua-gateway-ci", "version": "0.1.0"}
 
 
 def gateway_binary() -> Path:
@@ -50,34 +47,68 @@ def backend_args() -> str:
     return "mcp --direct" if sys.platform == "darwin" else "mcp"
 
 
-def http_json(url: str, payload: dict | None = None, timeout: float = 10.0) -> dict:
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
+def request_meta() -> dict:
+    return {
+        "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+
+
+def build_rpc(method: str, params: dict | None, request_id: int) -> tuple[dict, dict]:
+    actual_params = dict(params or {})
+    if MODERN_PROTOCOL:
+        actual_params["_meta"] = request_meta()
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": actual_params,
+    }
     headers = {
         "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
         "MCP-Protocol-Version": PROTOCOL_VERSION,
     }
-    if data is not None:
-        headers["Content-Type"] = "application/json"
+    if MODERN_PROTOCOL:
+        headers["Mcp-Method"] = method
+        if method == "tools/call":
+            name = actual_params.get("name")
+            if isinstance(name, str):
+                headers["Mcp-Name"] = name
+    return payload, headers
 
-    req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-        content_type = resp.headers.get("Content-Type", "")
 
+def decode_http_response(resp) -> dict:
+    body = resp.read().decode("utf-8")
+    content_type = resp.headers.get("Content-Type", "")
     if "application/json" in content_type:
         return json.loads(body)
-
     for line in body.splitlines():
         if line.startswith("data:"):
             return json.loads(line.removeprefix("data:").strip())
-    raise RuntimeError(f"unexpected HTTP response from {url}: {body[:500]}")
+    raise RuntimeError(f"unexpected HTTP response: {body[:500]}")
+
+
+def http_json(
+    url: str,
+    payload: dict | None = None,
+    timeout: float = 10.0,
+    headers: dict | None = None,
+) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req_headers = dict(headers or {"Accept": "application/json"})
+    if data is not None:
+        req_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=req_headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return decode_http_response(resp)
 
 
 def rpc(method: str, params: dict | None = None, request_id: int = 1) -> dict:
-    payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
-    if params is not None:
-        payload["params"] = params
-    response = http_json(MCP_URL, payload)
+    payload, headers = build_rpc(method, params, request_id)
+    response = http_json(MCP_URL, payload, headers=headers)
     if "error" in response:
         raise RuntimeError(f"MCP {method} failed: {response['error']}")
     if "result" not in response:
@@ -85,15 +116,30 @@ def rpc(method: str, params: dict | None = None, request_id: int = 1) -> dict:
     return response["result"]
 
 
-def initialize() -> dict:
-    return rpc(
+def establish_protocol() -> None:
+    if MODERN_PROTOCOL:
+        result = rpc("server/discover", {}, request_id=1)
+        supported = result.get("supportedVersions", [])
+        if PROTOCOL_VERSION not in supported:
+            raise RuntimeError(
+                f"server/discover did not advertise {PROTOCOL_VERSION}: {supported}"
+            )
+        return
+
+    result = rpc(
         "initialize",
         {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
-            "clientInfo": {"name": "cua-gateway-ci", "version": "0.1.0"},
+            "clientInfo": CLIENT_INFO,
         },
+        request_id=1,
     )
+    negotiated = result.get("protocolVersion")
+    if negotiated != PROTOCOL_VERSION:
+        raise RuntimeError(
+            f"unexpected MCP protocol negotiation: wanted {PROTOCOL_VERSION}, got {negotiated}"
+        )
 
 
 def list_tools() -> list[dict]:
@@ -102,6 +148,32 @@ def list_tools() -> list[dict]:
     if not isinstance(tools, list):
         raise RuntimeError(f"tools/list returned invalid tools field: {result}")
     return tools
+
+
+def assert_transport_guards() -> None:
+    method = "server/discover" if MODERN_PROTOCOL else "initialize"
+    params = (
+        {}
+        if MODERN_PROTOCOL
+        else {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": CLIENT_INFO,
+        }
+    )
+    payload, headers = build_rpc(method, params, request_id=90)
+
+    for name, bad_headers in (
+        ("Origin", {**headers, "Origin": "https://evil.example"}),
+        ("Host", {**headers, "Host": "evil.example"}),
+    ):
+        try:
+            http_json(MCP_URL, payload, timeout=5.0, headers=bad_headers)
+        except urllib.error.HTTPError as exc:
+            if exc.code < 400:
+                raise RuntimeError(f"{name} guard returned unexpected status {exc.code}")
+        else:
+            raise RuntimeError(f"malicious {name} was accepted by the MCP endpoint")
 
 
 def read_gateway_log(log_file: TextIO) -> str:
@@ -142,6 +214,13 @@ def start_gateway(deny_tool: str | None = None) -> tuple[subprocess.Popen[str], 
             "CUMG_MCP_PATH": "/mcp",
             "CUMG_BACKEND_COMMAND": "cua-driver",
             "CUMG_BACKEND_ARGS": backend_args(),
+            # CI explicitly opts in to the entire real Cua tool surface. The
+            # product default is deny-all.
+            "CUMG_ALLOW_TOOLS": "*",
+            "CUMG_CONNECT_TIMEOUT_SECS": "15",
+            "CUMG_TOOL_TIMEOUT_SECS": "30",
+            "CUMG_RECONNECT_ATTEMPTS": "3",
+            "CUMG_RECONNECT_BACKOFF_MS": "100",
             # Keep gateway audit logs while suppressing verbose rmcp peer dumps.
             "RUST_LOG": "warn,computer_use_mcp_gateway=info",
         }
@@ -151,10 +230,6 @@ def start_gateway(deny_tool: str | None = None) -> tuple[subprocess.Popen[str], 
     else:
         env.pop("CUMG_DENY_TOOLS", None)
 
-    # Do not capture child output with PIPE here. Windows anonymous pipes have a
-    # small buffer and verbose protocol logs can block the gateway before the
-    # test drains stdout. A temporary file preserves diagnostics without
-    # back-pressuring the process.
     log_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
     proc = subprocess.Popen(
         [str(gateway_binary())],
@@ -199,7 +274,14 @@ def assert_blocked(tool_name: str) -> None:
 
 def main() -> int:
     print(
-        f"platform={sys.platform} python={sys.version.split()[0]} backend_args={backend_args()}"
+        " ".join(
+            [
+                f"platform={sys.platform}",
+                f"python={sys.version.split()[0]}",
+                f"backend_args={backend_args()}",
+                f"protocol={PROTOCOL_VERSION}",
+            ]
+        )
     )
     version = subprocess.run(
         ["cua-driver", "--version"],
@@ -211,12 +293,8 @@ def main() -> int:
 
     first, first_log = start_gateway()
     try:
-        init = initialize()
-        negotiated = init.get("protocolVersion")
-        if negotiated != PROTOCOL_VERSION:
-            raise RuntimeError(
-                f"unexpected MCP protocol negotiation: wanted {PROTOCOL_VERSION}, got {negotiated}"
-            )
+        establish_protocol()
+        assert_transport_guards()
         tools = list_tools()
         if not tools:
             raise RuntimeError("real Cua backend returned zero MCP tools")
@@ -230,7 +308,7 @@ def main() -> int:
 
     second, second_log = start_gateway(deny_tool=denied)
     try:
-        initialize()
+        establish_protocol()
         filtered_names = [
             tool.get("name")
             for tool in list_tools()
@@ -240,7 +318,9 @@ def main() -> int:
             raise RuntimeError(f"deny policy leaked tool through tools/list: {denied}")
         assert_blocked(denied)
         print(
-            f"PASS real Cua MCP smoke: tools={len(names)} filtered={len(filtered_names)} denied={denied}"
+            "PASS real Cua MCP smoke: "
+            f"protocol={PROTOCOL_VERSION} tools={len(names)} "
+            f"filtered={len(filtered_names)} denied={denied}"
         )
     finally:
         stop_gateway(second, second_log)
