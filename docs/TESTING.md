@@ -6,22 +6,73 @@ The test strategy separates deterministic repository checks, protocol/backend co
 
 `.github/workflows/ci.yml` runs with read-only repository permissions.
 
-### Rust validation
+### Rust and deterministic validation
 
 ```bash
 cargo fmt --check
 cargo check --locked --all-targets
 cargo test --locked
-python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py
+python3 -m py_compile \
+  scripts/cua_gateway_smoke.py \
+  scripts/cua_desktop_e2e.py \
+  scripts/mock_mcp_backend.py \
+  scripts/v1_quality_gate.py \
+  scripts/v1_conformance.py
+cargo build --locked
+python3 scripts/v1_quality_gate.py
+python3 scripts/v1_conformance.py
 ```
+
+`cargo test --locked` includes a downstream-cancellation test that starts the deterministic MCP fixture, begins a pending tool request, cancels it, and requires the downstream `notifications/cancelled` request ID to equal the in-flight backend tool request ID. This proves cancellation propagation rather than merely dropping the gateway-side future.
+
+### Deterministic V1 quality fixture
+
+`scripts/mock_mcp_backend.py` is a test-only stdio MCP backend. It never touches a desktop and exposes only:
+
+- `noop` — immediate side-effect-free success;
+- `slow` — remains pending until a downstream cancellation notification arrives.
+
+`scripts/v1_quality_gate.py` runs the real gateway process against this backend and verifies:
+
+1. stateless `2026-07-28` discovery;
+2. policy-filtered tool discovery;
+3. exactly 100 successful `tools/call` round trips through Gateway → backend MCP stdio;
+4. gateway readiness after the soak;
+5. `/healthz` contains the gateway-owned backend child PID, cumulative CPU seconds, and RSS bytes;
+6. a five-second Linux-hosted idle sample of the gateway process stays below the regression gates of 2% CPU and 128 MiB RSS.
+
+These thresholds are regression guards, not capacity or production-performance claims. A representative passing hosted-Linux sample measured 100 calls in 0.142 seconds, 0.000% idle gateway CPU, and 17.191 MiB gateway RSS. Exact numbers vary by runner; the configured thresholds are the pass/fail contract.
+
+### Official MCP conformance runner
+
+`scripts/v1_conformance.py` pins the official runner package to:
+
+```text
+@modelcontextprotocol/conformance@0.2.0-alpha.11
+```
+
+CI requires Node 20+ and asks the pinned runner to load both frozen requirement revisions tracked by this project:
+
+```text
+2025-11-25
+2026-07-28
+```
+
+It then runs the V1-applicable server-boundary scenarios against a real gateway process:
+
+- `server-initialize`;
+- `tools-list`;
+- `dns-rebinding-protection`.
+
+This is deliberately **not** described as full MCP conformance certification. The upstream complete requirement sets contain prompts, resources, completion, authentication, and fixture-specific tool-content behavior that this tools-only gateway does not advertise or implement. We run the official scenarios that directly apply to the gateway boundary and retain the broader dual-protocol smoke as a compatibility claim.
 
 ### Real-Cua compatibility matrix
 
-GitHub-hosted CI runs the gateway against a pinned Cua Driver on:
+GitHub-hosted CI runs the gateway against pinned Cua Driver 0.19.3 on:
 
-- Linux
-- macOS
-- Windows
+- Linux;
+- macOS;
+- Windows.
 
 For each OS, CI:
 
@@ -34,7 +85,7 @@ For each OS, CI:
 7. runs real-Cua MCP smoke for `2025-11-25`;
 8. runs real-Cua MCP smoke for `2026-07-28`.
 
-The smoke harness exercises the actual Gateway → `cua-driver mcp` path, backend tool discovery, `/healthz`, northbound MCP lifecycle behavior, tool filtering, deny-policy behavior, and rejection of malicious Host/Origin values.
+The smoke harness exercises the actual Gateway → `cua-driver mcp` path, backend tool discovery, `/healthz`, northbound MCP lifecycle behavior, tool filtering, deny-policy behavior, backend resource telemetry availability where supported, and rejection of malicious Host/Origin values.
 
 ## Documentation CI
 
@@ -44,9 +95,7 @@ The smoke harness exercises the actual Gateway → `cua-driver mcp` path, backen
 python3 scripts/check_docs.py
 ```
 
-The checker scans `README.md`, `CONTRIBUTING.md`, and `docs/*.md` and fails when a repository-local Markdown link points to a missing target or escapes the repository root.
-
-It deliberately does **not** fetch external URLs. Installation commands, current MCP-client UI/configuration, and reverse-proxy behavior can change upstream, so changes to those examples should be reviewed against the authoritative upstream documentation rather than depending on a flaky network link checker.
+The checker scans `README.md`, `CONTRIBUTING.md`, and `docs/*.md` and fails when a repository-local Markdown link points to a missing target or escapes the repository root. It deliberately does not fetch external URLs.
 
 ## What normal CI proves
 
@@ -57,23 +106,41 @@ Normal CI provides strong evidence for:
 - the pinned Cua compatibility input on three operating systems;
 - Gateway ↔ Cua MCP stdio connectivity;
 - northbound MCP lifecycle compatibility for the two exercised protocol revisions;
+- selected official conformance scenarios at the V1 server boundary;
 - dynamic tool discovery/filtering;
 - deny-by-default policy enforcement;
+- conservative semantic tool classification;
+- actual downstream cancellation notification with the correct request ID;
 - Host/Origin transport guards;
+- deterministic 100-call gateway/backend-MCP soak behavior;
+- short-window idle gateway CPU/RSS regression limits;
+- gateway-owned backend child PID/CPU/RSS health telemetry;
 - repository-local documentation link integrity.
 
 ## What normal CI does not prove
 
-GitHub-hosted macOS runners are not a substitute for a persistent logged-in desktop with real Accessibility and Screen Recording grants. Normal CI therefore does not claim to prove:
+GitHub-hosted runners are not a substitute for the final operator-controlled acceptance checks. Normal CI does not claim to prove:
 
-- real screenshots of a user desktop;
-- real clicks/typing against a persistent GUI session;
-- macOS TCC permission persistence;
+- real screenshots/clicks/typing on a persistent TCC-granted macOS desktop;
+- macOS TCC permission persistence on the dedicated test machine;
 - arbitrary application-specific GUI workflows;
-- long-running soak/resource behavior;
-- continuing correctness of external third-party setup instructions after an upstream product changes.
+- a production-duration soak or production capacity/performance benchmark;
+- a real Cloudflare Access/Tunnel deployment using the operator's account;
+- a real ChatGPT remote MCP connection through that authenticated deployment;
+- continuing correctness of third-party setup instructions after an upstream product changes;
+- full MCP conformance certification beyond the applicable official scenarios described above.
 
-The dual-protocol smoke suite is also **not** an MCP conformance certification. Integration of the official MCP conformance requirement runner remains tracked in `docs/ROADMAP.md`.
+The remaining V1 operator checks are in [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
+
+## Backend resource telemetry semantics
+
+`/healthz` reports metrics for the **gateway-owned backend child process** it spawned, when the platform can query them:
+
+- PID;
+- cumulative CPU seconds;
+- resident RSS bytes.
+
+On macOS, Cua may proxy through its supported application/daemon lifecycle. These values therefore describe the direct child owned by the gateway, not necessarily the aggregate resource usage of every Cua process on the machine.
 
 ## Updating the Cua compatibility pin
 
@@ -87,9 +154,9 @@ When changing the CI pin:
 4. verify the asset names/architectures still match the workflow assumptions;
 5. let CI independently compare the installed executable to the verified payload executable;
 6. require all three OS jobs and both protocol lifecycle smokes to pass before merge;
-7. review newly discovered Cua tools against the gateway and optional backend policy before widening any production allowlist.
+7. review newly discovered Cua tools against the exact-name policy and semantic classification before widening any production allowlist.
 
-Do not replace the pinned release URLs with a mutable `latest` or convenience installer URL in normal CI.
+Do not replace pinned release URLs with a mutable `latest` or convenience installer URL in normal CI.
 
 ## Desktop E2E
 
@@ -100,14 +167,9 @@ Do not replace the pinned release URLs with a mutable `latest` or convenience in
 - targeted at `[self-hosted, macOS, cua-desktop-e2e]`;
 - read-only with respect to repository contents.
 
-The dedicated runner must be:
+The dedicated runner must be a test machine, logged into a real macOS GUI session, preconfigured with CuaDriver Accessibility and Screen Recording permissions, and isolated from untrusted pull-request execution.
 
-- a test machine, not a daily-use workstation;
-- logged into a real macOS GUI session;
-- preconfigured with CuaDriver Accessibility and Screen Recording permissions;
-- isolated from untrusted pull-request execution.
-
-The fixture performs a real desktop path using TextEdit:
+The fixture performs:
 
 ```text
 launch fresh TextEdit
@@ -118,28 +180,19 @@ launch fresh TextEdit
     → verify marker
 ```
 
-This lane exists because a full computer-use E2E needs the OS permission and GUI state that ephemeral hosted runners cannot reliably preserve.
+Execution of this lane is intentionally left to the operator. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
 
 ## Running smoke locally
 
-After building the gateway and installing Cua, the compatibility harness can be run directly:
+After building the gateway and installing Cua:
 
 ```bash
 cargo build --locked
 MCP_PROTOCOL_VERSION=2025-11-25 python3 scripts/cua_gateway_smoke.py
 MCP_PROTOCOL_VERSION=2026-07-28 python3 scripts/cua_gateway_smoke.py
+python3 scripts/v1_quality_gate.py
+python3 scripts/v1_conformance.py
 python3 scripts/check_docs.py
 ```
 
-The Cua smoke script starts its own gateway process/configuration for the smoke scenario. Do not point it at a production desktop or reuse production credentials.
-
-## Future coverage
-
-Still tracked for V1 hardening/dogfood:
-
-- official MCP conformance requirement runner integration;
-- first successful dedicated-Mac desktop E2E execution;
-- idle CPU/RAM benchmark;
-- 100-call soak test;
-- remote Cloudflare Access/Tunnel dogfood for this gateway;
-- ChatGPT remote MCP dogfood for this gateway.
+The Cua smoke script starts its own gateway process/configuration. Do not point test harnesses at a production desktop or reuse production credentials.

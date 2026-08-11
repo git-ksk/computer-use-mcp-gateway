@@ -132,18 +132,31 @@ async fn main() -> Result<()> {
 async fn health_response(
     backend: Arc<dyn ComputerUseBackend>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let resources = backend.resource_metrics().await;
     match backend.health().await {
         BackendHealth::Ready => (
             StatusCode::OK,
-            Json(json!({ "status": "ok", "backend": "ready" })),
+            Json(json!({
+                "status": "ok",
+                "backend": "ready",
+                "backend_resources": resources
+            })),
         ),
         BackendHealth::Unhealthy => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "degraded", "backend": "unhealthy" })),
+            Json(json!({
+                "status": "degraded",
+                "backend": "unhealthy",
+                "backend_resources": resources
+            })),
         ),
         BackendHealth::Stopped => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "degraded", "backend": "stopped" })),
+            Json(json!({
+                "status": "degraded",
+                "backend": "stopped",
+                "backend_resources": resources
+            })),
         ),
     }
 }

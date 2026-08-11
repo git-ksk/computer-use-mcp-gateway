@@ -30,7 +30,16 @@ jobs:
         run: cargo test --locked
 
       - name: Python harness syntax
-        run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py
+        run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_conformance.py
+
+      - name: Build gateway for V1 quality gate
+        run: cargo build --locked
+
+      - name: V1 100-call soak and idle CPU/RSS
+        run: python3 scripts/v1_quality_gate.py
+
+      - name: Official MCP conformance scenarios
+        run: python3 scripts/v1_conformance.py
 
   cua-smoke:
     name: Cua smoke (${{ matrix.name }})

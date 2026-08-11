@@ -38,10 +38,10 @@ Before major V2 implementation, V2-M0 must demonstrate one concrete security/con
 - [x] reject unsafe Origin values
 - [x] reject unsafe Host authorities / DNS rebinding attempts
 - [x] bind to localhost by default
-- [ ] integrate the official MCP conformance requirement runner
-- [ ] explicit downstream cancellation propagation test/guarantee
+- [x] integrate the pinned official MCP conformance runner for V1-applicable server-boundary scenarios
+- [x] explicitly propagate upstream cancellation to the downstream MCP request ID and test it
 
-> Passing the repository's dual-protocol smoke tests is a compatibility claim, not an MCP conformance certification.
+> Passing the repository's dual-protocol smoke tests plus the selected official conformance scenarios is **not** a full MCP conformance certification. The upstream frozen requirement sets include capabilities and fixture-specific scenarios that this tools-only gateway intentionally does not advertise.
 
 ### M3: policy and observability
 - [x] deny-by-default tool allowlist / denylist
@@ -50,8 +50,8 @@ Before major V2 implementation, V2-M0 must demonstrate one concrete security/con
 - [x] per-call timeout
 - [x] structured audit metadata
 - [x] no sensitive argument/result logging by default
-- [ ] semantic dangerous-tool classification (`observe` / `interact` / `system` / `dangerous`)
-- [ ] backend CPU/RSS health metrics
+- [x] semantic tool classification (`observe` / `interact` / `system` / `dangerous`), with unknown tools classified conservatively as `dangerous`
+- [x] gateway-owned backend child PID / cumulative CPU seconds / RSS health metrics
 
 ### M4: CI and dogfood
 - [x] Rust fmt/check/test CI with `Cargo.lock` and `--locked`
@@ -65,22 +65,22 @@ Before major V2 implementation, V2-M0 must demonstrate one concrete security/con
 - [ ] execute desktop E2E on a dedicated TCC-granted test Mac
 - [ ] Cloudflare Tunnel + Access deployment dogfood for this gateway
 - [ ] ChatGPT remote MCP connection dogfood for this gateway
-- [ ] idle CPU/RAM benchmark
-- [ ] 100-call soak test
+- [x] idle gateway CPU/RAM regression benchmark in hosted Linux CI
+- [x] deterministic 100-call `tools/call` soak test through the real gateway/backend-MCP path
 
 ### V1 finite completion gate
 
-Close the V1 line rather than expanding it indefinitely once these gaps are addressed:
+Automated/code-local V1 closeout is complete. Only operator-controlled acceptance remains before calling V1 fully closed:
 
-- [ ] official MCP conformance requirement runner integrated
-- [ ] downstream cancellation propagation explicitly tested/guaranteed
-- [ ] semantic dangerous-tool classification available
+- [x] pinned official MCP conformance runner integrated for V1-applicable server-boundary scenarios
+- [x] downstream cancellation propagation explicitly tested/guaranteed
+- [x] semantic dangerous-tool classification available
 - [ ] trusted desktop E2E executed on the dedicated test Mac
-- [ ] representative remote deployment/ChatGPT dogfood completed where practical
-- [ ] idle resource benchmark completed
-- [ ] 100-call soak test completed
+- [ ] representative Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood completed
+- [x] idle resource benchmark completed
+- [x] 100-call soak test completed
 
-After this gate, do not add V1 features solely to duplicate capabilities that Cua or another backend already provides upstream.
+See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the two remaining operator-controlled checks. After they pass (or are explicitly waived), close V1 and do not add features solely to duplicate capabilities that Cua or another backend already provides upstream.
 
 ## V2 — Secure delegated device capability control plane candidate
 

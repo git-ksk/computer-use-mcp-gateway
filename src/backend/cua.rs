@@ -6,18 +6,21 @@
 //! On macOS, `cua-driver mcp` may proxy through the supported CuaDriver.app
 //! daemon. Do not replace that lifecycle with a raw `cua-driver serve` spawn.
 
-use super::{BackendHealth, ComputerUseBackend};
+use super::{BackendHealth, BackendResourceMetrics, ComputerUseBackend};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use rmcp::{
-    model::{CallToolRequestParams, CallToolResult, JsonObject, Tool},
-    service::{Peer, RoleClient, RunningService, ServiceExt},
+    model::{
+        CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+        ClientRequest, JsonObject, ServerResult, Tool,
+    },
+    service::{Peer, PeerRequestOptions, RoleClient, RunningService, ServiceExt},
     transport::TokioChildProcess,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, watch},
     time::{sleep, timeout},
 };
 use tracing::warn;
@@ -31,6 +34,7 @@ pub struct CuaBackend {
     reconnect_attempts: u32,
     reconnect_backoff: Duration,
     service: Arc<Mutex<Option<RunningService<RoleClient, ()>>>>,
+    backend_pid: Arc<Mutex<Option<u32>>>,
     reconnect_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
 }
@@ -64,6 +68,7 @@ impl CuaBackend {
             reconnect_attempts: reconnect_attempts.max(1),
             reconnect_backoff,
             service: Arc::new(Mutex::new(None)),
+            backend_pid: Arc::new(Mutex::new(None)),
             reconnect_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
         }
@@ -77,6 +82,7 @@ impl CuaBackend {
 
     async fn close_current(&self) {
         let service = self.service.lock().await.take();
+        *self.backend_pid.lock().await = None;
         if let Some(mut service) = service {
             let _ = timeout(self.connect_timeout, service.close()).await;
         }
@@ -95,12 +101,14 @@ impl CuaBackend {
 
         let transport =
             TokioChildProcess::new(command).context("failed to spawn Cua MCP backend process")?;
+        let pid = transport.id();
         let service = timeout(self.connect_timeout, ().serve(transport))
             .await
             .context("timed out initializing Cua MCP backend")?
             .context("failed to initialize Cua MCP backend")?;
 
         *self.service.lock().await = Some(service);
+        *self.backend_pid.lock().await = pid;
         Ok(())
     }
 
@@ -163,6 +171,107 @@ impl CuaBackend {
             );
         }
     }
+
+    async fn notify_cancelled(
+        peer: &Peer<RoleClient>,
+        request_id: rmcp::model::RequestId,
+        reason: &str,
+    ) {
+        let _ = peer
+            .notify_cancelled(CancelledNotificationParam::new(
+                Some(request_id),
+                Some(reason.to_owned()),
+            ))
+            .await;
+    }
+
+    #[cfg(unix)]
+    async fn query_process_metrics(pid: u32) -> Option<BackendResourceMetrics> {
+        let pid_arg = pid.to_string();
+        let output = Command::new("ps")
+            .args(["-o", "time=", "-o", "rss=", "-p", &pid_arg])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut fields = stdout.split_whitespace();
+        let cpu_seconds = fields.next().and_then(parse_ps_cpu_time);
+        let rss_bytes = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|kib| kib.saturating_mul(1024));
+
+        Some(BackendResourceMetrics {
+            pid,
+            cpu_seconds,
+            rss_bytes,
+        })
+    }
+
+    #[cfg(windows)]
+    async fn query_process_metrics(pid: u32) -> Option<BackendResourceMetrics> {
+        let script = format!(
+            "$p=Get-Process -Id {pid} -ErrorAction Stop; \
+             $c=[System.Globalization.CultureInfo]::InvariantCulture; \
+             $cpu=if ($null -eq $p.CPU) {{'0'}} else {{$p.CPU.ToString($c)}}; \
+             Write-Output ($cpu + ' ' + $p.WorkingSet64.ToString($c))"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut fields = stdout.split_whitespace();
+        let cpu_seconds = fields.next().and_then(|value| value.parse::<f64>().ok());
+        let rss_bytes = fields.next().and_then(|value| value.parse::<u64>().ok());
+
+        Some(BackendResourceMetrics {
+            pid,
+            cpu_seconds,
+            rss_bytes,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    async fn query_process_metrics(pid: u32) -> Option<BackendResourceMetrics> {
+        Some(BackendResourceMetrics {
+            pid,
+            cpu_seconds: None,
+            rss_bytes: None,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn parse_ps_cpu_time(value: &str) -> Option<f64> {
+    let (days, clock) = match value.split_once('-') {
+        Some((days, clock)) => (days.parse::<f64>().ok()?, clock),
+        None => (0.0, value),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let (hours, minutes, seconds): (f64, f64, f64) = match parts.as_slice() {
+        [minutes, seconds] => (
+            0.0,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        [hours, minutes, seconds] => (
+            hours.parse::<f64>().ok()?,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds)
 }
 
 #[async_trait]
@@ -182,6 +291,11 @@ impl ComputerUseBackend for CuaBackend {
         }
     }
 
+    async fn resource_metrics(&self) -> Option<BackendResourceMetrics> {
+        let pid = (*self.backend_pid.lock().await)?;
+        Self::query_process_metrics(pid).await
+    }
+
     async fn list_tools(&self) -> Result<Vec<Tool>> {
         let _operation = self.operation_lock.lock().await;
         match self.list_tools_once().await {
@@ -195,29 +309,56 @@ impl ComputerUseBackend for CuaBackend {
         }
     }
 
-    async fn call_tool(&self, name: &str, arguments: Option<JsonObject>) -> Result<CallToolResult> {
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+        mut cancellation: watch::Receiver<bool>,
+    ) -> Result<CallToolResult> {
         // A single physical desktop is a shared mutable resource. Serialize all
         // backend operations in V1 so independent MCP clients cannot interleave
         // clicks, keystrokes, snapshots, and stateful element-index operations.
         let _operation = self.operation_lock.lock().await;
         let peer = self.peer().await?;
-        let mut request = CallToolRequestParams::new(name.to_owned());
+        let mut params = CallToolRequestParams::new(name.to_owned());
         if let Some(arguments) = arguments {
-            request = request.with_arguments(arguments);
+            params = params.with_arguments(arguments);
         }
 
-        let result = timeout(self.tool_timeout, peer.call_tool(request)).await;
-        match result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => {
-                self.recover_after_failure().await;
-                Err(error)
-                    .context("Cua MCP tool call failed; connection recovered for the next call")
+        let handle = peer
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .context("failed to send Cua MCP tool call")?;
+        let request_id = handle.id.clone();
+        let response = handle.await_response();
+        tokio::pin!(response);
+
+        tokio::select! {
+            result = &mut response => {
+                match result {
+                    Ok(ServerResult::CallToolResult(result)) => Ok(result),
+                    Ok(_) => bail!("Cua MCP tool call returned an unsupported multi-round-trip response"),
+                    Err(error) => {
+                        self.recover_after_failure().await;
+                        Err(error).context("Cua MCP tool call failed; connection recovered for the next call")
+                    }
+                }
             }
-            Err(_) => {
+            changed = cancellation.changed() => {
+                if changed.is_ok() && *cancellation.borrow() {
+                    Self::notify_cancelled(&peer, request_id, "upstream MCP request cancelled").await;
+                    bail!("Cua MCP tool call cancelled by the upstream MCP client; the call was not replayed")
+                }
+                bail!("Cua MCP cancellation channel closed unexpectedly")
+            }
+            _ = sleep(self.tool_timeout) => {
+                Self::notify_cancelled(&peer, request_id, "gateway tool timeout").await;
                 self.recover_after_failure().await;
                 bail!(
-                    "Cua MCP tool call timed out after {} seconds; the call was not retried because its side effects may be unknown",
+                    "Cua MCP tool call timed out after {} seconds; cancellation was propagated and the call was not retried because its side effects may be unknown",
                     self.tool_timeout.as_secs()
                 )
             }
@@ -228,5 +369,90 @@ impl ComputerUseBackend for CuaBackend {
         let _reconnect = self.reconnect_lock.lock().await;
         self.close_current().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    async fn wait_for_file(path: &std::path::Path) {
+        timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture marker was not created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_ps_cpu_time_formats() {
+        assert_eq!(parse_ps_cpu_time("01:02"), Some(62.0));
+        assert_eq!(parse_ps_cpu_time("01:02:03"), Some(3_723.0));
+        assert_eq!(parse_ps_cpu_time("2-01:02:03"), Some(176_523.0));
+        assert_eq!(parse_ps_cpu_time("00:00.25"), Some(0.25));
+        assert_eq!(parse_ps_cpu_time("garbage"), None);
+    }
+
+    #[tokio::test]
+    async fn propagates_cancellation_to_downstream_request_id() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let call_marker = dir.join(format!("cumg-call-{}-{nonce}", std::process::id()));
+        let cancel_marker = dir.join(format!("cumg-cancel-{}-{nonce}", std::process::id()));
+
+        let backend = CuaBackend::new(
+            "python3",
+            vec![
+                "scripts/mock_mcp_backend.py".into(),
+                "--call-marker".into(),
+                call_marker.to_string_lossy().into_owned(),
+                "--cancel-marker".into(),
+                cancel_marker.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            1,
+            Duration::from_millis(10),
+        );
+        backend.connect().await.expect("fixture backend connects");
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let caller = backend.clone();
+        let call = tokio::spawn(async move { caller.call_tool("slow", None, cancel_rx).await });
+
+        wait_for_file(&call_marker).await;
+        cancel_tx
+            .send(true)
+            .expect("cancellation receiver is alive");
+
+        let result = timeout(Duration::from_secs(5), call)
+            .await
+            .expect("cancelled call completes")
+            .expect("call task joins");
+        assert!(result.is_err(), "cancelled call must not report success");
+
+        wait_for_file(&cancel_marker).await;
+        assert_eq!(
+            fs::read_to_string(&call_marker).expect("read call marker"),
+            fs::read_to_string(&cancel_marker).expect("read cancel marker"),
+            "downstream cancellation must reference the in-flight tool request"
+        );
+
+        backend
+            .shutdown()
+            .await
+            .expect("fixture backend shuts down");
+        let _ = fs::remove_file(call_marker);
+        let _ = fs::remove_file(cancel_marker);
     }
 }
