@@ -121,13 +121,14 @@ Common causes are:
 - `cua-driver` is not on `PATH`;
 - Cua cannot initialize on the current desktop session;
 - the backend connection exceeds `CUMG_CONNECT_TIMEOUT_SECS`;
-- a custom `CUMG_BACKEND_COMMAND` or `CUMG_BACKEND_ARGS` is invalid.
+- a custom `CUMG_BACKEND_COMMAND` or `CUMG_BACKEND_ARGS` is invalid;
+- `CUMG_MAX_HTTP_CONCURRENCY` is set to `0`.
 
 V1 splits `CUMG_BACKEND_ARGS` on ASCII whitespace; it does not implement shell-style quoting for embedded spaces.
 
 ## `/healthz` returns HTTP 503
 
-The gateway reports 503 when the backend is stopped or its MCP transport is unhealthy.
+The gateway reports 503 from `/healthz` when the backend is stopped or its MCP transport is unhealthy. The MCP concurrency guard is scoped to the MCP route, so an overloaded `/mcp` request does not turn `/healthz` into `gateway_overloaded`.
 
 Check Cua directly, then inspect gateway logs:
 
@@ -137,6 +138,14 @@ cua-driver call list_apps
 ```
 
 A backend transport failure may be repaired for a later request, but the failed computer-use action is not replayed automatically.
+
+By default `/healthz` intentionally returns only coarse readiness. If you explicitly need local process diagnostics, `CUMG_HEALTH_DETAILS=true` adds backend PID/CPU/RSS metadata. Leave that setting false for normal remote deployments and protect the entire public hostname, including `/healthz`, with the same reverse-proxy authentication boundary.
+
+## MCP returns HTTP 503 with `gateway_overloaded`
+
+The gateway has reached `CUMG_MAX_HTTP_CONCURRENCY` (default `16`). Excess MCP HTTP requests fail immediately rather than accumulating in an unbounded waiter queue.
+
+This is separate from backend desktop serialization and separate from reverse-proxy rate limiting. If normal traffic reaches the ceiling, first check for a buggy client retry loop, abandoned concurrent requests, or an overly aggressive caller. Increase the limit only after understanding the workload; do not disable proxy-side rate limits or authentication as a workaround.
 
 ## MCP connects but shows no tools
 
