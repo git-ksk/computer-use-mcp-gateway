@@ -323,7 +323,9 @@ mod tests {
         let call = tokio::spawn(async move { caller.call_tool("slow", None, cancel_rx).await });
 
         wait_for_file(&call_marker).await;
-        cancel_tx.send(true).expect("cancellation receiver is alive");
+        cancel_tx
+            .send(true)
+            .expect("cancellation receiver is alive");
 
         let result = timeout(Duration::from_secs(5), call)
             .await
@@ -338,7 +340,10 @@ mod tests {
             "downstream cancellation must reference the in-flight tool request"
         );
 
-        backend.shutdown().await.expect("fixture backend shuts down");
+        backend
+            .shutdown()
+            .await
+            .expect("fixture backend shuts down");
         let _ = fs::remove_file(call_marker);
         let _ = fs::remove_file(cancel_marker);
     }
