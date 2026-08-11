@@ -6,7 +6,7 @@
 //! On macOS, `cua-driver mcp` may proxy through the supported CuaDriver.app
 //! daemon. Do not replace that lifecycle with a raw `cua-driver serve` spawn.
 
-use super::{BackendHealth, ComputerUseBackend};
+use super::{BackendHealth, BackendResourceMetrics, ComputerUseBackend};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use rmcp::{
@@ -34,6 +34,7 @@ pub struct CuaBackend {
     reconnect_attempts: u32,
     reconnect_backoff: Duration,
     service: Arc<Mutex<Option<RunningService<RoleClient, ()>>>>,
+    backend_pid: Arc<Mutex<Option<u32>>>,
     reconnect_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
 }
@@ -67,6 +68,7 @@ impl CuaBackend {
             reconnect_attempts: reconnect_attempts.max(1),
             reconnect_backoff,
             service: Arc::new(Mutex::new(None)),
+            backend_pid: Arc::new(Mutex::new(None)),
             reconnect_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
         }
@@ -80,6 +82,7 @@ impl CuaBackend {
 
     async fn close_current(&self) {
         let service = self.service.lock().await.take();
+        *self.backend_pid.lock().await = None;
         if let Some(mut service) = service {
             let _ = timeout(self.connect_timeout, service.close()).await;
         }
@@ -98,12 +101,14 @@ impl CuaBackend {
 
         let transport =
             TokioChildProcess::new(command).context("failed to spawn Cua MCP backend process")?;
+        let pid = transport.id();
         let service = timeout(self.connect_timeout, ().serve(transport))
             .await
             .context("timed out initializing Cua MCP backend")?
             .context("failed to initialize Cua MCP backend")?;
 
         *self.service.lock().await = Some(service);
+        *self.backend_pid.lock().await = pid;
         Ok(())
     }
 
@@ -179,6 +184,90 @@ impl CuaBackend {
             ))
             .await;
     }
+
+    #[cfg(unix)]
+    async fn query_process_metrics(pid: u32) -> Option<BackendResourceMetrics> {
+        let pid_arg = pid.to_string();
+        let output = Command::new("ps")
+            .args(["-o", "time=", "-o", "rss=", "-p", &pid_arg])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut fields = stdout.split_whitespace();
+        let cpu_seconds = fields.next().and_then(parse_ps_cpu_time);
+        let rss_bytes = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|kib| kib.saturating_mul(1024));
+
+        Some(BackendResourceMetrics {
+            pid,
+            cpu_seconds,
+            rss_bytes,
+        })
+    }
+
+    #[cfg(windows)]
+    async fn query_process_metrics(pid: u32) -> Option<BackendResourceMetrics> {
+        let script = format!(
+            "$p=Get-Process -Id {pid} -ErrorAction Stop; \
+             $c=[System.Globalization.CultureInfo]::InvariantCulture; \
+             $cpu=if ($null -eq $p.CPU) {{'0'}} else {{$p.CPU.ToString($c)}}; \
+             Write-Output ($cpu + ' ' + $p.WorkingSet64.ToString($c))"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let mut fields = stdout.split_whitespace();
+        let cpu_seconds = fields.next().and_then(|value| value.parse::<f64>().ok());
+        let rss_bytes = fields.next().and_then(|value| value.parse::<u64>().ok());
+
+        Some(BackendResourceMetrics {
+            pid,
+            cpu_seconds,
+            rss_bytes,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    async fn query_process_metrics(pid: u32) -> Option<BackendResourceMetrics> {
+        Some(BackendResourceMetrics {
+            pid,
+            cpu_seconds: None,
+            rss_bytes: None,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn parse_ps_cpu_time(value: &str) -> Option<f64> {
+    let (days, clock) = match value.split_once('-') {
+        Some((days, clock)) => (days.parse::<f64>().ok()?, clock),
+        None => (0.0, value),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] => (0.0, minutes.parse().ok()?, seconds.parse().ok()?),
+        [hours, minutes, seconds] => (
+            hours.parse().ok()?,
+            minutes.parse().ok()?,
+            seconds.parse().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds)
 }
 
 #[async_trait]
@@ -196,6 +285,11 @@ impl ComputerUseBackend for CuaBackend {
             }
             Some(_) => BackendHealth::Ready,
         }
+    }
+
+    async fn resource_metrics(&self) -> Option<BackendResourceMetrics> {
+        let pid = (*self.backend_pid.lock().await)?;
+        Self::query_process_metrics(pid).await
     }
 
     async fn list_tools(&self) -> Result<Vec<Tool>> {
@@ -290,6 +384,16 @@ mod tests {
         })
         .await
         .expect("fixture marker was not created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_ps_cpu_time_formats() {
+        assert_eq!(parse_ps_cpu_time("01:02"), Some(62.0));
+        assert_eq!(parse_ps_cpu_time("01:02:03"), Some(3_723.0));
+        assert_eq!(parse_ps_cpu_time("2-01:02:03"), Some(176_523.0));
+        assert_eq!(parse_ps_cpu_time("00:00.25"), Some(0.25));
+        assert_eq!(parse_ps_cpu_time("garbage"), None);
     }
 
     #[tokio::test]
