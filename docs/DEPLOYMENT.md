@@ -44,6 +44,12 @@ curl --fail http://127.0.0.1:8100/healthz
 
 A healthy response means the gateway currently considers its backend connection ready. It is not an end-to-end proof that every desktop permission or tool action is usable.
 
+## Backend command configuration
+
+`CUMG_BACKEND_COMMAND` is the executable and `CUMG_BACKEND_ARGS` is the argument string. V1 splits `CUMG_BACKEND_ARGS` on ASCII whitespace; it does not implement shell-style quoting or escaping. The default `mcp` value is safe, but arguments containing embedded spaces cannot currently be represented reliably through this setting.
+
+Do not put secrets in backend command arguments. They may be visible to local process inspection even though the gateway intentionally avoids logging argument values.
+
 ## Tool policy
 
 The gateway is deny-by-default:
@@ -132,6 +138,7 @@ V1 has no built-in:
 - multi-machine routing;
 - per-user desktop isolation;
 - distributed locking;
+- shell-style quoting for `CUMG_BACKEND_ARGS`;
 - cloud control plane.
 
 All MCP clients connected to one V1 gateway ultimately share one serialized physical desktop/backend state.
