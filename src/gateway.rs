@@ -11,14 +11,17 @@ use rmcp::{
     },
     service::{RequestContext, RoleServer},
 };
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct Gateway {
     backend: Arc<dyn ComputerUseBackend>,
     policy: ToolPolicy,
-    tools: Arc<Vec<Tool>>,
+    tools: Arc<RwLock<Vec<Tool>>>,
 }
 
 impl Gateway {
@@ -26,15 +29,34 @@ impl Gateway {
         backend: Arc<dyn ComputerUseBackend>,
         policy: ToolPolicy,
     ) -> Result<Self> {
-        let discovered = backend
+        let gateway = Self {
+            backend,
+            policy,
+            tools: Arc::new(RwLock::new(Vec::new())),
+        };
+        gateway
+            .refresh_tools()
+            .await
+            .context("failed to discover backend MCP tools")?;
+        Ok(gateway)
+    }
+
+    async fn refresh_tools(&self) -> Result<Vec<Tool>> {
+        let discovered = self
+            .backend
             .list_tools()
             .await
             .context("failed to discover backend MCP tools")?;
         let total = discovered.len();
         let tools: Vec<Tool> = discovered
             .into_iter()
-            .filter(|tool| policy.evaluate(tool.name.as_ref()) == PolicyDecision::Allow)
+            .filter(|tool| self.policy.evaluate(tool.name.as_ref()) == PolicyDecision::Allow)
             .collect();
+
+        {
+            let mut cached = self.tools.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *cached = tools.clone();
+        }
 
         info!(
             event = "backend_tool_discovery",
@@ -42,16 +64,20 @@ impl Gateway {
             exposed_tools = tools.len(),
             "backend MCP tool discovery complete"
         );
+        Ok(tools)
+    }
 
-        Ok(Self {
-            backend,
-            policy,
-            tools: Arc::new(tools),
-        })
+    fn cached_tools(&self) -> Vec<Tool> {
+        self.tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn exposed_tool(&self, name: &str) -> Option<Tool> {
         self.tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .find(|tool| tool.name.as_ref() == name)
             .cloned()
@@ -81,8 +107,20 @@ impl ServerHandler for Gateway {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let tools = match self.refresh_tools().await {
+            Ok(tools) => tools,
+            Err(_) => {
+                warn!(
+                    event = "backend_tool_discovery",
+                    outcome = "cached_fallback",
+                    "backend tool refresh failed; serving the last policy-filtered snapshot"
+                );
+                self.cached_tools()
+            }
+        };
+
         Ok(ListToolsResult {
-            tools: self.tools.as_ref().clone(),
+            tools,
             ..Default::default()
         })
     }
@@ -99,9 +137,7 @@ impl ServerHandler for Gateway {
         let started = Instant::now();
         let tool_name = request.name.to_string();
 
-        if self.policy.evaluate(&tool_name) == PolicyDecision::Deny
-            || self.exposed_tool(&tool_name).is_none()
-        {
+        if self.policy.evaluate(&tool_name) == PolicyDecision::Deny {
             warn!(
                 event = "mcp_tool_call",
                 tool = %tool_name,
@@ -111,6 +147,24 @@ impl ServerHandler for Gateway {
                 "tool call blocked by gateway policy"
             );
             return Ok(Self::blocked_result());
+        }
+
+        // Refresh once when a policy-allowed tool is not in the current snapshot.
+        // This lets backend upgrades become visible without restarting the gateway,
+        // while still failing closed if discovery cannot confirm the tool exists.
+        if self.exposed_tool(&tool_name).is_none() {
+            let _ = self.refresh_tools().await;
+            if self.exposed_tool(&tool_name).is_none() {
+                warn!(
+                    event = "mcp_tool_call",
+                    tool = %tool_name,
+                    policy = "allow",
+                    outcome = "unavailable",
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "tool is allowed by policy but unavailable in the backend snapshot"
+                );
+                return Ok(Self::blocked_result());
+            }
         }
 
         match self.backend.call_tool(&tool_name, request.arguments).await {
@@ -135,7 +189,7 @@ impl ServerHandler for Gateway {
                     "backend tool call failed"
                 );
                 Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "The computer-use backend could not complete this tool call.",
+                    "The computer-use backend could not complete this tool call. Its connection is recovered for a subsequent request when possible; the failed call is never replayed automatically."
                 )])
                 .into())
             }
