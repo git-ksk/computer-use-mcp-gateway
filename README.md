@@ -34,7 +34,7 @@ The gateway owns the network and policy boundary. Cua owns desktop automation an
 Implemented V1 capabilities:
 
 - MCP Streamable HTTP endpoint at `/mcp`
-- Legacy `2025-11-25` and stateless `2026-07-28` MCP lifecycle compatibility
+- Legacy `2025-11-25` and stateless `2026-07-28` MCP lifecycle compatibility smoke coverage
 - Localhost-only binding by default (`127.0.0.1:8100`)
 - Host validation and browser Origin validation on the MCP endpoint
 - `cua-driver mcp` child process over MCP stdio
@@ -50,6 +50,8 @@ Implemented V1 capabilities:
 - Optional Cua policy layer for argument-level defense in depth
 - Real-Cua CI smoke coverage on Linux, macOS, and Windows
 - Manual, trusted self-hosted macOS desktop E2E lane for screenshot → click → type → independent readback
+
+The dual-protocol smoke suite verifies compatibility with the exercised lifecycles; it is **not** an MCP conformance certification. Official conformance-runner integration remains a roadmap item.
 
 V1 intentionally does **not** implement multi-machine routing, a custom computer-use engine, a cloud control plane, or a custom Hub-to-Agent protocol.
 
@@ -120,7 +122,7 @@ The binary itself fails closed when `CUMG_ALLOW_TOOLS` is empty. `.env.example` 
 
 Keep `CUMG_BIND` on loopback. For a public hostname behind Cloudflare Access/Tunnel or another authenticated TLS proxy, either preserve/rewrite the origin `Host` to an allowed loopback authority or explicitly add the public authority to `CUMG_ALLOWED_HOSTS`. If browser-originated MCP requests are expected, explicitly add their exact HTTPS origin to `CUMG_ALLOWED_ORIGINS`; do not disable the checks globally.
 
-The gateway does **not** provide public authentication itself in V1. Authentication and TLS are a required upstream deployment boundary for remote use.
+The gateway does **not** provide public authentication itself in V1. Authentication and TLS are a required upstream deployment boundary for remote use. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) before exposing the gateway through a tunnel or proxy.
 
 ## Development
 
@@ -128,15 +130,26 @@ The gateway does **not** provide public authentication itself in V1. Authenticat
 cargo fmt --check
 cargo check --locked --all-targets
 cargo test --locked
+python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py
 ```
 
-Normal CI also installs a checksum-verified pinned Cua Driver and runs the real gateway/Cua smoke on Linux, macOS, and Windows against both MCP protocol lifecycles. It additionally verifies that malicious Host and Origin values are rejected.
+Normal CI independently verifies the pinned Cua installer SHA-256, the platform release payload SHA-256, and the installed `cua-driver` executable identity before running the real gateway/Cua smoke on Linux, macOS, and Windows against both MCP protocol lifecycles. It also verifies that malicious Host and Origin values are rejected.
+
+See [`docs/TESTING.md`](docs/TESTING.md) for the CI matrix, what the smoke tests prove, and what still requires a trusted desktop runner.
 
 ### Desktop E2E
 
 `.github/workflows/desktop-e2e.yml` is deliberately `workflow_dispatch`-only, main-branch-only, and targets a dedicated runner labelled `cua-desktop-e2e`. The runner must be a logged-in macOS desktop with the CuaDriver application identity already granted Accessibility and Screen Recording permissions.
 
 Do **not** attach a daily-use Mac as an unrestricted self-hosted runner to this public repository, and never enable this desktop workflow for pull-request events. The E2E fixture opens a fresh TextEdit instance through the gateway, obtains screenshot evidence, clicks the editor, types a unique marker, and independently verifies the resulting accessibility state.
+
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, and failure model
+- [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, policy, CI supply chain, and desktop-runner safety
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — localhost-first deployment and reverse-proxy requirements
+- [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, smoke scope, and desktop E2E
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — repository implementation snapshot; the project design report remains canonical
 
 ## Security model
 
@@ -154,7 +167,7 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) for the security notes.
 
 ## Roadmap
 
-The canonical roadmap is maintained in the project design report. The repository's [`docs/ROADMAP.md`](docs/ROADMAP.md) is a supporting snapshot, not a replacement for that report.
+The canonical roadmap is maintained in the project design report. The repository's [`docs/ROADMAP.md`](docs/ROADMAP.md) is a supporting implementation snapshot, not a replacement for that report.
 
 ## License
 
