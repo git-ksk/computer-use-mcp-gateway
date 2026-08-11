@@ -145,6 +145,9 @@ fn map_command(
         DeviceCommand::PointerClick { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::PointerClick,
         )),
+        DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
+            DeviceCapability::ExecuteProcess,
+        )),
     }
 }
 
@@ -195,6 +198,9 @@ fn normalize_result(
         }
         DeviceCommand::PointerClick { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::PointerClick,
+        )),
+        DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
+            DeviceCapability::ExecuteProcess,
         )),
     }
 }

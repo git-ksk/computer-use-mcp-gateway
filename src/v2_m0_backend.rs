@@ -161,6 +161,11 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::PointerClick,
                 ));
             }
+            DeviceCommand::ExecuteProcess { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::ExecuteProcess,
+                ));
+            }
         };
         validate_adapter_result(command, &result)?;
         Ok(result)

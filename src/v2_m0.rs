@@ -27,6 +27,7 @@ pub enum DeviceCapability {
     ListApplications,
     ScreenGeometry,
     PointerClick,
+    ExecuteProcess,
 }
 
 impl DeviceCapability {
@@ -34,6 +35,9 @@ impl DeviceCapability {
         match self {
             Self::ListApplications | Self::ScreenGeometry => CapabilityClass::Observe,
             Self::PointerClick => CapabilityClass::Interact,
+            // Direct process execution can mutate arbitrary local state and is
+            // therefore never implied by observe/interact access.
+            Self::ExecuteProcess => CapabilityClass::Dangerous,
         }
     }
 }
@@ -47,6 +51,33 @@ pub enum PointerButton {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessEnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessRequest {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub env: Vec<ProcessEnvVar>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceCommand {
     ListApplications,
@@ -56,6 +87,9 @@ pub enum DeviceCommand {
         y: i32,
         button: PointerButton,
     },
+    ExecuteProcess {
+        request: ProcessRequest,
+    },
 }
 
 impl DeviceCommand {
@@ -64,6 +98,7 @@ impl DeviceCommand {
             Self::ListApplications => DeviceCapability::ListApplications,
             Self::ScreenGeometry => DeviceCapability::ScreenGeometry,
             Self::PointerClick { .. } => DeviceCapability::PointerClick,
+            Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
         }
     }
 
@@ -639,6 +674,9 @@ pub enum DeviceResult {
         scale_factor_milli: u32,
     },
     PointerClickCompleted,
+    Process {
+        output: ProcessOutput,
+    },
 }
 
 impl DeviceResult {
@@ -651,6 +689,7 @@ impl DeviceResult {
                     Self::PointerClickCompleted,
                     DeviceCommand::PointerClick { .. }
                 )
+                | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
         )
     }
 }
