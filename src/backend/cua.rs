@@ -10,14 +10,17 @@ use super::{BackendHealth, ComputerUseBackend};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use rmcp::{
-    model::{CallToolRequestParams, CallToolResult, JsonObject, Tool},
-    service::{Peer, RoleClient, RunningService, ServiceExt},
+    model::{
+        CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+        ClientRequest, JsonObject, ServerResult, Tool,
+    },
+    service::{Peer, PeerRequestOptions, RoleClient, RunningService, ServiceExt},
     transport::TokioChildProcess,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, watch},
     time::{sleep, timeout},
 };
 use tracing::warn;
@@ -163,6 +166,16 @@ impl CuaBackend {
             );
         }
     }
+
+    async fn notify_cancelled(peer: &Peer<RoleClient>, request_id: rmcp::model::RequestId, reason: &str) {
+        let _ = peer
+            .notify_cancelled(CancelledNotificationParam {
+                request_id: Some(request_id),
+                reason: Some(reason.to_owned()),
+                meta: None,
+            })
+            .await;
+    }
 }
 
 #[async_trait]
@@ -195,29 +208,60 @@ impl ComputerUseBackend for CuaBackend {
         }
     }
 
-    async fn call_tool(&self, name: &str, arguments: Option<JsonObject>) -> Result<CallToolResult> {
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+        mut cancellation: watch::Receiver<bool>,
+    ) -> Result<CallToolResult> {
         // A single physical desktop is a shared mutable resource. Serialize all
         // backend operations in V1 so independent MCP clients cannot interleave
         // clicks, keystrokes, snapshots, and stateful element-index operations.
         let _operation = self.operation_lock.lock().await;
         let peer = self.peer().await?;
-        let mut request = CallToolRequestParams::new(name.to_owned());
+        let mut params = CallToolRequestParams::new(name.to_owned());
         if let Some(arguments) = arguments {
-            request = request.with_arguments(arguments);
+            params = params.with_arguments(arguments);
         }
 
-        let result = timeout(self.tool_timeout, peer.call_tool(request)).await;
-        match result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => {
-                self.recover_after_failure().await;
-                Err(error)
-                    .context("Cua MCP tool call failed; connection recovered for the next call")
+        let handle = peer
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest {
+                    method: Default::default(),
+                    params,
+                    extensions: Default::default(),
+                }),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .context("failed to send Cua MCP tool call")?;
+        let request_id = handle.id.clone();
+        let response = handle.await_response();
+        tokio::pin!(response);
+
+        tokio::select! {
+            result = &mut response => {
+                match result {
+                    Ok(ServerResult::CallToolResult(result)) => Ok(result),
+                    Ok(_) => bail!("Cua MCP tool call returned an unsupported multi-round-trip response"),
+                    Err(error) => {
+                        self.recover_after_failure().await;
+                        Err(error).context("Cua MCP tool call failed; connection recovered for the next call")
+                    }
+                }
             }
-            Err(_) => {
+            changed = cancellation.changed() => {
+                if changed.is_ok() && *cancellation.borrow() {
+                    Self::notify_cancelled(&peer, request_id, "upstream MCP request cancelled").await;
+                    bail!("Cua MCP tool call cancelled by the upstream MCP client; the call was not replayed")
+                }
+                bail!("Cua MCP cancellation channel closed unexpectedly")
+            }
+            _ = sleep(self.tool_timeout) => {
+                Self::notify_cancelled(&peer, request_id, "gateway tool timeout").await;
                 self.recover_after_failure().await;
                 bail!(
-                    "Cua MCP tool call timed out after {} seconds; the call was not retried because its side effects may be unknown",
+                    "Cua MCP tool call timed out after {} seconds; cancellation was propagated and the call was not retried because its side effects may be unknown",
                     self.tool_timeout.as_secs()
                 )
             }
