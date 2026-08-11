@@ -20,25 +20,17 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt
           rustup default 1.88.0
 
-      - name: Generate lockfile
-        run: cargo generate-lockfile
-
-      - name: Preserve generated lockfile
-        uses: actions/upload-artifact@v6
-        with:
-          name: cargo-lock
-          path: Cargo.lock
-          if-no-files-found: error
-          retention-days: 1
-
       - name: Format
         run: cargo fmt --check
 
       - name: Check
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Python harness syntax
+        run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py
 
   cua-smoke:
     name: Cua smoke (${{ matrix.name }})
@@ -124,13 +116,9 @@ jobs:
           esac
           cua-driver telemetry disable
 
-      - name: Generate lockfile
-        shell: bash
-        run: cargo generate-lockfile
-
       - name: Build gateway
         shell: bash
-        run: cargo build
+        run: cargo build --locked
 
       - name: Real Cua MCP smoke (2025-11-25)
         shell: bash
@@ -143,39 +131,3 @@ jobs:
         env:
           MCP_PROTOCOL_VERSION: "2026-07-28"
         run: ${{ matrix.python }} scripts/cua_gateway_smoke.py
-
-  lockfile-bootstrap:
-    # One-time bootstrap only: same-repo PR, exact trusted actor and exact branch.
-    # Remove this job immediately after Cargo.lock is committed.
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.actor == 'git-ksk' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'hardening/v1-remote-ready'
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout trusted hardening branch
-        uses: actions/checkout@v6
-        with:
-          ref: hardening/v1-remote-ready
-
-      - name: Install Rust 1.88
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
-
-      - name: Generate and commit Cargo.lock once
-        shell: bash
-        run: |
-          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
-            echo "Cargo.lock is already tracked; bootstrap is complete."
-            exit 0
-          fi
-          cargo generate-lockfile
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock
-          git commit -m "build: lock Rust dependencies"
-          git push origin HEAD:hardening/v1-remote-ready
