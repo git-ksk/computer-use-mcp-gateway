@@ -9,14 +9,16 @@ Northbound                                  Southbound
 
 MCP client
     |
-    | Streamable HTTP / POST /mcp
+    | MCP Streamable HTTP /mcp
     v
 +-----------------------------+
 | computer-use-mcp-gateway    |
 |                             |
-|  HTTP transport             |
+|  Host / Origin guards       |
 |       |                     |
 |  policy / audit             |
+|       |                     |
+|  dynamic tool snapshot      |
 |       |                     |
 |  backend abstraction        |
 +-------|---------------------+
@@ -30,13 +32,21 @@ MCP client
 
 **Gateway**
 - MCP transport boundary
+- Host/Origin transport guards
 - backend lifecycle
-- dynamic tool discovery
+- dynamic tool discovery and cached policy-filtered snapshot
 - request forwarding
-- policy enforcement
+- deny-by-default policy enforcement
 - health and audit metadata
 
-**Backend**
+**Backend adapter**
+- child-process connection lifecycle
+- connection and operation timeouts
+- bounded reconnect/backoff
+- serialization of operations against one physical desktop
+- no automatic replay of failed state-changing calls
+
+**Cua backend**
 - screenshots
 - accessibility/UI trees
 - click/type/scroll
@@ -45,7 +55,7 @@ MCP client
 
 ## Backend abstraction
 
-V1 starts with Cua but must not hard-code Cua semantics into the public gateway surface.
+V1 starts with Cua but does not hard-code Cua semantics into the public gateway surface.
 
 ```text
 Backend
@@ -60,7 +70,25 @@ The first implementation is `CuaBackend`.
 
 ## State model
 
-MCP `2026-07-28` removes protocol-level HTTP sessions. Public request handlers therefore cannot store client state inside an HTTP MCP session. Shared backend state is owned by an application-level `GatewayState` and is independent of MCP transport sessions.
+MCP `2026-07-28` removes protocol-level HTTP sessions. Public request handlers therefore cannot rely on client state stored in an HTTP MCP session.
+
+Application-level state is independent of MCP transport sessions:
+
+- `Gateway` owns the policy and a shared, policy-filtered tool snapshot.
+- `CuaBackend` owns the current MCP client service and synchronization locks.
+- `tools/list` refreshes backend discovery; if refresh fails it may serve the last policy-filtered cached snapshot.
+- a policy-allowed `tools/call` missing from the current snapshot triggers one refresh and fails closed if discovery still cannot confirm the tool.
+- backend operations are serialized because cursor/focus/UI snapshot state is shared mutable desktop state.
+
+## Failure model
+
+Read-only tool discovery can reconnect and retry after a transport failure. State-changing computer-use calls cannot be safely replayed because the desktop may already have partially applied the action. A failed call is therefore returned as an error after recovery is attempted for the next request.
+
+## Security boundary
+
+The gateway is not an internet authentication service. Remote deployments keep the process on loopback and place authenticated TLS termination in front of it. The `/mcp` boundary additionally validates Host authorities and browser Origin values.
+
+Tool exposure is deny-by-default. Cua's own policy engine can provide a second, argument-aware capability ceiling.
 
 ## V2 boundary
 
