@@ -21,12 +21,11 @@ The persisted checkpoint intentionally contains **no private signing keys**. Hub
 
 The repository tests prove the TLS wrapper negotiates TLS 1.3 with the dedicated ALPN and rejects an untrusted server certificate. Runtime tests also cover heartbeat replay/generation/timeout handling, capped reconnect backoff, one-device routing, consumed/revoked grant persistence, revoked device/generation persistence, and crash/restart operation replay barriers.
 
-The existing M0 live-Cua PoC continues to prove the semantic path from an authorized client principal through a short-lived grant and bounded Hub/Agent execution to the Cua adapter. The next M1 integration slice must compose that protocol over the encrypted TLS channel rather than treating TLS and the control protocol as separate tests.
+The existing M0 live-Cua PoC continues to prove the semantic path from an authorized client principal through a short-lived grant and bounded Hub/Agent execution to the Cua adapter. M1 now also has an end-to-end integration test that composes the TLS channel with the application protocol in one outbound connection: TLS 1.3 + dedicated ALPN, Ed25519 Hub/Agent authentication, signed session acceptance, signed heartbeat/ack, one-device routing, bounded admission and lease ownership, short-lived grant validation on the Agent, and a signed typed result.
 
 ## Still required before V2-M1 acceptance
 
-- compose TLS + Ed25519 Hub/Agent handshake + heartbeat + typed command/result in one end-to-end connection;
-- package an actual long-lived outbound Agent connection loop using bounded reconnect and heartbeat timeout behavior;
+- package an actual long-lived outbound Agent connection loop using bounded reconnect and heartbeat timeout behavior, and prove reconnect across multiple encrypted sessions;
 - define production certificate/private-key provisioning and rotation without committing secrets to repository state;
 - integrate a real northbound authenticated identity source with `AuthenticatedClientPrincipal` rather than constructing the principal inside a PoC;
 - prove live cancellation against backend operations, including the explicit fail-closed behavior for operations that cannot be interrupted safely;

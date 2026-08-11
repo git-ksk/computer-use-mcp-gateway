@@ -148,9 +148,10 @@ If later M1 evidence shows these controls do not provide a meaningful operationa
 
 Only after V2-M0 GO:
 
-> **M1 implementation note (2026-08-11):** the foundation now includes TLS 1.3 configuration with pinned trust + dedicated ALPN, signed heartbeat messages, bounded reconnect policy, one-device routing, and restart-safe public trust/replay checkpoints. These are implementation-level controls, not M1 acceptance: the encrypted channel still needs to be composed with the complete Hub↔Agent protocol in one end-to-end connection, and live backend cancellation/private-key provisioning remain open. See [`V2_M1_PROGRESS.md`](V2_M1_PROGRESS.md).
+> **M1 implementation note (2026-08-11):** the foundation includes TLS 1.3 with pinned trust + dedicated ALPN, signed heartbeat messages, bounded reconnect policy, one-device routing, restart-safe public trust/replay checkpoints, and an end-to-end outbound TLS integration covering Ed25519 authentication → heartbeat → routing/admission/lease → short-lived grant → signed typed result. M1 acceptance is still open: long-lived reconnect lifecycle, live backend cancellation, real northbound auth integration, and private-key provisioning remain. See [`V2_M1_PROGRESS.md`](V2_M1_PROGRESS.md).
 
-- [ ] outbound Agent connection over the accepted encrypted M1 channel
+- [x] outbound Agent connection over the accepted encrypted M1 channel
+- [ ] long-lived Agent lifecycle and multi-session reconnect acceptance
 - [x] heartbeat/reconnect semantics with bounded backoff
 - [x] one-device routing
 - [x] versioned capability advertisement with revision/generation tracking
