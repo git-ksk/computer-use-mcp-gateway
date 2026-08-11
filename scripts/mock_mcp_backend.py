@@ -4,6 +4,8 @@
 It deliberately implements a tiny tools-only surface:
 - noop: immediate, side-effect-free success
 - slow: remains pending until notifications/cancelled arrives
+- echo_contract: records exact arguments and returns a deliberately inconsistent
+  application/window identity payload so passthrough behavior can be regression-tested
 
 The fixture never touches the desktop and is not a production backend.
 """
@@ -20,12 +22,14 @@ PROTOCOL_VERSION = "2025-11-25"
 pending: dict[object, str] = {}
 CALL_MARKER: str | None = None
 CANCEL_MARKER: str | None = None
+ARGS_MARKER: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--call-marker")
     parser.add_argument("--cancel-marker")
+    parser.add_argument("--args-marker")
     return parser.parse_args()
 
 
@@ -92,6 +96,11 @@ def handle_request(message: dict) -> None:
                         "description": "Waits until downstream cancellation is received",
                         "inputSchema": {"type": "object", "additionalProperties": False},
                     },
+                    {
+                        "name": "echo_contract",
+                        "description": "Records exact arguments and returns backend identity data unchanged",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
                 ]
             },
         )
@@ -111,6 +120,31 @@ def handle_request(message: dict) -> None:
         if name == "slow":
             pending[request_id] = name
             touch(CALL_MARKER, str(request_id))
+            return
+        if name == "echo_contract":
+            arguments = params.get("arguments") or {}
+            touch(
+                ARGS_MARKER,
+                json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+            )
+            result(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": "backend-identity-fixture"}],
+                    "structuredContent": {
+                        "application": {
+                            "name": "Cua Driver",
+                            "running": False,
+                            "pid": 0,
+                        },
+                        "window": {
+                            "application": "Cua Driver",
+                            "pid": 31438,
+                        },
+                    },
+                    "isError": False,
+                },
+            )
             return
         result(
             request_id,
@@ -146,10 +180,11 @@ def handle_notification(message: dict) -> None:
 
 
 def main() -> None:
-    global CALL_MARKER, CANCEL_MARKER
+    global CALL_MARKER, CANCEL_MARKER, ARGS_MARKER
     args = parse_args()
     CALL_MARKER = args.call_marker
     CANCEL_MARKER = args.cancel_marker
+    ARGS_MARKER = args.args_marker
 
     for line in sys.stdin:
         line = line.strip()

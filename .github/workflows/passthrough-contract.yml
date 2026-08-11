@@ -1,0 +1,30 @@
+name: Backend Passthrough Contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  passthrough:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Python syntax
+        run: python3 -m py_compile scripts/mock_mcp_backend.py scripts/v1_passthrough_contract.py
+
+      - name: Build gateway
+        run: cargo build --locked
+
+      - name: Verify transparent session and identity passthrough
+        run: python3 scripts/v1_passthrough_contract.py
