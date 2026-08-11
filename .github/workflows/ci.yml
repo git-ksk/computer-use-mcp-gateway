@@ -67,6 +67,99 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxi6 at-spi2-core
 
+      - name: Verify Cua release payload (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            macOS)
+              asset="cua-driver-rs-0.19.3-darwin-universal.tar.gz"
+              expected="a5b064bd3e05c3d97c4aaba1b8818e7b4203081ffc5f3186220005d356574aaa"
+              ;;
+            Linux)
+              case "$(uname -m)" in
+                x86_64|amd64)
+                  asset="cua-driver-rs-0.19.3-linux-x86_64-binary.tar.gz"
+                  expected="3db9d4257d84bacaf7eb104d225f85613ce67edbb20d6eeb83c1384b6d8a5b10"
+                  ;;
+                aarch64|arm64)
+                  asset="cua-driver-rs-0.19.3-linux-arm64-binary.tar.gz"
+                  expected="68c4bc4455250384b6e0fc6ab99ed2be5de8944de4ecea00fc3f4a88d8f4d460"
+                  ;;
+                *) echo "unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+              esac
+              ;;
+            *) echo "unexpected runner OS: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+
+          payload="$RUNNER_TEMP/$asset"
+          curl -fsSLo "$payload" "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.19.3/$asset"
+          python3 - "$payload" "$expected" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          expected = sys.argv[2]
+          actual = hashlib.sha256(path.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"Cua release payload checksum mismatch: {actual}")
+          PY
+
+          extract="$RUNNER_TEMP/cua-verified-payload"
+          rm -rf "$extract"
+          mkdir -p "$extract"
+          tar -xzf "$payload" -C "$extract"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            binary="$(find "$extract" -type f -path '*/CuaDriver.app/Contents/MacOS/cua-driver' -print -quit)"
+          else
+            binary="$(find "$extract" -type f -name cua-driver -print -quit)"
+          fi
+          if [[ -z "$binary" ]]; then
+            echo "verified Cua payload did not contain cua-driver" >&2
+            exit 1
+          fi
+          binary_sha="$(python3 - "$binary" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+          PY
+          )"
+          echo "CUA_EXPECTED_BINARY_SHA256=$binary_sha" >> "$GITHUB_ENV"
+
+      - name: Verify Cua release payload (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          switch ($env:PROCESSOR_ARCHITECTURE) {
+            "AMD64" {
+              $asset = "cua-driver-rs-0.19.3-windows-x86_64.zip"
+              $expected = "e48b0117e343cec2577fc12693c741e094f389f8d4aef91e06284960bb03bce1"
+            }
+            "ARM64" {
+              $asset = "cua-driver-rs-0.19.3-windows-arm64.zip"
+              $expected = "693cff4618fdcb6b0ea797e2f5b17eb6291dcea4b62da7bc6b5c373f1aa1852f"
+            }
+            default { throw "unsupported Windows architecture: $env:PROCESSOR_ARCHITECTURE" }
+          }
+
+          $payload = Join-Path $env:RUNNER_TEMP $asset
+          Invoke-WebRequest "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.19.3/$asset" -OutFile $payload
+          $actual = (Get-FileHash -Algorithm SHA256 $payload).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Cua release payload checksum mismatch: $actual"
+          }
+
+          $extract = Join-Path $env:RUNNER_TEMP "cua-verified-payload"
+          Remove-Item -Recurse -Force $extract -ErrorAction SilentlyContinue
+          Expand-Archive -Path $payload -DestinationPath $extract
+          $binary = Get-ChildItem -Path $extract -Recurse -File -Filter "cua-driver.exe" | Select-Object -First 1
+          if (-not $binary) {
+            throw "verified Cua payload did not contain cua-driver.exe"
+          }
+          $binarySha = (Get-FileHash -Algorithm SHA256 $binary.FullName).Hash.ToLowerInvariant()
+          "CUA_EXPECTED_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Install verified Cua Driver (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -105,9 +198,25 @@ jobs:
           $global:LASTEXITCODE = 0
           $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Verify Cua Driver and disable telemetry
+      - name: Verify installed Cua Driver identity and disable telemetry
         shell: bash
         run: |
+          ${{ matrix.python }} - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import shutil
+          path = shutil.which("cua-driver")
+          if not path:
+              raise SystemExit("cua-driver was not found on PATH")
+          actual = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+          expected = os.environ["CUA_EXPECTED_BINARY_SHA256"]
+          if actual != expected:
+              raise SystemExit(
+                  f"installed Cua binary differs from verified release payload: {actual} != {expected}"
+              )
+          print(f"verified installed Cua binary sha256={actual}")
+          PY
           version="$(cua-driver --version)"
           echo "$version"
           case "$version" in
