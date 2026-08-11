@@ -81,6 +81,12 @@ pub fn known_tool_class(tool_name: &str) -> Option<ToolClass> {
         | "browser_type"
         | "browser_dialog"
         | "browser_pointer"
+        // Platform-specific low-level mouse primitives exposed by pinned Cua
+        // 0.19.3 on Linux.
+        | "mouse_button_down"
+        | "mouse_button_up"
+        | "mouse_drag"
+        | "parallel_mouse_drag"
         // Retained compatibility names from older reviewed Cua surfaces.
         | "type_text_chars"
         | "set_agent_cursor"
@@ -202,10 +208,15 @@ mod tests {
 
     #[test]
     fn pinned_cua_0_19_3_surface_is_explicitly_reviewed() {
-        let fixture = include_str!("../tests/fixtures/cua-0.19.3-tools.txt");
+        let fixtures = [
+            include_str!("../tests/fixtures/cua-0.19.3-tools.txt"),
+            include_str!("../tests/fixtures/cua-0.19.3-tools-linux-extra.txt"),
+            include_str!("../tests/fixtures/cua-0.19.3-tools-windows-extra.txt"),
+        ];
         let mut count = 0usize;
-        for tool_name in fixture
-            .lines()
+        for tool_name in fixtures
+            .into_iter()
+            .flat_map(str::lines)
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
@@ -215,7 +226,7 @@ mod tests {
                 "pinned Cua tool is missing an explicit semantic class: {tool_name}"
             );
         }
-        assert_eq!(count, 54, "unexpected pinned Cua 0.19.3 fixture size");
+        assert_eq!(count, 59, "unexpected reviewed Cua 0.19.3 tool union size");
     }
 
     #[test]

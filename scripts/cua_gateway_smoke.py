@@ -34,18 +34,40 @@ PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-11-25")
 MODERN_PROTOCOL = PROTOCOL_VERSION == "2026-07-28"
 CLIENT_INFO = {"name": "cua-gateway-ci", "version": "0.1.0"}
 PINNED_CUA_TOOL_FIXTURE = Path("tests/fixtures/cua-0.19.3-tools.txt")
+PINNED_CUA_LINUX_EXTRA_FIXTURE = Path("tests/fixtures/cua-0.19.3-tools-linux-extra.txt")
+PINNED_CUA_WINDOWS_EXTRA_FIXTURE = Path("tests/fixtures/cua-0.19.3-tools-windows-extra.txt")
+
+
+def _fixture_names(path: Path) -> set[str]:
+    return {
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
 
 
 def pinned_cua_tool_names() -> set[str]:
-    names = {
-        line.strip()
-        for line in PINNED_CUA_TOOL_FIXTURE.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    }
+    names = _fixture_names(PINNED_CUA_TOOL_FIXTURE)
     if len(names) != 54:
         raise RuntimeError(
-            f"unexpected pinned Cua tool fixture size: {len(names)} (expected 54)"
+            f"unexpected common Cua tool fixture size: {len(names)} (expected 54)"
         )
+
+    if sys.platform.startswith("linux"):
+        extra = _fixture_names(PINNED_CUA_LINUX_EXTRA_FIXTURE)
+        if len(extra) != 4:
+            raise RuntimeError(
+                f"unexpected Linux Cua tool fixture size: {len(extra)} (expected 4)"
+            )
+        names |= extra
+    elif os.name == "nt":
+        extra = _fixture_names(PINNED_CUA_WINDOWS_EXTRA_FIXTURE)
+        if len(extra) != 1:
+            raise RuntimeError(
+                f"unexpected Windows Cua tool fixture size: {len(extra)} (expected 1)"
+            )
+        names |= extra
+
     return names
 
 
