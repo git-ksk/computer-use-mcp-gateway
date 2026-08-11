@@ -10,15 +10,22 @@ The fixture never touches the desktop and is not a production backend.
 
 from __future__ import annotations
 
+import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
 PROTOCOL_VERSION = "2025-11-25"
-CALL_MARKER = os.environ.get("CUMG_MOCK_CALL_MARKER")
-CANCEL_MARKER = os.environ.get("CUMG_MOCK_CANCEL_MARKER")
 pending: dict[object, str] = {}
+CALL_MARKER: str | None = None
+CANCEL_MARKER: str | None = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--call-marker")
+    parser.add_argument("--cancel-marker")
+    return parser.parse_args()
 
 
 def emit(message: dict) -> None:
@@ -134,6 +141,11 @@ def handle_notification(message: dict) -> None:
 
 
 def main() -> None:
+    global CALL_MARKER, CANCEL_MARKER
+    args = parse_args()
+    CALL_MARKER = args.call_marker
+    CANCEL_MARKER = args.cancel_marker
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
