@@ -162,6 +162,30 @@ def choose_text_element(state: dict[str, Any]) -> dict[str, Any]:
     return candidates[0][1]
 
 
+def wait_for_window(pid: int, preferred_title: str, timeout: float = 10.0) -> dict[str, Any]:
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        state = structured(call_tool("list_windows", {"pid": pid}, 110 + attempt))
+        windows = state.get("windows")
+        if isinstance(windows, list):
+            eligible = [window for window in windows if isinstance(window, dict)]
+            titled = [
+                window
+                for window in eligible
+                if preferred_title and preferred_title in str(window.get("title", ""))
+            ]
+            visible = [window for window in eligible if window.get("is_on_screen") is True]
+            for pool in (titled, visible, eligible):
+                if pool:
+                    window_id = pool[0].get("window_id")
+                    if isinstance(window_id, int):
+                        return pool[0]
+        attempt += 1
+        time.sleep(0.25)
+    raise RuntimeError(f"TextEdit launched but no window became available within {timeout:.1f}s")
+
+
 def read_log(log_file: TextIO) -> str:
     log_file.flush()
     pos = log_file.tell()
@@ -178,7 +202,7 @@ def start_gateway() -> tuple[subprocess.Popen[str], TextIO]:
             "CUMG_BIND": f"{HOST}:{PORT}",
             "CUMG_BACKEND_COMMAND": "cua-driver",
             "CUMG_BACKEND_ARGS": "mcp",
-            "CUMG_ALLOW_TOOLS": "launch_app,kill_app,bring_to_front,list_windows,get_window_state,click,type_text",
+            "CUMG_ALLOW_TOOLS": "launch_app,kill_app,list_windows,get_window_state,click,type_text",
             "CUMG_CONNECT_TIMEOUT_SECS": "15",
             "CUMG_TOOL_TIMEOUT_SECS": "60",
             "CUMG_RECONNECT_ATTEMPTS": "3",
@@ -236,6 +260,8 @@ def main() -> int:
 
     process, log_file = start_gateway()
     pid: int | None = None
+    fixture_path = Path(tempfile.gettempdir()) / f"cumg-desktop-e2e-{os.getpid()}.txt"
+    fixture_path.write_text("", encoding="utf-8")
     try:
         initialize()
         launch = call_tool(
@@ -243,6 +269,7 @@ def main() -> int:
             {
                 "bundle_id": "com.apple.TextEdit",
                 "creates_new_application_instance": True,
+                "urls": [str(fixture_path)],
             },
             10,
         )
@@ -251,14 +278,9 @@ def main() -> int:
         if pid is None:
             raise RuntimeError(f"launch_app returned no pid: {launch_state}")
 
-        window_id = recursively_find_int(launch_state.get("windows", []), "window_id")
-        if window_id is None:
-            windows = structured(call_tool("list_windows", {"pid": pid}, 11))
-            window_id = recursively_find_int(windows, "window_id")
-        if window_id is None:
-            raise RuntimeError("TextEdit launched but no window became available")
+        window = wait_for_window(pid, fixture_path.name)
+        window_id = window["window_id"]
 
-        call_tool("bring_to_front", {"pid": pid, "window_id": window_id}, 12)
         state_result = call_tool(
             "get_window_state",
             {"pid": pid, "window_id": window_id},
@@ -272,27 +294,41 @@ def main() -> int:
         if not isinstance(element_index, int):
             raise RuntimeError(f"editor element had no element_index: {element}")
 
-        click_args: dict[str, Any] = {
-            "pid": pid,
-            "window_id": window_id,
-            "element_index": element_index,
-        }
-        snapshot_id = state.get("snapshot_id")
-        if snapshot_id is not None:
-            click_args["snapshot_id"] = snapshot_id
-        call_tool("click", click_args, 14)
+        frame = element.get("frame") or {}
+        bounds = window.get("bounds") or {}
+        try:
+            local_x = float(frame["x"]) - float(bounds["x"]) + min(20.0, float(frame["w"]) / 2.0)
+            local_y = float(frame["y"]) - float(bounds["y"]) + min(20.0, float(frame["h"]) / 2.0)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"could not derive editor pixel target: element={element} window={window}") from exc
 
-        marker = f"CUMG_DESKTOP_E2E_{int(time.time())}"
         call_tool(
-            "type_text",
+            "click",
             {
                 "pid": pid,
                 "window_id": window_id,
-                "element_index": element_index,
-                "text": marker,
+                "x": local_x,
+                "y": local_y,
             },
-            15,
+            14,
         )
+
+        marker = f"CUMG_DESKTOP_E2E_{int(time.time())}"
+        type_args: dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+            "text": marker,
+        }
+        element_token = element.get("element_token")
+        snapshot_id = state.get("snapshot_id")
+        if isinstance(element_token, str):
+            type_args["element_token"] = element_token
+        elif isinstance(snapshot_id, str):
+            type_args["element_index"] = element_index
+            type_args["snapshot_id"] = snapshot_id
+        else:
+            raise RuntimeError("editor element had neither element_token nor snapshot_id")
+        call_tool("type_text", type_args, 15)
 
         verified_result = call_tool(
             "get_window_state",
@@ -314,6 +350,10 @@ def main() -> int:
                 call_tool("kill_app", {"pid": pid}, 99)
             except Exception as exc:  # cleanup only
                 print(f"cleanup warning: {exc}")
+        try:
+            fixture_path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"fixture cleanup warning: {exc}")
         stop_gateway(process, log_file)
 
 

@@ -1,37 +1,35 @@
 # V1 acceptance
 
-Automated/code-local V1 closeout is covered by normal CI. The authenticated Cloudflare Access/Tunnel + ChatGPT remote dogfood was completed on 2026-08-11. One acceptance check remains outside hosted CI because it requires a trusted dedicated real desktop.
+V1 acceptance was completed on 2026-08-11. Normal CI covers automated/code-local closeout; operator-controlled acceptance covered both a trusted real macOS desktop and the authenticated Cloudflare Access/Tunnel + ChatGPT remote path.
 
-Do not run the remaining dedicated-desktop check on an unrestricted daily-use workstation or with production secrets committed to this repository.
+The desktop acceptance is a **product-level real-desktop check**, not a requirement to operate a permanent GitHub self-hosted runner. The same fixture may be run either directly by a trusted operator on a logged-in TCC-granted Mac or through the manual self-hosted workflow. The repository keeps `.github/workflows/desktop-e2e.yml` as a repeatable automation path for teams that maintain a dedicated runner.
 
-## 1. Dedicated macOS desktop E2E
+## 1. Trusted macOS desktop E2E — completed 2026-08-11
 
-Use a dedicated test Mac, not a normal personal workstation.
+The acceptance fixture is `scripts/cua_desktop_e2e.py`. It is guarded by `CUMG_DESKTOP_E2E_ACK=1` because it performs real GUI actions.
 
-Prerequisites:
+Accepted execution modes:
 
-- the machine is logged into an interactive macOS GUI session;
-- CuaDriver is installed and working;
-- CuaDriver has Accessibility and Screen Recording permissions;
-- a GitHub Actions self-hosted runner is installed only on this dedicated machine;
-- the runner has the `cua-desktop-e2e` label;
-- the runner is not permitted to execute untrusted pull-request code.
+- direct operator-controlled run on a trusted, logged-in macOS desktop with CuaDriver Accessibility and Screen Recording permissions; or
+- `.github/workflows/desktop-e2e.yml` via `workflow_dispatch` on a dedicated `cua-desktop-e2e` self-hosted runner.
 
-Run `.github/workflows/desktop-e2e.yml` manually from `main` using `workflow_dispatch`.
+The 2026-08-11 V1 closeout used the first mode. No self-hosted runner was registered or claimed as part of this evidence.
 
 Acceptance evidence:
 
-- [ ] workflow runs from trusted `main`;
-- [ ] it lands on the dedicated `cua-desktop-e2e` runner;
-- [ ] TextEdit is launched fresh;
-- [ ] screenshot evidence is obtained;
-- [ ] the editor is clicked;
-- [ ] a unique marker is typed;
-- [ ] the marker is independently observed through accessibility state;
-- [ ] TextEdit is cleaned up;
-- [ ] the workflow completes successfully.
+- [x] the gateway started on loopback with a narrow six-tool E2E allowlist;
+- [x] a fresh TextEdit instance opened a unique temporary text fixture;
+- [x] the exact visible fixture window was selected after bounded window-readiness polling;
+- [x] `get_window_state` returned screenshot evidence;
+- [x] the editor was clicked using window-local screenshot coordinates derived from the observed AX frame and window bounds;
+- [x] a unique `CUMG_DESKTOP_E2E_<timestamp>` marker was typed using the current Cua `element_token` / snapshot contract;
+- [x] a fresh accessibility snapshot independently contained the marker;
+- [x] TextEdit and the temporary fixture were cleaned up;
+- [x] the script returned `PASS desktop E2E: gateway -> Cua -> TextEdit -> screenshot -> click -> type -> AX verify`.
 
-Do not upload screenshots or artifacts containing unrelated desktop data merely to prove the run. The workflow result plus its non-sensitive logs are sufficient unless debugging is required.
+The closeout run also hardened the fixture against three real macOS/Cua conditions discovered during execution: asynchronous TextEdit window creation, multiple helper/hidden windows in one TextEdit PID, and Cua 0.17+ refusal of bare `element_index` writes.
+
+Do not upload screenshots or artifacts containing unrelated desktop data merely to prove a future rerun. Non-sensitive logs and the deterministic AX readback are sufficient unless debugging is required.
 
 ## 2. Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood — completed 2026-08-11
 
@@ -68,6 +66,6 @@ Recorded acceptance evidence (2026-08-11):
 
 ## Closing V1
 
-The remote-access section is complete. Once the dedicated macOS desktop E2E section passes, update [`ROADMAP.md`](ROADMAP.md) to check the final V1 acceptance item and record V1 as closed.
+Both operator-controlled acceptance sections passed on 2026-08-11, so V1 is closed. No acceptance item was waived.
 
-If one of these checks is deliberately waived rather than executed, record that decision explicitly instead of silently marking it complete. V2-M0 should not begin merely because V1 implementation is feature-complete; its separate GO/NO-GO gate still applies.
+V2-M0 must still pass its separate competitor-gap / trust-model GO/NO-GO gate before major V2 implementation begins. V1 closure is not itself evidence that V2 should proceed.

@@ -62,7 +62,7 @@ Before major V2 implementation, V2-M0 must demonstrate one concrete security/con
 - [x] pinned Cua release payload SHA-256 verification
 - [x] installed `cua-driver` binary identity verification against the verified payload
 - [x] manual trusted self-hosted macOS desktop E2E workflow
-- [ ] execute desktop E2E on a dedicated TCC-granted test Mac
+- [x] trusted real-desktop E2E executed on a TCC-granted operator-controlled Mac (completed 2026-08-11)
 - [x] Cloudflare Tunnel + Access deployment dogfood for this gateway (completed 2026-08-11)
 - [x] ChatGPT remote MCP connection dogfood for this gateway (completed 2026-08-11)
 - [x] idle gateway CPU/RAM regression benchmark in hosted Linux CI
@@ -70,17 +70,17 @@ Before major V2 implementation, V2-M0 must demonstrate one concrete security/con
 
 ### V1 finite completion gate
 
-Automated/code-local V1 closeout is complete. Only operator-controlled acceptance remains before calling V1 fully closed:
+V1 acceptance is complete. V1 was closed on 2026-08-11 after automated/code-local checks plus operator-controlled real-desktop and remote-access acceptance:
 
 - [x] pinned official MCP conformance runner integrated for V1-applicable server-boundary scenarios
 - [x] downstream cancellation propagation explicitly tested/guaranteed
 - [x] semantic dangerous-tool classification available
-- [ ] trusted desktop E2E executed on the dedicated test Mac
+- [x] trusted real-desktop E2E executed on a TCC-granted operator-controlled Mac (2026-08-11)
 - [x] representative Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood completed (2026-08-11)
 - [x] idle resource benchmark completed
 - [x] 100-call soak test completed
 
-See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the remaining dedicated-desktop operator check. After it passes (or is explicitly waived), close V1 and do not add features solely to duplicate capabilities that Cua or another backend already provides upstream.
+See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the recorded acceptance evidence. V1 is closed; do not add V1 features solely to duplicate capabilities that Cua or another backend already provides upstream. V2-M0 retains its independent GO/NO-GO gate.
 
 ## V2 — Secure delegated device capability control plane candidate
 

@@ -2,7 +2,7 @@
 
 A lightweight Rust gateway that exposes a local computer-use MCP backend through a policy-controlled MCP Streamable HTTP endpoint.
 
-> Status: **V1 hardened / pre-alpha; automated closeout complete**. The gateway connects to Cua over MCP stdio, applies a fail-closed capability boundary, and keeps the network listener on localhost by default. One operator-controlled acceptance check remains before V1 is formally closed; see [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md).
+> Status: **V1 closed / pre-alpha (2026-08-11)**. The gateway connects to Cua over MCP stdio, applies a fail-closed capability boundary, and keeps the network listener on localhost by default. Automated checks, trusted real-desktop E2E, and representative Cloudflare Access/Tunnel + ChatGPT remote dogfood are complete; see [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md).
 
 ## Start here
 
