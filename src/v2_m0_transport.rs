@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fmt,
     io::{Read, Write},
+    time::Instant,
 };
 
 pub const HUB_AGENT_SCHEMA_VERSION: u16 = 1;
@@ -40,6 +41,10 @@ impl HubIdentity {
         self.signing_key.verifying_key().to_bytes()
     }
 
+    pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(message).to_bytes().to_vec()
+    }
+
     pub fn challenge(&self, hello: &AgentHello) -> Result<HubChallenge, TransportError> {
         validate_schema(hello.schema_version)?;
         let mut hub_nonce = [0_u8; 32];
@@ -62,12 +67,14 @@ impl HubIdentity {
         challenge: &HubChallenge,
         device_generation: u64,
         capability_revision: u64,
+        hub_time_ms: u64,
     ) -> Result<SessionAccepted, TransportError> {
         let mut accepted = SessionAccepted {
             schema_version: HUB_AGENT_SCHEMA_VERSION,
             device_id: hello.device_id.clone(),
             device_generation,
             capability_revision,
+            hub_time_ms,
             signature: Vec::new(),
         };
         let transcript = session_accepted_bytes(hello, challenge, &accepted)?;
@@ -89,6 +96,26 @@ impl HubIdentity {
             signature: Vec::new(),
         };
         let transcript = remote_command_bytes(hello, challenge, &remote)?;
+        remote.signature = self.signing_key.sign(&transcript).to_bytes().to_vec();
+        Ok(remote)
+    }
+
+    pub fn remote_cancel(
+        &self,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        device_id: String,
+        device_generation: u64,
+        operation_id: String,
+    ) -> Result<RemoteCancel, TransportError> {
+        let mut remote = RemoteCancel {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            device_id,
+            device_generation,
+            operation_id,
+            signature: Vec::new(),
+        };
+        let transcript = remote_cancel_bytes(hello, challenge, &remote)?;
         remote.signature = self.signing_key.sign(&transcript).to_bytes().to_vec();
         Ok(remote)
     }
@@ -139,7 +166,28 @@ pub struct SessionAccepted {
     pub device_id: String,
     pub device_generation: u64,
     pub capability_revision: u64,
+    pub hub_time_ms: u64,
     pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustedSessionClock {
+    hub_time_ms: u64,
+    started: Instant,
+}
+
+impl TrustedSessionClock {
+    pub fn new(hub_time_ms: u64) -> Self {
+        Self {
+            hub_time_ms,
+            started: Instant::now(),
+        }
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.hub_time_ms.saturating_add(elapsed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,11 +206,39 @@ pub struct RemoteResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCancel {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub operation_id: String,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationDisposition {
+    CancelledBeforeExecution,
+    CancellationRequested,
+    AlreadyTerminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCancellationAck {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub operation_id: String,
+    pub disposition: CancellationDisposition,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
 pub enum AgentToHub {
     Hello(AgentHello),
     Proof(AgentProof),
     Result(RemoteResult),
+    CancellationAck(RemoteCancellationAck),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +247,7 @@ pub enum HubToAgent {
     Challenge(HubChallenge),
     Accepted(SessionAccepted),
     Command(RemoteCommand),
+    Cancel(RemoteCancel),
 }
 
 pub fn verify_hub_challenge(
@@ -264,6 +341,60 @@ pub fn verify_remote_command(
     trusted_hub
         .verify(&transcript, &signature)
         .map_err(|_| TransportError::InvalidHubSignature)
+}
+
+pub fn verify_remote_cancel(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteCancel,
+    trusted_hub: &VerifyingKey,
+) -> Result<(), TransportError> {
+    validate_schema(remote.schema_version)?;
+    if remote.device_id != hello.device_id {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let signature =
+        signature_from_slice(&remote.signature).map_err(|_| TransportError::InvalidHubSignature)?;
+    let transcript = remote_cancel_bytes(hello, challenge, remote)?;
+    trusted_hub
+        .verify(&transcript, &signature)
+        .map_err(|_| TransportError::InvalidHubSignature)
+}
+
+pub fn build_remote_cancellation_ack(
+    identity: &DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    cancel: &RemoteCancel,
+    disposition: CancellationDisposition,
+) -> Result<RemoteCancellationAck, TransportError> {
+    let mut ack = RemoteCancellationAck {
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: cancel.device_id.clone(),
+        device_generation: cancel.device_generation,
+        operation_id: cancel.operation_id.clone(),
+        disposition,
+        signature: Vec::new(),
+    };
+    let transcript = remote_cancellation_ack_bytes(hello, challenge, &ack)?;
+    ack.signature = identity.sign_message(&transcript);
+    Ok(ack)
+}
+
+pub fn verify_remote_cancellation_ack(
+    registry: &DeviceRegistry,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &RemoteCancellationAck,
+) -> Result<(), TransportError> {
+    validate_schema(ack.schema_version)?;
+    if ack.device_id != hello.device_id {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let transcript = remote_cancellation_ack_bytes(hello, challenge, ack)?;
+    registry
+        .verify_device_signature(&hello.device_id, &transcript, &ack.signature)
+        .map_err(TransportError::Control)
 }
 
 pub fn build_remote_result(
@@ -399,6 +530,7 @@ fn session_accepted_bytes(
         hub_nonce: &'a [u8; 32],
         device_generation: u64,
         capability_revision: u64,
+        hub_time_ms: u64,
     }
     serde_json::to_vec(&Transcript {
         domain: "cumg-v2-m0-session-accepted",
@@ -407,6 +539,7 @@ fn session_accepted_bytes(
         hub_nonce: &challenge.hub_nonce,
         device_generation: accepted.device_generation,
         capability_revision: accepted.capability_revision,
+        hub_time_ms: accepted.hub_time_ms,
     })
     .map_err(TransportError::Serialization)
 }
@@ -434,6 +567,62 @@ fn remote_command_bytes(
         hub_nonce: &challenge.hub_nonce,
         command: &remote.command,
         grant: &remote.grant,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn remote_cancel_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteCancel,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        operation_id: &'a str,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m0-remote-cancel",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &remote.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: remote.device_generation,
+        operation_id: &remote.operation_id,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn remote_cancellation_ack_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &RemoteCancellationAck,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        operation_id: &'a str,
+        disposition: CancellationDisposition,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m0-remote-cancellation-ack",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &ack.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: ack.device_generation,
+        operation_id: &ack.operation_id,
+        disposition: ack.disposition,
     })
     .map_err(TransportError::Serialization)
 }
@@ -577,6 +766,27 @@ mod tests {
     }
 
     #[test]
+    fn session_acceptance_binds_hub_time_for_grant_expiry_clocking() {
+        let (_registry, _identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id, caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let accepted = hub
+            .accept_session(&hello, &challenge, 1, 1, 50_000)
+            .unwrap();
+        verify_session_accepted(&hello, &challenge, &accepted, &hub.verifier()).unwrap();
+        let clock = TrustedSessionClock::new(accepted.hub_time_ms);
+        assert!(clock.now_ms() >= 50_000);
+
+        let mut tampered = accepted;
+        tampered.hub_time_ms = 1;
+        assert!(matches!(
+            verify_session_accepted(&hello, &challenge, &tampered, &hub.verifier()),
+            Err(TransportError::InvalidHubSignature)
+        ));
+    }
+
+    #[test]
     fn signed_command_is_bound_to_the_connection_and_payload() {
         use crate::v2_m0::{
             CONTROL_SCHEMA_VERSION, CapabilityClass, CommandEnvelope, DeviceCommand, GrantAuthority,
@@ -632,6 +842,43 @@ mod tests {
         tampered.result.result = DeviceResult::Applications { count: 8 };
         assert!(matches!(
             verify_remote_result(&registry, &hello, &challenge, &tampered),
+            Err(TransportError::Control(
+                ControlError::InvalidDeviceSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn cancellation_and_ack_are_signed_and_connection_bound() {
+        let (registry, identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id.clone(), caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let cancel = hub
+            .remote_cancel(&hello, &challenge, device_id, 3, "op-cancel".into())
+            .unwrap();
+        verify_remote_cancel(&hello, &challenge, &cancel, &hub.verifier()).unwrap();
+        let ack = build_remote_cancellation_ack(
+            &identity,
+            &hello,
+            &challenge,
+            &cancel,
+            CancellationDisposition::CancellationRequested,
+        )
+        .unwrap();
+        verify_remote_cancellation_ack(&registry, &hello, &challenge, &ack).unwrap();
+
+        let mut tampered = cancel.clone();
+        tampered.operation_id = "op-other".into();
+        assert!(matches!(
+            verify_remote_cancel(&hello, &challenge, &tampered, &hub.verifier()),
+            Err(TransportError::InvalidHubSignature)
+        ));
+
+        let mut tampered_ack = ack.clone();
+        tampered_ack.disposition = CancellationDisposition::AlreadyTerminal;
+        assert!(matches!(
+            verify_remote_cancellation_ack(&registry, &hello, &challenge, &tampered_ack),
             Err(TransportError::Control(
                 ControlError::InvalidDeviceSignature
             ))

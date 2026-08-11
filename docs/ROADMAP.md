@@ -104,14 +104,14 @@ Cua remains an important backend. Cua-specific tool names or transport behavior 
 
 ### V2-M0: competitor-gap PoC + trust model — GO/NO-GO gate
 
-> **V2-M0 implementation note (2026-08-11):** the transport-independent control plane in `src/v2_m0.rs` now has an isolated outbound Hub↔Agent network slice in `src/v2_m0_transport.rs`, exercised by `src/bin/v2_m0_network_poc.rs`. The PoCs prove cryptographic enrollment, mutually authenticated outbound Agent connectivity on loopback, bounded versioned framing, typed backend-neutral command/results, Agent-side short-lived grant validation, replay/revocation/expiry rejection, generation-bound leases, stale capability/generation rejection, and content-minimizing audit evidence. The GO/NO-GO decision remains **PENDING** until the remaining trust-model and production remote-transport requirements are resolved. See [`V2_M0_POC.md`](V2_M0_POC.md).
+> **V2-M0 implementation note (2026-08-11):** the control plane now includes outbound mutually authenticated Agent connectivity, signed connection-bound session/command/cancellation/result messages, signed-Hub-time grant clocking, northbound principal authorization, continuity-proven Hub/Agent/grant-key rotation, bounded Hub/Agent execution control, and a backend-neutral adapter contract. The explicit M0 decision is **GO to V2-M1**, not production-ready. Remote confidentiality and real deployment auth/persistence remain M1 requirements. See [`V2_M0_POC.md`](V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
 
 Before building a general Hub or multi-machine router:
 
 - [x] document overlap/gaps against Cua upstream and representative remote-device / AI-remote-control MCP products
 - [x] define one concrete delegated-capability scenario that is not already cleanly satisfied by those products
-- [ ] prove that scenario end-to-end with one device, including the outbound authenticated Agent hop
-- [ ] record an explicit GO/NO-GO decision based on the PoC rather than project momentum
+- [x] prove that scenario end-to-end with one device, including the outbound authenticated Agent hop
+- [x] record an explicit GO/NO-GO decision based on the PoC rather than project momentum
 
 Candidate PoC evidence:
 
@@ -127,20 +127,22 @@ Candidate PoC evidence:
 Trust/protocol design required before GO:
 
 - [x] device identity and enrollment model
-- [ ] separate MCP client→Hub authentication/authorization from Hub↔Agent authentication and key rotation, so the control plane can answer who may use which capability on which device
+- [x] separate MCP client→Hub authentication/authorization from Hub↔Agent authentication and key rotation, so the control plane can answer who may use which capability on which device
 - [x] typed, versioned command/result schema independent of transport and backend
 - [x] capability advertisement/negotiation model that includes `backend`, `backend_version`, `platform`, and `capability_schema_version`
 - [x] capability revision/generation semantics so the Hub can detect stale discovery after Agent reconnects, backend upgrades, or policy-surface changes
 - [x] fail-closed handling for capabilities not explicitly understood by the Hub/Agent contract
-- [ ] backend-adapter conformance tests that normalize backend/platform-specific tool behavior without leaking Cua-specific names or transport semantics into the Hub↔Agent protocol
+- [x] backend-adapter conformance tests that normalize backend/platform-specific tool behavior without leaking Cua-specific names or transport semantics into the Hub↔Agent protocol
 - [x] short-lived grant format, expiry, revocation, and replay rules
 - [x] operation IDs and lease ownership semantics
-- [ ] bounded backpressure across Hub global limits, per-device queue/lease ownership, and Agent single-operation execution
-- [ ] cancellation and reconnect semantics
+- [x] bounded backpressure across Hub global limits, per-device queue/lease ownership, and Agent single-operation execution
+- [x] cancellation and reconnect semantics
 - [x] audit identifiers and policy-decision evidence
-- [ ] threat model covering compromised Hub, Agent, backend, and MCP client
+- [x] threat model covering compromised Hub, Agent, backend, and MCP client
 
-If the PoC does not establish a meaningful gap, stop here.
+**V2-M0 decision (2026-08-11): GO to V2-M1.** The PoC establishes a narrower capability-control gap worth pursuing: explicit client→device→capability authorization, independently verifiable short-lived grants, continuity-proven Hub/Agent/grant-key rotation, generation-bound leases, bounded admission, signed cancellation/result semantics, replay-safe ambiguous outcomes, and a backend-neutral adapter boundary. This is a GO to build the **single secure remote Agent** slice only; it is not a production-readiness claim and does not authorize skipping M1 encrypted transport, real northbound auth integration, persistence, or live backend cancellation acceptance. See [`V2_M0_POC.md`](V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+
+If later M1 evidence shows these controls do not provide a meaningful operational advantage over maintained alternatives, revisit the decision rather than continuing by momentum.
 
 ### V2-M1: single secure remote Agent
 

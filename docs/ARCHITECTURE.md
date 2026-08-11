@@ -168,4 +168,4 @@ Cua remains an important backend, but Cua-specific tool names or wire behavior m
 
 If the V2-M0 PoC cannot demonstrate a meaningful capability-control gap against existing computer-use/remote-device products, the roadmap says to stop rather than build another generic remote-device orchestrator.
 
-See [`ROADMAP.md`](ROADMAP.md) for the GO/NO-GO gate and explicit non-goals.
+See [`ROADMAP.md`](ROADMAP.md) for milestones and explicit non-goals, and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md) for V2 trust boundaries, compromise assumptions, key rotation, replay, cancellation, and residual risks.

@@ -111,6 +111,10 @@ impl DeviceIdentity {
     pub fn sign_message(&self, message: &[u8]) -> Vec<u8> {
         self.signing_key.sign(message).to_bytes().to_vec()
     }
+
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.signing_key.verifying_key()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +201,47 @@ impl DeviceRegistry {
             .map_err(|_| ControlError::InvalidDeviceSignature)
     }
 
+    pub fn rotate_device_key(
+        &mut self,
+        device_id: &str,
+        new_public_key: &[u8],
+        rotation_message: &[u8],
+        old_proof: &[u8],
+        new_proof: &[u8],
+    ) -> Result<(), ControlError> {
+        if self.revoked.contains(device_id) {
+            return Err(ControlError::DeviceRevoked);
+        }
+        let new_key_bytes: [u8; 32] = new_public_key
+            .try_into()
+            .map_err(|_| ControlError::InvalidDeviceIdentity)?;
+        let new_verifying_key = VerifyingKey::from_bytes(&new_key_bytes)
+            .map_err(|_| ControlError::InvalidDeviceIdentity)?;
+        let old_sig_bytes: [u8; 64] = old_proof
+            .try_into()
+            .map_err(|_| ControlError::InvalidDeviceSignature)?;
+        let new_sig_bytes: [u8; 64] = new_proof
+            .try_into()
+            .map_err(|_| ControlError::InvalidDeviceSignature)?;
+        let old_signature = Signature::from_bytes(&old_sig_bytes);
+        let new_signature = Signature::from_bytes(&new_sig_bytes);
+        let device = self
+            .devices
+            .get_mut(device_id)
+            .ok_or(ControlError::UnknownDevice)?;
+        device
+            .verifying_key
+            .verify(rotation_message, &old_signature)
+            .map_err(|_| ControlError::InvalidDeviceRotationProof)?;
+        new_verifying_key
+            .verify(rotation_message, &new_signature)
+            .map_err(|_| ControlError::InvalidDeviceRotationProof)?;
+        device.verifying_key = new_verifying_key;
+        device.generation = device.generation.saturating_add(1).max(1);
+        device.capabilities = None;
+        Ok(())
+    }
+
     pub fn connect(
         &mut self,
         device_id: &str,
@@ -245,6 +290,7 @@ impl DeviceRegistry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantPayload {
     pub schema_version: u16,
+    pub issuer_key_id: String,
     pub grant_id: String,
     pub device_id: String,
     pub capability: CapabilityClass,
@@ -274,6 +320,10 @@ impl GrantAuthority {
         self.signing_key.verifying_key()
     }
 
+    pub fn key_id(&self) -> String {
+        verifying_key_id(&self.verifier())
+    }
+
     pub fn issue(
         &self,
         device_id: &str,
@@ -288,6 +338,7 @@ impl GrantAuthority {
         OsRng.fill_bytes(&mut random);
         let payload = GrantPayload {
             schema_version: CONTROL_SCHEMA_VERSION,
+            issuer_key_id: self.key_id(),
             grant_id: format!("grant_{}", hex(&random)),
             device_id: device_id.to_owned(),
             capability,
@@ -302,18 +353,30 @@ impl GrantAuthority {
 
 #[derive(Debug)]
 pub struct GrantLedger {
-    verifier: VerifyingKey,
+    verifiers: HashMap<String, VerifyingKey>,
     consumed: HashSet<String>,
     revoked: HashSet<String>,
 }
 
 impl GrantLedger {
     pub fn new(verifier: VerifyingKey) -> Self {
+        let mut verifiers = HashMap::new();
+        verifiers.insert(verifying_key_id(&verifier), verifier);
         Self {
-            verifier,
+            verifiers,
             consumed: HashSet::new(),
             revoked: HashSet::new(),
         }
+    }
+
+    pub fn trust_verifier(&mut self, verifier: VerifyingKey) -> String {
+        let key_id = verifying_key_id(&verifier);
+        self.verifiers.insert(key_id.clone(), verifier);
+        key_id
+    }
+
+    pub fn retire_verifier(&mut self, key_id: &str) -> bool {
+        self.verifiers.remove(key_id).is_some()
     }
 
     pub fn revoke(&mut self, grant_id: &str) {
@@ -367,7 +430,11 @@ impl GrantLedger {
             .map_err(|_| ControlError::InvalidGrantSignature)?;
         let signature = Signature::from_bytes(&sig_bytes);
         let bytes = canonical_grant_bytes(&token.payload)?;
-        self.verifier
+        let verifier = self
+            .verifiers
+            .get(&token.payload.issuer_key_id)
+            .ok_or(ControlError::UnknownGrantSigningKey)?;
+        verifier
             .verify(&bytes, &signature)
             .map_err(|_| ControlError::InvalidGrantSignature)
     }
@@ -437,7 +504,7 @@ pub enum DeviceResult {
 }
 
 impl DeviceResult {
-    fn matches_command(&self, command: &DeviceCommand) -> bool {
+    pub(crate) fn matches_command(&self, command: &DeviceCommand) -> bool {
         matches!(
             (self, command),
             (Self::Applications { .. }, DeviceCommand::ListApplications)
@@ -610,6 +677,7 @@ pub enum ControlError {
     InvalidDeviceIdentity,
     InvalidEnrollmentProof,
     InvalidDeviceSignature,
+    InvalidDeviceRotationProof,
     UnknownDevice,
     DeviceRevoked,
     DeviceOffline,
@@ -621,6 +689,7 @@ pub enum ControlError {
     },
     InvalidGrantLifetime,
     InvalidGrantSignature,
+    UnknownGrantSigningKey,
     GrantDeviceMismatch,
     GrantNotYetValid,
     GrantExpired,
@@ -665,6 +734,10 @@ impl std::error::Error for ControlError {}
 
 fn canonical_grant_bytes(payload: &GrantPayload) -> Result<Vec<u8>, ControlError> {
     serde_json::to_vec(payload).map_err(|_| ControlError::Serialization)
+}
+
+pub fn verifying_key_id(verifier: &VerifyingKey) -> String {
+    format!("key_{}", hex(&verifier.to_bytes()))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -763,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_grant_signature_is_rejected() {
+    fn unknown_grant_signing_key_and_signature_tampering_are_rejected() {
         let (_registry, _identity, device_id) = enrolled();
         let authority = GrantAuthority::generate();
         let attacker = GrantAuthority::generate();
@@ -773,6 +846,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             ledger.authorize_once(&forged, &device_id, CapabilityClass::Observe, 1_001),
+            Err(ControlError::UnknownGrantSigningKey)
+        );
+
+        let mut tampered = authority
+            .issue(&device_id, CapabilityClass::Observe, 1_000, 30_000)
+            .unwrap();
+        tampered.signature[0] ^= 0x01;
+        assert_eq!(
+            ledger.authorize_once(&tampered, &device_id, CapabilityClass::Observe, 1_001),
             Err(ControlError::InvalidGrantSignature)
         );
     }

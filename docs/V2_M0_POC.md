@@ -1,6 +1,6 @@
 # V2-M0 control-plane PoC
 
-Status: **in progress — no GO decision yet**.
+Status: **V2-M0 GO recorded 2026-08-11 — proceed to V2-M1 only**.
 
 This PoC deliberately tests the control semantics before selecting or building a Hub↔Agent transport. V1 remains unchanged.
 
@@ -91,16 +91,15 @@ The frame codec rejects payloads over 64 KiB before allocation of the declared p
 
 ## What this PoC does not prove yet
 
-These PoCs do **not** yet satisfy the complete V2-M0 GO gate. In particular, it does not yet implement or prove:
+The M0 GO does **not** make these PoCs production-ready. V2-M1 still must implement or prove:
 
-- production remote transport confidentiality/integrity beyond the loopback-only authenticated TCP PoC;
-- Hub identity/key rotation and Agent credential rotation;
-- MCP-client→Hub authorization mapping to device/capability grants;
-- distributed cancellation/backpressure behavior across a real transport;
-- compromised-Hub/Agent/backend/client threat-model analysis;
-- backend-adapter conformance across more than Cua on this one machine.
+- production remote transport confidentiality beyond the loopback-only signed/authenticated TCP PoC;
+- a real northbound OAuth/Access adapter (the PoC consumes an already-authenticated principal);
+- persistent Hub/Agent trust, revocation, and terminal-operation state across process restart;
+- live cancellation acceptance against interruptible and non-interruptible backend actions;
+- production deployment rate limiting, secret storage, and observability.
 
-Until those remaining items are designed and reviewed, the V2-M0 decision remains **PENDING**, not GO.
+These are now V2-M1 implementation/acceptance requirements rather than reasons to keep M0 undecided. The trust-model baseline is documented in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
 
 ## Recorded local run — 2026-08-11
 
@@ -114,7 +113,7 @@ The first operator-controlled run passed on macOS arm64 against Cua Driver 0.19.
 - expired grant: REJECTED;
 - reconnect generation attempting to take a live prior-generation lease: REJECTED.
 
-This is evidence for the local control semantics only. It does not change the V2-M0 GO/NO-GO state from **PENDING**.
+This is evidence for the local control semantics. The later outbound/network/trust-model evidence is what closes the M0 decision.
 
 ## Recorded outbound network run — 2026-08-11
 
@@ -130,4 +129,32 @@ Additional transport tests confirmed:
 - oversized declared frame: REJECTED before payload allocation/read;
 - bounded typed frame round-trip: PASS.
 
-This proves the outbound authenticated control hop on loopback only. It does not claim encrypted remote transport or change the V2-M0 GO/NO-GO state from **PENDING**.
+This proves the outbound authenticated control hop on loopback only. It does not claim encrypted remote transport; encrypted remote transport is a V2-M1 acceptance requirement.
+
+
+## Additional M0 trust/control evidence — 2026-08-11
+
+After the first network run, the PoC added and tested:
+
+- separate northbound `AuthenticatedClientPrincipal` authorization before grant issuance;
+- exact principal→device→capability policy with unauthorized `interact` rejected before Agent dispatch;
+- Hub transport-key continuity rotation with old+new signatures and monotonic epoch;
+- Agent device-key continuity rotation with old+new proof while preserving logical device ID and invalidating the active session;
+- grant-signing key IDs with overlap and fail-closed retirement;
+- signed Hub time in session acceptance plus Agent monotonic elapsed time for grant-expiry checks;
+- bounded Hub global admission and per-device queues;
+- Agent single-operation execution and terminal operation replay rejection;
+- signed, connection-bound cancellation and cancellation acknowledgement messages;
+- disconnect-after-dispatch → `indeterminate` terminal Hub state with no automatic replay;
+- backend adapter conformance across independent fixture implementations;
+- live Cua execution through `CuaCliAdapter`, keeping Cua tool names/results out of the Hub↔Agent protocol.
+
+The compromised-component and residual-risk analysis is in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+
+## V2-M0 GO decision
+
+**Decision: GO to V2-M1 (single secure remote Agent).**
+
+The evidence supports a differentiated capability-control slice rather than another screenshot/input engine: authenticated client-to-device capability delegation, independently checked short-lived grants, continuity-proven key rotation, generation/lease ownership, bounded execution, replay-safe cancellation/disconnect semantics, and a backend-neutral adapter boundary.
+
+This GO is deliberately narrow. It does **not** mean the loopback TCP PoC is production-ready, and it does not authorize starting multi-machine routing yet. V2-M1 must first prove encrypted remote transport, real northbound authentication integration, persistent trust/operation state, heartbeat/reconnect, and live backend cancellation behavior.

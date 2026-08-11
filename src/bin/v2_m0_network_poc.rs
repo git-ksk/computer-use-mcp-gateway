@@ -1,25 +1,29 @@
 use anyhow::{Context, Result, anyhow, bail};
 use computer_use_mcp_gateway::{
     v2_m0::{
-        AuditEvidence, AuditLog, AuditReason, CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION,
-        CapabilityAdvertisement, CapabilityClass, CommandEnvelope, CommandResultEnvelope,
-        DeviceCapability, DeviceCommand, DeviceIdentity, DeviceRegistry, DeviceResult,
-        DeviceSession, GrantAuthority, GrantLedger, LeaseManager, PolicyOutcome,
-        validate_command_result, validate_command_session,
+        AuditEvidence, AuditLog, AuditReason, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
+        CapabilityClass, CommandEnvelope, CommandResultEnvelope, DeviceCommand, DeviceIdentity,
+        DeviceRegistry, DeviceResult, DeviceSession, GrantAuthority, GrantLedger, LeaseManager,
+        PolicyOutcome, validate_command_result, validate_command_session,
+    },
+    v2_m0_backend::{BackendAdapter, CuaCliAdapter, validate_adapter_advertisement},
+    v2_m0_execution::{
+        AdmissionDecision, AdmissionLimits, AgentExecutionGate, HubAdmissionController,
+        OperationRef,
     },
     v2_m0_transport::{
         AgentHello, AgentProof, AgentToHub, HUB_AGENT_SCHEMA_VERSION, HubIdentity, HubToAgent,
-        build_agent_proof, build_remote_result, read_frame, verify_agent_proof,
-        verify_hub_challenge, verify_remote_command, verify_remote_result, verify_session_accepted,
-        write_frame,
+        TrustedSessionClock, build_agent_proof, build_remote_result, read_frame,
+        verify_agent_proof, verify_hub_challenge, verify_remote_command, verify_remote_result,
+        verify_session_accepted, write_frame,
     },
+    v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy},
 };
 use ed25519_dalek::VerifyingKey;
 use serde_json::json;
 use std::{
     env,
     net::{SocketAddr, TcpListener, TcpStream},
-    process::Command,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -44,28 +48,35 @@ fn main() -> Result<()> {
         &enrollment_proof,
     )?;
 
-    let backend_version = backend_version().unwrap_or_else(|| "unknown".into());
-    let capabilities = CapabilityAdvertisement {
-        backend: "cua".into(),
-        backend_version: backend_version.clone(),
-        platform: format!("{}-{}", env::consts::OS, env::consts::ARCH),
-        capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-        revision: 1,
-        supported: vec![
-            DeviceCapability::ListApplications,
-            DeviceCapability::ScreenGeometry,
-            DeviceCapability::PointerClick,
-        ],
-    };
+    let backend = CuaCliAdapter::detect(
+        backend_command(),
+        format!("{}-{}", env::consts::OS, env::consts::ARCH),
+        1,
+    )?;
+    let capabilities = backend.advertisement();
+    validate_adapter_advertisement(&capabilities)?;
+    let backend_version = capabilities.backend_version.clone();
 
     let hub_identity = HubIdentity::generate();
     let trusted_hub = hub_identity.verifier();
     let grant_authority = GrantAuthority::generate();
     let agent_grant_verifier = grant_authority.verifier();
+    let client = AuthenticatedClientPrincipal::new("poc://northbound-auth", "poc-client")?;
+    let mut client_policy = ClientAuthorizationPolicy::default();
+    client_policy.allow(&client, &device_id, CapabilityClass::Observe);
+    let interact_without_authorization_rejected = client_policy
+        .issue_grant(
+            &client,
+            &grant_authority,
+            &device_id,
+            CapabilityClass::Interact,
+            now_ms(),
+            60_000,
+        )
+        .is_err();
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let hub_addr = listener.local_addr()?;
-    let backend_command = backend_command();
     let agent_device_id = device_id.clone();
     let agent_capabilities = capabilities.clone();
     let agent_identity = device_identity.clone();
@@ -78,7 +89,7 @@ fn main() -> Result<()> {
             agent_capabilities,
             trusted_hub,
             agent_grant_verifier,
-            backend_command,
+            backend,
         )
         .map_err(|error| format!("{error:#}"))
     });
@@ -107,16 +118,24 @@ fn main() -> Result<()> {
     verify_agent_proof(&registry, &hello, &challenge, &proof)?;
 
     let session = registry.connect(&device_id, hello.capabilities.clone())?;
+    let started = now_ms();
     let accepted = hub_identity.accept_session(
         &hello,
         &challenge,
         session.generation,
         session.capabilities.revision,
+        started,
     )?;
     write_frame(&mut stream, &HubToAgent::Accepted(accepted))?;
 
-    let started = now_ms();
-    let grant = grant_authority.issue(&device_id, CapabilityClass::Observe, started, 60_000)?;
+    let grant = client_policy.issue_grant(
+        &client,
+        &grant_authority,
+        &device_id,
+        CapabilityClass::Observe,
+        started,
+        60_000,
+    )?;
     let command = CommandEnvelope {
         schema_version: CONTROL_SCHEMA_VERSION,
         device_id: device_id.clone(),
@@ -126,6 +145,22 @@ fn main() -> Result<()> {
         command: DeviceCommand::ListApplications,
     };
     validate_command_session(&command, &session)?;
+
+    let operation = OperationRef {
+        device_id: device_id.clone(),
+        device_generation: session.generation,
+        operation_id: command.operation_id.clone(),
+    };
+    let mut admission = HubAdmissionController::new(AdmissionLimits {
+        max_global_active: 4,
+        max_queued_per_device: 2,
+    })?;
+    if !matches!(
+        admission.admit(operation.clone())?,
+        AdmissionDecision::StartNow(_)
+    ) {
+        bail!("first one-device PoC operation should start immediately");
+    }
 
     let mut leases = LeaseManager::default();
     leases.acquire(
@@ -138,6 +173,7 @@ fn main() -> Result<()> {
 
     let remote_command =
         hub_identity.remote_command(&hello, &challenge, command.clone(), grant.clone())?;
+    admission.mark_dispatched(&command.operation_id)?;
     write_frame(&mut stream, &HubToAgent::Command(remote_command))?;
 
     let remote_result = match read_frame::<_, AgentToHub>(&mut stream)? {
@@ -151,6 +187,7 @@ fn main() -> Result<()> {
         _ => bail!("ListApplications returned a mismatched result type"),
     };
     leases.release(&device_id, &command.operation_id, session.generation)?;
+    admission.complete(&command.operation_id, false)?;
 
     let mut audit = AuditLog::default();
     audit.record(AuditEvidence {
@@ -189,6 +226,7 @@ fn main() -> Result<()> {
                 "enrolled_device_identity_verified_by_hub": true,
                 "grant_signing_key_separate_from_transport_identity": true,
                 "fresh_connection_nonces": true,
+                "grant_expiry_clock_anchored_to_signed_hub_time": true,
                 "session_acceptance_signed_and_connection_bound": true,
                 "commands_signed_and_connection_bound": true,
                 "results_signed_and_connection_bound": true,
@@ -206,17 +244,21 @@ fn main() -> Result<()> {
             "evidence": {
                 "typed_versioned_wire_protocol": true,
                 "typed_backend_neutral_command_result": true,
+                "northbound_authenticated_principal_authorized_for_device_and_capability": true,
+                "interact_without_client_authorization_rejected": interact_without_authorization_rejected,
+                "hub_bounded_admission_applied": true,
+                "agent_single_operation_gate_applied": agent_evidence.single_operation_gate,
                 "short_lived_grant_validated_on_agent": agent_evidence.grant_validated,
                 "real_backend_call_executed_on_agent": agent_evidence.backend_executed,
                 "audit_event_count": audit.events().len(),
                 "raw_backend_output_logged": false,
             },
-            "remaining_v2_m0_gaps": [
-                "remote transport confidentiality is not proven by this loopback-only TCP slice",
-                "Hub identity/key rotation and Agent credential rotation",
-                "MCP-client-to-Hub authorization mapping",
-                "distributed cancellation/backpressure",
-                "compromised-component threat model"
+            "v2_m1_required_followups": [
+                "authenticated encrypted remote Hub-Agent transport",
+                "real northbound authentication integration from verified identity-provider output",
+                "persistent trust/revocation/terminal-operation state",
+                "heartbeat/reconnect with bounded backoff",
+                "live cancellation acceptance for interruptible and non-interruptible backend actions"
             ]
         }))?
     );
@@ -229,6 +271,7 @@ struct AgentEvidence {
     hub_authenticated: bool,
     grant_validated: bool,
     backend_executed: bool,
+    single_operation_gate: bool,
 }
 
 fn run_agent(
@@ -238,7 +281,7 @@ fn run_agent(
     capabilities: CapabilityAdvertisement,
     trusted_hub: VerifyingKey,
     grant_verifier: VerifyingKey,
-    backend_command: String,
+    mut backend: CuaCliAdapter,
 ) -> Result<AgentEvidence> {
     let mut stream =
         TcpStream::connect(hub_addr).context("Agent failed to connect outbound to Hub")?;
@@ -261,6 +304,7 @@ fn run_agent(
         other => bail!("expected Hub acceptance, got {other:?}"),
     };
     verify_session_accepted(&hello, &challenge, &accepted, &trusted_hub)?;
+    let trusted_clock = TrustedSessionClock::new(accepted.hub_time_ms);
     if accepted.device_id != device_id || accepted.capability_revision != capabilities.revision {
         bail!("Hub acceptance did not match the Agent session");
     }
@@ -276,29 +320,33 @@ fn run_agent(
     };
     verify_remote_command(&hello, &challenge, &remote, &trusted_hub)?;
     validate_command_session(&remote.command, &session)?;
+    let operation = OperationRef {
+        device_id: device_id.clone(),
+        device_generation: remote.command.device_generation,
+        operation_id: remote.command.operation_id.clone(),
+    };
+    let mut execution_gate = AgentExecutionGate::default();
+    execution_gate.begin(operation)?;
 
     let mut grants = GrantLedger::new(grant_verifier);
     grants.authorize_once(
         &remote.grant,
         &device_id,
         remote.command.required_class(),
-        now_ms(),
+        trusted_clock.now_ms(),
     )?;
 
-    let result = match &remote.command.command {
-        DeviceCommand::ListApplications => DeviceResult::Applications {
-            count: call_cua_list_apps(&backend_command)?,
-        },
-        _ => bail!("network PoC only executes ListApplications"),
-    };
+    let result = backend.execute(&remote.command.command)?;
+    let operation_id = remote.command.operation_id.clone();
     let result = CommandResultEnvelope {
         schema_version: CONTROL_SCHEMA_VERSION,
         device_id,
         device_generation: remote.command.device_generation,
         capability_revision: remote.command.capability_revision,
-        operation_id: remote.command.operation_id,
+        operation_id: operation_id.clone(),
         result,
     };
+    execution_gate.finish(&operation_id)?;
     let remote_result = build_remote_result(&identity, &hello, &challenge, result)?;
     write_frame(&mut stream, &AgentToHub::Result(remote_result))?;
 
@@ -306,6 +354,7 @@ fn run_agent(
         hub_authenticated: true,
         grant_validated: true,
         backend_executed: true,
+        single_operation_gate: true,
     })
 }
 
@@ -318,35 +367,4 @@ fn configure_stream(stream: &TcpStream) -> Result<()> {
 
 fn backend_command() -> String {
     env::var("CUMG_BACKEND_COMMAND").unwrap_or_else(|_| "cua-driver".into())
-}
-
-fn backend_version() -> Option<String> {
-    let output = Command::new(backend_command())
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .split_whitespace()
-        .last()
-        .map(ToOwned::to_owned)
-}
-
-fn call_cua_list_apps(backend_command: &str) -> Result<u64> {
-    let output = Command::new(backend_command)
-        .args(["call", "list_apps", "{}"])
-        .output()?;
-    if !output.status.success() {
-        bail!("cua list_apps failed with status {}", output.status);
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let count = value
-        .get("apps")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
-        .ok_or_else(|| anyhow!("cua list_apps did not return an apps array"))?;
-    u64::try_from(count).context("app count exceeded u64")
 }

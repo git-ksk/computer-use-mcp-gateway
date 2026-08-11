@@ -88,3 +88,10 @@ The deterministic V1 quality fixture does not touch a desktop. It covers cancell
 Gateway audit logs record coarse metadata such as tool name, semantic class, policy decision, outcome, and duration. Keep raw arguments/results and credentials out of normal logs.
 
 For security-sensitive reports, do not include credentials or unrelated private desktop data in public issues. Prefer GitHub private vulnerability reporting when available.
+
+
+## V2 trust model
+
+V2 separates northbound authenticated client principals, Hub transport identity, grant-signing authority, and Agent device identity. Key rotation requires continuity proof; bounded admission and signed cancellation/reconnect semantics fail closed around ambiguous operations. The complete compromised-component analysis and non-claims are documented in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+
+The V2-M0 GO is a decision to proceed to the single secure remote Agent milestone, not a production-readiness claim. M1 must add encrypted remote transport and real northbound authentication integration before remote production use.
