@@ -273,3 +273,73 @@ impl ComputerUseBackend for CuaBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    async fn wait_for_file(path: &std::path::Path) {
+        timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fixture marker was not created");
+    }
+
+    #[tokio::test]
+    async fn propagates_cancellation_to_downstream_request_id() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let call_marker = dir.join(format!("cumg-call-{}-{nonce}", std::process::id()));
+        let cancel_marker = dir.join(format!("cumg-cancel-{}-{nonce}", std::process::id()));
+
+        let backend = CuaBackend::new(
+            "python3",
+            vec![
+                "scripts/mock_mcp_backend.py".into(),
+                "--call-marker".into(),
+                call_marker.to_string_lossy().into_owned(),
+                "--cancel-marker".into(),
+                cancel_marker.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            1,
+            Duration::from_millis(10),
+        );
+        backend.connect().await.expect("fixture backend connects");
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let caller = backend.clone();
+        let call = tokio::spawn(async move { caller.call_tool("slow", None, cancel_rx).await });
+
+        wait_for_file(&call_marker).await;
+        cancel_tx.send(true).expect("cancellation receiver is alive");
+
+        let result = timeout(Duration::from_secs(5), call)
+            .await
+            .expect("cancelled call completes")
+            .expect("call task joins");
+        assert!(result.is_err(), "cancelled call must not report success");
+
+        wait_for_file(&cancel_marker).await;
+        assert_eq!(
+            fs::read_to_string(&call_marker).expect("read call marker"),
+            fs::read_to_string(&cancel_marker).expect("read cancel marker"),
+            "downstream cancellation must reference the in-flight tool request"
+        );
+
+        backend.shutdown().await.expect("fixture backend shuts down");
+        let _ = fs::remove_file(call_marker);
+        let _ = fs::remove_file(cancel_marker);
+    }
+}
