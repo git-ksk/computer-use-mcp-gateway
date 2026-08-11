@@ -165,7 +165,7 @@ The differentiated control semantics are intended to center on:
 - policy-decision evidence without raw desktop-content logging;
 - a backend-neutral capability contract.
 
-Transport is an implementation choice, not the product boundary. WebSocket may be a candidate transport, but the command/grant schema must remain transport-neutral so a later QUIC/gRPC or other transport change does not redefine semantics.
+Transport is an implementation choice, not the product boundary. The M1 production candidate is now **gRPC bidirectional streaming over TLS**, while the earlier raw TLS transport remains as a regression/reference implementation. The application command/grant schema remains transport-neutral so a later WebSocket, QUIC, or other transport adapter does not redefine semantics. During the first gRPC migration slice, Protobuf owns the RPC/carrier framing while the existing independently signed application messages remain unchanged inside the bounded carrier; this deliberately avoids coupling transport migration to a simultaneous security-protocol rewrite.
 
 Cua remains an important GUI/computer-use backend, but Cua-specific tool names or wire behavior must not become the permanent Hub-to-Agent protocol. Direct process/shell execution is owned by the Agent itself and must not be implemented by automating a terminal window through Cua. Structured argv execution is the preferred default; free-form shell execution and filesystem mutation are separate, higher-risk capability surfaces with explicit policy.
 

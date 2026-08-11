@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package cumg.v2;
+
+// Production-candidate carrier for the existing signed V2 application protocol.
+// The application payload remains independently signed and transport-neutral.
+service AgentControl {
+  rpc OpenSession(stream AgentFrame) returns (stream HubFrame);
+}
+
+message AgentFrame {
+  bytes signed_message_json = 1;
+}
+
+message HubFrame {
+  bytes signed_message_json = 1;
+}

@@ -2,6 +2,16 @@
 
 Status: **in progress**. V2-M0 is GO; V2-M1 is not yet accepted or production-ready.
 
+## Transport migration: gRPC bidi production candidate
+
+The M1 transport strategy now keeps the protocol boundary flexible while selecting **gRPC bidirectional streaming over TLS** as the production candidate. The earlier raw TLS + bounded JSON framing implementation remains in the repository as a regression/reference transport instead of being deleted. This allows direct behavioral comparison while the new transport matures.
+
+The first gRPC slice deliberately minimizes simultaneous change: Protobuf defines the bidirectional `AgentControl/OpenSession` RPC and bounded `AgentFrame`/`HubFrame` carriers, while the payload is the existing independently signed V2 application message. gRPC therefore replaces custom stream framing and supplies HTTP/2 streaming/flow-control semantics without weakening or duplicating Ed25519 identity, signed session/command/result messages, short-lived grants, generation checks, replay barriers, leases, or cancellation semantics. Native Protobuf fields for the application envelope can be migrated later without making that rewrite a prerequisite for validating the transport.
+
+A TLS-enabled integration test now proves one gRPC bidirectional session carrying the existing V2 authentication/heartbeat protocol and an Agent-native structured `git status --short` execution. The command is executed by the Rust process executor directly, with no Cua or Terminal GUI path. The repo still runs the equivalent raw-TLS process E2E alongside it.
+
+The initial deployment candidate for this transport is a small always-on VM Hub, with Agents making outbound connections. Serverless/WebSocket transports remain possible future adapters rather than constraints on the application protocol.
+
 ## Shell-first Agent direction
 
 The M1 Agent is now explicitly planned as a self-owned remote execution agent, not merely a secure transport wrapper around Cua. The next implementation priority is **direct process/shell execution inside the Agent**. This lets common developer workflows such as `git`, `cargo`, `npm`, `xcodebuild`, and `fastlane` run without opening Terminal, synthesizing GUI input, or scraping terminal output through a computer-use backend.
@@ -54,7 +64,7 @@ A separate operator-controlled M1 backend run on 2026-08-11 connected the asynch
 
 ## Still required before V2-M1 acceptance
 
-- implement the first-class direct process executor (`program`/`argv`/`cwd`) with bounded stdout/stderr, environment policy, timeout/cancellation, operation-state integration, and no dependency on a terminal GUI or Cua;
+- integrate the now-implemented first-class direct process executor into the operator-facing long-lived Agent service; the executor already supports structured `program`/`argv`/`cwd`, bounded stdout/stderr, environment policy, timeout/cancellation, operation-state integration, and no dependency on a terminal GUI or Cua;
 - define the separate higher-risk shell-command capability and the minimum bounded filesystem surface needed for practical repository/build workflows;
 - package the reusable lifecycle into an operator-facing long-lived Agent process/service and wire heartbeat-timeout detection to that service lifecycle; the lifecycle runner and two-session encrypted reconnect/generation test are implemented;
 - integrate the file-based key boundary with the operator-facing Agent/Hub services and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;

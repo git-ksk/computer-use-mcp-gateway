@@ -152,7 +152,10 @@ Only after V2-M0 GO:
 
 > **Shell-first product direction (2026-08-11):** the self-owned Agent is not intended to remain only a secure wrapper around Cua. Direct process/shell execution is a first-class Agent capability and is the next implementation priority. Shell/process operations must execute locally in the Agent without driving a terminal GUI or routing through Cua. GUI/computer-use remains available through the Cua adapter during the transition and can later gain native platform adapters. The preferred delivery order is **Agent core → direct process/shell → bounded filesystem capabilities → GUI via Cua → native GUI backends**.
 
+> **Transport direction (2026-08-12):** keep Hub↔Agent application semantics transport-neutral, retain the existing raw TLS + signed-JSON implementation as a regression/reference transport, and use **gRPC bidirectional streaming over TLS with Protobuf code generation as the M1 production candidate**. The first migration slice intentionally carries the existing independently signed V2 messages inside bounded Protobuf frames so transport migration does not rewrite grants, leases, replay protection, cancellation, or Agent execution at the same time. A native-Protobuf application schema may follow incrementally. The initial Hub deployment target is a small always-on VM rather than a request-lifetime serverless runtime.
+
 - [x] outbound Agent connection over the accepted encrypted M1 channel
+- [x] gRPC bidirectional streaming transport candidate over TLS, preserving the existing signed application protocol during migration
 - [x] reusable outbound lifecycle and encrypted multi-session reconnect acceptance
 - [ ] operator-facing long-lived Agent process/service lifecycle
 - [x] separate file-based key/trust-anchor provisioning boundary with fail-closed filesystem checks
@@ -164,7 +167,7 @@ Only after V2-M0 GO:
 - [x] bounded per-device queueing/load shedding before work reaches the Agent
 - [x] short-lived capability-grant validation
 - [x] fail-closed stale/offline-agent and stale-capability behavior
-- [ ] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
+- [x] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
 - [ ] explicit higher-risk shell-command capability for shell syntax/pipelines; keep it distinct from structured argv execution
 - [ ] bounded filesystem capability surface required by shell workflows, with path/policy controls rather than unrestricted implicit filesystem authority
 - [ ] clean live cancellation/disconnect semantics across the backend boundary
