@@ -13,12 +13,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust 1.88
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt
           rustup default 1.88.0
+
+      - name: Generate lockfile
+        run: cargo generate-lockfile
+
+      - name: Preserve generated lockfile
+        uses: actions/upload-artifact@v6
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Format
         run: cargo fmt --check
@@ -46,11 +57,10 @@ jobs:
             python: python
     runs-on: ${{ matrix.os }}
     env:
-      # Pin the upstream compatibility target so CI does not change beneath a commit.
       CUA_DRIVER_RS_VERSION: "0.19.3"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust 1.88
         shell: bash
@@ -65,39 +75,71 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxi6 at-spi2-core
 
-      - name: Install Cua Driver (Linux/macOS)
+      - name: Install verified Cua Driver (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          /bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"
+          installer="$RUNNER_TEMP/cua-install.sh"
+          curl -fsSLo "$installer" "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.19.3/install.sh"
+          python3 - "$installer" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          expected = "52293f8683c6c41ef8df0bb17907f3bd9266314e04f7b0c8f3c4576e7ba139f7"
+          actual = hashlib.sha256(path.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"Cua installer checksum mismatch: {actual}")
+          PY
+          /bin/bash "$installer"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install Cua Driver (Windows)
+      - name: Install verified Cua Driver (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $installer = Invoke-RestMethod https://cua.ai/driver/install.ps1
-          & ([scriptblock]::Create($installer)) -NoAutoStart
+          $installer = Join-Path $env:RUNNER_TEMP "cua-install.ps1"
+          Invoke-WebRequest "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.19.3/install.ps1" -OutFile $installer
+          $expected = "44bbb4b021778bf419f8882190aaab1f790cd8d2970997761da410c18090f55a"
+          $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Cua installer checksum mismatch: $actual"
+          }
+          & $installer -NoAutoStart
           $bin = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin"
           if (-not (Test-Path "$bin\cua-driver.exe")) {
             throw "Cua Driver installer completed without cua-driver.exe"
           }
-          # The upstream installer may leave LASTEXITCODE from a best-effort
-          # native probe even after a successful install. The binary check
-          # above is the authoritative CI condition.
           $global:LASTEXITCODE = 0
           $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Verify Cua Driver and disable telemetry
         shell: bash
         run: |
-          cua-driver --version
+          version="$(cua-driver --version)"
+          echo "$version"
+          case "$version" in
+            *"0.19.3"*) ;;
+            *) echo "unexpected Cua Driver version: $version" >&2; exit 1 ;;
+          esac
           cua-driver telemetry disable
+
+      - name: Generate lockfile
+        shell: bash
+        run: cargo generate-lockfile
 
       - name: Build gateway
         shell: bash
         run: cargo build
 
-      - name: Real Cua MCP gateway smoke
+      - name: Real Cua MCP smoke (2025-11-25)
         shell: bash
+        env:
+          MCP_PROTOCOL_VERSION: "2025-11-25"
+        run: ${{ matrix.python }} scripts/cua_gateway_smoke.py
+
+      - name: Real Cua MCP smoke (2026-07-28)
+        shell: bash
+        env:
+          MCP_PROTOCOL_VERSION: "2026-07-28"
         run: ${{ matrix.python }} scripts/cua_gateway_smoke.py
