@@ -104,38 +104,40 @@ Cua remains an important backend. Cua-specific tool names or transport behavior 
 
 ### V2-M0: competitor-gap PoC + trust model — GO/NO-GO gate
 
+> **V2-M0 implementation note (2026-08-11):** the first transport-independent control-plane prototype is now in `src/v2_m0.rs`, with a one-device live-Cua runner in `src/bin/v2_m0_poc.rs`. It proves cryptographic enrollment, short-lived semantic grants, replay/revocation/expiry rejection, generation-bound leases, stale capability/generation rejection, and content-minimizing audit evidence. The GO/NO-GO decision remains **PENDING** until outbound authenticated Hub↔Agent connectivity and the remaining trust-model items are proven. See [`V2_M0_POC.md`](V2_M0_POC.md).
+
 Before building a general Hub or multi-machine router:
 
-- [ ] document overlap/gaps against Cua upstream and representative remote-device / AI-remote-control MCP products
-- [ ] define one concrete delegated-capability scenario that is not already cleanly satisfied by those products
-- [ ] prove that scenario end-to-end with one device
+- [x] document overlap/gaps against Cua upstream and representative remote-device / AI-remote-control MCP products
+- [x] define one concrete delegated-capability scenario that is not already cleanly satisfied by those products
+- [ ] prove that scenario end-to-end with one device, including the outbound authenticated Agent hop
 - [ ] record an explicit GO/NO-GO decision based on the PoC rather than project momentum
 
 Candidate PoC evidence:
 
-1. enroll one device with a cryptographic device identity;
-2. Agent establishes outbound-only authenticated connectivity where practical;
-3. issue a short-lived `observe` capability grant;
-4. reject an `interact` action until a separate grant/approval exists;
-5. hold one operation lease so conflicting control of the same desktop fails closed;
-6. reject replay of a consumed, revoked, or expired grant;
-7. emit audit evidence for device/grant/policy/outcome without storing raw screenshots, tool arguments, or results;
-8. prove reconnect cannot silently transfer an in-flight action lease.
+1. [x] enroll one device with a cryptographic device identity;
+2. [ ] Agent establishes outbound-only authenticated connectivity where practical;
+3. [x] issue a short-lived `observe` capability grant;
+4. [x] reject an `interact` action until a separate grant/approval exists;
+5. [x] hold one operation lease so conflicting control of the same desktop fails closed;
+6. [x] reject replay of a consumed, revoked, or expired grant;
+7. [x] emit audit evidence for device/grant/policy/outcome without storing raw screenshots, tool arguments, or results;
+8. [x] prove reconnect cannot silently transfer an in-flight action lease.
 
 Trust/protocol design required before GO:
 
-- [ ] device identity and enrollment model
+- [x] device identity and enrollment model
 - [ ] separate MCP client→Hub authentication/authorization from Hub↔Agent authentication and key rotation, so the control plane can answer who may use which capability on which device
 - [ ] typed, versioned command/result schema independent of transport and backend
-- [ ] capability advertisement/negotiation model that includes `backend`, `backend_version`, `platform`, and `capability_schema_version`
-- [ ] capability revision/generation semantics so the Hub can detect stale discovery after Agent reconnects, backend upgrades, or policy-surface changes
-- [ ] fail-closed handling for capabilities not explicitly understood by the Hub/Agent contract
+- [x] capability advertisement/negotiation model that includes `backend`, `backend_version`, `platform`, and `capability_schema_version`
+- [x] capability revision/generation semantics so the Hub can detect stale discovery after Agent reconnects, backend upgrades, or policy-surface changes
+- [x] fail-closed handling for capabilities not explicitly understood by the Hub/Agent contract
 - [ ] backend-adapter conformance tests that normalize backend/platform-specific tool behavior without leaking Cua-specific names or transport semantics into the Hub↔Agent protocol
-- [ ] short-lived grant format, expiry, revocation, and replay rules
-- [ ] operation IDs and lease ownership semantics
+- [x] short-lived grant format, expiry, revocation, and replay rules
+- [x] operation IDs and lease ownership semantics
 - [ ] bounded backpressure across Hub global limits, per-device queue/lease ownership, and Agent single-operation execution
 - [ ] cancellation and reconnect semantics
-- [ ] audit identifiers and policy-decision evidence
+- [x] audit identifiers and policy-decision evidence
 - [ ] threat model covering compromised Hub, Agent, backend, and MCP client
 
 If the PoC does not establish a meaningful gap, stop here.
