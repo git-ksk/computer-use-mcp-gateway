@@ -119,6 +119,26 @@ impl HubIdentity {
         remote.signature = self.signing_key.sign(&transcript).to_bytes().to_vec();
         Ok(remote)
     }
+
+    pub fn heartbeat_ack(
+        &self,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        heartbeat: &AgentHeartbeat,
+        hub_time_ms: u64,
+    ) -> Result<HubHeartbeatAck, TransportError> {
+        let mut ack = HubHeartbeatAck {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            device_id: heartbeat.device_id.clone(),
+            device_generation: heartbeat.device_generation,
+            sequence: heartbeat.sequence,
+            hub_time_ms,
+            signature: Vec::new(),
+        };
+        let transcript = hub_heartbeat_ack_bytes(hello, challenge, &ack)?;
+        ack.signature = self.signing_key.sign(&transcript).to_bytes().to_vec();
+        Ok(ack)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,12 +253,32 @@ pub struct RemoteCancellationAck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHeartbeat {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub sequence: u64,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubHeartbeatAck {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub sequence: u64,
+    pub hub_time_ms: u64,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
 pub enum AgentToHub {
     Hello(AgentHello),
     Proof(AgentProof),
     Result(RemoteResult),
     CancellationAck(RemoteCancellationAck),
+    Heartbeat(AgentHeartbeat),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +288,7 @@ pub enum HubToAgent {
     Accepted(SessionAccepted),
     Command(RemoteCommand),
     Cancel(RemoteCancel),
+    HeartbeatAck(HubHeartbeatAck),
 }
 
 pub fn verify_hub_challenge(
@@ -395,6 +436,59 @@ pub fn verify_remote_cancellation_ack(
     registry
         .verify_device_signature(&hello.device_id, &transcript, &ack.signature)
         .map_err(TransportError::Control)
+}
+
+pub fn build_agent_heartbeat(
+    identity: &DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    device_generation: u64,
+    sequence: u64,
+) -> Result<AgentHeartbeat, TransportError> {
+    let mut heartbeat = AgentHeartbeat {
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: hello.device_id.clone(),
+        device_generation,
+        sequence,
+        signature: Vec::new(),
+    };
+    let transcript = agent_heartbeat_bytes(hello, challenge, &heartbeat)?;
+    heartbeat.signature = identity.sign_message(&transcript);
+    Ok(heartbeat)
+}
+
+pub fn verify_agent_heartbeat(
+    registry: &DeviceRegistry,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    heartbeat: &AgentHeartbeat,
+) -> Result<(), TransportError> {
+    validate_schema(heartbeat.schema_version)?;
+    if heartbeat.device_id != hello.device_id {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let transcript = agent_heartbeat_bytes(hello, challenge, heartbeat)?;
+    registry
+        .verify_device_signature(&hello.device_id, &transcript, &heartbeat.signature)
+        .map_err(TransportError::Control)
+}
+
+pub fn verify_hub_heartbeat_ack(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &HubHeartbeatAck,
+    trusted_hub: &VerifyingKey,
+) -> Result<(), TransportError> {
+    validate_schema(ack.schema_version)?;
+    if ack.device_id != hello.device_id {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let signature =
+        signature_from_slice(&ack.signature).map_err(|_| TransportError::InvalidHubSignature)?;
+    let transcript = hub_heartbeat_ack_bytes(hello, challenge, ack)?;
+    trusted_hub
+        .verify(&transcript, &signature)
+        .map_err(|_| TransportError::InvalidHubSignature)
 }
 
 pub fn build_remote_result(
@@ -567,6 +661,62 @@ fn remote_command_bytes(
         hub_nonce: &challenge.hub_nonce,
         command: &remote.command,
         grant: &remote.grant,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn agent_heartbeat_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    heartbeat: &AgentHeartbeat,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        sequence: u64,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m1-agent-heartbeat",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &heartbeat.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: heartbeat.device_generation,
+        sequence: heartbeat.sequence,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn hub_heartbeat_ack_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &HubHeartbeatAck,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        sequence: u64,
+        hub_time_ms: u64,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m1-hub-heartbeat-ack",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &ack.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: ack.device_generation,
+        sequence: ack.sequence,
+        hub_time_ms: ack.hub_time_ms,
     })
     .map_err(TransportError::Serialization)
 }
@@ -842,6 +992,29 @@ mod tests {
         tampered.result.result = DeviceResult::Applications { count: 8 };
         assert!(matches!(
             verify_remote_result(&registry, &hello, &challenge, &tampered),
+            Err(TransportError::Control(
+                ControlError::InvalidDeviceSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn heartbeat_and_ack_are_signed_and_connection_bound() {
+        let (registry, identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id, caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let heartbeat = build_agent_heartbeat(&identity, &hello, &challenge, 4, 9).unwrap();
+        verify_agent_heartbeat(&registry, &hello, &challenge, &heartbeat).unwrap();
+        let ack = hub
+            .heartbeat_ack(&hello, &challenge, &heartbeat, 50_000)
+            .unwrap();
+        verify_hub_heartbeat_ack(&hello, &challenge, &ack, &hub.verifier()).unwrap();
+
+        let mut tampered = heartbeat;
+        tampered.sequence += 1;
+        assert!(matches!(
+            verify_agent_heartbeat(&registry, &hello, &challenge, &tampered),
             Err(TransportError::Control(
                 ControlError::InvalidDeviceSignature
             ))

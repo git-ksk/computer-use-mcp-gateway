@@ -28,6 +28,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "si
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
+rcgen = "0.14"

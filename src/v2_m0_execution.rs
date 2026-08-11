@@ -4,6 +4,7 @@
 //! operation and remembers terminal operation IDs so a reconnect or retry cannot
 //! silently replay an action whose outcome may already be externally visible.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
@@ -22,14 +23,14 @@ impl AdmissionLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRef {
     pub device_id: String,
     pub device_generation: u64,
     pub operation_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HubOperationState {
     ActiveNotDispatched,
     Dispatched,
@@ -64,6 +65,17 @@ struct HubOperation {
     state: HubOperationState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubOperationSnapshot {
+    pub operation: OperationRef,
+    pub state: HubOperationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubAdmissionSnapshot {
+    pub operations: Vec<HubOperationSnapshot>,
+}
+
 #[derive(Debug)]
 pub struct HubAdmissionController {
     limits: AdmissionLimits,
@@ -80,6 +92,60 @@ impl HubAdmissionController {
             operations: HashMap::new(),
             queued_by_device: HashMap::new(),
         })
+    }
+
+    pub fn snapshot_for_restart(&self) -> HubAdmissionSnapshot {
+        let mut operations: Vec<_> = self
+            .operations
+            .values()
+            .map(|operation| HubOperationSnapshot {
+                operation: operation.operation.clone(),
+                state: match operation.state {
+                    HubOperationState::ActiveNotDispatched => HubOperationState::Cancelled,
+                    HubOperationState::Dispatched | HubOperationState::CancelRequested => {
+                        HubOperationState::Indeterminate
+                    }
+                    terminal => terminal,
+                },
+            })
+            .collect();
+        operations.sort_by(|left, right| {
+            left.operation
+                .operation_id
+                .cmp(&right.operation.operation_id)
+        });
+        HubAdmissionSnapshot { operations }
+    }
+
+    pub fn restore_after_restart(
+        limits: AdmissionLimits,
+        snapshot: HubAdmissionSnapshot,
+    ) -> Result<Self, ExecutionError> {
+        let mut controller = Self::new(limits)?;
+        for persisted in snapshot.operations {
+            if !matches!(
+                persisted.state,
+                HubOperationState::Completed
+                    | HubOperationState::Cancelled
+                    | HubOperationState::Indeterminate
+            ) {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            if controller
+                .operations
+                .contains_key(&persisted.operation.operation_id)
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            controller.operations.insert(
+                persisted.operation.operation_id.clone(),
+                HubOperation {
+                    operation: persisted.operation,
+                    state: persisted.state,
+                },
+            );
+        }
+        Ok(controller)
     }
 
     pub fn admit(&mut self, operation: OperationRef) -> Result<AdmissionDecision, ExecutionError> {
@@ -282,6 +348,11 @@ pub enum AgentOperationState {
     CancelRequested,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExecutionSnapshot {
+    pub terminal_operation_ids: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct AgentExecutionGate {
     active: Option<(OperationRef, AgentOperationState)>,
@@ -289,6 +360,33 @@ pub struct AgentExecutionGate {
 }
 
 impl AgentExecutionGate {
+    pub fn snapshot_for_restart(&self) -> AgentExecutionSnapshot {
+        let mut terminal_operation_ids: Vec<_> =
+            self.terminal_operation_ids.iter().cloned().collect();
+        if let Some((active, _)) = &self.active {
+            terminal_operation_ids.push(active.operation_id.clone());
+        }
+        terminal_operation_ids.sort();
+        terminal_operation_ids.dedup();
+        AgentExecutionSnapshot {
+            terminal_operation_ids,
+        }
+    }
+
+    pub fn restore_after_restart(snapshot: AgentExecutionSnapshot) -> Result<Self, ExecutionError> {
+        if snapshot
+            .terminal_operation_ids
+            .iter()
+            .any(|operation_id| operation_id.trim().is_empty())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        Ok(Self {
+            active: None,
+            terminal_operation_ids: snapshot.terminal_operation_ids.into_iter().collect(),
+        })
+    }
+
     pub fn begin(&mut self, operation: OperationRef) -> Result<(), ExecutionError> {
         if self
             .terminal_operation_ids
@@ -346,6 +444,7 @@ pub enum ExecutionError {
     UnknownOperation,
     InvalidTransition,
     AgentBusy,
+    InvalidSnapshot,
 }
 
 impl fmt::Display for ExecutionError {
@@ -483,6 +582,49 @@ mod tests {
             hub.admit(op("dev-a", 8, "a1")),
             Err(ExecutionError::OperationReplay)
         );
+    }
+
+    #[test]
+    fn hub_restart_snapshot_never_restores_in_flight_work_as_runnable() {
+        let limits = AdmissionLimits {
+            max_global_active: 2,
+            max_queued_per_device: 1,
+        };
+        let mut hub = HubAdmissionController::new(limits).unwrap();
+        hub.admit(op("dev-a", 1, "not-dispatched")).unwrap();
+        hub.admit(op("dev-b", 1, "dispatched")).unwrap();
+        hub.mark_dispatched("dispatched").unwrap();
+        let snapshot = hub.snapshot_for_restart();
+        let mut restored = HubAdmissionController::restore_after_restart(limits, snapshot).unwrap();
+        assert_eq!(
+            restored.state("not-dispatched"),
+            Some(HubOperationState::Cancelled)
+        );
+        assert_eq!(
+            restored.state("dispatched"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert_eq!(
+            restored.admit(op("dev-a", 2, "not-dispatched")),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert_eq!(
+            restored.admit(op("dev-b", 2, "dispatched")),
+            Err(ExecutionError::OperationReplay)
+        );
+    }
+
+    #[test]
+    fn agent_restart_snapshot_marks_active_operation_terminal() {
+        let mut gate = AgentExecutionGate::default();
+        gate.begin(op("dev-a", 1, "a1")).unwrap();
+        let snapshot = gate.snapshot_for_restart();
+        let mut restored = AgentExecutionGate::restore_after_restart(snapshot).unwrap();
+        assert_eq!(
+            restored.begin(op("dev-a", 2, "a1")),
+            Err(ExecutionError::OperationReplay)
+        );
+        restored.begin(op("dev-a", 2, "a2")).unwrap();
     }
 
     #[test]

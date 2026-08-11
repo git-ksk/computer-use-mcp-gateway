@@ -94,4 +94,4 @@ For security-sensitive reports, do not include credentials or unrelated private 
 
 V2 separates northbound authenticated client principals, Hub transport identity, grant-signing authority, and Agent device identity. Key rotation requires continuity proof; bounded admission and signed cancellation/reconnect semantics fail closed around ambiguous operations. The complete compromised-component analysis and non-claims are documented in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
 
-The V2-M0 GO is a decision to proceed to the single secure remote Agent milestone, not a production-readiness claim. M1 must add encrypted remote transport and real northbound authentication integration before remote production use.
+The V2-M0 GO is a decision to proceed to the single secure remote Agent milestone, not a production-readiness claim. M1 now has a TLS 1.3/pinned-trust transport wrapper plus restart-safe public trust/replay checkpoints, but those pieces are not yet an accepted remote Agent service. Private signing/TLS keys are deliberately outside the JSON checkpoint format and still require production key custody. See [`V2_M1_PROGRESS.md`](V2_M1_PROGRESS.md).

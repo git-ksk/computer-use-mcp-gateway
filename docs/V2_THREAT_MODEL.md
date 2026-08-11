@@ -213,9 +213,9 @@ A V2-M0 GO decision means the differentiated control-plane semantics justify pro
 
 Before a remote Agent is exposed outside a loopback/test environment, M1 must at minimum add and verify:
 
-- authenticated encrypted Hub-Agent transport (TLS or equivalently reviewed secure tunnel);
+- compose the implemented TLS 1.3/pinned-trust transport wrapper with the complete authenticated Hub-Agent protocol in one end-to-end connection;
 - real northbound authentication integration that constructs `AuthenticatedClientPrincipal` only from verified identity-provider output;
-- persistent/recoverable key, revocation, operation, and terminal replay state;
-- heartbeat/reconnect with bounded backoff;
+- production private-key/certificate custody and rotation; public trust/revocation/terminal replay checkpoints are implemented, but private signing keys are intentionally not stored in those JSON checkpoints;
+- long-lived heartbeat/reconnect operation using the implemented bounded-backoff and timeout state machines;
 - live cancellation behavior for each backend operation class and explicit handling when a backend cannot interrupt safely;
 - deployment-level rate limiting, secret storage, and observability.

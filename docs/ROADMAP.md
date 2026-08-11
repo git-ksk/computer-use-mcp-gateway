@@ -148,16 +148,18 @@ If later M1 evidence shows these controls do not provide a meaningful operationa
 
 Only after V2-M0 GO:
 
-- [ ] outbound Agent connection
-- [ ] heartbeat/reconnect with bounded backoff
-- [ ] one-device routing
-- [ ] versioned capability advertisement with revision/generation tracking
-- [ ] per-device operation lease / serialization ownership
-- [ ] bounded per-device queueing/load shedding before work reaches the Agent
-- [ ] short-lived capability-grant validation
-- [ ] fail-closed stale/offline-agent and stale-capability behavior
-- [ ] clean cancellation/disconnect semantics
-- [ ] Cua adapter behind the backend capability contract with adapter conformance coverage
+> **M1 implementation note (2026-08-11):** the foundation now includes TLS 1.3 configuration with pinned trust + dedicated ALPN, signed heartbeat messages, bounded reconnect policy, one-device routing, and restart-safe public trust/replay checkpoints. These are implementation-level controls, not M1 acceptance: the encrypted channel still needs to be composed with the complete Hub↔Agent protocol in one end-to-end connection, and live backend cancellation/private-key provisioning remain open. See [`V2_M1_PROGRESS.md`](V2_M1_PROGRESS.md).
+
+- [ ] outbound Agent connection over the accepted encrypted M1 channel
+- [x] heartbeat/reconnect semantics with bounded backoff
+- [x] one-device routing
+- [x] versioned capability advertisement with revision/generation tracking
+- [x] per-device operation lease / serialization ownership
+- [x] bounded per-device queueing/load shedding before work reaches the Agent
+- [x] short-lived capability-grant validation
+- [x] fail-closed stale/offline-agent and stale-capability behavior
+- [ ] clean live cancellation/disconnect semantics across the backend boundary
+- [x] Cua adapter behind the backend capability contract with adapter conformance coverage
 
 ### V2-M2: multi-machine Hub
 

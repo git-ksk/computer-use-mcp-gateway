@@ -131,6 +131,21 @@ struct EnrolledDevice {
     capabilities: Option<CapabilityAdvertisement>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrolledDeviceSnapshot {
+    pub device_id: String,
+    pub verifying_key: [u8; 32],
+    pub generation: u64,
+    pub capabilities: Option<CapabilityAdvertisement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRegistrySnapshot {
+    pub schema_version: u16,
+    pub devices: Vec<EnrolledDeviceSnapshot>,
+    pub revoked_device_ids: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct DeviceRegistry {
     devices: HashMap<String, EnrolledDevice>,
@@ -138,6 +153,60 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
+    pub fn snapshot(&self) -> DeviceRegistrySnapshot {
+        let mut devices: Vec<_> = self
+            .devices
+            .iter()
+            .map(|(device_id, device)| EnrolledDeviceSnapshot {
+                device_id: device_id.clone(),
+                verifying_key: device.verifying_key.to_bytes(),
+                generation: device.generation,
+                capabilities: device.capabilities.clone(),
+            })
+            .collect();
+        devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        let mut revoked_device_ids: Vec<_> = self.revoked.iter().cloned().collect();
+        revoked_device_ids.sort();
+        DeviceRegistrySnapshot {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            devices,
+            revoked_device_ids,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: DeviceRegistrySnapshot) -> Result<Self, ControlError> {
+        if snapshot.schema_version != CONTROL_SCHEMA_VERSION {
+            return Err(ControlError::UnsupportedControlSchema {
+                got: snapshot.schema_version,
+            });
+        }
+        let mut devices = HashMap::new();
+        for device in snapshot.devices {
+            if devices.contains_key(&device.device_id) {
+                return Err(ControlError::InvalidRegistrySnapshot);
+            }
+            let verifying_key = VerifyingKey::from_bytes(&device.verifying_key)
+                .map_err(|_| ControlError::InvalidRegistrySnapshot)?;
+            if let Some(capabilities) = &device.capabilities {
+                if capabilities.capability_schema_version != CAPABILITY_SCHEMA_VERSION {
+                    return Err(ControlError::UnsupportedCapabilitySchema {
+                        got: capabilities.capability_schema_version,
+                    });
+                }
+            }
+            devices.insert(
+                device.device_id,
+                EnrolledDevice {
+                    verifying_key,
+                    generation: device.generation,
+                    capabilities: device.capabilities,
+                },
+            );
+        }
+        let revoked = snapshot.revoked_device_ids.into_iter().collect();
+        Ok(Self { devices, revoked })
+    }
+
     pub fn enrollment_challenge() -> [u8; 32] {
         let mut challenge = [0_u8; 32];
         OsRng.fill_bytes(&mut challenge);
@@ -351,6 +420,14 @@ impl GrantAuthority {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantLedgerSnapshot {
+    pub schema_version: u16,
+    pub verifier_keys: Vec<[u8; 32]>,
+    pub consumed_grant_ids: Vec<String>,
+    pub revoked_grant_ids: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct GrantLedger {
     verifiers: HashMap<String, VerifyingKey>,
@@ -367,6 +444,47 @@ impl GrantLedger {
             consumed: HashSet::new(),
             revoked: HashSet::new(),
         }
+    }
+
+    pub fn snapshot(&self) -> GrantLedgerSnapshot {
+        let mut verifier_keys: Vec<_> = self
+            .verifiers
+            .values()
+            .map(VerifyingKey::to_bytes)
+            .collect();
+        verifier_keys.sort();
+        let mut consumed_grant_ids: Vec<_> = self.consumed.iter().cloned().collect();
+        consumed_grant_ids.sort();
+        let mut revoked_grant_ids: Vec<_> = self.revoked.iter().cloned().collect();
+        revoked_grant_ids.sort();
+        GrantLedgerSnapshot {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            verifier_keys,
+            consumed_grant_ids,
+            revoked_grant_ids,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: GrantLedgerSnapshot) -> Result<Self, ControlError> {
+        if snapshot.schema_version != CONTROL_SCHEMA_VERSION {
+            return Err(ControlError::UnsupportedControlSchema {
+                got: snapshot.schema_version,
+            });
+        }
+        if snapshot.verifier_keys.is_empty() {
+            return Err(ControlError::InvalidGrantLedgerSnapshot);
+        }
+        let mut verifiers = HashMap::new();
+        for key_bytes in snapshot.verifier_keys {
+            let verifier = VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|_| ControlError::InvalidGrantLedgerSnapshot)?;
+            verifiers.insert(verifying_key_id(&verifier), verifier);
+        }
+        Ok(Self {
+            verifiers,
+            consumed: snapshot.consumed_grant_ids.into_iter().collect(),
+            revoked: snapshot.revoked_grant_ids.into_iter().collect(),
+        })
     }
 
     pub fn trust_verifier(&mut self, verifier: VerifyingKey) -> String {
@@ -678,6 +796,7 @@ pub enum ControlError {
     InvalidEnrollmentProof,
     InvalidDeviceSignature,
     InvalidDeviceRotationProof,
+    InvalidRegistrySnapshot,
     UnknownDevice,
     DeviceRevoked,
     DeviceOffline,
@@ -690,6 +809,7 @@ pub enum ControlError {
     InvalidGrantLifetime,
     InvalidGrantSignature,
     UnknownGrantSigningKey,
+    InvalidGrantLedgerSnapshot,
     GrantDeviceMismatch,
     GrantNotYetValid,
     GrantExpired,
@@ -965,6 +1085,58 @@ mod tests {
         assert_eq!(
             validate_command_result(&command, &mismatched),
             Err(ControlError::ResultTypeMismatch)
+        );
+    }
+
+    #[test]
+    fn registry_snapshot_round_trip_preserves_generation_capabilities_and_revocation() {
+        let (mut registry, _identity, device_id) = enrolled();
+        registry.connect(&device_id, capabilities(5)).unwrap();
+        let other = DeviceIdentity::generate();
+        let challenge = DeviceRegistry::enrollment_challenge();
+        let proof = other.enrollment_proof(&challenge);
+        let other_id = registry
+            .enroll(&other.public_key(), &challenge, &proof)
+            .unwrap();
+        registry.revoke_device(&other_id);
+        let restored = DeviceRegistry::from_snapshot(registry.snapshot()).unwrap();
+        assert_eq!(restored.current_session(&device_id).unwrap().generation, 1);
+        assert_eq!(
+            restored
+                .current_session(&device_id)
+                .unwrap()
+                .capabilities
+                .revision,
+            5
+        );
+        assert_eq!(
+            restored.verify_device_signature(&other_id, b"x", &other.sign_message(b"x")),
+            Err(ControlError::DeviceRevoked)
+        );
+    }
+
+    #[test]
+    fn grant_ledger_snapshot_preserves_consumed_and_revoked_replay_state() {
+        let authority = GrantAuthority::generate();
+        let mut ledger = GrantLedger::new(authority.verifier());
+        let consumed = authority
+            .issue("dev", CapabilityClass::Observe, 10, 100)
+            .unwrap();
+        ledger
+            .authorize_once(&consumed, "dev", CapabilityClass::Observe, 11)
+            .unwrap();
+        let revoked = authority
+            .issue("dev", CapabilityClass::Observe, 10, 100)
+            .unwrap();
+        ledger.revoke(&revoked.payload.grant_id);
+        let mut restored = GrantLedger::from_snapshot(ledger.snapshot()).unwrap();
+        assert_eq!(
+            restored.authorize_once(&consumed, "dev", CapabilityClass::Observe, 12),
+            Err(ControlError::GrantReplay)
+        );
+        assert_eq!(
+            restored.authorize_once(&revoked, "dev", CapabilityClass::Observe, 12),
+            Err(ControlError::GrantRevoked)
         );
     }
 

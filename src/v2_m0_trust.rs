@@ -151,6 +151,10 @@ impl TrustedHubIdentity {
         }
     }
 
+    pub fn from_verifier_and_epoch(current: VerifyingKey, epoch: u64) -> Self {
+        Self { current, epoch }
+    }
+
     pub fn verifier(&self) -> VerifyingKey {
         self.current
     }
