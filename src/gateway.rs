@@ -54,7 +54,10 @@ impl Gateway {
             .collect();
 
         {
-            let mut cached = self.tools.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cached = self
+                .tools
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *cached = tools.clone();
         }
 
