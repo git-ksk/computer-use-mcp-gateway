@@ -71,9 +71,8 @@ impl CuaBackend {
 
     async fn is_connected(&self) -> bool {
         let slot = self.service.lock().await;
-        slot.as_ref().is_some_and(|service| {
-            !service.is_closed() && !service.peer().is_transport_closed()
-        })
+        slot.as_ref()
+            .is_some_and(|service| !service.is_closed() && !service.peer().is_transport_closed())
     }
 
     async fn close_current(&self) {
@@ -118,9 +117,7 @@ impl CuaBackend {
                 Err(error) => {
                     last_error = Some(error);
                     if attempt + 1 < self.reconnect_attempts {
-                        let factor = 1_u32
-                            .checked_shl(attempt.min(31))
-                            .unwrap_or(u32::MAX);
+                        let factor = 1_u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
                         sleep(self.reconnect_backoff.saturating_mul(factor)).await;
                     }
                 }
@@ -214,7 +211,8 @@ impl ComputerUseBackend for CuaBackend {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
                 self.recover_after_failure().await;
-                Err(error).context("Cua MCP tool call failed; connection recovered for the next call")
+                Err(error)
+                    .context("Cua MCP tool call failed; connection recovered for the next call")
             }
             Err(_) => {
                 self.recover_after_failure().await;
