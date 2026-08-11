@@ -1,6 +1,6 @@
 # Testing
 
-The test strategy separates protocol/backend compatibility from real desktop GUI execution.
+The test strategy separates deterministic repository checks, protocol/backend compatibility, documentation integrity, and real desktop GUI execution.
 
 ## Normal CI
 
@@ -36,6 +36,18 @@ For each OS, CI:
 
 The smoke harness exercises the actual Gateway → `cua-driver mcp` path, backend tool discovery, `/healthz`, northbound MCP lifecycle behavior, tool filtering, deny-policy behavior, and rejection of malicious Host/Origin values.
 
+## Documentation CI
+
+`.github/workflows/docs.yml` is a separate read-only workflow that runs:
+
+```bash
+python3 scripts/check_docs.py
+```
+
+The checker scans `README.md`, `CONTRIBUTING.md`, and `docs/*.md` and fails when a repository-local Markdown link points to a missing target or escapes the repository root.
+
+It deliberately does **not** fetch external URLs. Installation commands, current MCP-client UI/configuration, and reverse-proxy behavior can change upstream, so changes to those examples should be reviewed against the authoritative upstream documentation rather than depending on a flaky network link checker.
+
 ## What normal CI proves
 
 Normal CI provides strong evidence for:
@@ -47,7 +59,8 @@ Normal CI provides strong evidence for:
 - northbound MCP lifecycle compatibility for the two exercised protocol revisions;
 - dynamic tool discovery/filtering;
 - deny-by-default policy enforcement;
-- Host/Origin transport guards.
+- Host/Origin transport guards;
+- repository-local documentation link integrity.
 
 ## What normal CI does not prove
 
@@ -57,7 +70,8 @@ GitHub-hosted macOS runners are not a substitute for a persistent logged-in desk
 - real clicks/typing against a persistent GUI session;
 - macOS TCC permission persistence;
 - arbitrary application-specific GUI workflows;
-- long-running soak/resource behavior.
+- long-running soak/resource behavior;
+- continuing correctness of external third-party setup instructions after an upstream product changes.
 
 The dual-protocol smoke suite is also **not** an MCP conformance certification. Integration of the official MCP conformance requirement runner remains tracked in `docs/ROADMAP.md`.
 
@@ -114,9 +128,10 @@ After building the gateway and installing Cua, the compatibility harness can be 
 cargo build --locked
 MCP_PROTOCOL_VERSION=2025-11-25 python3 scripts/cua_gateway_smoke.py
 MCP_PROTOCOL_VERSION=2026-07-28 python3 scripts/cua_gateway_smoke.py
+python3 scripts/check_docs.py
 ```
 
-The script starts its own gateway process/configuration for the smoke scenario. Do not point it at a production desktop or reuse production credentials.
+The Cua smoke script starts its own gateway process/configuration for the smoke scenario. Do not point it at a production desktop or reuse production credentials.
 
 ## Future coverage
 
