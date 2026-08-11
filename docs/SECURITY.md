@@ -25,6 +25,8 @@ The gateway performs a coarse capability check by MCP tool name. `CUMG_DENY_TOOL
 
 Cua's own policy engine should be used as an optional second layer when argument-level constraints matter. [`../examples/cua-policy.yaml`](../examples/cua-policy.yaml) demonstrates a deny-by-default backend policy with a bounded `type_text` rule. Gateway policy may narrow Cua; it must never be used as a reason to widen Cua's OS permissions or backend policy.
 
+A read-only tool is not necessarily low-sensitivity. Screenshots, accessibility trees, window titles, app lists, and clipboard reads can disclose private information even when they do not mutate the desktop. Treat `observe` capabilities as data-access permissions, not merely harmless diagnostics.
+
 Future semantic categories may provide a friendlier configuration surface:
 
 - `observe`: screenshot, accessibility snapshot, window/app listing
