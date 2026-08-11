@@ -1,0 +1,29 @@
+# Defense-in-depth policy for Cua Driver.
+#
+# This is intentionally narrower than the full Cua tool surface. Any tool not
+# listed here is denied by Cua's policy engine. Keep the gateway allowlist at
+# least as restrictive as this backend policy.
+
+allow:
+  tools:
+    - list_apps
+    - list_windows
+    - get_accessibility_tree
+    - get_screen_size
+    - get_window_state
+    - screenshot
+    - click
+    - press_key
+    - hotkey
+    - scroll
+    - wait
+  rules:
+    - tool: type_text
+      constraints:
+        text:
+          max_length: 500
+
+deny:
+  tools:
+    - shell_execute
+    - run_javascript
