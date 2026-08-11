@@ -3,11 +3,13 @@
 
 Runs the real gateway binary against scripts/mock_mcp_backend.py so the test
 covers the northbound Streamable HTTP server, gateway policy, backend MCP stdio
-adapter, serialization, and response forwarding without touching a desktop.
+adapter, serialization, response forwarding, and backend health metrics without
+touching a desktop.
 
-Resource measurement is intentionally Linux-only and measures the gateway PID,
-not the fixture backend. Thresholds are generous regression guards rather than
-marketing performance claims.
+Resource measurement is intentionally Linux-only. The idle regression gate
+measures the gateway PID, while `/healthz` independently reports the owned
+backend child process CPU time and RSS. Thresholds are generous regression
+guards rather than marketing performance claims.
 """
 
 from __future__ import annotations
@@ -100,6 +102,28 @@ def get_health(timeout: float = 2.0) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def is_ready(health: dict) -> bool:
+    return health.get("status") == "ok" and health.get("backend") == "ready"
+
+
+def assert_backend_metrics(health: dict) -> None:
+    resources = health.get("backend_resources")
+    if not isinstance(resources, dict):
+        raise RuntimeError(f"health response is missing backend_resources: {health}")
+    if not isinstance(resources.get("pid"), int) or resources["pid"] <= 0:
+        raise RuntimeError(f"invalid backend PID metric: {resources}")
+    cpu_seconds = resources.get("cpu_seconds")
+    if not isinstance(cpu_seconds, (int, float)) or cpu_seconds < 0:
+        raise RuntimeError(f"invalid backend CPU metric: {resources}")
+    rss_bytes = resources.get("rss_bytes")
+    if not isinstance(rss_bytes, int) or rss_bytes <= 0:
+        raise RuntimeError(f"invalid backend RSS metric: {resources}")
+    print(
+        "backend health metrics PASS: "
+        f"pid={resources['pid']} cpu_seconds={cpu_seconds:.3f} rss_bytes={rss_bytes}"
+    )
+
+
 def read_log(log_file: TextIO) -> str:
     log_file.flush()
     pos = log_file.tell()
@@ -119,7 +143,7 @@ def wait_ready(proc: subprocess.Popen[str], log_file: TextIO) -> None:
             )
         try:
             health = get_health()
-            if health == {"status": "ok", "backend": "ready"}:
+            if is_ready(health):
                 return
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             last_error = exc
@@ -189,8 +213,9 @@ def run_soak() -> None:
 
     duration = time.monotonic() - started
     health = get_health()
-    if health != {"status": "ok", "backend": "ready"}:
+    if not is_ready(health):
         raise RuntimeError(f"gateway unhealthy after soak: {health}")
+    assert_backend_metrics(health)
     print(f"100-call soak PASS: calls={SOAK_CALLS} duration_seconds={duration:.3f}")
 
 
