@@ -23,6 +23,7 @@ pending: dict[object, str] = {}
 CALL_MARKER: str | None = None
 CANCEL_MARKER: str | None = None
 ARGS_MARKER: str | None = None
+SLOW_LIST_APPS = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--call-marker")
     parser.add_argument("--cancel-marker")
     parser.add_argument("--args-marker")
+    parser.add_argument("--slow-list-apps", action="store_true")
     return parser.parse_args()
 
 
@@ -97,6 +99,16 @@ def handle_request(message: dict) -> None:
                         "inputSchema": {"type": "object", "additionalProperties": False},
                     },
                     {
+                        "name": "list_apps",
+                        "description": "Semantic adapter fixture for application listing",
+                        "inputSchema": {"type": "object", "additionalProperties": False},
+                    },
+                    {
+                        "name": "get_screen_size",
+                        "description": "Semantic adapter fixture for screen geometry",
+                        "inputSchema": {"type": "object", "additionalProperties": False},
+                    },
+                    {
                         "name": "echo_contract",
                         "description": "Records exact arguments and returns backend identity data unchanged",
                         "inputSchema": {"type": "object", "additionalProperties": True},
@@ -120,6 +132,39 @@ def handle_request(message: dict) -> None:
         if name == "slow":
             pending[request_id] = name
             touch(CALL_MARKER, str(request_id))
+            return
+        if name == "list_apps":
+            if SLOW_LIST_APPS:
+                pending[request_id] = name
+                touch(CALL_MARKER, str(request_id))
+                return
+            result(
+                request_id,
+                {
+                    "content": [],
+                    "structuredContent": {
+                        "apps": [
+                            {"name": "Fixture A", "pid": 101},
+                            {"name": "Fixture B", "pid": 202},
+                        ]
+                    },
+                    "isError": False,
+                },
+            )
+            return
+        if name == "get_screen_size":
+            result(
+                request_id,
+                {
+                    "content": [],
+                    "structuredContent": {
+                        "width": 1920,
+                        "height": 1080,
+                        "scale_factor": 2.0,
+                    },
+                    "isError": False,
+                },
+            )
             return
         if name == "echo_contract":
             arguments = params.get("arguments") or {}
@@ -180,11 +225,12 @@ def handle_notification(message: dict) -> None:
 
 
 def main() -> None:
-    global CALL_MARKER, CANCEL_MARKER, ARGS_MARKER
+    global CALL_MARKER, CANCEL_MARKER, ARGS_MARKER, SLOW_LIST_APPS
     args = parse_args()
     CALL_MARKER = args.call_marker
     CANCEL_MARKER = args.cancel_marker
     ARGS_MARKER = args.args_marker
+    SLOW_LIST_APPS = args.slow_list_apps
 
     for line in sys.stdin:
         line = line.strip()

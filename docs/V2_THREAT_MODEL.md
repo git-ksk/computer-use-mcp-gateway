@@ -175,9 +175,10 @@ Rules:
 - an Agent keeps terminal operation IDs to reject local replay during its lifetime;
 - a Hub connection loss after dispatch marks the operation `indeterminate`;
 - `indeterminate`, `completed`, and `cancelled` operation IDs cannot be re-admitted;
+- an `indeterminate` operation quarantines its device at Hub admission, so a different operation is also rejected until explicit resolution;
 - reconnect does not transfer an existing generation-bound operation lease.
 
-A backend-specific cancellation mechanism may be best-effort. Lack of a cancellation acknowledgement must never be interpreted as proof that the desktop action did not happen.
+The Cua MCP adapter propagates cancellation to the exact in-flight downstream request ID, but propagation is not treated as proof that a desktop side effect stopped. A propagated cancellation or timeout therefore maps to an `indeterminate` disposition and device quarantine. Lack of a backend-level proof of non-execution must never be interpreted as successful cancellation.
 
 ## Key rotation
 

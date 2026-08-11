@@ -161,6 +161,8 @@ Only after V2-M0 GO:
 - [x] short-lived capability-grant validation
 - [x] fail-closed stale/offline-agent and stale-capability behavior
 - [ ] clean live cancellation/disconnect semantics across the backend boundary
+  - [x] exact downstream cancellation propagation + indeterminate device quarantine in deterministic MCP acceptance
+  - [ ] real-Cua desktop cancellation acceptance
 - [x] Cua adapter behind the backend capability contract with adapter conformance coverage
 
 ### V2-M2: multi-machine Hub

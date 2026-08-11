@@ -1,7 +1,10 @@
 //! V2-M1 single secure remote Agent runtime semantics.
 
 use crate::v2_m0::{CommandEnvelope, ControlError, DeviceSession, validate_command_session};
-use crate::v2_m0_transport::AgentHeartbeat;
+use crate::v2_m0_execution::{
+    CompletionDecision, ExecutionError, HubAdmissionController, HubOperationState,
+};
+use crate::v2_m0_transport::{AgentHeartbeat, CancellationDisposition};
 use std::fmt;
 use std::time::Duration;
 
@@ -216,6 +219,42 @@ impl SingleDeviceRouter {
     }
 }
 
+pub fn apply_cancellation_disposition(
+    admission: &mut HubAdmissionController,
+    operation_id: &str,
+    disposition: CancellationDisposition,
+) -> Result<CompletionDecision, M1Error> {
+    match disposition {
+        CancellationDisposition::CancelledBeforeExecution => admission
+            .complete(operation_id, true)
+            .map_err(M1Error::Execution),
+        CancellationDisposition::CancellationRequested => {
+            if admission.state(operation_id) == Some(HubOperationState::CancelRequested) {
+                Ok(CompletionDecision::Idle)
+            } else {
+                Err(M1Error::CancellationStateMismatch)
+            }
+        }
+        CancellationDisposition::IndeterminateAfterPropagation => admission
+            .mark_indeterminate(operation_id)
+            .map_err(M1Error::Execution),
+        CancellationDisposition::AlreadyTerminal => {
+            if matches!(
+                admission.state(operation_id),
+                Some(
+                    HubOperationState::Completed
+                        | HubOperationState::Cancelled
+                        | HubOperationState::Indeterminate
+                )
+            ) {
+                Ok(CompletionDecision::Idle)
+            } else {
+                Err(M1Error::CancellationStateMismatch)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum M1Error {
     InvalidReconnectPolicy,
@@ -228,6 +267,8 @@ pub enum M1Error {
     InvalidDeviceId,
     WrongDevice,
     DeviceOffline,
+    CancellationStateMismatch,
+    Execution(ExecutionError),
     Control(ControlError),
 }
 
@@ -388,6 +429,68 @@ mod tests {
         );
         assert!(!tracker.is_timed_out(6_999));
         assert!(tracker.is_timed_out(7_000));
+    }
+
+    #[test]
+    fn indeterminate_cancellation_quarantines_the_device_until_explicit_resolution() {
+        use crate::v2_m0_execution::{
+            AdmissionDecision, AdmissionLimits, CancellationDecision, IndeterminateResolution,
+            OperationRef,
+        };
+
+        let mut admission = HubAdmissionController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 1,
+        })
+        .unwrap();
+        let operation = OperationRef {
+            device_id: "dev-a".into(),
+            device_generation: 1,
+            operation_id: "op-cancel".into(),
+        };
+        assert!(matches!(
+            admission.admit(operation.clone()).unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        admission.mark_dispatched(&operation.operation_id).unwrap();
+        assert!(matches!(
+            admission.cancel(&operation.operation_id).unwrap(),
+            CancellationDecision::SendCancellation(_)
+        ));
+        apply_cancellation_disposition(
+            &mut admission,
+            &operation.operation_id,
+            CancellationDisposition::IndeterminateAfterPropagation,
+        )
+        .unwrap();
+        assert_eq!(
+            admission.state(&operation.operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(matches!(
+            admission.admit(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 2,
+                operation_id: "op-next".into(),
+            }),
+            Err(ExecutionError::DeviceIndeterminate { .. })
+        ));
+        admission
+            .resolve_indeterminate(
+                &operation.operation_id,
+                IndeterminateResolution::ConfirmedNotExecuted,
+            )
+            .unwrap();
+        assert!(matches!(
+            admission
+                .admit(OperationRef {
+                    device_id: "dev-a".into(),
+                    device_generation: 2,
+                    operation_id: "op-next".into(),
+                })
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
     }
 
     #[test]

@@ -239,6 +239,7 @@ pub struct RemoteCancel {
 pub enum CancellationDisposition {
     CancelledBeforeExecution,
     CancellationRequested,
+    IndeterminateAfterPropagation,
     AlreadyTerminal,
 }
 

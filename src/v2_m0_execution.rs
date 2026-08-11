@@ -32,6 +32,7 @@ pub struct OperationRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HubOperationState {
+    Queued,
     ActiveNotDispatched,
     Dispatched,
     CancelRequested,
@@ -50,6 +51,12 @@ pub enum AdmissionDecision {
 pub enum CompletionDecision {
     Idle,
     StartNext(OperationRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndeterminateResolution {
+    ConfirmedCompleted,
+    ConfirmedNotExecuted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +89,7 @@ pub struct HubAdmissionController {
     active_by_device: HashMap<String, String>,
     operations: HashMap<String, HubOperation>,
     queued_by_device: HashMap<String, VecDeque<OperationRef>>,
+    blocked_by_indeterminate: HashMap<String, String>,
 }
 
 impl HubAdmissionController {
@@ -91,6 +99,7 @@ impl HubAdmissionController {
             active_by_device: HashMap::new(),
             operations: HashMap::new(),
             queued_by_device: HashMap::new(),
+            blocked_by_indeterminate: HashMap::new(),
         })
     }
 
@@ -101,7 +110,9 @@ impl HubAdmissionController {
             .map(|operation| HubOperationSnapshot {
                 operation: operation.operation.clone(),
                 state: match operation.state {
-                    HubOperationState::ActiveNotDispatched => HubOperationState::Cancelled,
+                    HubOperationState::Queued | HubOperationState::ActiveNotDispatched => {
+                        HubOperationState::Cancelled
+                    }
                     HubOperationState::Dispatched | HubOperationState::CancelRequested => {
                         HubOperationState::Indeterminate
                     }
@@ -137,6 +148,18 @@ impl HubAdmissionController {
             {
                 return Err(ExecutionError::InvalidSnapshot);
             }
+            if persisted.state == HubOperationState::Indeterminate {
+                if controller
+                    .blocked_by_indeterminate
+                    .insert(
+                        persisted.operation.device_id.clone(),
+                        persisted.operation.operation_id.clone(),
+                    )
+                    .is_some()
+                {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+            }
             controller.operations.insert(
                 persisted.operation.operation_id.clone(),
                 HubOperation {
@@ -152,14 +175,13 @@ impl HubAdmissionController {
         if operation.operation_id.trim().is_empty() || operation.device_id.trim().is_empty() {
             return Err(ExecutionError::InvalidOperation);
         }
-        if self.operations.contains_key(&operation.operation_id)
-            || self.queued_by_device.values().any(|queue| {
-                queue
-                    .iter()
-                    .any(|queued| queued.operation_id == operation.operation_id)
-            })
-        {
+        if self.operations.contains_key(&operation.operation_id) {
             return Err(ExecutionError::OperationReplay);
+        }
+        if let Some(operation_id) = self.blocked_by_indeterminate.get(&operation.device_id) {
+            return Err(ExecutionError::DeviceIndeterminate {
+                operation_id: operation_id.clone(),
+            });
         }
 
         let device_busy = self.active_by_device.contains_key(&operation.device_id);
@@ -176,10 +198,16 @@ impl HubAdmissionController {
         if queue.len() >= self.limits.max_queued_per_device {
             return Err(ExecutionError::BackpressureRejected);
         }
-        queue.push_back(operation);
-        Ok(AdmissionDecision::Queued {
-            position: queue.len(),
-        })
+        queue.push_back(operation.clone());
+        let position = queue.len();
+        self.operations.insert(
+            operation.operation_id.clone(),
+            HubOperation {
+                operation,
+                state: HubOperationState::Queued,
+            },
+        );
+        Ok(AdmissionDecision::Queued { position })
     }
 
     pub fn mark_dispatched(&mut self, operation_id: &str) -> Result<(), ExecutionError> {
@@ -195,42 +223,61 @@ impl HubAdmissionController {
     }
 
     pub fn cancel(&mut self, operation_id: &str) -> Result<CancellationDecision, ExecutionError> {
-        if let Some(operation) = self.operations.get_mut(operation_id) {
-            return match operation.state {
-                HubOperationState::ActiveNotDispatched => {
-                    operation.state = HubOperationState::Cancelled;
-                    let device_id = operation.operation.device_id.clone();
-                    self.active_by_device.remove(&device_id);
-                    let next = self
-                        .start_next_for_available_capacity(Some(&device_id))
-                        .map_or(CompletionDecision::Idle, CompletionDecision::StartNext);
-                    Ok(CancellationDecision::CancelledBeforeDispatch { next })
-                }
-                HubOperationState::Dispatched => {
-                    operation.state = HubOperationState::CancelRequested;
-                    Ok(CancellationDecision::SendCancellation(
-                        operation.operation.clone(),
-                    ))
-                }
-                HubOperationState::CancelRequested => Ok(CancellationDecision::SendCancellation(
-                    operation.operation.clone(),
-                )),
-                terminal => Ok(CancellationDecision::AlreadyTerminal(terminal)),
-            };
-        }
+        let state = self
+            .operations
+            .get(operation_id)
+            .map(|operation| operation.state)
+            .ok_or(ExecutionError::UnknownOperation)?;
 
-        for queue in self.queued_by_device.values_mut() {
-            if let Some(index) = queue
-                .iter()
-                .position(|operation| operation.operation_id == operation_id)
-            {
-                queue.remove(index);
-                return Ok(CancellationDecision::CancelledBeforeDispatch {
+        match state {
+            HubOperationState::Queued => {
+                let device_id = self.operations[operation_id].operation.device_id.clone();
+                if let Some(queue) = self.queued_by_device.get_mut(&device_id) {
+                    if let Some(index) = queue
+                        .iter()
+                        .position(|operation| operation.operation_id == operation_id)
+                    {
+                        queue.remove(index);
+                    }
+                    if queue.is_empty() {
+                        self.queued_by_device.remove(&device_id);
+                    }
+                }
+                self.operations
+                    .get_mut(operation_id)
+                    .expect("operation was resolved above")
+                    .state = HubOperationState::Cancelled;
+                Ok(CancellationDecision::CancelledBeforeDispatch {
                     next: CompletionDecision::Idle,
-                });
+                })
             }
+            HubOperationState::ActiveNotDispatched => {
+                let device_id = self.operations[operation_id].operation.device_id.clone();
+                self.operations
+                    .get_mut(operation_id)
+                    .expect("operation was resolved above")
+                    .state = HubOperationState::Cancelled;
+                self.active_by_device.remove(&device_id);
+                let next = self
+                    .start_next_for_available_capacity(Some(&device_id))
+                    .map_or(CompletionDecision::Idle, CompletionDecision::StartNext);
+                Ok(CancellationDecision::CancelledBeforeDispatch { next })
+            }
+            HubOperationState::Dispatched => {
+                let operation = self
+                    .operations
+                    .get_mut(operation_id)
+                    .expect("operation was resolved above");
+                operation.state = HubOperationState::CancelRequested;
+                Ok(CancellationDecision::SendCancellation(
+                    operation.operation.clone(),
+                ))
+            }
+            HubOperationState::CancelRequested => Ok(CancellationDecision::SendCancellation(
+                self.operations[operation_id].operation.clone(),
+            )),
+            terminal => Ok(CancellationDecision::AlreadyTerminal(terminal)),
         }
-        Err(ExecutionError::UnknownOperation)
     }
 
     pub fn complete(
@@ -264,6 +311,13 @@ impl HubAdmissionController {
         &mut self,
         operation_id: &str,
     ) -> Result<CompletionDecision, ExecutionError> {
+        self.mark_indeterminate(operation_id)
+    }
+
+    pub fn mark_indeterminate(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<CompletionDecision, ExecutionError> {
         let operation = self
             .operations
             .get_mut(operation_id)
@@ -277,6 +331,36 @@ impl HubAdmissionController {
         operation.state = HubOperationState::Indeterminate;
         let device_id = operation.operation.device_id.clone();
         self.active_by_device.remove(&device_id);
+        self.blocked_by_indeterminate
+            .insert(device_id, operation_id.to_owned());
+        Ok(CompletionDecision::Idle)
+    }
+
+    pub fn resolve_indeterminate(
+        &mut self,
+        operation_id: &str,
+        resolution: IndeterminateResolution,
+    ) -> Result<CompletionDecision, ExecutionError> {
+        let operation = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if operation.state != HubOperationState::Indeterminate {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let device_id = operation.operation.device_id.clone();
+        if self
+            .blocked_by_indeterminate
+            .get(&device_id)
+            .is_none_or(|blocked| blocked != operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        operation.state = match resolution {
+            IndeterminateResolution::ConfirmedCompleted => HubOperationState::Completed,
+            IndeterminateResolution::ConfirmedNotExecuted => HubOperationState::Cancelled,
+        };
+        self.blocked_by_indeterminate.remove(&device_id);
         Ok(self
             .start_next_for_available_capacity(Some(&device_id))
             .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
@@ -293,13 +377,18 @@ impl HubAdmissionController {
     fn start(&mut self, operation: OperationRef) {
         self.active_by_device
             .insert(operation.device_id.clone(), operation.operation_id.clone());
-        self.operations.insert(
-            operation.operation_id.clone(),
-            HubOperation {
-                operation,
-                state: HubOperationState::ActiveNotDispatched,
-            },
-        );
+        if let Some(existing) = self.operations.get_mut(&operation.operation_id) {
+            existing.operation = operation;
+            existing.state = HubOperationState::ActiveNotDispatched;
+        } else {
+            self.operations.insert(
+                operation.operation_id.clone(),
+                HubOperation {
+                    operation,
+                    state: HubOperationState::ActiveNotDispatched,
+                },
+            );
+        }
     }
 
     fn start_next_for_available_capacity(
@@ -311,7 +400,9 @@ impl HubAdmissionController {
         }
 
         if let Some(device_id) = preferred_device {
-            if !self.active_by_device.contains_key(device_id) {
+            if !self.active_by_device.contains_key(device_id)
+                && !self.blocked_by_indeterminate.contains_key(device_id)
+            {
                 if let Some(next) = self.pop_queued(device_id) {
                     self.start(next.clone());
                     return Some(next);
@@ -321,7 +412,9 @@ impl HubAdmissionController {
 
         let candidates: Vec<String> = self.queued_by_device.keys().cloned().collect();
         for device_id in candidates {
-            if self.active_by_device.contains_key(&device_id) {
+            if self.active_by_device.contains_key(&device_id)
+                || self.blocked_by_indeterminate.contains_key(&device_id)
+            {
                 continue;
             }
             if let Some(next) = self.pop_queued(&device_id) {
@@ -444,6 +537,7 @@ pub enum ExecutionError {
     UnknownOperation,
     InvalidTransition,
     AgentBusy,
+    DeviceIndeterminate { operation_id: String },
     InvalidSnapshot,
 }
 
@@ -582,6 +676,21 @@ mod tests {
             hub.admit(op("dev-a", 8, "a1")),
             Err(ExecutionError::OperationReplay)
         );
+        assert_eq!(
+            hub.admit(op("dev-a", 8, "a2")),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "a1".into()
+            })
+        );
+        assert_eq!(
+            hub.resolve_indeterminate("a1", IndeterminateResolution::ConfirmedNotExecuted)
+                .unwrap(),
+            CompletionDecision::Idle
+        );
+        assert!(matches!(
+            hub.admit(op("dev-a", 8, "a2")).unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
     }
 
     #[test]
@@ -612,6 +721,28 @@ mod tests {
             restored.admit(op("dev-b", 2, "dispatched")),
             Err(ExecutionError::OperationReplay)
         );
+        assert_eq!(
+            restored.admit(op("dev-b", 2, "new-after-restart")),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "dispatched".into()
+            })
+        );
+    }
+
+    #[test]
+    fn queued_operations_are_recorded_and_become_cancelled_on_restart() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        };
+        let mut hub = HubAdmissionController::new(limits).unwrap();
+        hub.admit(op("dev-a", 1, "active")).unwrap();
+        hub.admit(op("dev-a", 1, "queued")).unwrap();
+        assert_eq!(hub.state("queued"), Some(HubOperationState::Queued));
+        let restored =
+            HubAdmissionController::restore_after_restart(limits, hub.snapshot_for_restart())
+                .unwrap();
+        assert_eq!(restored.state("queued"), Some(HubOperationState::Cancelled));
     }
 
     #[test]
