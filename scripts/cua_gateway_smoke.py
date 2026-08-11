@@ -33,6 +33,32 @@ HEALTH_URL = f"{BASE_URL}/healthz"
 PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-11-25")
 MODERN_PROTOCOL = PROTOCOL_VERSION == "2026-07-28"
 CLIENT_INFO = {"name": "cua-gateway-ci", "version": "0.1.0"}
+PINNED_CUA_TOOL_FIXTURE = Path("tests/fixtures/cua-0.19.3-tools.txt")
+
+
+def pinned_cua_tool_names() -> set[str]:
+    names = {
+        line.strip()
+        for line in PINNED_CUA_TOOL_FIXTURE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    if len(names) != 54:
+        raise RuntimeError(
+            f"unexpected pinned Cua tool fixture size: {len(names)} (expected 54)"
+        )
+    return names
+
+
+def assert_pinned_tool_surface(names: list[str]) -> None:
+    expected = pinned_cua_tool_names()
+    actual = set(names)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing or extra:
+        raise RuntimeError(
+            "pinned Cua tool surface drifted; review semantic classification before "
+            f"updating the fixture: missing={missing} extra={extra}"
+        )
 
 
 def gateway_binary() -> Path:
@@ -301,6 +327,7 @@ def main() -> int:
         names = [tool.get("name") for tool in tools if isinstance(tool.get("name"), str)]
         if not names:
             raise RuntimeError("real Cua backend returned no named MCP tools")
+        assert_pinned_tool_surface(names)
         denied = names[0]
         print(f"discovered_tools={len(names)} policy_probe={denied}")
     finally:

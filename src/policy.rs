@@ -25,45 +25,100 @@ impl ToolClass {
     }
 }
 
-/// Conservative semantic classification for the Cua-compatible tool surface.
+/// Reviewed semantic classification for the Cua-compatible tool surface.
 ///
-/// Unknown tools are classified as `dangerous` so newly discovered backend
-/// capabilities never look safer than they have been reviewed to be. Exact
-/// name allow/deny policy remains the enforcement boundary in V1.
-pub fn classify_tool(tool_name: &str) -> ToolClass {
-    match tool_name {
+/// `known_tool_class` returns `Some` only for capabilities that have been
+/// intentionally reviewed. `classify_tool` preserves the V1 fail-closed rule by
+/// treating every genuinely unknown future capability as `dangerous`.
+///
+/// The pinned Cua 0.19.3 tool fixture is checked in unit tests and in the
+/// real-Cua smoke so a backend tool-surface change cannot silently become an
+/// "unknown => dangerous" audit label without an explicit review.
+pub fn known_tool_class(tool_name: &str) -> Option<ToolClass> {
+    let class = match tool_name {
+        // Read-only observation / inspection.
         "list_apps"
         | "list_windows"
-        | "get_accessibility_tree"
-        | "get_screen_size"
-        | "get_cursor_position"
         | "get_window_state"
+        | "verify_state"
+        | "clipboard_read"
+        | "get_screen_size"
+        | "get_desktop_state"
+        | "get_cursor_position"
+        | "get_agent_cursor_state"
+        | "health_report"
+        | "get_config"
+        | "get_accessibility_tree"
+        | "zoom"
+        | "get_browser_state"
+        | "get_recording_state"
+        | "get_session_state"
+        | "check_for_update"
+        // Retained compatibility names from older reviewed Cua surfaces.
         | "screenshot"
-        | "check_permissions"
-        | "debug_window_info"
-        | "zoom" => ToolClass::Observe,
+        | "debug_window_info" => ToolClass::Observe,
 
-        "click"
-        | "right_click"
+        // Direct UI/browser interaction whose primary effect is on the current
+        // desktop/browser/session rather than installing software or executing
+        // an open-ended command surface.
+        "bring_to_front"
+        | "set_window_frame"
+        | "click"
         | "double_click"
+        | "right_click"
         | "drag"
         | "type_text"
-        | "type_text_chars"
         | "press_key"
         | "hotkey"
+        | "set_value"
         | "scroll"
         | "move_cursor"
-        | "bring_to_front"
+        | "set_agent_cursor_enabled"
+        | "set_agent_cursor_motion"
+        | "set_agent_cursor_theme"
+        | "browser_navigate"
+        | "browser_click"
+        | "browser_type"
+        | "browser_dialog"
+        | "browser_pointer"
+        // Retained compatibility names from older reviewed Cua surfaces.
+        | "type_text_chars"
         | "set_agent_cursor"
         | "set_agent_cursor_position"
         | "set_agent_cursor_visible" => ToolClass::Interact,
 
-        "launch_app" | "kill_app" => ToolClass::System,
+        // Process/driver/session lifecycle and local machine configuration.
+        "launch_app"
+        | "kill_app"
+        | "clipboard_write"
+        | "check_permissions"
+        | "set_config"
+        | "browser_prepare"
+        | "start_recording"
+        | "stop_recording"
+        | "start_session"
+        | "end_session" => ToolClass::System,
 
-        "shell_execute" | "run_javascript" => ToolClass::Dangerous,
+        // Explicitly reviewed high-risk or broad-effect capabilities. These are
+        // deliberately `dangerous`; unlike the fallback below, they are known.
+        "invoke_menu"
+        | "page"
+        | "browser_set_input_files"
+        | "browser_download"
+        | "replay_trajectory"
+        | "install_ffmpeg"
+        | "escalate_session"
+        // Retained compatibility names from older reviewed Cua surfaces.
+        | "shell_execute"
+        | "run_javascript" => ToolClass::Dangerous,
 
-        _ => ToolClass::Dangerous,
-    }
+        _ => return None,
+    };
+    Some(class)
+}
+
+pub fn classify_tool(tool_name: &str) -> ToolClass {
+    known_tool_class(tool_name).unwrap_or(ToolClass::Dangerous)
 }
 
 /// Tool policy applied before a backend call is forwarded.
@@ -143,6 +198,34 @@ mod tests {
         assert_eq!(classify_tool("click"), ToolClass::Interact);
         assert_eq!(classify_tool("kill_app"), ToolClass::System);
         assert_eq!(classify_tool("shell_execute"), ToolClass::Dangerous);
+    }
+
+    #[test]
+    fn pinned_cua_0_19_3_surface_is_explicitly_reviewed() {
+        let fixture = include_str!("../tests/fixtures/cua-0.19.3-tools.txt");
+        let mut count = 0usize;
+        for tool_name in fixture
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            count += 1;
+            assert!(
+                known_tool_class(tool_name).is_some(),
+                "pinned Cua tool is missing an explicit semantic class: {tool_name}"
+            );
+        }
+        assert_eq!(count, 54, "unexpected pinned Cua 0.19.3 fixture size");
+    }
+
+    #[test]
+    fn explicitly_dangerous_tools_are_distinct_from_unknown_tools() {
+        assert_eq!(
+            known_tool_class("replay_trajectory"),
+            Some(ToolClass::Dangerous)
+        );
+        assert_eq!(known_tool_class("future_backend_tool"), None);
+        assert_eq!(classify_tool("future_backend_tool"), ToolClass::Dangerous);
     }
 
     #[test]

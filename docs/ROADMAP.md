@@ -63,8 +63,8 @@ Before major V2 implementation, V2-M0 must demonstrate one concrete security/con
 - [x] installed `cua-driver` binary identity verification against the verified payload
 - [x] manual trusted self-hosted macOS desktop E2E workflow
 - [ ] execute desktop E2E on a dedicated TCC-granted test Mac
-- [ ] Cloudflare Tunnel + Access deployment dogfood for this gateway
-- [ ] ChatGPT remote MCP connection dogfood for this gateway
+- [x] Cloudflare Tunnel + Access deployment dogfood for this gateway (completed 2026-08-11)
+- [x] ChatGPT remote MCP connection dogfood for this gateway (completed 2026-08-11)
 - [x] idle gateway CPU/RAM regression benchmark in hosted Linux CI
 - [x] deterministic 100-call `tools/call` soak test through the real gateway/backend-MCP path
 
@@ -76,11 +76,11 @@ Automated/code-local V1 closeout is complete. Only operator-controlled acceptanc
 - [x] downstream cancellation propagation explicitly tested/guaranteed
 - [x] semantic dangerous-tool classification available
 - [ ] trusted desktop E2E executed on the dedicated test Mac
-- [ ] representative Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood completed
+- [x] representative Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood completed (2026-08-11)
 - [x] idle resource benchmark completed
 - [x] 100-call soak test completed
 
-See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the two remaining operator-controlled checks. After they pass (or are explicitly waived), close V1 and do not add features solely to duplicate capabilities that Cua or another backend already provides upstream.
+See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the remaining dedicated-desktop operator check. After it passes (or is explicitly waived), close V1 and do not add features solely to duplicate capabilities that Cua or another backend already provides upstream.
 
 ## V2 — Secure delegated device capability control plane candidate
 
