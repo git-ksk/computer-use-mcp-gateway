@@ -1,0 +1,287 @@
+# Troubleshooting
+
+Work from the bottom of the stack upward:
+
+```text
+OS / desktop permissions
+        ↓
+Cua Driver
+        ↓
+computer-use-mcp-gateway
+        ↓
+reverse proxy / authentication
+        ↓
+MCP client
+```
+
+Do not debug a remote client until the local Cua and gateway checks pass.
+
+## `cua-driver: command not found`
+
+Open a new terminal after installation. On macOS/Linux, Cua normally exposes the CLI through `~/.local/bin`; ensure that directory is on `PATH`.
+
+Verify:
+
+```bash
+cua-driver --version
+cua-driver doctor
+```
+
+On Windows, open a new PowerShell window so the updated User `Path` is loaded.
+
+## Cua works poorly or `doctor` reports a problem
+
+Run:
+
+```bash
+cua-driver doctor
+cua-driver call list_apps
+```
+
+Fix Cua before debugging the gateway. The gateway does not emulate missing platform capabilities.
+
+## macOS: permissions show `unknown` or actions fail
+
+Cua's macOS permissions should be associated with `CuaDriver.app`. Start the application-backed daemon first:
+
+```bash
+open -n -g -a CuaDriver --args serve
+cua-driver permissions status
+```
+
+If grants are missing:
+
+```bash
+cua-driver permissions grant
+```
+
+Enable both **Accessibility** and **Screen & System Audio Recording** for CuaDriver in System Settings. If a grant changed, fully relaunch CuaDriver and check again.
+
+Avoid replacing the supported application/TCC lifecycle with an arbitrary unsigned helper process.
+
+## Linux: `libXi.so.6` is missing
+
+On Debian/Ubuntu-like systems:
+
+```bash
+sudo apt update
+sudo apt install libxi6 at-spi2-core
+```
+
+Then rerun:
+
+```bash
+cua-driver doctor
+```
+
+## Linux: tool list exists but there is no usable GUI
+
+A headless shell does not provide a desktop to click or inspect. Cua computer-use tools need a compatible live display session. Verify your X11/XWayland/AT-SPI environment with `cua-driver doctor`.
+
+## Windows: GUI tools fail from a service or SSH session
+
+Normal computer-use actions require an interactive Windows desktop session. Confirm that the Cua daemon is running in an interactive logon session:
+
+```powershell
+cua-driver doctor
+cua-driver autostart kick
+```
+
+Then test a harmless read operation:
+
+```powershell
+cua-driver call list_apps
+```
+
+## Gateway exits during startup
+
+First confirm the tested backend is available:
+
+```bash
+cua-driver --version
+cua-driver call list_apps
+```
+
+Then run the gateway with logs visible:
+
+```bash
+cargo run --locked -- --allow-tools list_apps
+```
+
+Common causes are:
+
+- `cua-driver` is not on `PATH`;
+- Cua cannot initialize on the current desktop session;
+- the backend connection exceeds `CUMG_CONNECT_TIMEOUT_SECS`;
+- a custom `CUMG_BACKEND_COMMAND` or `CUMG_BACKEND_ARGS` is invalid.
+
+V1 splits `CUMG_BACKEND_ARGS` on ASCII whitespace; it does not implement shell-style quoting for embedded spaces.
+
+## `/healthz` returns HTTP 503
+
+The gateway reports 503 when the backend is stopped or its MCP transport is unhealthy.
+
+Check Cua directly, then inspect gateway logs:
+
+```bash
+cua-driver doctor
+cua-driver call list_apps
+```
+
+A backend transport failure may be repaired for a later request, but the failed computer-use action is not replayed automatically.
+
+## MCP connects but shows no tools
+
+The gateway is **deny-by-default**. An empty allowlist is intentionally a valid zero-tool configuration.
+
+Start with an explicit tool:
+
+```bash
+cargo run --locked -- --allow-tools list_apps
+```
+
+If a configured tool still does not appear, confirm the exact backend tool name. The gateway only exposes tools that are both discovered from Cua and allowed by policy.
+
+Do not use `CUMG_ALLOW_TOOLS=*` as a routine troubleshooting shortcut on a remote or sensitive desktop.
+
+## An allowed tool is reported unavailable
+
+The backend tool surface can vary by Cua version/platform/mode. The gateway refreshes discovery and still fails closed if the policy-allowed name is not present.
+
+Check:
+
+```bash
+cua-driver --version
+```
+
+This repository's CI compatibility target is Cua Driver 0.19.3. If you are on another version, compare its tool surface before changing the gateway policy.
+
+## HTTP 403: Host rejected
+
+The MCP endpoint validates the inbound `Host` authority to reduce DNS-rebinding risk.
+
+Local requests should use the normal loopback authority:
+
+```text
+127.0.0.1:8100
+localhost:8100
+```
+
+For a reverse proxy, either:
+
+- deliberately rewrite the origin `Host` to an allowed loopback authority; or
+- add the exact public authority to `CUMG_ALLOWED_HOSTS`.
+
+Example:
+
+```text
+CUMG_ALLOWED_HOSTS=computer.example.com
+```
+
+Include a port only when the forwarded Host actually contains it. Do not disable Host validation globally.
+
+## HTTP 403: Origin rejected
+
+Browser-originated MCP requests may contain `Origin`. The match is exact, including scheme and port.
+
+Example:
+
+```text
+CUMG_ALLOWED_ORIGINS=https://client.example.com
+```
+
+`https://client.example.com` and `http://client.example.com` are different origins. So are non-default ports.
+
+Non-browser MCP clients often do not send `Origin`; do not add wildcard origins simply to make an unrelated proxy error disappear.
+
+## Cloudflare returns a login page, 401, or 403 to an automated MCP client
+
+An interactive identity-provider login is not suitable for every headless/automated MCP client.
+
+For machine access, configure an authentication mechanism the client can actually present on every required request. One option is a Cloudflare Access Service Token with a matching **Service Auth** policy.
+
+Cloudflare's standard headers are:
+
+```text
+CF-Access-Client-Id
+CF-Access-Client-Secret
+```
+
+For Codex, [`CLIENTS.md`](CLIENTS.md) shows how to source those headers from environment variables instead of committing the secret to `config.toml`.
+
+Do not remove Access authentication to make an MCP client connect.
+
+## Cloudflare reaches the tunnel but the gateway rejects Host
+
+Prefer an intentional origin Host rewrite in the tunnel configuration:
+
+```yaml
+originRequest:
+  httpHostHeader: 127.0.0.1:8100
+```
+
+Cloudflare documents `httpHostHeader` as the Host header sent to the local service. Alternatively, keep the public Host and explicitly configure `CUMG_ALLOWED_HOSTS` to match it.
+
+See [`../examples/cloudflared.yml`](../examples/cloudflared.yml) and [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+## Tool call times out
+
+The default backend operation timeout is 60 seconds. You can raise it for a known slow operation:
+
+```text
+CUMG_TOOL_TIMEOUT_SECS=120
+```
+
+A timeout is ambiguous for a computer-use action: the click/type/app action may have partially happened before the response was lost. The gateway therefore does **not** automatically retry that call.
+
+Inspect the desktop state before manually retrying a state-changing operation.
+
+## Two clients interfere with each other
+
+All backend operations are serialized in V1 because the clients ultimately share one physical cursor/focus/application state. Serialization prevents operation interleaving but does not provide per-user desktop isolation.
+
+If two users require independent desktops, run independent machine/session environments or wait for a future multi-machine/session-isolation design; do not assume V1 provides tenant isolation.
+
+## Client still shows an old tool list
+
+The gateway dynamically refreshes backend discovery when listing tools, but some clients cache or snapshot the server tool surface.
+
+First reconnect/restart or refresh the MCP server in the client. For hosted ChatGPT apps, use the current product's tool refresh/rescan flow where available.
+
+Do not broaden the gateway allowlist just because a client UI is stale.
+
+## Need more gateway logs
+
+You can increase Rust tracing verbosity:
+
+### macOS / Linux
+
+```bash
+RUST_LOG=debug cargo run --locked -- --allow-tools list_apps
+```
+
+### Windows PowerShell
+
+```powershell
+$env:RUST_LOG = "debug"
+cargo run --locked -- --allow-tools "list_apps"
+```
+
+The gateway intentionally avoids logging raw MCP tool arguments/results, screenshots, clipboard values, or credentials. Still review logs before posting them publicly because hostnames, tool names, timing, and local environment details may be sensitive.
+
+## Still stuck
+
+Collect the minimum non-sensitive diagnostics:
+
+```text
+OS/version
+rustc --version
+cua-driver --version
+cua-driver doctor   (redact sensitive paths/identifiers if needed)
+healthz status
+exact gateway error category
+MCP client name/version
+local vs remote connection
+```
+
+Never attach real screenshots, credentials, Access tokens, private hostnames, or raw desktop contents to a public issue.

@@ -1,14 +1,21 @@
-# Example only. Keep the gateway bound to 127.0.0.1.
-# Protect the public hostname with Cloudflare Access.
+# Example for a locally-managed Cloudflare Tunnel.
 #
-# IMPORTANT: cloudflared normally forwards the public hostname in the Host
-# authority. Configure the gateway with:
+# Security order matters:
+#   1. Create/protect computer.example.com with a Cloudflare Access application.
+#   2. Then publish the tunnel route.
+#   3. Keep the gateway itself bound to 127.0.0.1.
+#
+# This example rewrites the Host sent to the local gateway so the gateway's
+# default loopback Host allowlist continues to work. If you remove the
+# httpHostHeader override, explicitly set:
 #   CUMG_ALLOWED_HOSTS=computer.example.com
-# If a browser-originated MCP client is expected, also allow its exact HTTPS
-# origin with CUMG_ALLOWED_ORIGINS. Do not disable Host/Origin validation.
 #
-# Replace all placeholders below. Never commit a real tunnel ID, credential
-# file path containing private information, Access token, or production host.
+# For defense in depth, Cloudflare can also make cloudflared validate the
+# Access JWT before proxying to the origin. Uncomment the `access` block and
+# replace TEAM_NAME / ACCESS_APPLICATION_AUD_TAG with your Access values.
+#
+# Never commit a real tunnel ID, credentials file, service-token secret,
+# private hostname, or personal filesystem path.
 
 tunnel: YOUR_TUNNEL_ID
 credentials-file: /path/to/YOUR_TUNNEL_ID.json
@@ -16,4 +23,12 @@ credentials-file: /path/to/YOUR_TUNNEL_ID.json
 ingress:
   - hostname: computer.example.com
     service: http://127.0.0.1:8100
+    originRequest:
+      httpHostHeader: 127.0.0.1:8100
+      # access:
+      #   required: true
+      #   teamName: TEAM_NAME
+      #   audTag:
+      #     - ACCESS_APPLICATION_AUD_TAG
+
   - service: http_status:404

@@ -90,9 +90,11 @@ The gateway is not an internet authentication service. Remote deployments keep t
 
 Tool exposure is deny-by-default. Cua's own policy engine can provide a second, argument-aware capability ceiling.
 
-## V2 boundary
+## V2 candidate boundary
 
-V2 splits the local gateway into Hub + Agent:
+V2 is **not** automatically "V1 plus multi-machine routing." The roadmap requires a competitor-gap PoC and an explicit GO/NO-GO decision before major V2 implementation.
+
+The candidate is a **secure delegated device capability control plane**:
 
 ```text
 MCP Client
@@ -101,12 +103,27 @@ MCP Client
    v
 Hub
    |
-   | typed RPC over WebSocket (initial candidate)
+   | authenticated, typed, backend-neutral command/grant protocol
    v
-Agent
+outbound Agent
    |
    +-- Cua MCP backend
    +-- future native backend
 ```
 
-The Hub-to-Agent protocol must be transport-neutral so WebSocket can later be replaced by QUIC/gRPC without changing command semantics.
+The differentiated control semantics are intended to center on:
+
+- cryptographic device identity and enrollment;
+- short-lived capability grants with expiry/revocation/replay rules;
+- explicit operation IDs and per-device lease ownership;
+- fail-closed cancellation/reconnect behavior;
+- policy-decision evidence without raw desktop-content logging;
+- a backend-neutral capability contract.
+
+Transport is an implementation choice, not the product boundary. WebSocket may be a candidate transport, but the command/grant schema must remain transport-neutral so a later QUIC/gRPC or other transport change does not redefine semantics.
+
+Cua remains an important backend, but Cua-specific tool names or wire behavior must not become the permanent Hub-to-Agent protocol.
+
+If the V2-M0 PoC cannot demonstrate a meaningful capability-control gap against existing computer-use/remote-device products, the roadmap says to stop rather than build another generic remote-device orchestrator.
+
+See [`ROADMAP.md`](ROADMAP.md) for the GO/NO-GO gate and explicit non-goals.
