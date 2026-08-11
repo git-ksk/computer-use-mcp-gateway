@@ -1,103 +1,90 @@
 # Security
 
-Computer-use is equivalent to granting remote keyboard, mouse, screen, clipboard, application, and potentially shell/filesystem capabilities. The gateway is therefore a security boundary, not merely a transport adapter.
+Computer-use grants a client access to sensitive desktop capabilities. Treat this gateway as a security boundary, not merely a transport adapter.
 
 ## V1 defaults
 
-- Listen only on `127.0.0.1` unless explicitly overridden.
-- Do not implement anonymous public internet exposure.
-- Require an authenticating TLS reverse proxy for remote access.
-- Keep Cua on stdio; do not expose its backend transport directly.
-- Validate inbound MCP `Host` authorities.
-- Validate browser `Origin` values when they are present.
-- Fail closed on gateway tool policy: an empty allowlist exposes no tools.
-- Require explicit `CUMG_ALLOW_TOOLS=*` to expose every discovered backend tool.
-- Apply deny rules before forwarding a call.
-- Serialize backend operations against the one physical desktop.
-- Bound backend connection and operation duration with timeouts.
-- Reconnect after transport failure with bounded exponential backoff.
-- Never replay a failed tool call automatically; its side effects may already have occurred.
-- Avoid logging raw tool arguments, results, screenshots, clipboard values, or credentials.
+- listen only on `127.0.0.1` unless a different bind is deliberately reviewed;
+- require authenticated TLS termination before remote access;
+- keep the backend on stdio instead of exposing it directly;
+- validate inbound MCP Host authorities and browser Origin values;
+- deny all tools when the gateway allowlist is empty;
+- require explicit `CUMG_ALLOW_TOOLS=*` to expose every discovered backend tool;
+- apply deny rules before forwarding a call;
+- serialize operations against the one physical desktop;
+- use bounded connection/tool timeouts and reconnect backoff;
+- propagate upstream cancellation to the actual downstream MCP request ID;
+- never automatically replay failed, timed-out, or cancelled tool calls;
+- avoid logging raw tool arguments, results, screenshots, clipboard values, or credentials.
 
-## Two policy layers
+## Policy layers
 
-The gateway performs a coarse capability check by MCP tool name. `CUMG_DENY_TOOLS` always overrides `CUMG_ALLOW_TOOLS`.
+Authorization remains exact-name based. `CUMG_DENY_TOOLS` overrides `CUMG_ALLOW_TOOLS`.
 
-Cua's own policy engine should be used as an optional second layer when argument-level constraints matter. [`../examples/cua-policy.yaml`](../examples/cua-policy.yaml) demonstrates a deny-by-default backend policy with a bounded `type_text` rule. Gateway policy may narrow Cua; it must never be used as a reason to widen Cua's OS permissions or backend policy.
+V1 also classifies tools as `observe`, `interact`, `system`, or `dangerous` for audit/review purposes. Unknown or newly discovered names are classified as `dangerous` until reviewed. Semantic classification does **not** grant access and does not widen the exact-name allowlist.
 
-A read-only tool is not necessarily low-sensitivity. Screenshots, accessibility trees, window titles, app lists, and clipboard reads can disclose private information even when they do not mutate the desktop. Treat `observe` capabilities as data-access permissions, not merely harmless diagnostics.
+Cua's own policy engine is an optional second layer when argument-level constraints matter. Start from [`../examples/cua-policy.yaml`](../examples/cua-policy.yaml) and review it for the target machine.
 
-Future semantic categories may provide a friendlier configuration surface:
+Read-only operations can still expose private desktop data. Treat screenshots, accessibility information, window/app metadata, and similar observation capabilities as sensitive data access.
 
-- `observe`: screenshot, accessibility snapshot, window/app listing
-- `interact`: click, type, scroll, drag, keyboard
-- `system`: clipboard, app launch, file interactions
-- `dangerous`: shell, destructive filesystem actions, credential-sensitive actions
+## Failure and cancellation semantics
 
-Until those categories exist, configure exact tool names and review backend upgrades that add new capabilities. Dynamic rediscovery still applies the gateway policy before a newly discovered tool can become visible.
+Read-only discovery may reconnect and retry after a transport failure. Computer-use actions are different because the desktop may already have partially applied an action.
+
+For an in-flight tool call, the gateway keeps the downstream MCP request ID. If the northbound request is cancelled, the gateway sends downstream `notifications/cancelled` for that same request ID and returns an error without replay. Tool timeout follows the same no-replay rule and attempts downstream cancellation before recovery for a later request.
+
+The deterministic CI fixture verifies that the downstream cancellation ID matches the in-flight backend request ID.
 
 ## Host and Origin validation
 
-`/mcp` uses rmcp's Streamable HTTP Host and Origin guards. The default accepted Host authorities are loopback-only. The default browser origins are derived from the configured loopback bind port.
+The MCP boundary uses Host and Origin guards. Default accepted authorities/origins are loopback-oriented. For a remote deployment, configure the exact expected public authority/origin or deliberately rewrite Host at the trusted proxy. Do not disable these guards just to make a proxy configuration work.
 
-For a reverse proxy, prefer preserving or rewriting the origin Host to an allowed loopback authority where practical. If the proxy forwards a public Host, add that exact authority to `CUMG_ALLOWED_HOSTS`. Add browser origins to `CUMG_ALLOWED_ORIGINS` only when they are actually needed. Do not solve a deployment mismatch by disabling Host or Origin validation globally.
+See [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
-`/healthz` is intentionally non-sensitive readiness metadata. Authentication still belongs at the reverse proxy for all remotely reachable routes.
+## Health metadata
 
-## Backend failure semantics
+`/healthz` reports readiness and may include operational metrics for the gateway-owned backend child process:
 
-Backend discovery may be retried after a connection failure because it is read-only. A failed computer-use action is different: timeout or transport failure can leave the desktop in an unknown state. The gateway therefore repairs the backend connection for a subsequent request but returns an error for the current request and does not replay it.
+- PID;
+- cumulative CPU seconds;
+- RSS bytes.
 
-All backend calls are serialized in V1. This favors correctness over throughput because independent clients otherwise share the same cursor, focus, windows, accessibility snapshot indices, and application state.
+This does not include raw desktop content, but remotely reachable health routes should still sit behind the same authenticated deployment boundary.
+
+On macOS, Cua may use its supported application/daemon lifecycle, so these metrics describe the direct child owned by the gateway rather than aggregate Cua process usage.
 
 ## Cloudflare deployment
 
-Recommended V1 topology:
+Recommended topology:
 
 ```text
-Internet
-  |
-Cloudflare Access
-  |
+remote MCP client
+    |
+authenticated TLS / Cloudflare Access
+    |
 Cloudflare Tunnel
-  |
+    |
 127.0.0.1:<gateway>
-  |
+    |
 Cua stdio
 ```
 
-Do not bind directly to `0.0.0.0` merely because Cloudflare Tunnel is present. Access authentication and TLS are upstream requirements; the V1 gateway does not implement public authentication itself.
-
-If Cloudflare forwards the public hostname in `Host`, set `CUMG_ALLOWED_HOSTS` to that exact hostname (and port if applicable). See [`DEPLOYMENT.md`](DEPLOYMENT.md) and [`../examples/cloudflared.yml`](../examples/cloudflared.yml).
+Keep the gateway on loopback. Do not commit real tunnel credentials, Access tokens, private hostnames, or `.env` files.
 
 ## Self-hosted desktop E2E
 
-A TCC-granted desktop runner is a high-trust machine. `.github/workflows/desktop-e2e.yml` is therefore deliberately manual-only, limited to `main`, and requires a dedicated `cua-desktop-e2e` runner label. It must never run for public pull requests or arbitrary fork code.
+A desktop runner with macOS Accessibility and Screen Recording grants is a high-trust machine. `.github/workflows/desktop-e2e.yml` is therefore manual-only, `main`-only, and targets the dedicated `cua-desktop-e2e` runner label.
 
-Use a dedicated test Mac rather than a daily-use workstation. The runner must already be logged into a GUI session and have CuaDriver's Accessibility and Screen Recording permissions configured before the workflow is enabled.
+Use a dedicated test Mac rather than a daily-use workstation, and never execute untrusted pull-request code on that runner. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the final operator-controlled acceptance procedure.
 
 ## CI supply chain
 
-Normal CI uses read-only repository permissions and locked Rust dependency resolution.
+Normal CI has read-only repository permissions and locked Rust dependency resolution. Before real-Cua smoke, CI verifies the pinned Cua installer, platform release payload, and installed executable identity so the installed binary must match the independently verified release payload.
 
-For the Cua compatibility target, CI verifies the chain before any real-Cua smoke test:
+The deterministic V1 quality fixture does not touch a desktop. It covers cancellation, 100-call soak behavior, short-window idle resource regression checks, backend process telemetry, and the selected applicable official MCP conformance scenarios.
 
-1. Pin a specific Cua Driver version.
-2. Download the versioned installer and verify its SHA-256.
-3. Download the platform-specific release payload and verify its pinned SHA-256 independently of the installer.
-4. Extract the expected `cua-driver` executable from that verified payload and record its SHA-256.
-5. Run the verified installer.
-6. Resolve the installed `cua-driver` from `PATH` and require its executable SHA-256 to match the executable extracted from the verified release payload.
-7. Only then build the gateway with `cargo build --locked` and run real-Cua protocol smoke tests.
+## Logs and reporting
 
-This protects CI from a mutable convenience installer and also detects an installer that would install bytes different from the independently verified release payload. It does not make a broader claim that the upstream release itself is trustworthy; the pinned hashes are the repository's reviewed compatibility inputs.
+Gateway audit logs record coarse metadata such as tool name, semantic class, policy decision, outcome, and duration. Keep raw arguments/results and credentials out of normal logs.
 
-## Secrets and logs
-
-Do not commit tunnel credentials, Access tokens, private hostnames, personal filesystem paths, screenshots, or desktop artifacts. `.env` and `.env.*` are ignored except for `.env.example`.
-
-Gateway audit logs intentionally record coarse metadata such as tool name, policy decision, outcome, and duration. Do not add raw arguments/results to normal logs. Failure logs from the backend should likewise avoid user content where possible.
-
-## Reporting vulnerabilities
-
-For security-sensitive findings, avoid posting credentials, screenshots, or exploit material containing private data in a public issue. Use GitHub's private vulnerability reporting feature when it is enabled for the repository; otherwise contact the maintainer through a private channel before publishing sensitive details.
+For security-sensitive reports, do not include credentials or unrelated private desktop data in public issues. Prefer GitHub private vulnerability reporting when available.
