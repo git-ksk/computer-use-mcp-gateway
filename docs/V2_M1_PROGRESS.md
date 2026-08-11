@@ -27,6 +27,8 @@ The repository tests prove the TLS wrapper negotiates TLS 1.3 with the dedicated
 
 The existing M0 live-Cua PoC continues to prove the semantic path from an authorized client principal through a short-lived grant and bounded Hub/Agent execution to the Cua adapter. M1 now also has an end-to-end integration test that composes the TLS channel with the application protocol in one outbound connection: TLS 1.3 + dedicated ALPN, Ed25519 Hub/Agent authentication, signed session acceptance, signed heartbeat/ack, one-device routing, bounded admission and lease ownership, short-lived grant validation on the Agent, and a signed typed result.
 
+A separate operator-controlled M1 backend run on 2026-08-11 connected the asynchronous `CuaMcpAdapter` to Cua Driver 0.19.3 through its MCP transport. `ListApplications` normalized to an application count of 77 and `ScreenGeometry` normalized to 1920×1080 points with scale factor 1.0; the PoC did not emit the raw application list. This proves the asynchronous semantic adapter against the real backend for observe operations, not real-Cua cancellation.
+
 ## Still required before V2-M1 acceptance
 
 - package the reusable lifecycle into an operator-facing long-lived Agent process/service and wire heartbeat-timeout detection to that service lifecycle; the lifecycle runner and two-session encrypted reconnect/generation test are implemented;
