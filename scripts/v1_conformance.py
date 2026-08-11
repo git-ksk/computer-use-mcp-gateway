@@ -57,7 +57,7 @@ def wait_ready(proc: subprocess.Popen[str], log_file: TextIO) -> None:
         try:
             with urllib.request.urlopen(HEALTH_URL, timeout=2) as response:
                 health = json.loads(response.read().decode("utf-8"))
-            if health == {"status": "ok", "backend": "ready"}:
+            if health.get("status") == "ok" and health.get("backend") == "ready":
                 return
         except Exception:
             pass
