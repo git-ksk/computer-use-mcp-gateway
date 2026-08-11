@@ -89,6 +89,24 @@ CUMG_ALLOWED_ORIGINS=https://client.example.com
 
 Non-browser MCP clients may omit `Origin`. Do not use wildcard origins for convenience.
 
+## HTTP overload and health-route hardening
+
+The gateway keeps a local defense-in-depth ceiling in front of the MCP HTTP route. `CUMG_MAX_HTTP_CONCURRENCY` defaults to `16`. Once all slots are in use, another MCP HTTP request fails immediately with HTTP `503` and `error: gateway_overloaded` instead of joining an unbounded waiter queue.
+
+This does **not** replace the existing backend operation serialization: one physical desktop is still protected by the backend `operation_lock`. The HTTP ceiling protects the northbound process boundary from request accumulation before those serialized operations execute.
+
+Keep reverse-proxy or Cloudflare rate limiting as an independent outer control. The local concurrency ceiling is not authentication and should not be described as a complete denial-of-service defense.
+
+`/healthz` returns only coarse readiness by default:
+
+```json
+{"status":"ok","backend":"ready"}
+```
+
+Set `CUMG_HEALTH_DETAILS=true` only when detailed local diagnostics are intentionally required. That opt-in adds backend process metadata such as PID, cumulative CPU seconds, and RSS. Remote deployments should normally leave it disabled.
+
+Authentication at the reverse proxy must cover the **entire public hostname**, including `/mcp`, `/healthz`, and any future auxiliary route. Do not create an unauthenticated path exception merely to make a remote health check convenient. A path-specific proxy policy that protects `/mcp` but exposes `/healthz` is not the documented deployment model.
+
 ## Cloudflare Access + Tunnel
 
 Cloudflare is one example deployment, not a required dependency. Current Cloudflare guidance recommends creating the **Access application before publishing the tunnel route**; otherwise the hostname can be publicly reachable without the intended Access policy.
@@ -111,7 +129,7 @@ In Cloudflare Zero Trust, create a self-hosted Access application for your inten
 computer.example.com
 ```
 
-Create a policy that matches the intended users or machine credentials. Do not publish the tunnel hostname first and plan to add Access later.
+Create a policy that matches the intended users or machine credentials. The application/policy must protect the hostname as a whole, including `/healthz`; do not scope authentication only to `/mcp`. Do not publish the tunnel hostname first and plan to add Access later.
 
 For automated MCP clients that cannot complete an interactive identity-provider login, a Cloudflare Access **Service Token** with a **Service Auth** policy is one option. See [`CLIENTS.md`](CLIENTS.md) for a Codex header example.
 
@@ -206,7 +224,7 @@ https://computer.example.com/mcp
 
 ### 8. Verify authentication, then MCP
 
-First verify that unauthenticated access is rejected by Access. Then connect using the intended identity/OAuth/service-token mechanism.
+First verify that unauthenticated access is rejected by Access for both `/mcp` and `/healthz`. Then connect using the intended identity/OAuth/service-token mechanism.
 
 For a Service Token, Cloudflare's standard request headers are:
 
@@ -222,9 +240,10 @@ Never put the secret in the repository. [`CLIENTS.md`](CLIENTS.md) shows an envi
 If you use something other than Cloudflare, preserve the same properties:
 
 - HTTPS/TLS for the remote connection;
-- authentication before requests reach the gateway;
+- authentication for the whole public hostname, including health/auxiliary routes, before requests reach the gateway;
 - an intentional Host forwarding/rewrite policy matching `CUMG_ALLOWED_HOSTS`;
 - exact Origin allowlisting when browser Origins are expected;
+- an explicit request-rate/concurrency policy appropriate to the deployment in addition to the gateway's local concurrency ceiling;
 - no direct route to the Cua stdio backend;
 - no accidental public exposure of other local services;
 - preferably an additional origin-side verification mechanism so a proxy-policy bypass does not silently become anonymous access.
