@@ -38,6 +38,75 @@ impl ReconnectPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDirective {
+    Reconnect,
+    Shutdown,
+}
+
+#[derive(Debug)]
+pub enum LifecycleError<E> {
+    Exhausted { attempts: u32, last_error: E },
+}
+
+pub fn run_outbound_lifecycle<C, E, Connect, RunSession, Sleep>(
+    policy: ReconnectPolicy,
+    mut connect: Connect,
+    mut run_session: RunSession,
+    mut sleep: Sleep,
+) -> Result<(), LifecycleError<E>>
+where
+    Connect: FnMut() -> Result<C, E>,
+    RunSession: FnMut(C) -> Result<SessionDirective, E>,
+    Sleep: FnMut(Duration),
+{
+    let policy = policy
+        .validate()
+        .expect("run_outbound_lifecycle requires a validated reconnect policy");
+    let mut consecutive_failures = 0_u32;
+
+    loop {
+        let connection = match connect() {
+            Ok(connection) => connection,
+            Err(error) => {
+                if consecutive_failures >= policy.max_attempts.saturating_sub(1) {
+                    return Err(LifecycleError::Exhausted {
+                        attempts: consecutive_failures.saturating_add(1),
+                        last_error: error,
+                    });
+                }
+                let delay = policy
+                    .delay_for_attempt(consecutive_failures)
+                    .expect("attempt remains below validated max_attempts");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                sleep(delay);
+                continue;
+            }
+        };
+
+        match run_session(connection) {
+            Ok(SessionDirective::Shutdown) => return Ok(()),
+            Ok(SessionDirective::Reconnect) => {
+                consecutive_failures = 0;
+                sleep(policy.initial_delay);
+            }
+            Err(error) => {
+                if consecutive_failures >= policy.max_attempts.saturating_sub(1) {
+                    return Err(LifecycleError::Exhausted {
+                        attempts: consecutive_failures.saturating_add(1),
+                        last_error: error,
+                    });
+                }
+                let delay = policy
+                    .delay_for_attempt(consecutive_failures)
+                    .expect("attempt remains below validated max_attempts");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                sleep(delay);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatTracker {
     device_id: String,
@@ -221,6 +290,76 @@ mod tests {
         assert_eq!(
             policy.delay_for_attempt(8),
             Err(M1Error::ReconnectExhausted)
+        );
+    }
+
+    #[test]
+    fn outbound_lifecycle_backs_off_failures_and_resets_after_a_good_session() {
+        let policy = ReconnectPolicy {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(80),
+            max_attempts: 4,
+        };
+        let mut connect_attempt = 0_u32;
+        let mut session_count = 0_u32;
+        let mut sleeps = Vec::new();
+        let result = run_outbound_lifecycle(
+            policy,
+            || {
+                connect_attempt += 1;
+                match connect_attempt {
+                    1 | 2 | 4 => Err("connect"),
+                    _ => Ok(connect_attempt),
+                }
+            },
+            |_| {
+                session_count += 1;
+                if session_count == 1 {
+                    Ok(SessionDirective::Reconnect)
+                } else {
+                    Ok(SessionDirective::Shutdown)
+                }
+            },
+            |delay| sleeps.push(delay),
+        );
+        assert!(result.is_ok());
+        assert_eq!(connect_attempt, 5);
+        assert_eq!(session_count, 2);
+        assert_eq!(
+            sleeps,
+            vec![
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn outbound_lifecycle_exhausts_after_bounded_consecutive_failures() {
+        let policy = ReconnectPolicy {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(40),
+            max_attempts: 3,
+        };
+        let mut sleeps = Vec::new();
+        let result = run_outbound_lifecycle(
+            policy,
+            || Err::<(), _>("offline"),
+            |_| Ok::<_, &str>(SessionDirective::Shutdown),
+            |delay| sleeps.push(delay),
+        );
+        assert!(matches!(
+            result,
+            Err(LifecycleError::Exhausted {
+                attempts: 3,
+                last_error: "offline"
+            })
+        ));
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_millis(10), Duration::from_millis(20)]
         );
     }
 

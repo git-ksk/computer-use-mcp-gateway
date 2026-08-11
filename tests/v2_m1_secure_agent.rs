@@ -16,7 +16,10 @@ use computer_use_mcp_gateway::{
         verify_agent_proof, verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_command,
         verify_remote_result, verify_session_accepted, write_frame,
     },
-    v2_m1::{HeartbeatTracker, SingleDeviceRouter},
+    v2_m1::{
+        HeartbeatTracker, ReconnectPolicy, SessionDirective, SingleDeviceRouter,
+        run_outbound_lifecycle,
+    },
     v2_m1_tls::{
         HUB_AGENT_ALPN, accept_hub_tls, client_config_with_pinned_root, connect_agent_tls,
         server_config_from_der,
@@ -26,6 +29,7 @@ use rcgen::{CertifiedKey, generate_simple_self_signed};
 use std::{
     net::{TcpListener, TcpStream},
     thread,
+    time::Duration,
 };
 
 const HUB_TIME_MS: u64 = 100_000;
@@ -297,5 +301,156 @@ fn outbound_tls_connection_composes_the_full_authenticated_single_device_path() 
     assert!(agent_evidence.grant_validated && agent_evidence.result_signed);
     assert_eq!(hub_evidence.heartbeat_sequence, 1);
     assert_eq!(hub_evidence.result_count, 3);
+    Ok(())
+}
+
+#[test]
+fn encrypted_reconnect_advances_generation_and_rejects_the_stale_session() -> Result<()> {
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let certificate_der = cert.der().to_vec();
+    let server_tls =
+        server_config_from_der(vec![certificate_der.clone()], signing_key.serialize_der())?;
+    let agent_tls = client_config_with_pinned_root(certificate_der)?;
+
+    let identity = DeviceIdentity::generate();
+    let enrollment_challenge = DeviceRegistry::enrollment_challenge();
+    let proof = identity.enrollment_proof(&enrollment_challenge);
+    let mut registry = DeviceRegistry::default();
+    let device_id = registry.enroll(&identity.public_key(), &enrollment_challenge, &proof)?;
+    let hub_identity = HubIdentity::generate();
+    let trusted_hub = hub_identity.verifier();
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let expected_device_id = device_id.clone();
+    let hub = thread::spawn(move || -> Result<(Vec<u64>, bool)> {
+        let mut generations = Vec::new();
+        let mut router = SingleDeviceRouter::new(expected_device_id.clone())?;
+        for index in 0..2_u64 {
+            let (stream, _) = listener.accept()?;
+            let mut tls = accept_hub_tls(stream, server_tls.clone())?;
+            let hello = match read_frame::<_, AgentToHub>(&mut tls)? {
+                AgentToHub::Hello(hello) => hello,
+                other => bail!("expected hello, got {other:?}"),
+            };
+            let challenge = hub_identity.challenge(&hello)?;
+            write_frame(&mut tls, &HubToAgent::Challenge(challenge.clone()))?;
+            let proof = match read_frame::<_, AgentToHub>(&mut tls)? {
+                AgentToHub::Proof(proof) => proof,
+                other => bail!("expected proof, got {other:?}"),
+            };
+            verify_agent_proof(&registry, &hello, &challenge, &proof)?;
+            let session = registry.connect(&expected_device_id, hello.capabilities.clone())?;
+            router.connect(session.clone())?;
+            generations.push(session.generation);
+            let accepted = hub_identity.accept_session(
+                &hello,
+                &challenge,
+                session.generation,
+                session.capabilities.revision,
+                HUB_TIME_MS + index,
+            )?;
+            write_frame(&mut tls, &HubToAgent::Accepted(accepted))?;
+
+            let heartbeat = match read_frame::<_, AgentToHub>(&mut tls)? {
+                AgentToHub::Heartbeat(heartbeat) => heartbeat,
+                other => bail!("expected heartbeat, got {other:?}"),
+            };
+            verify_agent_heartbeat(&registry, &hello, &challenge, &heartbeat)?;
+            let mut tracker = HeartbeatTracker::new(
+                expected_device_id.clone(),
+                session.generation,
+                HUB_TIME_MS + index,
+                10_000,
+            )?;
+            tracker.observe(&heartbeat, HUB_TIME_MS + index + 1)?;
+            let ack = hub_identity.heartbeat_ack(
+                &hello,
+                &challenge,
+                &heartbeat,
+                HUB_TIME_MS + index + 1,
+            )?;
+            write_frame(&mut tls, &HubToAgent::HeartbeatAck(ack))?;
+        }
+
+        let stale = CommandEnvelope {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            device_id: expected_device_id,
+            device_generation: generations[0],
+            capability_revision: 7,
+            operation_id: "stale-after-reconnect".into(),
+            command: DeviceCommand::ListApplications,
+        };
+        let stale_rejected = matches!(
+            router.route(&stale),
+            Err(computer_use_mcp_gateway::v2_m1::M1Error::Control(
+                computer_use_mcp_gateway::v2_m0::ControlError::StaleDeviceGeneration { .. }
+            ))
+        );
+        Ok((generations, stale_rejected))
+    });
+
+    let mut established_sessions = 0_u32;
+    let lifecycle = run_outbound_lifecycle(
+        ReconnectPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(8),
+            max_attempts: 3,
+        },
+        || {
+            let tcp = TcpStream::connect(address).map_err(|error| error.to_string())?;
+            connect_agent_tls(tcp, "localhost", agent_tls.clone())
+                .map_err(|error| error.to_string())
+        },
+        |mut tls| {
+            let result = (|| -> Result<SessionDirective> {
+                let hello = computer_use_mcp_gateway::v2_m0_transport::AgentHello::new(
+                    device_id.clone(),
+                    capabilities(),
+                );
+                write_frame(&mut tls, &AgentToHub::Hello(hello.clone()))?;
+                let challenge = match read_frame::<_, HubToAgent>(&mut tls)? {
+                    HubToAgent::Challenge(challenge) => challenge,
+                    other => bail!("expected challenge, got {other:?}"),
+                };
+                verify_hub_challenge(&hello, &challenge, &trusted_hub)?;
+                let proof = build_agent_proof(&identity, &hello, &challenge)?;
+                write_frame(&mut tls, &AgentToHub::Proof(proof))?;
+                let accepted = match read_frame::<_, HubToAgent>(&mut tls)? {
+                    HubToAgent::Accepted(accepted) => accepted,
+                    other => bail!("expected acceptance, got {other:?}"),
+                };
+                verify_session_accepted(&hello, &challenge, &accepted, &trusted_hub)?;
+                let heartbeat = build_agent_heartbeat(
+                    &identity,
+                    &hello,
+                    &challenge,
+                    accepted.device_generation,
+                    1,
+                )?;
+                write_frame(&mut tls, &AgentToHub::Heartbeat(heartbeat))?;
+                let ack = match read_frame::<_, HubToAgent>(&mut tls)? {
+                    HubToAgent::HeartbeatAck(ack) => ack,
+                    other => bail!("expected heartbeat ack, got {other:?}"),
+                };
+                verify_hub_heartbeat_ack(&hello, &challenge, &ack, &trusted_hub)?;
+                established_sessions += 1;
+                Ok(if established_sessions == 1 {
+                    SessionDirective::Reconnect
+                } else {
+                    SessionDirective::Shutdown
+                })
+            })();
+            result.map_err(|error| format!("{error:#}"))
+        },
+        thread::sleep,
+    );
+    lifecycle.map_err(|error| anyhow!("reconnect lifecycle failed: {error:?}"))?;
+    let (generations, stale_rejected) = hub
+        .join()
+        .map_err(|_| anyhow!("Hub reconnect thread panicked"))??;
+    assert_eq!(established_sessions, 2);
+    assert_eq!(generations, vec![1, 2]);
+    assert!(stale_rejected);
     Ok(())
 }

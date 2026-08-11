@@ -10,6 +10,7 @@ The current `v2-m1-secure-agent` implementation adds these M1 building blocks wh
 - application-layer Ed25519 Hub/Agent authentication and signed session/command/result/cancellation messages remain above TLS rather than being replaced by transport identity;
 - signed Agent heartbeat and Hub acknowledgement messages bound to the authenticated connection transcript;
 - monotonically increasing heartbeat sequence enforcement, generation matching, timeout/offline detection, and bounded exponential reconnect policy;
+- a reusable outbound lifecycle runner that bounds consecutive connection/session failures, resets the failure streak after an established session, and reconnects without transferring prior session generation state;
 - one-device routing that rejects offline, wrong-device, stale-generation, stale-capability, and unsupported-capability commands;
 - restart snapshots for device registry, grant verifier/revocation/consumption state, Hub operation state, and Agent terminal-operation replay barriers;
 - append-only checkpoint files with bounded size, `create_new`, flush/fsync, symlink rejection, and restrictive Unix directory/file permission checks;
@@ -19,13 +20,13 @@ The persisted checkpoint intentionally contains **no private signing keys**. Hub
 
 ## Evidence currently covered by tests
 
-The repository tests prove the TLS wrapper negotiates TLS 1.3 with the dedicated ALPN and rejects an untrusted server certificate. Runtime tests also cover heartbeat replay/generation/timeout handling, capped reconnect backoff, one-device routing, consumed/revoked grant persistence, revoked device/generation persistence, and crash/restart operation replay barriers.
+The repository tests prove the TLS wrapper negotiates TLS 1.3 with the dedicated ALPN and rejects an untrusted server certificate. Runtime tests also cover heartbeat replay/generation/timeout handling, capped reconnect backoff, one-device routing, consumed/revoked grant persistence, revoked device/generation persistence, and crash/restart operation replay barriers. A second encrypted integration test runs two outbound TLS sessions from the same Agent identity, proves the Hub advances device generation from 1 to 2, and confirms a command bound to generation 1 is rejected after generation 2 becomes current.
 
 The existing M0 live-Cua PoC continues to prove the semantic path from an authorized client principal through a short-lived grant and bounded Hub/Agent execution to the Cua adapter. M1 now also has an end-to-end integration test that composes the TLS channel with the application protocol in one outbound connection: TLS 1.3 + dedicated ALPN, Ed25519 Hub/Agent authentication, signed session acceptance, signed heartbeat/ack, one-device routing, bounded admission and lease ownership, short-lived grant validation on the Agent, and a signed typed result.
 
 ## Still required before V2-M1 acceptance
 
-- package an actual long-lived outbound Agent connection loop using bounded reconnect and heartbeat timeout behavior, and prove reconnect across multiple encrypted sessions;
+- package the reusable lifecycle into an operator-facing long-lived Agent process/service and wire heartbeat-timeout detection to that service lifecycle; the lifecycle runner and two-session encrypted reconnect/generation test are implemented;
 - define production certificate/private-key provisioning and rotation without committing secrets to repository state;
 - integrate a real northbound authenticated identity source with `AuthenticatedClientPrincipal` rather than constructing the principal inside a PoC;
 - prove live cancellation against backend operations, including the explicit fail-closed behavior for operations that cannot be interrupted safely;
