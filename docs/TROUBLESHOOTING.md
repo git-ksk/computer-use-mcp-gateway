@@ -57,6 +57,14 @@ cua-driver permissions grant
 
 Enable both **Accessibility** and **Screen & System Audio Recording** for CuaDriver in System Settings. If a grant changed, fully relaunch CuaDriver and check again.
 
+If `CuaDriver.app` is missing specifically from **System Settings → Privacy & Security → Screen & System Audio Recording**, click `+`, select `/Applications/CuaDriver.app`, enable it, relaunch CuaDriver if necessary, and run:
+
+```bash
+cua-driver permissions status
+```
+
+Treat manual addition as a fallback only when macOS does not list CuaDriver automatically; it is not a routine installation step.
+
 Avoid replacing the supported application/TCC lifecycle with an arbitrary unsigned helper process.
 
 ## Linux: `libXi.so.6` is missing
