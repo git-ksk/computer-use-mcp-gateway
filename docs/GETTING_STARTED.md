@@ -143,6 +143,8 @@ cua-driver permissions status
 
 Grant **Accessibility** and **Screen & System Audio Recording** to CuaDriver in System Settings when macOS opens the relevant panes. A changed TCC grant may require CuaDriver to relaunch before it becomes effective.
 
+If `CuaDriver.app` does **not** appear automatically under **System Settings → Privacy & Security → Screen & System Audio Recording**, use this fallback only for that case: click `+`, select `/Applications/CuaDriver.app`, enable it, relaunch CuaDriver if necessary, then verify again with `cua-driver permissions status`. Manual addition is not required when macOS already lists CuaDriver normally.
+
 ### Windows
 
 Requirements: Windows 10/11 or Windows Server with an interactive desktop session and PowerShell.
