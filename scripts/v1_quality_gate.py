@@ -8,8 +8,9 @@ touching a desktop.
 
 Resource measurement is intentionally Linux-only. The idle regression gate
 measures the gateway PID, while `/healthz` independently reports the owned
-backend child process CPU time and RSS. Thresholds are generous regression
-guards rather than marketing performance claims.
+backend child process CPU time and RSS after this diagnostic fixture explicitly
+opts into detailed health metadata. Thresholds are generous regression guards
+rather than marketing performance claims.
 """
 
 from __future__ import annotations
@@ -162,6 +163,7 @@ def start_gateway() -> tuple[subprocess.Popen[str], TextIO]:
             "CUMG_CONNECT_TIMEOUT_SECS": "5",
             "CUMG_TOOL_TIMEOUT_SECS": "10",
             "CUMG_RECONNECT_ATTEMPTS": "1",
+            "CUMG_HEALTH_DETAILS": "true",
             "RUST_LOG": "warn",
         }
     )
