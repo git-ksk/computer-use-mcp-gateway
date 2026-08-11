@@ -2,6 +2,29 @@
 
 Status: **in progress**. V2-M0 is GO; V2-M1 is not yet accepted or production-ready.
 
+## Shell-first Agent direction
+
+The M1 Agent is now explicitly planned as a self-owned remote execution agent, not merely a secure transport wrapper around Cua. The next implementation priority is **direct process/shell execution inside the Agent**. This lets common developer workflows such as `git`, `cargo`, `npm`, `xcodebuild`, and `fastlane` run without opening Terminal, synthesizing GUI input, or scraping terminal output through a computer-use backend.
+
+The intended capability layering is:
+
+```text
+Hub
+  |
+  v
+self-owned Agent
+  +-- direct process executor      <- next priority
+  +-- explicit shell executor      <- separate, higher-risk capability
+  +-- bounded filesystem surface   <- follows shell/process needs
+  +-- GUI/computer-use adapter
+       +-- Cua                     <- transition/default GUI backend
+       +-- future native backends  <- later
+```
+
+Structured process execution should be the safe default: an explicit executable, argument vector, working directory, bounded environment, output limits, timeout, and cancellation semantics. Free-form shell syntax/pipelines should be a distinct higher-risk capability rather than silently treating every process request as `sh -c`. Filesystem access should likewise be explicit and policy-bounded.
+
+This ordering changes implementation priority, not the trust model. Existing TLS, identity, grants, leases, replay protection, admission control, cancellation state, and audit rules remain the security boundary for shell/process capabilities. GUI support is not removed: Cua remains available behind the adapter contract while the Agent gains direct shell utility first.
+
 ## Implemented foundation
 
 The current `v2-m1-secure-agent` implementation adds these M1 building blocks while preserving the M0 application-layer identity and capability controls:
@@ -31,6 +54,8 @@ A separate operator-controlled M1 backend run on 2026-08-11 connected the asynch
 
 ## Still required before V2-M1 acceptance
 
+- implement the first-class direct process executor (`program`/`argv`/`cwd`) with bounded stdout/stderr, environment policy, timeout/cancellation, operation-state integration, and no dependency on a terminal GUI or Cua;
+- define the separate higher-risk shell-command capability and the minimum bounded filesystem surface needed for practical repository/build workflows;
 - package the reusable lifecycle into an operator-facing long-lived Agent process/service and wire heartbeat-timeout detection to that service lifecycle; the lifecycle runner and two-session encrypted reconnect/generation test are implemented;
 - integrate the file-based key boundary with the operator-facing Agent/Hub services and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;
 - integrate a real northbound authenticated identity source with `AuthenticatedClientPrincipal` rather than constructing the principal inside a PoC;

@@ -149,8 +149,11 @@ Hub
    v
 outbound Agent
    |
-   +-- Cua MCP backend
-   +-- future native backend
+   +-- direct process/shell executor
+   +-- bounded filesystem capabilities
+   +-- GUI/computer-use adapter
+        +-- Cua MCP backend
+        +-- future native GUI backend
 ```
 
 The differentiated control semantics are intended to center on:
@@ -164,7 +167,9 @@ The differentiated control semantics are intended to center on:
 
 Transport is an implementation choice, not the product boundary. WebSocket may be a candidate transport, but the command/grant schema must remain transport-neutral so a later QUIC/gRPC or other transport change does not redefine semantics.
 
-Cua remains an important backend, but Cua-specific tool names or wire behavior must not become the permanent Hub-to-Agent protocol.
+Cua remains an important GUI/computer-use backend, but Cua-specific tool names or wire behavior must not become the permanent Hub-to-Agent protocol. Direct process/shell execution is owned by the Agent itself and must not be implemented by automating a terminal window through Cua. Structured argv execution is the preferred default; free-form shell execution and filesystem mutation are separate, higher-risk capability surfaces with explicit policy.
+
+The implementation order is intentionally shell-first: establish the secure Agent core, add direct process/shell execution, add only the bounded filesystem operations required by those workflows, retain Cua for GUI/computer-use during the transition, then add native GUI backends later. This keeps GUI backend replacement independent from the Agent's usefulness for development and operations tasks.
 
 If the V2-M0 PoC cannot demonstrate a meaningful capability-control gap against existing computer-use/remote-device products, the roadmap says to stop rather than build another generic remote-device orchestrator.
 

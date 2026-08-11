@@ -150,6 +150,8 @@ Only after V2-M0 GO:
 
 > **M1 implementation note (2026-08-11):** the foundation includes TLS 1.3 with pinned trust + dedicated ALPN, signed heartbeat messages, bounded reconnect policy, one-device routing, restart-safe public trust/replay checkpoints, and an end-to-end outbound TLS integration covering Ed25519 authentication → heartbeat → routing/admission/lease → short-lived grant → signed typed result. M1 acceptance is still open: long-lived reconnect lifecycle, live backend cancellation, real northbound auth integration, and private-key provisioning remain. See [`V2_M1_PROGRESS.md`](V2_M1_PROGRESS.md).
 
+> **Shell-first product direction (2026-08-11):** the self-owned Agent is not intended to remain only a secure wrapper around Cua. Direct process/shell execution is a first-class Agent capability and is the next implementation priority. Shell/process operations must execute locally in the Agent without driving a terminal GUI or routing through Cua. GUI/computer-use remains available through the Cua adapter during the transition and can later gain native platform adapters. The preferred delivery order is **Agent core → direct process/shell → bounded filesystem capabilities → GUI via Cua → native GUI backends**.
+
 - [x] outbound Agent connection over the accepted encrypted M1 channel
 - [x] reusable outbound lifecycle and encrypted multi-session reconnect acceptance
 - [ ] operator-facing long-lived Agent process/service lifecycle
@@ -162,10 +164,14 @@ Only after V2-M0 GO:
 - [x] bounded per-device queueing/load shedding before work reaches the Agent
 - [x] short-lived capability-grant validation
 - [x] fail-closed stale/offline-agent and stale-capability behavior
+- [ ] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
+- [ ] explicit higher-risk shell-command capability for shell syntax/pipelines; keep it distinct from structured argv execution
+- [ ] bounded filesystem capability surface required by shell workflows, with path/policy controls rather than unrestricted implicit filesystem authority
 - [ ] clean live cancellation/disconnect semantics across the backend boundary
   - [x] exact downstream cancellation propagation + indeterminate device quarantine in deterministic MCP acceptance
   - [ ] real-Cua desktop cancellation acceptance
 - [x] Cua adapter behind the backend capability contract with adapter conformance coverage
+- [ ] keep GUI/computer-use behind a pluggable adapter boundary: Cua remains the initial GUI backend; native GUI backends are a later step and must not block shell-first M1 utility
 
 ### V2-M2: multi-machine Hub
 
