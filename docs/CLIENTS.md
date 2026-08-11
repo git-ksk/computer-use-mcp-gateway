@@ -85,16 +85,13 @@ $env:CF_ACCESS_CLIENT_ID = "your-client-id"
 $env:CF_ACCESS_CLIENT_SECRET = "your-client-secret"
 ```
 
-Then configure Codex to obtain the HTTP header values from those environment variables:
+Then configure Codex to obtain the HTTP header values from those environment variables. Keep the TOML inline table on one line so the snippet is valid when copied directly:
 
 ```toml
 [mcp_servers.computer_use_gateway]
 url = "https://computer.example.com/mcp"
 default_tools_approval_mode = "prompt"
-env_http_headers = {
-  "CF-Access-Client-Id" = "CF_ACCESS_CLIENT_ID",
-  "CF-Access-Client-Secret" = "CF_ACCESS_CLIENT_SECRET"
-}
+env_http_headers = { "CF-Access-Client-Id" = "CF_ACCESS_CLIENT_ID", "CF-Access-Client-Secret" = "CF_ACCESS_CLIENT_SECRET" }
 ```
 
 The Cloudflare Access application must have a policy that accepts the service token. Treat the Client Secret as a credential: do not commit it, paste it into issues, or put it into normal gateway logs.
