@@ -9,13 +9,68 @@ This guide takes a new user from a clean machine to a locally reachable `compute
 - an interactive desktop session
 - Cua Driver
 
-This pre-alpha repository is currently distributed from source, so Rust is part of the user setup rather than only a contributor dependency.
+This pre-alpha repository is currently distributed from source, so Git, Rust, and the platform's normal native build tools are part of the user setup rather than only contributor dependencies.
 
 The repository currently tests against **Cua Driver 0.19.3** in CI. Newer Cua releases may work, but 0.19.3 is the reproducible compatibility target until the repository pins and tests another version.
 
 The gateway is localhost-first and deny-by-default. The examples below expose only a small non-mutating inspection surface. Inspection can still reveal sensitive window titles, application names, screen dimensions, or accessibility text, so review the allowlist before using it on a personal desktop.
 
-## 1. Install Rust 1.88+
+## 1. Install Git and native build prerequisites
+
+Official Git platform installers are listed at:
+
+```text
+https://git-scm.com/install/
+```
+
+### macOS
+
+Apple's Command Line Tools provide Git and the native linker/toolchain needed by Rust builds:
+
+```bash
+xcode-select --install
+```
+
+After installation:
+
+```bash
+git --version
+```
+
+### Windows
+
+Install Git for Windows. One official Git page option is `winget`:
+
+```powershell
+winget install --id Git.Git -e --source winget
+```
+
+Open a new PowerShell window and verify:
+
+```powershell
+git --version
+```
+
+The Rust step below also needs the Microsoft C++ build/linker prerequisites. `rustup-init` can offer to install them; alternatively install Visual Studio Build Tools with **Desktop development with C++**.
+
+### Linux
+
+Use your distribution's package manager. On Debian/Ubuntu-like systems, this also installs the basic native build toolchain and `curl` used by the setup commands below:
+
+```bash
+sudo apt update
+sudo apt install git curl build-essential
+```
+
+Then verify:
+
+```bash
+git --version
+```
+
+For Fedora, Arch, openSUSE, and other distributions, use the Git package listed by your distribution or the official Git install page above.
+
+## 2. Install Rust 1.88+
 
 Rust's official installer is `rustup`:
 
@@ -44,22 +99,9 @@ The reported Rust version must be 1.88 or newer. If you already use rustup but y
 rustup update stable
 ```
 
-On macOS, if the linker/developer tools are missing, install Apple's command-line developer tools:
-
-```bash
-xcode-select --install
-```
-
-On Debian/Ubuntu-like Linux systems, install the normal native build toolchain if your machine does not already have a linker/compiler:
-
-```bash
-sudo apt update
-sudo apt install build-essential
-```
-
 ### Windows
 
-Use the Windows `rustup-init` installer from the official Rust install page above. Rust's default Windows MSVC toolchain needs the Microsoft C++ linker/libraries; the installer may offer to install the prerequisites, or you can install Visual Studio Build Tools with **Desktop development with C++**.
+Use the Windows `rustup-init` installer from the official Rust install page above. Rust's default Windows MSVC toolchain needs the Microsoft C++ linker/libraries; accept the prerequisite installation when offered or install Visual Studio Build Tools with **Desktop development with C++**.
 
 Open a new PowerShell window after installation and verify:
 
@@ -74,7 +116,7 @@ The reported Rust version must be 1.88 or newer. If an existing rustup installat
 rustup update stable
 ```
 
-## 2. Install Cua Driver 0.19.3
+## 3. Install Cua Driver 0.19.3
 
 ### macOS
 
@@ -147,7 +189,7 @@ Cua Driver documents product telemetry as enabled by default. Disable it if that
 cua-driver telemetry disable
 ```
 
-## 3. Verify Cua before adding the gateway
+## 4. Verify Cua before adding the gateway
 
 Confirm that the backend can answer a harmless read operation:
 
@@ -157,7 +199,7 @@ cua-driver call list_apps
 
 If this fails, fix the Cua installation/permissions first. The gateway cannot repair missing OS permissions or an unusable desktop session.
 
-## 4. Clone and build the gateway
+## 5. Clone and build the gateway
 
 ```bash
 git clone https://github.com/git-ksk/computer-use-mcp-gateway.git
@@ -167,7 +209,7 @@ cargo build --locked
 
 `Cargo.lock` is committed and normal builds use `--locked` so the dependency graph is reproducible.
 
-## 5. Start the gateway locally
+## 6. Start the gateway locally
 
 The shortest cross-platform path is to pass the initial allowlist as a CLI option instead of loading a shell-specific `.env` file.
 
@@ -197,7 +239,7 @@ For persistent configuration, copy `.env.example` and set environment variables 
 cargo run --locked -- --help
 ```
 
-## 6. Check local readiness
+## 7. Check local readiness
 
 ### macOS / Linux
 
@@ -219,7 +261,7 @@ A ready gateway returns the equivalent of:
 
 A successful `/healthz` response means the gateway considers the backend connection ready. It does not prove that every desktop permission and every Cua tool is usable.
 
-## 7. Connect an MCP client
+## 8. Connect an MCP client
 
 Use MCP **Streamable HTTP** and point the client at:
 
@@ -229,7 +271,7 @@ http://127.0.0.1:8100/mcp
 
 For Codex CLI, the Codex IDE extension, and ChatGPT desktop's MCP-server settings, see [`CLIENTS.md`](CLIENTS.md). ChatGPT web cannot use this localhost URL directly; remote access requires an authenticated HTTPS endpoint or another product-supported secure tunnel mechanism.
 
-## 8. Add capabilities deliberately
+## 9. Add capabilities deliberately
 
 The gateway exposes no tools when `CUMG_ALLOW_TOOLS` is empty. Add only the tools your workflow needs. For example, a local test that needs interaction might explicitly include selected input tools rather than opening the entire backend surface.
 
@@ -237,7 +279,7 @@ The gateway exposes no tools when `CUMG_ALLOW_TOOLS` is empty. Add only the tool
 
 For argument-level restrictions, use Cua's native policy engine as a second layer. Start from [`../examples/cua-policy.yaml`](../examples/cua-policy.yaml) and configure `CUA_DRIVER_POLICY_FILE` after reviewing it for your machine.
 
-## 9. Make it remote only after local success
+## 10. Make it remote only after local success
 
 Once all of these are true:
 
