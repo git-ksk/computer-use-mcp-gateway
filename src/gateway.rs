@@ -1,6 +1,6 @@
 use crate::{
     backend::ComputerUseBackend,
-    policy::{PolicyDecision, ToolPolicy},
+    policy::{PolicyDecision, ToolClass, ToolPolicy},
 };
 use anyhow::{Context, Result};
 use rmcp::{
@@ -15,6 +15,7 @@ use std::{
     sync::{Arc, RwLock},
     time::Instant,
 };
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -53,6 +54,19 @@ impl Gateway {
             .filter(|tool| self.policy.evaluate(tool.name.as_ref()) == PolicyDecision::Allow)
             .collect();
 
+        let mut observe = 0usize;
+        let mut interact = 0usize;
+        let mut system = 0usize;
+        let mut dangerous = 0usize;
+        for tool in &tools {
+            match self.policy.classify(tool.name.as_ref()) {
+                ToolClass::Observe => observe += 1,
+                ToolClass::Interact => interact += 1,
+                ToolClass::System => system += 1,
+                ToolClass::Dangerous => dangerous += 1,
+            }
+        }
+
         {
             let mut cached = self
                 .tools
@@ -65,6 +79,10 @@ impl Gateway {
             event = "backend_tool_discovery",
             discovered_tools = total,
             exposed_tools = tools.len(),
+            observe_tools = observe,
+            interact_tools = interact,
+            system_tools = system,
+            dangerous_tools = dangerous,
             "backend MCP tool discovery complete"
         );
         Ok(tools)
@@ -135,15 +153,17 @@ impl ServerHandler for Gateway {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let started = Instant::now();
         let tool_name = request.name.to_string();
+        let tool_class = self.policy.classify(&tool_name).as_str();
 
         if self.policy.evaluate(&tool_name) == PolicyDecision::Deny {
             warn!(
                 event = "mcp_tool_call",
                 tool = %tool_name,
+                tool_class,
                 policy = "deny",
                 outcome = "blocked",
                 duration_ms = started.elapsed().as_millis() as u64,
@@ -161,6 +181,7 @@ impl ServerHandler for Gateway {
                 warn!(
                     event = "mcp_tool_call",
                     tool = %tool_name,
+                    tool_class,
                     policy = "allow",
                     outcome = "unavailable",
                     duration_ms = started.elapsed().as_millis() as u64,
@@ -170,11 +191,29 @@ impl ServerHandler for Gateway {
             }
         }
 
-        match self.backend.call_tool(&tool_name, request.arguments).await {
+        // rmcp cancels RequestContext::ct when the upstream client sends
+        // notifications/cancelled. Forward that signal into the backend call;
+        // CuaBackend then emits a cancellation notification with the actual
+        // downstream request ID instead of merely dropping the local future.
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let upstream_ct = context.ct.clone();
+        let cancellation_forwarder = tokio::spawn(async move {
+            upstream_ct.cancelled().await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let backend_result = self
+            .backend
+            .call_tool(&tool_name, request.arguments, cancel_rx)
+            .await;
+        cancellation_forwarder.abort();
+
+        match backend_result {
             Ok(result) => {
                 info!(
                     event = "mcp_tool_call",
                     tool = %tool_name,
+                    tool_class,
                     policy = "allow",
                     outcome = if result.is_error.unwrap_or(false) { "tool_error" } else { "success" },
                     duration_ms = started.elapsed().as_millis() as u64,
@@ -182,10 +221,26 @@ impl ServerHandler for Gateway {
                 );
                 Ok(result.into())
             }
+            Err(_) if context.ct.is_cancelled() => {
+                warn!(
+                    event = "mcp_tool_call",
+                    tool = %tool_name,
+                    tool_class,
+                    policy = "allow",
+                    outcome = "cancelled",
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "tool call cancelled; downstream cancellation was propagated"
+                );
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "The computer-use tool call was cancelled. Cancellation was propagated to the backend and the call was not replayed."
+                )])
+                .into())
+            }
             Err(_) => {
                 warn!(
                     event = "mcp_tool_call",
                     tool = %tool_name,
+                    tool_class,
                     policy = "allow",
                     outcome = "backend_error",
                     duration_ms = started.elapsed().as_millis() as u64,
