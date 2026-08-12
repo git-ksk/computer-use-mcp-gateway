@@ -30,9 +30,13 @@ pub enum ReferenceExecutionOutcome {
     /// Cancellation was observed before the deterministic commit boundary.
     ProvenNotStarted,
     /// Local work is proven terminated after the commit boundary.
-    ProvenCleanTermination { effect_committed: bool },
+    ProvenCleanTermination {
+        effect_committed: bool,
+    },
     /// The executor cannot prove a terminal outcome after commit.
-    Indeterminate { effect_may_have_happened: bool },
+    Indeterminate {
+        effect_may_have_happened: bool,
+    },
 }
 
 #[derive(Debug, Clone)]

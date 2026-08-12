@@ -92,7 +92,11 @@ impl fmt::Display for FixedMultiDeviceHubError {
                 write!(f, "duplicate fixed device id: {device_id}")
             }
             Self::DuplicateStateDirectory(path) => {
-                write!(f, "fixed devices must not share state directory: {}", path.display())
+                write!(
+                    f,
+                    "fixed devices must not share state directory: {}",
+                    path.display()
+                )
             }
             Self::Hub(error) => write!(f, "failed to construct fixed device Hub: {error}"),
         }

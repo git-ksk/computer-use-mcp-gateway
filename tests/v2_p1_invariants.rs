@@ -59,13 +59,7 @@ fn device_a_quarantine_does_not_block_device_b_and_restores_independently() {
     ledger.mark_dispatched("op-a", &alice(), 11, 2).unwrap();
     ledger.mark_dispatched("op-b", &bob(), 31, 2).unwrap();
     ledger
-        .mark_indeterminate(
-            "op-a",
-            &alice(),
-            11,
-            IndeterminateReason::ConnectionLost,
-            3,
-        )
+        .mark_indeterminate("op-a", &alice(), 11, IndeterminateReason::ConnectionLost, 3)
         .unwrap();
 
     assert!(matches!(
@@ -240,13 +234,7 @@ fn late_duplicate_or_cross_device_settlement_cannot_mutate_neighbor() {
     assert_eq!(ledger.state("op-b"), Some(HubOperationState::Dispatched));
 
     ledger
-        .mark_indeterminate(
-            "op-a",
-            &alice(),
-            17,
-            IndeterminateReason::ConnectionLost,
-            4,
-        )
+        .mark_indeterminate("op-a", &alice(), 17, IndeterminateReason::ConnectionLost, 4)
         .unwrap();
     assert_eq!(
         ledger.finalize(

@@ -145,14 +145,17 @@ async fn reference_backend_proven_not_started_is_terminal_without_quarantine() -
     assert_eq!(receipt.operation.operation_id, "op-shared");
     assert_eq!(receipt.owner, owner());
     assert_eq!(receipt.operation.device_generation, 9);
-    assert_eq!(receipt.evidence, ExecutionEvidence::ProvenProcessTermination);
+    assert_eq!(
+        receipt.evidence,
+        ExecutionEvidence::ProvenProcessTermination
+    );
     assert!(ledger.quarantine("desktop-a").is_none());
     Ok(())
 }
 
 #[tokio::test]
-async fn reference_backend_clean_termination_is_terminal_but_unproven_is_indeterminate() -> Result<()>
-{
+async fn reference_backend_clean_termination_is_terminal_but_unproven_is_indeterminate()
+-> Result<()> {
     for contract in [
         ReferenceCancellationContract::ProvenCleanTermination,
         ReferenceCancellationContract::UnprovenAfterCommit,
@@ -201,7 +204,8 @@ async fn reference_backend_clean_termination_is_terminal_but_unproven_is_indeter
 
 #[cfg(unix)]
 #[tokio::test]
-async fn cua_and_reference_unknown_outcomes_use_the_same_authoritative_core_semantics() -> Result<()> {
+async fn cua_and_reference_unknown_outcomes_use_the_same_authoritative_core_semantics() -> Result<()>
+{
     let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts/mock_cua_mcp_backend.py");
     let cua = CuaMcpAdapter::new(
@@ -271,7 +275,9 @@ async fn cua_and_reference_unknown_outcomes_use_the_same_authoritative_core_sema
         reference_ledger.state("op-shared")
     );
     assert_eq!(
-        cua_ledger.receipt("op-shared").map(|receipt| &receipt.owner),
+        cua_ledger
+            .receipt("op-shared")
+            .map(|receipt| &receipt.owner),
         reference_ledger
             .receipt("op-shared")
             .map(|receipt| &receipt.owner)

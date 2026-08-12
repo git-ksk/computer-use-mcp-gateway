@@ -1,6 +1,6 @@
 # V2 P0 execution-safety core
 
-Status: **P0 accepted on 2026-08-12; P1 follow-ups remain open.**
+Status: **P0 accepted on 2026-08-12; P1 fixed-set multi-device and materially different second-backend proofs are implemented, while the physical real-Cua P1 rerun remains open.**
 
 Canonical product boundary: [`V2_POSITIONING.md`](V2_POSITIONING.md). Primary tracker: [Issue #24](https://github.com/git-ksk/computer-use-mcp-gateway/issues/24).
 
@@ -258,10 +258,21 @@ The P0 implementation was reviewed against these failure classes:
 
 Do not mark the following complete as part of this P0 pass:
 
-- **P1 multi-device invariant proof.** The authoritative controller remains exercised through the existing single-device Hub runtime; independent Device A/Device B quarantine behavior still requires a later minimal multi-device proof before fleet work.
-- **P1 second materially different backend.** The deterministic Cua-shaped fixture proves the Cua adapter execution boundary and cancellation races, but it is not a second backend with a different evidence contract.
+- **P1 fixed-set multi-device invariant proof — completed.** `v2_multi_device::FixedMultiDeviceHub` composes an immutable explicitly provisioned set of ordinary `SingleDeviceHub` instances. Every device keeps its own P0 controller, checkpoint directory, queue, session generation, and gRPC service; there is no shared fleet registry, discovery plane, or cross-device scheduler. `tests/v2_p1_invariants.rs` and `tests/v2_p1_multi_device_e2e.rs` cover A ambiguous/B executing, A partition/B normal, Hub restart with A quarantined, isolated generation advance, competing principals, stale/late settlement, and no replay.
+- **P1 second materially different backend — completed.** `v2_reference_backend::DeterministicReferenceExecutor` is a process-like in-process executor rather than a Cua-shaped mock. It can prove pre-commit non-start or clean local termination, and deliberately returns `Indeterminate` when post-commit outcome cannot be proven. `tests/v2_p1_backend_portability.rs` routes both Cua ambiguity and the reference executor through the same authoritative operation controller.
+- **P1 physical real-Cua rerun — still open.** The existing real-Cua acceptance is main-only on the trusted TCC-granted macOS runner. P1 does not claim a fresh physical-desktop rerun until that lane is executed on the final code; deterministic Cua regression remains in normal CI.
 - **Remote recovery administration.** The semantic resolution API exists and is auditable, but a standalone remotely exposed operator UI/API with its own authentication/authorization has not been introduced; that must reuse an existing auth system rather than create a generic CUMG auth protocol.
 - **Provider-timeout reason precision.** An autonomous Cua timeout is conservatively surfaced to the Hub through connection-loss ambiguity, so the safety state is correct but the persisted reason may be `ConnectionLost` rather than a provider-specific timeout reason. Do not weaken quarantine merely to improve diagnostics.
 - **v4 checkpoint migration.** Automatic migration is intentionally absent because v4 cannot prove the new owner/quarantine fields.
 
 These residual items are not blockers to the P0 invariant implemented here; they remain explicit follow-up work in Issue #24 rather than being silently closed.
+
+## 13. P1 proof boundary
+
+P1 deliberately leaves the P0 authoritative state machine unchanged. The multi-device layer is composition only: an exact stable device ID selects one pre-provisioned `SingleDeviceHub`, and construction rejects shared checkpoint directories. A quarantined Device A therefore cannot transfer ownership, queue state, generation, resolution, or replay eligibility into Device B. There is no mutable enrollment or failover route that can silently substitute a different device.
+
+The second-backend proof is also adapter-only. A backend may produce an ordinary terminal outcome only when its contract supplies evidence equivalent to the existing P0 evidence classes. The deterministic reference executor can prove not-started or clean local termination; after its commit boundary, an unprovable cancellation is always classified as `Indeterminate`. Cua retains its conservative post-provider cancellation semantics. Neither backend owns or forks a second operation state machine.
+
+P1 security review also keeps the compromised-backend boundary explicit: an authenticated but compromised Agent/backend can still lie about claimed terminal evidence or act outside the protocol. CUMG prevents stale ownership, cross-device replay, and accidental ambiguity collapse among protocol-conforming components; it does not provide Byzantine attestation of arbitrary desktop effects.
+
+The fixed-set proof is intentionally not a fleet product. Shared-endpoint discovery, mutable device registration, generic failover routing, fleet UX, a new policy language, native GUI expansion, and a ROSClaw fork remain out of scope.

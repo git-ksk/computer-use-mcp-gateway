@@ -13,9 +13,7 @@ use computer_use_mcp_gateway::{
     v2_m1_grpc::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
     },
-    v2_m1_hub::{
-        HubCommandError, HubHandle, HubProvisionedMaterial, HubServiceConfig,
-    },
+    v2_m1_hub::{HubCommandError, HubHandle, HubProvisionedMaterial, HubServiceConfig},
     v2_m1_keys::AgentProvisionedMaterial,
     v2_multi_device::FixedMultiDeviceHub,
 };
@@ -169,11 +167,9 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     let cancel_marker = root.join("a-drag-cancels");
     let b_during_a_marker = root.join("b-during-a");
     let b_after_restart_marker = root.join("b-after-restart");
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts/mock_cua_mcp_backend.py");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/mock_cua_mcp_backend.py");
 
-    let CertifiedKey { cert, signing_key } =
-        generate_simple_self_signed(vec!["localhost".into()])?;
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_pem = cert.pem();
     let cert_der = cert.der().to_vec();
     let key_pem = signing_key.serialize_pem();
@@ -292,12 +288,7 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
         &grants_a,
         cert_der.clone(),
     );
-    let material_b = agent_material(
-        device_b_identity,
-        &hub_b_identity,
-        &grants_b,
-        cert_der,
-    );
+    let material_b = agent_material(device_b_identity, &hub_b_identity, &grants_b, cert_der);
 
     let mut agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
     let mut agent_b = AgentService::new(config_b, material_b)?;
@@ -344,9 +335,7 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
         .await?;
 
     assert!(matches!(
-        handle_a
-            .cancel_as(bob.clone(), ambiguous_a.clone())
-            .await,
+        handle_a.cancel_as(bob.clone(), ambiguous_a.clone()).await,
         Err(HubCommandError::Rejected)
     ));
     assert_eq!(
@@ -505,9 +494,10 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
             .await
     });
 
-    let a_generation_after_hub_restart = wait_new_generation(&handle_a, a_generation_after_reconnect)
-        .await
-        .context("Device A did not reconnect after Hub restart")?;
+    let a_generation_after_hub_restart =
+        wait_new_generation(&handle_a, a_generation_after_reconnect)
+            .await
+            .context("Device A did not reconnect after Hub restart")?;
     let b_generation_after_hub_restart = wait_new_generation(&handle_b, b_generation)
         .await
         .context("Device B did not reconnect after Hub restart")?;
@@ -560,7 +550,10 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
         .await?
         .wait()
         .await?;
-    assert!(matches!(reused_a.result, DeviceResult::ScreenGeometry { .. }));
+    assert!(matches!(
+        reused_a.result,
+        DeviceResult::ScreenGeometry { .. }
+    ));
     assert_ne!(reused_a.operation_id, ambiguous_a);
     assert_eq!(line_count(&drag_marker)?, 1);
     assert_eq!(line_count(&cancel_marker)?, 1);
