@@ -1,6 +1,6 @@
 name: V2 P1 Validation Fixup
 
-# Temporary validation-only workflow. Revision 4: separate partition proof from Agent-process restart.
+# Temporary validation-only workflow. Revision 5: separate partition proof from Agent-process restart.
 on:
   pull_request:
 
@@ -24,47 +24,37 @@ jobs:
           p = Path("tests/v2_p1_multi_device_e2e.rs")
           text = p.read_text()
 
-          stop_anchor = '''        Some((ambiguous_a.clone(), alice.clone(), a_generation))
-              );
-
-              // Crash the remaining Hub route'''
-          stop_new = '''        Some((ambiguous_a.clone(), alice.clone(), a_generation))
-              );
-
+          crash_marker = "\n    // Crash the remaining Hub route, then reconstruct the fixed set from the two\n"
+          stop_block = '''
               // The partition invariant is now proven. Stop this Agent process cleanly
               // before the Hub crash. The restart phase then proves recovery from the
               // same durable Agent checkpoint independently of tonic abort classification.
               let _ = a2_shutdown_tx.send(true);
               let _ = a_task.await;
+          '''
+          if "let _ = a2_shutdown_tx.send(true);" not in text:
+              if crash_marker not in text:
+                  raise SystemExit("partition crash marker missing")
+              text = text.replace(crash_marker, stop_block + crash_marker, 1)
 
-              // Crash the remaining Hub route'''
-          if stop_anchor in text:
-              text = text.replace(stop_anchor, stop_new, 1)
-          elif "let _ = a2_shutdown_tx.send(true);" not in text:
-              raise SystemExit("partition stop anchor missing")
-
-          reconnect_anchor = '''    let a_generation_after_hub_restart =
-              wait_new_generation(&handle_a, a_generation_after_reconnect)'''
-          reconnect_new = '''    // Recreate A from its durable Agent checkpoint after the Hub is back. The
+          generation_marker = "\n    let a_generation_after_hub_restart =\n"
+          restart_block = '''
+              // Recreate A from its durable Agent checkpoint after the Hub is back. The
               // earlier phase already proved isolated reconnect while B kept its generation.
               let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
               let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
               a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
+          '''
+          if "let (a3_shutdown_tx, a3_shutdown_rx)" not in text:
+              if generation_marker not in text:
+                  raise SystemExit("post-restart generation marker missing")
+              text = text.replace(generation_marker, restart_block + generation_marker, 1)
 
-              let a_generation_after_hub_restart =
-              wait_new_generation(&handle_a, a_generation_after_reconnect)'''
-          if reconnect_anchor in text:
-              text = text.replace(reconnect_anchor, reconnect_new, 1)
-          elif "let (a3_shutdown_tx, a3_shutdown_rx)" not in text:
-              raise SystemExit("post-restart reconnect anchor missing")
-
-          if "    a2_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;" in text:
-              text = text.replace(
-                  "    a2_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;",
-                  "    a3_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;",
-                  1,
-              )
-          elif "a3_shutdown_tx.send(true)?;" not in text:
+          old_cleanup = "    a2_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;"
+          new_cleanup = "    a3_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;"
+          if old_cleanup in text:
+              text = text.replace(old_cleanup, new_cleanup, 1)
+          elif new_cleanup not in text:
               raise SystemExit("cleanup sender anchor missing")
 
           p.write_text(text)
