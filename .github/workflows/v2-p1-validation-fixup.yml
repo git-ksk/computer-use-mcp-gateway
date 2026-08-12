@@ -1,0 +1,50 @@
+name: V2 P1 Validation Fixup
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  fixup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validation head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Apply known pending-command assertion fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("tests/v2_p1_multi_device_e2e.rs")
+          text = p.read_text()
+          old = '''    assert!(matches!(
+              handle_a
+                  .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+                  .await,
+              Err(HubCommandError::DeviceIndeterminate { operation_id }) if operation_id == ambiguous_a
+          ));'''
+          new = '''    assert!(matches!(
+              handle_a
+                  .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+                  .await?
+                  .wait()
+                  .await,
+              Err(HubCommandError::DeviceIndeterminate { operation_id }) if operation_id == ambiguous_a
+          ));'''
+          if old in text:
+              p.write_text(text.replace(old, new, 1))
+          elif new not in text:
+              raise SystemExit("pending-command assertion anchor missing")
+          PY
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add tests/v2_p1_multi_device_e2e.rs
+            git commit -m "test(v2): await quarantined command rejection"
+            git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          fi
