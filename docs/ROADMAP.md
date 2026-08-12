@@ -125,34 +125,36 @@ M2 is no longer “build a multi-machine Hub” as a feature milestone. The firs
 
 ### P0: authoritative operation state machine
 
-- [ ] define one reviewed operation-state model for dispatch, running, cancellation, terminal outcomes, and `indeterminate`;
-- [ ] define evidence required to prove non-execution or clean termination;
-- [ ] ensure timeout/cancel/disconnect/lost-result paths cannot collapse uncertainty into ordinary failure;
-- [ ] reject late/stale results after session/device/ownership generation changes;
-- [ ] prevent duplicate terminal finalization;
-- [ ] add invariant/property coverage for illegal transitions;
-- [ ] keep replay/tombstone state bounded without forgetting unresolved ambiguity.
+- [x] define one reviewed operation-state model for dispatch, running, cancellation, terminal outcomes, and `indeterminate`;
+- [x] define evidence required to prove non-execution or clean termination;
+- [x] ensure timeout/cancel/disconnect/lost-result paths cannot collapse uncertainty into ordinary failure;
+- [x] reject late/stale results after session/device/ownership generation changes;
+- [x] prevent duplicate terminal finalization;
+- [x] add invariant/property coverage for illegal transitions;
+- [x] keep replay/tombstone state bounded without forgetting unresolved ambiguity.
 
 ### P0: first-class quarantine and explicit resolution
 
-- [ ] persist quarantine independently of connection/session lifetime;
-- [ ] bind quarantine to the exact ambiguous operation and device generation;
-- [ ] expose an explicit, auditable resolution path;
-- [ ] record resolver principal, operation ID, decision, and relevant evidence metadata;
-- [ ] ensure resolution can never replay the old operation;
-- [ ] crash/restart test while quarantined;
-- [ ] crash/restart test during resolution;
-- [ ] deny normal work until the exact ambiguous state is resolved.
+- [x] persist quarantine independently of connection/session lifetime;
+- [x] bind quarantine to the exact ambiguous operation and device generation;
+- [x] expose an explicit, auditable resolution path;
+- [x] record resolver principal, operation ID, decision, and relevant evidence metadata;
+- [x] ensure resolution can never replay the old operation;
+- [x] crash/restart test while quarantined;
+- [x] crash/restart test during resolution;
+- [x] deny normal work until the exact ambiguous state is resolved.
 
 ### P0: ownership and fencing under failure
 
-- [ ] competing principals cannot steal or inherit in-flight ownership;
-- [ ] reconnect cannot silently transfer old ownership;
-- [ ] Hub restart preserves quarantine/ownership decisions;
-- [ ] Agent restart preserves enough state to reject replay/stale finalization;
-- [ ] stale Agent generations cannot finalize old operations;
-- [ ] duplicate/late cancellation acknowledgements cannot clear quarantine incorrectly;
-- [ ] network partition/reconnect races are covered around dispatch and result delivery.
+- [x] competing principals cannot steal or inherit in-flight ownership;
+- [x] reconnect cannot silently transfer old ownership;
+- [x] Hub restart preserves quarantine/ownership decisions;
+- [x] Agent restart preserves enough state to reject replay/stale finalization;
+- [x] stale Agent generations cannot finalize old operations;
+- [x] duplicate/late cancellation acknowledgements cannot clear quarantine incorrectly;
+- [x] network partition/reconnect races are covered around dispatch and result delivery.
+
+P0 execution-safety hardening is accepted on 2026-08-12. The detailed gap analysis, invariants, security review, and residual work are recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
 
 ## V2-M2 acceptance — multi-device invariant proof
 

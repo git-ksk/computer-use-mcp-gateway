@@ -43,6 +43,7 @@ tracing-opentelemetry = { version = "0.33.0", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1"
+proptest = "1"
 rcgen = "0.14"
 
 [build-dependencies]

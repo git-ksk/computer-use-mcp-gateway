@@ -8,6 +8,7 @@
 //! and short-lived exact capability grants.
 
 use crate::{
+    v2_execution_safety::OperationOwner,
     v2_m0::{
         DeviceCapability, DeviceCommand, DeviceResult, ProcessEnvVar, ProcessRequest, ShellRequest,
     },
@@ -703,12 +704,14 @@ impl V2NorthboundMcp {
 
     async fn execute_command(
         &self,
+        principal: &AuthenticatedClientPrincipal,
         command: DeviceCommand,
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
+        let owner = OperationOwner::from_principal(principal);
         let pending = self
             .hub
-            .start_command(command)
+            .start_command_as(owner.clone(), command)
             .await
             .map_err(hub_error_to_mcp)?;
         let operation_id = pending.operation_id.clone();
@@ -716,7 +719,7 @@ impl V2NorthboundMcp {
         tokio::select! {
             result = &mut wait => result.map(|result| result.result).map_err(hub_error_to_mcp),
             _ = context.ct.cancelled() => {
-                let _ = self.hub.cancel(operation_id).await;
+                let _ = self.hub.cancel_as(owner, operation_id).await;
                 Err(McpError::invalid_request("Tool call was cancelled", None))
             }
         }
@@ -801,7 +804,9 @@ impl ServerHandler for V2NorthboundMcp {
             _ => return Err(McpError::invalid_params("Unknown V2 Hub tool", None)),
         };
 
-        let result = self.execute_command(command, &context).await?;
+        let result = self
+            .execute_command(&auth.principal, command, &context)
+            .await?;
         let value = serde_json::to_string(&result)
             .map_err(|_| McpError::internal_error("Failed to serialize device result", None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(value)]).into())

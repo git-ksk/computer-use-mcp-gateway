@@ -81,6 +81,8 @@ The templates own supervision/config/log routing; they do not change principal, 
 
 The ignored/manual test `tests/v2_m1_cua_cancellation_e2e.rs` was run on the operator-controlled macOS desktop against the installed **Cua Driver 0.19.3** with Accessibility and Screen Recording permission available.
 
+Post-M1 P0 hardening extends the same acceptance test without weakening the historical M1 gate: the TextEdit fixture is now launched through the Agent-native shell path under an explicit operation owner, the real Cua action uses that same desktop execution boundary, quarantine is checked against a competing principal, and an explicit auditable resolution is required before Cua reuse. See [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
+
 The test runs the real M1 Hub and Agent over TLS-protected gRPC, performs a real Cua `ScreenGeometry`, then starts a 10-second no-displacement desktop drag and cancels it after 500 ms. Required evidence:
 
 1. Agent propagates MCP cancellation to the live downstream Cua request;

@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use computer_use_mcp_gateway::{
-    v2_m0::{DeviceCommand, DeviceIdentity, DeviceResult, GrantAuthority},
+    v2_execution_safety::{ExecutionEvidence, OperationOwner},
+    v2_m0::{DeviceCommand, DeviceIdentity, DeviceResult, GrantAuthority, ShellRequest},
+    v2_m0_execution::IndeterminateResolution,
     v2_m0_transport::{CancellationDisposition, HubIdentity},
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig, CuaAgentConfig},
@@ -13,7 +15,7 @@ use computer_use_mcp_gateway::{
     v2_m1_keys::AgentProvisionedMaterial,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
@@ -31,16 +33,6 @@ fn temp_dir(name: &str) -> PathBuf {
 
 fn prepare_textedit_fixture(path: &std::path::Path) -> Result<()> {
     std::fs::write(path, b"V2 real-Cua cancellation fixture\n")?;
-    let status = Command::new("open")
-        .args(["-a", "TextEdit"])
-        .arg(path)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("failed to launch TextEdit fixture"));
-    }
-    // Avoid Apple Events/osascript here: the acceptance target is Cua itself,
-    // and a dedicated logged-in runner keeps TextEdit as the foreground fixture.
-    std::thread::sleep(Duration::from_millis(800));
     Ok(())
 }
 
@@ -110,7 +102,7 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
             hub_endpoint: format!("https://localhost:{}", address.port()),
             hub_domain: "localhost".into(),
             device_id,
-            allowed_cwd_roots: vec![cwd],
+            allowed_cwd_roots: vec![cwd.clone()],
             state_dir: temp_dir("v2-real-cua-agent-state"),
             heartbeat_interval: Duration::from_millis(100),
             reconnect: ReconnectPolicy {
@@ -150,8 +142,37 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
     .await
     .context("real-Cua Agent did not connect")?;
 
+    let alice = OperationOwner::new("https://issuer.example", "alice")?;
+    let bob = OperationOwner::new("https://issuer.example", "bob")?;
+
+    // Launch the real desktop application through the native shell executor,
+    // not outside CUMG. The next GUI command therefore crosses the same Hub
+    // operation owner/fence boundary as this shell side effect.
+    let launch = handle
+        .start_command_as(
+            alice.clone(),
+            DeviceCommand::Shell {
+                request: ShellRequest {
+                    command: format!("/usr/bin/open -a TextEdit '{}'", fixture.to_string_lossy()),
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    env: vec![],
+                    timeout_ms: 10_000,
+                },
+            },
+        )
+        .await?
+        .wait()
+        .await?;
+    assert!(matches!(launch.result, DeviceResult::Shell { .. }));
+    assert_eq!(launch.receipt.owner, alice);
+    assert_eq!(
+        launch.receipt.evidence,
+        ExecutionEvidence::VerifiedAgentResult
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
     let geometry = handle
-        .start_command(DeviceCommand::ScreenGeometry)
+        .start_command_as(alice.clone(), DeviceCommand::ScreenGeometry)
         .await?
         .wait()
         .await?;
@@ -165,20 +186,25 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
     // a long press with no cursor displacement while still leaving a 10s window
     // in which downstream MCP cancellation can race a live desktop operation.
     let pending = handle
-        .start_command(DeviceCommand::PointerDrag {
-            from_x: 500,
-            from_y: 400,
-            to_x: 500,
-            to_y: 400,
-            duration_ms: 10_000,
-        })
+        .start_command_as(
+            alice.clone(),
+            DeviceCommand::PointerDrag {
+                from_x: 500,
+                from_y: 400,
+                to_x: 500,
+                to_y: 400,
+                duration_ms: 10_000,
+            },
+        )
         .await?;
     let operation_id = pending.operation_id.clone();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let disposition =
-        tokio::time::timeout(Duration::from_secs(5), handle.cancel(operation_id.clone()))
-            .await
-            .context("cancel timed out")??;
+    let disposition = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.cancel_as(alice.clone(), operation_id.clone()),
+    )
+    .await
+    .context("cancel timed out")??;
     assert_eq!(
         disposition,
         CancellationDisposition::IndeterminateAfterPropagation
@@ -191,8 +217,17 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
         Err(HubCommandError::DeviceIndeterminate { operation_id: ref blocked }) if blocked == &operation_id
     ));
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let blocked_pending = handle.start_command(DeviceCommand::ScreenGeometry).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let quarantine = handle
+        .desktop_quarantine()
+        .await
+        .ok_or_else(|| anyhow!("real-Cua desktop quarantine missing"))?;
+    assert_eq!(quarantine.operation_id, operation_id);
+    assert_eq!(quarantine.owner, alice);
+
+    let blocked_pending = handle
+        .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+        .await?;
     let blocked = tokio::time::timeout(Duration::from_secs(5), blocked_pending.wait())
         .await
         .context("quarantine check timed out")?;
@@ -200,6 +235,31 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
         blocked,
         Err(HubCommandError::DeviceIndeterminate { operation_id: ref blocked_id }) if blocked_id == &operation_id
     ));
+
+    let resolution = handle
+        .resolve_indeterminate(
+            &operation_id,
+            alice.clone(),
+            IndeterminateResolution::ConfirmedCompleted,
+            "real-Cua acceptance explicitly reconciled the TextEdit desktop state",
+        )
+        .await?;
+    assert_eq!(resolution.operation.operation_id, operation_id);
+    assert_eq!(resolution.evidence, ExecutionEvidence::OperatorResolution);
+    assert!(handle.desktop_quarantine().await.is_none());
+
+    let reused = handle
+        .start_command_as(bob, DeviceCommand::ScreenGeometry)
+        .await?
+        .wait()
+        .await?;
+    assert!(matches!(reused.result, DeviceResult::ScreenGeometry { .. }));
+
+    let audit = handle.resolution_records().await;
+    assert_eq!(
+        audit.last().map(|record| record.operation_id.as_str()),
+        Some(operation_id.as_str())
+    );
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), agent_task).await;

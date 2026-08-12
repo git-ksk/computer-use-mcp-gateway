@@ -139,7 +139,11 @@ Controls already proven in M0:
 - session acceptance, commands, cancellation, results, and cancellation acknowledgements are signed and connection-bound;
 - oversized frames are rejected before declared payload allocation;
 - a signed Hub time anchors grant-expiry evaluation to monotonic elapsed time on the Agent;
-- connection loss after dispatch becomes an indeterminate terminal Hub state and is never automatically replayed.
+- connection loss after dispatch becomes durable `Indeterminate` state plus exact-operation desktop quarantine and is never automatically replayed;
+- the authoritative Hub operation record additionally binds issuer/subject ownership and device generation, so a competing principal or stale Agent generation cannot settle the operation;
+- reconnect/liveness cannot clear quarantine; explicit resolution is persistence-gated and auditable.
+
+Post-M1 P0 execution-safety details and residual recovery assumptions are recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
 
 Current M1 evidence includes TLS-protected gRPC bidirectional streaming with pinned certificate trust/domain validation plus independent Ed25519 application authentication. The earlier raw-TLS transport remains a regression/reference implementation and is TLS 1.3-only with a dedicated ALPN. An operator-facing single-device `v2_hub` daemon now exists and is covered together with `v2_agent` by an end-to-end TLS/gRPC test. Residual deployment risk remains: public endpoint hardening, connection/TLS-handshake rate limits, real northbound authentication, and production certificate lifecycle are not yet complete, so this is not yet a production exposure claim.
 

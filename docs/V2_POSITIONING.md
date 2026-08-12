@@ -2,6 +2,8 @@
 
 Status: **accepted direction, narrowed after final competitor review (2026-08-12)**.
 
+Accepted P0 implementation/gap-analysis record: [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). The post-M1 core now has an explicit authoritative operation ledger, owner/generation fencing, durable desktop quarantine, evidence-bearing receipts, and explicit resolution; P1 multi-device and second-backend proofs remain separate work.
+
 This document defines the product boundary for V2 after V2-M1 acceptance and the final competitor review. The boundary is intentionally narrower than “secure remote computer use”, “vendor-neutral device control plane”, or “multi-machine MCP”.
 
 ## Positioning
@@ -279,7 +281,7 @@ Future implementation order is deliberately **core-first**.
 
 ### Priority 0 — reference-model gap analysis
 
-Before expanding or redesigning the state machine, perform a one-to-one comparison against ROSClaw's action/session/permit/lease/recovery/receipt model and Agent libOS's external-effect persistence/finalization model.
+**Completed for the P0 hardening pass; see [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).** The reviewed rule remains: before future state-machine changes, perform a one-to-one comparison against ROSClaw's action/session/permit/lease/recovery/receipt model and Agent libOS's external-effect persistence/finalization model.
 
 - identify semantics CUMG already matches;
 - adopt stronger proven semantics where they fit desktops;

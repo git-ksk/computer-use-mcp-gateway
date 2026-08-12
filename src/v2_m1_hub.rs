@@ -5,6 +5,10 @@
 //! state before risky transitions, and exposes a small in-process handle that a
 //! future authenticated northbound MCP layer can call without depending on gRPC.
 
+use crate::v2_execution_safety::{
+    AuthoritativeOperationController, DesktopQuarantine, ExecutionEvidence, ExecutionReceipt,
+    IndeterminateReason, OperationOwner, ResolutionRecord,
+};
 use crate::v2_m0::{
     CONTROL_SCHEMA_VERSION, CommandEnvelope, DeviceCommand, DeviceErrorCode, DeviceRegistry,
     DeviceResult, DirectoryEntry, GrantAuthority, ProcessOutput, ProcessRequest, ShellRequest,
@@ -12,7 +16,7 @@ use crate::v2_m0::{
 };
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision,
-    HubAdmissionController, HubOperationState, OperationRef,
+    HubOperationState, IndeterminateResolution, OperationRef,
 };
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubIdentity, HubToAgent,
@@ -88,7 +92,7 @@ impl HubServiceConfig {
 
 struct PersistentHubState {
     registry: DeviceRegistry,
-    admission: HubAdmissionController,
+    execution: AuthoritativeOperationController,
 }
 
 #[derive(Clone)]
@@ -123,18 +127,21 @@ pub struct HubHandle {
 pub struct HubCommandResult {
     pub operation_id: String,
     pub result: DeviceResult,
+    pub receipt: ExecutionReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubProcessResult {
     pub operation_id: String,
     pub output: ProcessOutput,
+    pub receipt: ExecutionReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubShellResult {
     pub operation_id: String,
     pub output: ProcessOutput,
+    pub receipt: ExecutionReceipt,
 }
 
 pub struct HubPendingCommand {
@@ -162,6 +169,7 @@ impl HubPendingProcess {
             DeviceResult::Process { output } => Ok(HubProcessResult {
                 operation_id: result.operation_id,
                 output,
+                receipt: result.receipt,
             }),
             DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
             _ => Err(HubCommandError::UnexpectedResult),
@@ -181,6 +189,7 @@ impl HubPendingShell {
             DeviceResult::Shell { output } => Ok(HubShellResult {
                 operation_id: result.operation_id,
                 output,
+                receipt: result.receipt,
             }),
             DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
             _ => Err(HubCommandError::UnexpectedResult),
@@ -192,16 +201,19 @@ impl HubPendingShell {
 enum HubRequest {
     Execute {
         operation_id: String,
+        owner: OperationOwner,
         command: DeviceCommand,
         reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
     },
     Cancel {
         operation_id: String,
+        owner: OperationOwner,
         reply: oneshot::Sender<Result<CancellationDisposition, HubCommandError>>,
     },
 }
 
 struct PendingOperation {
+    owner: OperationOwner,
     command: DeviceCommand,
     envelope: Option<CommandEnvelope>,
     reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
@@ -219,14 +231,14 @@ impl SingleDeviceHub {
         let mut identity_registry = DeviceRegistry::default();
         let provisioned_device_id =
             identity_registry.provision_trusted_device(material.device_verifier);
-        let (device_id, registry, admission) = match checkpoint.load_latest::<HubPersistentState>()
+        let (device_id, registry, execution) = match checkpoint.load_latest::<HubPersistentState>()
         {
             Ok(state) => {
                 if state.registry.devices.len() != 1 {
                     return Err(HubServiceError::CheckpointDeviceTrustMismatch);
                 }
                 let device_id = state.registry.devices[0].device_id.clone();
-                let (mut registry, admission) = state
+                let (mut registry, execution) = state
                     .restore(config.admission_limits())
                     .map_err(HubServiceError::Persistence)?;
                 if registry
@@ -251,12 +263,12 @@ impl SingleDeviceHub {
                         return Err(HubServiceError::CheckpointDeviceTrustMismatch);
                     }
                 }
-                (device_id, registry, admission)
+                (device_id, registry, execution)
             }
             Err(PersistenceError::NoCheckpoint) => (
                 provisioned_device_id,
                 identity_registry,
-                HubAdmissionController::new(config.admission_limits())
+                AuthoritativeOperationController::new(config.admission_limits())
                     .map_err(HubServiceError::Execution)?,
             ),
             Err(error) => return Err(HubServiceError::Persistence(error)),
@@ -275,7 +287,7 @@ impl SingleDeviceHub {
             checkpoint,
             persistent: Mutex::new(PersistentHubState {
                 registry,
-                admission,
+                execution,
             }),
             live: Mutex::new(None),
             session_slots,
@@ -329,7 +341,7 @@ impl SingleDeviceHub {
                 .registry
                 .connect(&self.inner.device_id, hello.capabilities.clone())?;
             persistent
-                .admission
+                .execution
                 .prune_terminal_before_generation(&self.inner.device_id, session.generation)?;
             // Generation advancement and safe replay-tombstone pruning must
             // survive a Hub crash before the Agent receives acceptance.
@@ -420,7 +432,7 @@ impl SingleDeviceHub {
                         return Ok(());
                     };
                     match request {
-                        HubRequest::Execute { operation_id, command, reply } => {
+                        HubRequest::Execute { operation_id, owner, command, reply } => {
                             if pending.contains_key(&operation_id) {
                                 let _ = reply.send(Err(HubCommandError::OperationReplay));
                                 continue;
@@ -432,7 +444,12 @@ impl SingleDeviceHub {
                             };
                             let decision = {
                                 let mut persistent = self.inner.persistent.lock().await;
-                                match persistent.admission.admit(operation) {
+                                match persistent.execution.prepare(
+                                    operation,
+                                    owner.clone(),
+                                    command.capability(),
+                                    unix_time_ms()?,
+                                ) {
                                     Ok(decision) => {
                                         persist_locked(&self.inner, &persistent)?;
                                         Ok(decision)
@@ -448,6 +465,7 @@ impl SingleDeviceHub {
                                 }
                             };
                             pending.insert(operation_id.clone(), PendingOperation {
+                                owner,
                                 command,
                                 envelope: None,
                                 reply,
@@ -468,10 +486,15 @@ impl SingleDeviceHub {
                                 AdmissionDecision::Queued { .. } => queue_order.push_back(operation_id),
                             }
                         }
-                        HubRequest::Cancel { operation_id, reply } => {
+                        HubRequest::Cancel { operation_id, owner, reply } => {
                             let decision = {
                                 let mut persistent = self.inner.persistent.lock().await;
-                                match persistent.admission.cancel(&operation_id) {
+                                match persistent.execution.request_cancel(
+                                    &operation_id,
+                                    &owner,
+                                    generation,
+                                    unix_time_ms()?,
+                                ) {
                                     Ok(decision) => {
                                         persist_locked(&self.inner, &persistent)?;
                                         Ok(decision)
@@ -569,6 +592,7 @@ impl SingleDeviceHub {
                                 &challenge,
                                 generation,
                                 &mut pending,
+                                &mut queue_order,
                                 &mut cancel_waiters,
                             ).await?;
                         }
@@ -626,7 +650,12 @@ impl SingleDeviceHub {
         // restore a command that may have executed as runnable.
         {
             let mut persistent = self.inner.persistent.lock().await;
-            persistent.admission.mark_dispatched(operation_id)?;
+            persistent.execution.mark_dispatched(
+                operation_id,
+                &operation.owner,
+                generation,
+                unix_time_ms()?,
+            )?;
             persist_locked(&self.inner, &persistent)?;
         }
         operation.envelope = Some(command);
@@ -659,19 +688,46 @@ impl SingleDeviceHub {
             .as_ref()
             .ok_or(HubServiceError::PendingOperationMissing)?;
         validate_command_result(command, &result.result)?;
+        let owner = operation.owner.clone();
         let device_result = result.result.result.clone();
-        let cancelled = matches!(
-            &device_result,
-            DeviceResult::Process { output } | DeviceResult::Shell { output } if output.cancelled
-        );
-        let next = {
+        let (terminal_state, evidence) = match &device_result {
+            DeviceResult::Error { .. } => (
+                HubOperationState::Failed,
+                ExecutionEvidence::VerifiedRemoteError,
+            ),
+            DeviceResult::Process { output } | DeviceResult::Shell { output }
+                if output.cancelled =>
+            {
+                (
+                    HubOperationState::Cancelled,
+                    ExecutionEvidence::ProvenProcessTermination,
+                )
+            }
+            DeviceResult::Process { output } | DeviceResult::Shell { output }
+                if output.timed_out =>
+            {
+                (
+                    HubOperationState::Failed,
+                    ExecutionEvidence::ProvenProcessTermination,
+                )
+            }
+            _ => (
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+            ),
+        };
+        let (next, receipt) = {
             let mut persistent = self.inner.persistent.lock().await;
-            let next = persistent
-                .admission
-                .complete(&operation_id, cancelled)
-                .map_err(HubServiceError::Execution)?;
+            let settled = persistent.execution.finalize(
+                &operation_id,
+                &owner,
+                generation,
+                terminal_state,
+                evidence,
+                unix_time_ms()?,
+            )?;
             persist_locked(&self.inner, &persistent)?;
-            next
+            settled
         };
         if let Some(operation) = pending.remove(&operation_id) {
             let response = match device_result {
@@ -679,6 +735,7 @@ impl SingleDeviceHub {
                 result => Ok(HubCommandResult {
                     operation_id: operation_id.clone(),
                     result,
+                    receipt,
                 }),
             };
             let _ = operation.reply.send(response);
@@ -734,6 +791,7 @@ impl SingleDeviceHub {
         challenge: &HubChallenge,
         generation: u64,
         pending: &mut HashMap<String, PendingOperation>,
+        queue_order: &mut VecDeque<String>,
         cancel_waiters: &mut HashMap<
             String,
             oneshot::Sender<Result<CancellationDisposition, HubCommandError>>,
@@ -746,15 +804,72 @@ impl SingleDeviceHub {
             let persistent = self.inner.persistent.lock().await;
             verify_remote_cancellation_ack(&persistent.registry, hello, challenge, &ack)?;
         }
+        if ack.disposition == CancellationDisposition::IndeterminateAfterPropagation
+            && !pending.contains_key(&ack.operation_id)
+        {
+            let state = {
+                let persistent = self.inner.persistent.lock().await;
+                persistent.execution.state(&ack.operation_id)
+            };
+            if matches!(
+                state,
+                Some(
+                    HubOperationState::Indeterminate
+                        | HubOperationState::Completed
+                        | HubOperationState::Failed
+                        | HubOperationState::Cancelled
+                )
+            ) {
+                tracing::warn!(
+                    event = "v2_hub_late_cancellation_ack_ignored",
+                    operation_id = %ack.operation_id,
+                    ?state,
+                    "verified late/duplicate cancellation acknowledgement cannot mutate terminal or quarantined state"
+                );
+                if let Some(waiter) = cancel_waiters.remove(&ack.operation_id) {
+                    let _ = waiter.send(Ok(ack.disposition));
+                }
+                return Ok(());
+            }
+        }
         if ack.disposition == CancellationDisposition::IndeterminateAfterPropagation {
-            {
+            let owner = pending
+                .get(&ack.operation_id)
+                .ok_or(HubServiceError::PendingOperationMissing)?
+                .owner
+                .clone();
+            let cancelled_queued = {
                 let mut persistent = self.inner.persistent.lock().await;
                 if matches!(
-                    persistent.admission.state(&ack.operation_id),
+                    persistent.execution.state(&ack.operation_id),
                     Some(HubOperationState::Dispatched | HubOperationState::CancelRequested)
                 ) {
-                    persistent.admission.mark_indeterminate(&ack.operation_id)?;
-                    persist_locked(&self.inner, &persistent)?;
+                    persistent.execution.mark_indeterminate(
+                        &ack.operation_id,
+                        &owner,
+                        generation,
+                        IndeterminateReason::CancellationUnproven,
+                        unix_time_ms()?,
+                    )?;
+                }
+                let cancelled: Vec<_> = pending
+                    .keys()
+                    .filter(|operation_id| {
+                        operation_id.as_str() != ack.operation_id
+                            && persistent.execution.state(operation_id)
+                                == Some(HubOperationState::Cancelled)
+                    })
+                    .cloned()
+                    .collect();
+                persist_locked(&self.inner, &persistent)?;
+                cancelled
+            };
+            for operation_id in cancelled_queued {
+                queue_order.retain(|queued| queued != &operation_id);
+                if let Some(operation) = pending.remove(&operation_id) {
+                    let _ = operation
+                        .reply
+                        .send(Err(HubCommandError::CancelledBeforeDispatch));
                 }
             }
             if let Some(operation) = pending.remove(&ack.operation_id) {
@@ -806,21 +921,28 @@ impl SingleDeviceHub {
         // Always settle operations belonging to this transport generation, even
         // if a newer session already superseded it. Dispatched work becomes
         // indeterminate; queued/not-yet-dispatched work is cancelled.
-        let operation_ids: Vec<_> = persistent
-            .admission
+        let operations: Vec<_> = persistent
+            .execution
             .snapshot_for_restart()
             .operations
             .into_iter()
             .filter(|operation| operation.operation.device_generation == generation)
-            .map(|operation| operation.operation.operation_id)
             .collect();
-        for operation_id in operation_ids {
-            match persistent.admission.state(&operation_id) {
+        for operation in operations {
+            let operation_id = operation.operation.operation_id;
+            match persistent.execution.state(&operation_id) {
                 Some(HubOperationState::Dispatched | HubOperationState::CancelRequested) => {
-                    let _ = persistent.admission.mark_connection_lost(&operation_id);
+                    persistent
+                        .execution
+                        .mark_connection_lost(&operation_id, unix_time_ms()?)?;
                 }
                 Some(HubOperationState::Queued | HubOperationState::ActiveNotDispatched) => {
-                    let _ = persistent.admission.cancel(&operation_id);
+                    let _ = persistent.execution.request_cancel(
+                        &operation_id,
+                        &operation.owner,
+                        generation,
+                        unix_time_ms()?,
+                    )?;
                 }
                 _ => {}
             }
@@ -847,8 +969,26 @@ impl HubHandle {
         self.inner.live.lock().await.is_some()
     }
 
+    pub async fn current_generation(&self) -> Option<u64> {
+        self.inner
+            .live
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.generation)
+    }
+
     pub async fn start_command(
         &self,
+        command: DeviceCommand,
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as(OperationOwner::local_hub(), command)
+            .await
+    }
+
+    pub async fn start_command_as(
+        &self,
+        owner: OperationOwner,
         command: DeviceCommand,
     ) -> Result<HubPendingCommand, HubCommandError> {
         let operation_id = random_operation_id();
@@ -861,6 +1001,7 @@ impl HubHandle {
         };
         tx.send(HubRequest::Execute {
             operation_id: operation_id.clone(),
+            owner,
             command,
             reply: reply_tx,
         })
@@ -944,6 +1085,15 @@ impl HubHandle {
         &self,
         operation_id: impl Into<String>,
     ) -> Result<CancellationDisposition, HubCommandError> {
+        self.cancel_as(OperationOwner::local_hub(), operation_id)
+            .await
+    }
+
+    pub async fn cancel_as(
+        &self,
+        owner: OperationOwner,
+        operation_id: impl Into<String>,
+    ) -> Result<CancellationDisposition, HubCommandError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let tx = {
             let live = self.inner.live.lock().await;
@@ -953,11 +1103,63 @@ impl HubHandle {
         };
         tx.send(HubRequest::Cancel {
             operation_id: operation_id.into(),
+            owner,
             reply: reply_tx,
         })
         .await
         .map_err(|_| HubCommandError::AgentOffline)?;
         reply_rx.await.map_err(|_| HubCommandError::SessionClosed)?
+    }
+
+    pub async fn resolve_indeterminate(
+        &self,
+        operation_id: &str,
+        resolver: OperationOwner,
+        decision: IndeterminateResolution,
+        evidence: impl Into<String>,
+    ) -> Result<ExecutionReceipt, HubCommandError> {
+        let mut persistent = self.inner.persistent.lock().await;
+        // Resolution is the one transition that re-opens a quarantined desktop.
+        // Preserve the exact fail-closed state so a checkpoint failure cannot
+        // leave memory reusable while durable state still says unresolved.
+        let rollback = persistent.execution.snapshot_for_restart();
+        let (_next, receipt) = persistent
+            .execution
+            .resolve_indeterminate(
+                operation_id,
+                resolver,
+                decision,
+                evidence,
+                unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
+            )
+            .map_err(command_error_from_execution)?;
+        if persist_locked(&self.inner, &persistent).is_err() {
+            persistent.execution = AuthoritativeOperationController::restore_after_restart(
+                self.inner.config.admission_limits(),
+                rollback,
+            )
+            .map_err(|_| HubCommandError::Rejected)?;
+            return Err(HubCommandError::Rejected);
+        }
+        Ok(receipt)
+    }
+
+    pub async fn desktop_quarantine(&self) -> Option<DesktopQuarantine> {
+        let persistent = self.inner.persistent.lock().await;
+        persistent
+            .execution
+            .quarantine(&self.inner.device_id)
+            .cloned()
+    }
+
+    pub async fn operation_receipt(&self, operation_id: &str) -> Option<ExecutionReceipt> {
+        let persistent = self.inner.persistent.lock().await;
+        persistent.execution.receipt(operation_id).cloned()
+    }
+
+    pub async fn resolution_records(&self) -> Vec<ResolutionRecord> {
+        let persistent = self.inner.persistent.lock().await;
+        persistent.execution.resolutions().to_vec()
     }
 }
 
@@ -1014,7 +1216,7 @@ fn persist_locked(
     inner: &HubInner,
     persistent: &PersistentHubState,
 ) -> Result<(), HubServiceError> {
-    let state = HubPersistentState::capture(&persistent.registry, &persistent.admission);
+    let state = HubPersistentState::capture(&persistent.registry, &persistent.execution);
     inner
         .checkpoint
         .save(&state)

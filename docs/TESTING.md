@@ -200,7 +200,21 @@ The real-Cua cancellation test is intentionally ignored in normal test discovery
 CUMG_V2_CUA_CANCEL_E2E_ACK=1 CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" cargo +1.88.0 test --locked   --test v2_m1_cua_cancellation_e2e -- --ignored --nocapture
 ```
 
-The test must observe `IndeterminateAfterPropagation`, resolve the original Hub operation to `DeviceIndeterminate`, and reject subsequent work through the same device quarantine. A merely delivered cancellation notification is not sufficient evidence of non-execution.
+The current post-M1/P0 version of this acceptance is stronger than the original M1 cancellation smoke. It launches the TextEdit fixture through the Agent-native shell executor, performs the real Cua desktop action under the same operation-owner boundary, observes `IndeterminateAfterPropagation`, verifies durable quarantine, rejects another principal, explicitly resolves the exact ambiguous operation, and then proves the desktop can be reused without replaying the old action. A merely delivered cancellation notification is not sufficient evidence of non-execution.
+
+### V2 P0 execution-safety regression
+
+The detailed invariant is recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). In addition to the repository-wide gate above, the focused deterministic regressions are:
+
+```bash
+cargo test v2_execution_safety --lib
+cargo test --test v2_m1_desktop_boundary_e2e
+cargo test --test v2_m1_partition_recovery
+```
+
+`v2_m1_desktop_boundary_e2e` uses a deterministic Cua-shaped stdio fixture and a real Hub-Agent TLS/gRPC session. It proves native shell and GUI-adapter commands share one owner/fence/quarantine boundary, includes a forced checkpoint-write failure during resolution, and requires rollback to quarantine before a successful retry.
+
+`v2_m1_partition_recovery` drops the Agent after dispatch while a native shell side effect can still complete locally, reconnects a new Agent generation, requires the exact old operation to remain quarantined, rejects a competing principal, and only permits new work after explicit resolution.
 
 Packaging/lifecycle acceptance also includes `plutil -lint` on the LaunchAgent template, shell syntax plus valid/mismatched certificate fixtures for the ACME deploy hook, and throwaway `v2_keyctl` generation/rotation outside the repository. The systemd unit must additionally be run through `systemd-analyze verify` on the target Linux distribution or Linux release CI because the macOS desktop acceptance host cannot execute systemd's semantic verifier.
 

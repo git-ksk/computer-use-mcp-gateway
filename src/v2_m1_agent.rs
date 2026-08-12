@@ -476,7 +476,10 @@ impl AgentService {
                 completion = operation_done_rx.recv(), if active.is_some() => {
                     let completion = completion.ok_or(AgentServiceError::OperationWorkerClosed)?;
                     let expected = active.take().ok_or(AgentServiceError::OperationStateMismatch)?;
-                    if completion.operation_id != expected.operation_id {
+                    if completion.operation_id != expected.operation_id
+                        || completion.device_generation != expected.device_generation
+                        || completion.device_generation != session.generation
+                    {
                         return Err(AgentServiceError::OperationStateMismatch);
                     }
                     self.execution.finish(&completion.operation_id)
@@ -506,13 +509,32 @@ impl AgentService {
                             ).map_err(AgentServiceError::Protocol)?;
                             send_agent(&outbound_tx, AgentToHub::Result(signed)).await?;
                         }
-                        AgentOperationOutcome::Indeterminate => {
-                            tracing::warn!(
-                                event = "v2_agent_backend_indeterminate",
-                                operation_id = %completion.operation_id,
-                                "backend outcome is ambiguous; reconnecting without a success result"
-                            );
-                            return Ok(SessionExit::Reconnect);
+                        AgentOperationOutcome::Indeterminate(cause) => {
+                            match cause {
+                                AgentIndeterminateCause::CancellationPropagated => {
+                                    // The cancellation branch already queued a signed
+                                    // IndeterminateAfterPropagation acknowledgement. Keep
+                                    // this transport generation alive so that acknowledgement
+                                    // cannot be lost merely because the local worker completed
+                                    // first; the Hub quarantine blocks all further work.
+                                    tracing::warn!(
+                                        event = "v2_agent_backend_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        "backend cancellation outcome is ambiguous; keeping session alive after signed quarantine acknowledgement"
+                                    );
+                                }
+                                AgentIndeterminateCause::BackendTimedOut => {
+                                    // No cancellation acknowledgement exists for an autonomous
+                                    // provider timeout. Reconnect deliberately forces the Hub's
+                                    // connection-loss path to settle the operation as unknown.
+                                    tracing::warn!(
+                                        event = "v2_agent_backend_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        "backend timed out with ambiguous outcome; reconnecting without a success result"
+                                    );
+                                    return Ok(SessionExit::Reconnect);
+                                }
+                            }
                         }
                     }
                 }
@@ -563,6 +585,7 @@ impl AgentService {
                             self.persist_state()?;
                             let operation_id = remote.command.operation_id.clone();
                             let worker_operation_id = operation_id.clone();
+                            let worker_generation = session.generation;
                             let done = operation_done_tx.clone();
                             let cancellation = match remote.command.command {
                                 DeviceCommand::ExecuteProcess { request } => {
@@ -577,6 +600,7 @@ impl AgentService {
                                             .and_then(|result| result.map(|output| DeviceResult::Process { output }).map_err(AgentOperationError::Process));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
                                             outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
@@ -594,6 +618,7 @@ impl AgentService {
                                             .and_then(|result| result.map(|output| DeviceResult::Shell { output }).map_err(AgentOperationError::Shell));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
                                             outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
@@ -607,6 +632,7 @@ impl AgentService {
                                             .and_then(|result| result.map_err(AgentOperationError::Filesystem));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
                                             outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
@@ -620,6 +646,7 @@ impl AgentService {
                                             .and_then(|result| result.map_err(AgentOperationError::Filesystem));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
                                             outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
@@ -636,9 +663,15 @@ impl AgentService {
                                             Ok(BackendExecutionOutcome::Completed(result)) => {
                                                 AgentOperationOutcome::Result(Ok(result))
                                             }
-                                            Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate
-                                                | BackendExecutionOutcome::TimedOutIndeterminate) => {
-                                                AgentOperationOutcome::Indeterminate
+                                            Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                                                AgentOperationOutcome::Indeterminate(
+                                                    AgentIndeterminateCause::CancellationPropagated,
+                                                )
+                                            }
+                                            Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
+                                                AgentOperationOutcome::Indeterminate(
+                                                    AgentIndeterminateCause::BackendTimedOut,
+                                                )
                                             }
                                             Err(error) => AgentOperationOutcome::Result(Err(
                                                 AgentOperationError::Backend(error),
@@ -646,13 +679,18 @@ impl AgentService {
                                         };
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
                                             outcome,
                                         }).await;
                                     });
                                     ActiveCancellation::Backend(cancel_tx)
                                 }
                             };
-                            active = Some(ActiveOperation { operation_id, cancellation });
+                            active = Some(ActiveOperation {
+                                operation_id,
+                                device_generation: session.generation,
+                                cancellation,
+                            });
                         }
                         HubToAgent::Cancel(cancel) => {
                             verify_remote_cancel(&hello, &challenge, &cancel, &self.trusted_hub.verifier())
@@ -724,6 +762,7 @@ enum SessionExit {
 #[derive(Debug)]
 struct ActiveOperation {
     operation_id: String,
+    device_generation: u64,
     cancellation: ActiveCancellation,
 }
 
@@ -737,12 +776,19 @@ enum ActiveCancellation {
 #[derive(Debug)]
 enum AgentOperationOutcome {
     Result(Result<DeviceResult, AgentOperationError>),
-    Indeterminate,
+    Indeterminate(AgentIndeterminateCause),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentIndeterminateCause {
+    CancellationPropagated,
+    BackendTimedOut,
 }
 
 #[derive(Debug)]
 struct OperationCompletion {
     operation_id: String,
+    device_generation: u64,
     outcome: AgentOperationOutcome,
 }
 
@@ -774,7 +820,9 @@ async fn terminate_active(
         .await
         .map_err(|_| AgentServiceError::OperationTerminationTimeout)?
         .ok_or(AgentServiceError::OperationWorkerClosed)?;
-    if completion.operation_id != operation.operation_id {
+    if completion.operation_id != operation.operation_id
+        || completion.device_generation != operation.device_generation
+    {
         return Err(AgentServiceError::OperationStateMismatch);
     }
     // Process descendants have been killed/waited by ProcessExecutor. Read-only

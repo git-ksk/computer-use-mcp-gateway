@@ -5,11 +5,9 @@
 //! Loading rejects symlinks, oversized files, weak Unix permissions, malformed
 //! state, and unsupported schema versions instead of silently falling back.
 
+use crate::v2_execution_safety::{AuthoritativeOperationController, AuthoritativeSafetySnapshot};
 use crate::v2_m0::{DeviceRegistry, DeviceRegistrySnapshot, GrantLedger, GrantLedgerSnapshot};
-use crate::v2_m0_execution::{
-    AdmissionLimits, AgentExecutionGate, AgentExecutionSnapshot, HubAdmissionController,
-    HubAdmissionSnapshot,
-};
+use crate::v2_m0_execution::{AdmissionLimits, AgentExecutionGate, AgentExecutionSnapshot};
 use crate::v2_m0_trust::TrustedHubIdentity;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -21,7 +19,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-pub const M1_STATE_SCHEMA_VERSION: u16 = 4;
+pub const M1_STATE_SCHEMA_VERSION: u16 = 5;
 pub const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
 pub const MAX_RETAINED_CHECKPOINTS: usize = 64;
 
@@ -80,22 +78,25 @@ impl AgentPersistentState {
 pub struct HubPersistentState {
     pub schema_version: u16,
     pub registry: DeviceRegistrySnapshot,
-    pub admission: HubAdmissionSnapshot,
+    pub execution: AuthoritativeSafetySnapshot,
 }
 
 impl HubPersistentState {
-    pub fn capture(registry: &DeviceRegistry, admission: &HubAdmissionController) -> Self {
+    pub fn capture(
+        registry: &DeviceRegistry,
+        execution: &AuthoritativeOperationController,
+    ) -> Self {
         Self {
             schema_version: M1_STATE_SCHEMA_VERSION,
             registry: registry.snapshot(),
-            admission: admission.snapshot_for_restart(),
+            execution: execution.snapshot_for_restart(),
         }
     }
 
     pub fn restore(
         self,
         limits: AdmissionLimits,
-    ) -> Result<(DeviceRegistry, HubAdmissionController), PersistenceError> {
+    ) -> Result<(DeviceRegistry, AuthoritativeOperationController), PersistenceError> {
         validate_state_schema(self.schema_version)?;
         let mut registry =
             DeviceRegistry::from_snapshot(self.registry).map_err(PersistenceError::Control)?;
@@ -103,9 +104,10 @@ impl HubPersistentState {
         // capability advertisements remain useful as history, but must not make
         // the device appear online until a fresh authenticated Agent reconnects.
         registry.mark_all_offline();
-        let admission = HubAdmissionController::restore_after_restart(limits, self.admission)
-            .map_err(PersistenceError::Execution)?;
-        Ok((registry, admission))
+        let execution =
+            AuthoritativeOperationController::restore_after_restart(limits, self.execution)
+                .map_err(PersistenceError::Execution)?;
+        Ok((registry, execution))
     }
 }
 
@@ -338,7 +340,8 @@ impl std::error::Error for PersistenceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_m0::{CapabilityClass, DeviceIdentity, GrantAuthority};
+    use crate::v2_execution_safety::OperationOwner;
+    use crate::v2_m0::{CapabilityClass, DeviceCapability, DeviceIdentity, GrantAuthority};
     use crate::v2_m0_execution::{AdmissionDecision, OperationRef};
     use crate::v2_m0_transport::HubIdentity;
     use rand::{RngCore, rngs::OsRng};
@@ -453,23 +456,29 @@ mod tests {
             max_global_active: 1,
             max_queued_per_device: 1,
         };
-        let mut admission = HubAdmissionController::new(limits).unwrap();
+        let mut execution = AuthoritativeOperationController::new(limits).unwrap();
         let operation = OperationRef {
-            device_id,
+            device_id: device_id.clone(),
             device_generation: 1,
             operation_id: "op-1".into(),
         };
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
         assert!(matches!(
-            admission.admit(operation).unwrap(),
+            execution
+                .prepare(operation, owner.clone(), DeviceCapability::PointerClick, 10)
+                .unwrap(),
             AdmissionDecision::StartNow(_)
         ));
-        admission.mark_dispatched("op-1").unwrap();
-        let state = HubPersistentState::capture(&registry, &admission);
+        execution.mark_dispatched("op-1", &owner, 1, 11).unwrap();
+        let state = HubPersistentState::capture(&registry, &execution);
         let (_registry, restored) = state.restore(limits).unwrap();
         assert_eq!(
             restored.state("op-1"),
             Some(crate::v2_m0_execution::HubOperationState::Indeterminate)
         );
+        let quarantine = restored.quarantine(&device_id).unwrap();
+        assert_eq!(quarantine.operation_id, "op-1");
+        assert_eq!(quarantine.device_generation, 1);
     }
 
     #[cfg(unix)]

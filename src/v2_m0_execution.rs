@@ -37,6 +37,7 @@ pub enum HubOperationState {
     Dispatched,
     CancelRequested,
     Completed,
+    Failed,
     Cancelled,
     Indeterminate,
 }
@@ -53,7 +54,8 @@ pub enum CompletionDecision {
     StartNext(OperationRef),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IndeterminateResolution {
     ConfirmedCompleted,
     ConfirmedNotExecuted,
@@ -137,6 +139,7 @@ impl HubAdmissionController {
             if !matches!(
                 persisted.state,
                 HubOperationState::Completed
+                    | HubOperationState::Failed
                     | HubOperationState::Cancelled
                     | HubOperationState::Indeterminate
             ) {
@@ -284,6 +287,31 @@ impl HubAdmissionController {
         operation_id: &str,
         cancelled: bool,
     ) -> Result<CompletionDecision, ExecutionError> {
+        self.finalize_terminal(
+            operation_id,
+            if cancelled {
+                HubOperationState::Cancelled
+            } else {
+                HubOperationState::Completed
+            },
+        )
+    }
+
+    /// Guarded terminal settlement used by the authoritative desktop safety
+    /// ledger. Only evidence-bearing terminal states are accepted here;
+    /// `Indeterminate` has a separate transition because it quarantines the
+    /// entire interactive desktop.
+    pub fn finalize_terminal(
+        &mut self,
+        operation_id: &str,
+        terminal: HubOperationState,
+    ) -> Result<CompletionDecision, ExecutionError> {
+        if !matches!(
+            terminal,
+            HubOperationState::Completed | HubOperationState::Failed | HubOperationState::Cancelled
+        ) {
+            return Err(ExecutionError::InvalidTransition);
+        }
         let operation = self
             .operations
             .get_mut(operation_id)
@@ -294,11 +322,7 @@ impl HubAdmissionController {
         ) {
             return Err(ExecutionError::InvalidTransition);
         }
-        operation.state = if cancelled {
-            HubOperationState::Cancelled
-        } else {
-            HubOperationState::Completed
-        };
+        operation.state = terminal;
         let device_id = operation.operation.device_id.clone();
         self.active_by_device.remove(&device_id);
         Ok(self
@@ -385,7 +409,9 @@ impl HubAdmissionController {
                     && operation.operation.device_generation < current_generation
                     && matches!(
                         operation.state,
-                        HubOperationState::Completed | HubOperationState::Cancelled
+                        HubOperationState::Completed
+                            | HubOperationState::Failed
+                            | HubOperationState::Cancelled
                     )
             })
             .map(|(operation_id, _)| operation_id.clone())
@@ -602,6 +628,7 @@ pub enum ExecutionError {
     InvalidTransition,
     AgentBusy,
     GenerationChangeWhileActive,
+    OwnershipFenceMismatch,
     DeviceIndeterminate { operation_id: String },
     InvalidSnapshot,
 }
