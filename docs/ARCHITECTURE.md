@@ -171,6 +171,8 @@ Cua remains an important GUI/computer-use backend, but Cua-specific tool names o
 
 The implementation order is intentionally shell-first: establish the secure Agent core, add direct process/shell execution, add only the bounded filesystem operations required by those workflows, retain Cua for GUI/computer-use during the transition, then add native GUI backends later. This keeps GUI backend replacement independent from the Agent's usefulness for development and operations tasks.
 
+The M1 operator-facing `v2_agent` process now uses outbound gRPC bidirectional streaming over TLS as the production-candidate carrier. It keeps receiving heartbeats/cancellation while direct process execution runs off the async receive loop, and it performs bounded reconnect after transport loss. The raw TLS carrier remains a regression/reference implementation rather than the deployment default.
+
 If the V2-M0 PoC cannot demonstrate a meaningful capability-control gap against existing computer-use/remote-device products, the roadmap says to stop rather than build another generic remote-device orchestrator.
 
 See [`ROADMAP.md`](ROADMAP.md) for milestones and explicit non-goals, and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md) for V2 trust boundaries, compromise assumptions, key rotation, replay, cancellation, and residual risks.

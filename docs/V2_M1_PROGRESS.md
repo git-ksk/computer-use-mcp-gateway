@@ -8,7 +8,7 @@ The M1 transport strategy now keeps the protocol boundary flexible while selecti
 
 The first gRPC slice deliberately minimizes simultaneous change: Protobuf defines the bidirectional `AgentControl/OpenSession` RPC and bounded `AgentFrame`/`HubFrame` carriers, while the payload is the existing independently signed V2 application message. gRPC therefore replaces custom stream framing and supplies HTTP/2 streaming/flow-control semantics without weakening or duplicating Ed25519 identity, signed session/command/result messages, short-lived grants, generation checks, replay barriers, leases, or cancellation semantics. Native Protobuf fields for the application envelope can be migrated later without making that rewrite a prerequisite for validating the transport.
 
-A TLS-enabled integration test now proves one gRPC bidirectional session carrying the existing V2 authentication/heartbeat protocol and an Agent-native structured `git status --short` execution. The command is executed by the Rust process executor directly, with no Cua or Terminal GUI path. The repo still runs the equivalent raw-TLS process E2E alongside it.
+A TLS-enabled integration test now proves one gRPC bidirectional session carrying the existing V2 authentication/heartbeat protocol and an Agent-native structured `git status --short` execution. The command is executed by the Rust process executor directly, with no Cua or Terminal GUI path. The repo still runs the equivalent raw-TLS process E2E alongside it. A second service-lifecycle E2E deliberately terminates the first authenticated stream, verifies outbound reconnect advances the device generation, then starts a long-running direct process and cancels it over the same live gRPC stream; the Agent emits a signed cancellation acknowledgement and a signed cancelled process result only after the child has been killed and waited.
 
 The initial deployment candidate for this transport is a small always-on VM Hub, with Agents making outbound connections. Serverless/WebSocket transports remain possible future adapters rather than constraints on the application protocol.
 
@@ -23,7 +23,7 @@ Hub
   |
   v
 self-owned Agent
-  +-- direct process executor      <- next priority
+  +-- direct process executor      <- implemented in M1
   +-- explicit shell executor      <- separate, higher-risk capability
   +-- bounded filesystem surface   <- follows shell/process needs
   +-- GUI/computer-use adapter
@@ -44,6 +44,8 @@ The current `v2-m1-secure-agent` implementation adds these M1 building blocks wh
 - signed Agent heartbeat and Hub acknowledgement messages bound to the authenticated connection transcript;
 - monotonically increasing heartbeat sequence enforcement, generation matching, timeout/offline detection, and bounded exponential reconnect policy;
 - a reusable outbound lifecycle runner that bounds consecutive connection/session failures, resets the failure streak after an established session, and reconnects without transferring prior session generation state;
+- an operator-facing `v2_agent` binary that loads the separate device/Hub/grant/TLS trust material, opens the outbound gRPC/TLS session, maintains signed heartbeats, reconnects with bounded exponential backoff, handles Ctrl-C shutdown, and keeps the receive loop responsive while direct process work runs on a blocking worker;
+- live Agent-native process cancellation over the gRPC session: a signed `Cancel` flips the process cancellation token without blocking stream receive, the direct child is killed and waited, the operation ID is made terminal, and signed cancellation/result evidence is returned;
 - one-device routing that rejects offline, wrong-device, stale-generation, stale-capability, and unsupported-capability commands;
 - restart snapshots for device registry, grant verifier/revocation/consumption state, Hub operation state, and Agent terminal-operation replay barriers;
 - append-only checkpoint files with bounded size, `create_new`, flush/fsync, symlink rejection, and restrictive Unix directory/file permission checks;
@@ -64,10 +66,12 @@ A separate operator-controlled M1 backend run on 2026-08-11 connected the asynch
 
 ## Still required before V2-M1 acceptance
 
-- integrate the now-implemented first-class direct process executor into the operator-facing long-lived Agent service; the executor already supports structured `program`/`argv`/`cwd`, bounded stdout/stderr, environment policy, timeout/cancellation, operation-state integration, and no dependency on a terminal GUI or Cua;
+The `v2_agent` process now integrates the direct process executor, gRPC/TLS outbound lifecycle, heartbeat timeout/reconnect behavior, cancellation, and the Agent-side file-based key/trust boundary. Remaining M1 work is narrower:
+
 - define the separate higher-risk shell-command capability and the minimum bounded filesystem surface needed for practical repository/build workflows;
-- package the reusable lifecycle into an operator-facing long-lived Agent process/service and wire heartbeat-timeout detection to that service lifecycle; the lifecycle runner and two-session encrypted reconnect/generation test are implemented;
-- integrate the file-based key boundary with the operator-facing Agent/Hub services and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;
+- add OS-specific service packaging/installation (for example launchd/systemd) around the now-runnable long-lived `v2_agent` process;
+- wire the existing Agent replay/trust checkpoint into `v2_agent` startup and mutation boundaries so process restart preserves consumed grants and terminal operation IDs, not only reconnect within one process lifetime;
+- integrate the Hub-side key boundary into the operator-facing Hub service and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;
 - integrate a real northbound authenticated identity source with `AuthenticatedClientPrincipal` rather than constructing the principal inside a PoC;
 - run cancellation acceptance against real Cua desktop operations; the deterministic MCP fixture already proves exact-request propagation and indeterminate quarantine, but it cannot prove a real desktop action stopped;
 - add deployment-level connection/rate limits and operational observability for the M1 service boundary.

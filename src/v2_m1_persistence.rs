@@ -5,10 +5,7 @@
 //! Loading rejects symlinks, oversized files, weak Unix permissions, malformed
 //! state, and unsupported schema versions instead of silently falling back.
 
-use crate::v2_m0::{
-    CONTROL_SCHEMA_VERSION, DeviceRegistry, DeviceRegistrySnapshot, GrantLedger,
-    GrantLedgerSnapshot,
-};
+use crate::v2_m0::{DeviceRegistry, DeviceRegistrySnapshot, GrantLedger, GrantLedgerSnapshot};
 use crate::v2_m0_execution::{
     AdmissionLimits, AgentExecutionGate, AgentExecutionSnapshot, HubAdmissionController,
     HubAdmissionSnapshot,

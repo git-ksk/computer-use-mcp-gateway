@@ -157,7 +157,7 @@ Only after V2-M0 GO:
 - [x] outbound Agent connection over the accepted encrypted M1 channel
 - [x] gRPC bidirectional streaming transport candidate over TLS, preserving the existing signed application protocol during migration
 - [x] reusable outbound lifecycle and encrypted multi-session reconnect acceptance
-- [ ] operator-facing long-lived Agent process/service lifecycle
+- [x] operator-facing long-lived Agent process lifecycle (`v2_agent`) with outbound gRPC/TLS, bounded reconnect, heartbeat liveness, Ctrl-C shutdown, and non-blocking process cancellation; OS-specific service packaging remains deployment work
 - [x] separate file-based key/trust-anchor provisioning boundary with fail-closed filesystem checks
 - [ ] production secret-store/certificate rotation integration for the deployed service
 - [x] heartbeat/reconnect semantics with bounded backoff
@@ -170,7 +170,8 @@ Only after V2-M0 GO:
 - [x] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
 - [ ] explicit higher-risk shell-command capability for shell syntax/pipelines; keep it distinct from structured argv execution
 - [ ] bounded filesystem capability surface required by shell workflows, with path/policy controls rather than unrestricted implicit filesystem authority
-- [ ] clean live cancellation/disconnect semantics across the backend boundary
+- [ ] clean live cancellation/disconnect semantics across all execution backends
+  - [x] Agent-native process cancellation while the gRPC stream remains responsive; child is killed/waited and the operation ID becomes terminal before reconnect
   - [x] exact downstream cancellation propagation + indeterminate device quarantine in deterministic MCP acceptance
   - [ ] real-Cua desktop cancellation acceptance
 - [x] Cua adapter behind the backend capability contract with adapter conformance coverage
