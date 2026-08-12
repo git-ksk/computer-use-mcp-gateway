@@ -82,7 +82,9 @@ Controls:
 - global admission and per-device queues are bounded;
 - the Hub-Agent protocol exposes typed semantic commands rather than arbitrary Cua tool names/arguments.
 
-Residual risk: the real northbound OAuth/Access integration is a deployment concern and must construct the authenticated principal from verified identity-provider output. The PoC models that boundary but does not implement a new OAuth server.
+The M1 northbound boundary now implements the MCP Authorization protected-resource side rather than a new OAuth server. `v2_hub` publishes RFC 9728 metadata, requires header bearer presentation, validates tokens through a configured RFC 7662 introspection endpoint, binds accepted tokens to the configured MCP resource audience, and constructs `AuthenticatedClientPrincipal` from the verified subject plus the configured authorization-server issuer. Required OAuth scopes gate entry to the MCP resource, while the separate local principal -> device -> exact `DeviceCapability` policy remains authoritative for delegated device access. The bearer header is removed before rmcp handler dispatch and no bearer field exists in the typed Hub-to-Agent command/grant path.
+
+Residual risk: authorization-server/introspection availability and credential compromise remain deployment trust dependencies; public HTTPS termination and rate limiting still sit outside the current loopback northbound listener. A compromised Hub can still mint valid Agent grants using its own grant authority, so OAuth does not reduce the already-documented fully-compromised-Hub trust failure.
 
 ### Compromised Hub
 

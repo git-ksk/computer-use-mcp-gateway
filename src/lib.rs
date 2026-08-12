@@ -16,3 +16,4 @@ pub mod v2_m1_tls;
 pub mod v2_m1_filesystem;
 pub mod v2_m1_grpc;
 pub mod v2_m1_hub;
+pub mod v2_m1_northbound;

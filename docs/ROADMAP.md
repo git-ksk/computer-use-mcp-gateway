@@ -162,6 +162,7 @@ Only after V2-M0 GO:
 - [x] Agent replay/trust checkpoint wired into the long-lived service so consumed grants and terminal/in-flight operation IDs survive process restart before execution can replay
 - [ ] production secret-store/certificate rotation integration for the deployed service
 - [x] operator-facing single-device Hub gRPC service (`v2_hub`) for the always-on VM target, with persisted generation/admission state, heartbeat timeout, exact-capability grant issuance, bounded queueing, cancellation, reconnect cleanup, and TLS key/certificate loading
+- [x] standard northbound MCP Authorization protected-resource boundary on `v2_hub` using RFC 9728 discovery + OAuth bearer validation through RFC 7662 introspection, reducing verified identity to `AuthenticatedClientPrincipal` before the existing principal -> device -> exact-capability policy; bearer tokens never cross the Hub-Agent boundary
 - [x] bound replay state across reconnects: Agent and Hub terminal tombstones are pruned at authenticated generation rollover, while indeterminate Hub operations are retained until explicit resolution; grant-consumption tombstones are expiry-pruned and checkpoint files use bounded retention
 - [x] heartbeat/reconnect semantics with bounded backoff
 - [x] one-device routing

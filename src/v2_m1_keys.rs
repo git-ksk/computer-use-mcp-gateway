@@ -83,6 +83,21 @@ pub fn load_grant_authority(path: &Path) -> Result<GrantAuthority, KeyMaterialEr
     Ok(GrantAuthority::from_secret_key_bytes(read_secret_32(path)?))
 }
 
+pub fn load_secret_text(path: &Path, max_bytes: u64) -> Result<String, KeyMaterialError> {
+    validate_regular_file(path, FileSensitivity::Secret)?;
+    let bytes = read_bounded(path, max_bytes)?;
+    let text = String::from_utf8(bytes).map_err(|_| KeyMaterialError::InvalidUtf8)?;
+    let value = text.trim();
+    if value.is_empty() {
+        return Err(KeyMaterialError::EmptySecret);
+    }
+    Ok(value.to_owned())
+}
+
+pub fn load_trusted_text(path: &Path, max_bytes: u64) -> Result<String, KeyMaterialError> {
+    read_public_text(path, max_bytes)
+}
+
 pub fn write_new_verifying_key(
     path: &Path,
     verifier: &VerifyingKey,
@@ -259,6 +274,7 @@ pub enum KeyMaterialError {
     WritableParentDirectory,
     FileTooLarge,
     InvalidUtf8,
+    EmptySecret,
     InvalidHexKey,
     InvalidEd25519PublicKey,
 }
