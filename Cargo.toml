@@ -36,6 +36,10 @@ tonic-prost = "0.14.6"
 tokio-stream = { version = "0.1", features = ["net"] }
 process-wrap = { version = "9.1.0", default-features = false, features = ["std", "process-group", "job-object"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace", "metrics"] }
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1"

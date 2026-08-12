@@ -156,7 +156,7 @@ impl BackendAdapter for CuaCliAdapter {
                     scale_factor_milli: (scale * 1000.0).round() as u32,
                 }
             }
-            DeviceCommand::PointerClick { .. } => {
+            DeviceCommand::PointerClick { .. } | DeviceCommand::PointerDrag { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::PointerClick,
                 ));

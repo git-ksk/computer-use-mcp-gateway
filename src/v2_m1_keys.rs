@@ -6,6 +6,7 @@
 
 use crate::v2_m0::{DeviceIdentity, GrantAuthority};
 use crate::v2_m0_transport::HubIdentity;
+use crate::v2_m0_trust::HubKeyRotation;
 use ed25519_dalek::VerifyingKey;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -22,6 +23,8 @@ pub struct AgentProvisionedMaterial {
     pub device_identity: DeviceIdentity,
     pub trusted_hub: VerifyingKey,
     pub grant_verifier: VerifyingKey,
+    pub additional_grant_verifiers: Vec<VerifyingKey>,
+    pub hub_rotation: Option<HubKeyRotation>,
     pub tls_root_der: Vec<u8>,
 }
 
@@ -49,6 +52,8 @@ pub fn load_agent_material(
         device_identity: load_device_identity(device_secret_file)?,
         trusted_hub: load_verifying_key(hub_public_key_file)?,
         grant_verifier: load_verifying_key(grant_public_key_file)?,
+        additional_grant_verifiers: Vec::new(),
+        hub_rotation: None,
         tls_root_der: read_public_file(tls_root_der_file, MAX_TLS_ROOT_BYTES)?,
     })
 }
@@ -103,6 +108,13 @@ pub fn write_new_verifying_key(
     verifier: &VerifyingKey,
 ) -> Result<(), KeyMaterialError> {
     write_new_public_text(path, &hex(&verifier.to_bytes()))
+}
+
+pub fn write_new_trusted_text(path: &Path, value: &str) -> Result<(), KeyMaterialError> {
+    if value.is_empty() || value.len() > 64 * 1024 {
+        return Err(KeyMaterialError::FileTooLarge);
+    }
+    write_new_public_text(path, value)
 }
 
 pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey, KeyMaterialError> {

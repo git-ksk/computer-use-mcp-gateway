@@ -114,8 +114,8 @@ def main() -> None:
             ["node", "-p", "process.versions.node.split('.')[0]"], text=True
         ).strip()
     )
-    if node_major < 20:
-        raise RuntimeError(f"official conformance runner requires Node 20+; found {node_major}")
+    if node_major < 22:
+        raise RuntimeError(f"official conformance runner requires Node 22+; found {node_major}")
 
     # Exercise the upstream frozen requirement-set parser for both protocol lines
     # tracked by this project. This is deliberately separate from certification.

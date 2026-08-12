@@ -188,6 +188,20 @@ The preferred remaining M1 order is:
 5. real-Cua cancellation acceptance;
 6. V2-M1 acceptance review before any V2-M2 multi-machine expansion.
 
+## V2-M1 completion against this policy
+
+V2-M1 was accepted on 2026-08-12 without collapsing the boundaries above:
+
+- northbound authentication uses MCP/OAuth protected-resource semantics and still reduces identity to `AuthenticatedClientPrincipal`; bearer tokens are not forwarded southbound;
+- Hub↔Agent remains gRPC bidirectional streaming over TLS with independently signed application messages;
+- ordinary server-certificate renewal is ACME-driven, while Hub/device/grant identities retain separate signed rotation lifecycles;
+- overload shedding uses standard gRPC/HTTP failures and leaves the existing operation admission/lease controller authoritative;
+- observability uses OpenTelemetry/OTLP standard configuration rather than a project-specific telemetry transport;
+- launchd/systemd own service supervision;
+- real-Cua cancellation still resolves to `indeterminate` + quarantine when the backend cannot prove non-execution.
+
+Acceptance evidence is in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). Future work should treat this document as the architectural boundary, not as a reason to replace proven custom safety semantics with nominally standard but weaker mechanisms.
+
 ## V2-M2 trigger for SPIFFE reconsideration
 
 Re-evaluate SPIFFE/SPIRE before or during V2-M2 when one or more of these become true:

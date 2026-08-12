@@ -56,11 +56,14 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
             state_dir: hub_state.clone(),
             heartbeat_timeout: Duration::from_millis(500),
             max_queued_per_device: 2,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
             grant_authority: grant_authority.clone(),
             device_verifier: device_identity.verifying_key(),
+            device_rotation: None,
         },
     )
     .map_err(|error| anyhow!("Hub init failed: {error:?}"))?;
@@ -95,11 +98,14 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
                 max_delay: Duration::from_millis(50),
                 max_attempts: 5,
             },
+            cua: None,
         },
         AgentProvisionedMaterial {
             device_identity,
             trusted_hub: hub_identity.verifier(),
             grant_verifier: grant_authority.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
             tls_root_der: cert_der,
         },
     )

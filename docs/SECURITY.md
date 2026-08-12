@@ -69,7 +69,7 @@ Cloudflare Tunnel
 Cua stdio
 ```
 
-Keep the gateway on loopback. Do not commit real tunnel credentials, Access tokens, private hostnames, or `.env` files.
+Keep the gateway on loopback. Do not commit real tunnel credentials, Access tokens, private hostnames, `.env` files, generated private keys, PKCS#12 bundles, or local `secrets/` directories. The repository ignore rules are defense in depth, not a substitute for a secret manager or repository secret scanning.
 
 ## Self-hosted desktop E2E
 
@@ -94,4 +94,4 @@ For security-sensitive reports, do not include credentials or unrelated private 
 
 V2 separates northbound authenticated client principals, Hub transport identity, grant-signing authority, and Agent device identity. Key rotation requires continuity proof; bounded admission and signed cancellation/reconnect semantics fail closed around ambiguous operations. The complete compromised-component analysis and non-claims are documented in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
 
-The V2-M0 GO is a decision to proceed to the single secure remote Agent milestone, not a production-readiness claim. M1 now has a TLS 1.3/pinned-trust transport wrapper plus restart-safe public trust/replay checkpoints and a separate file-based Ed25519 key/trust-anchor boundary. Private signing keys are deliberately outside the JSON checkpoint format; secret files fail closed on symlinks or weak Unix permissions, while production deployments may substitute an OS keychain/HSM/KMS boundary. The operator-facing service still needs to wire that custody model into its lifecycle. See [`V2_M1_PROGRESS.md`](V2_M1_PROGRESS.md).
+V2-M1 passed its single-secure-Agent acceptance gate on 2026-08-12. The production candidate keeps TLS-protected gRPC separate from independently signed application identity, preserves principal -> stable device -> exact capability grants, and never forwards a northbound OAuth bearer token to the Agent. Ambiguous desktop cancellation remains `indeterminate` and quarantines the device rather than authorizing replay. Linux Hub application keys use systemd encrypted credentials in the packaged service; ACME owns ordinary server-certificate renewal; Hub/device/grant key rotation stays independent and continuity-proven. OpenTelemetry/OTLP default telemetry excludes sensitive operation payloads. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).

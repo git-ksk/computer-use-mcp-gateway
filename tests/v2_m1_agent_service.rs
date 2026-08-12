@@ -325,6 +325,8 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
         device_identity,
         trusted_hub: hub_identity.verifier(),
         grant_verifier: grant_authority.verifier(),
+        additional_grant_verifiers: vec![],
+        hub_rotation: None,
         tls_root_der: cert_der,
     };
     let material_for_restart = material.clone();
@@ -344,6 +346,7 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
             max_delay: Duration::from_millis(50),
             max_attempts: 4,
         },
+        cua: None,
     };
     let restart_config = config.clone();
     let mut agent = AgentService::new(config, material)?;

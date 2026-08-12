@@ -1,0 +1,21 @@
+[Unit]
+Description=computer-use-mcp-gateway V2 Agent (user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=%h/.config/cumg-v2-agent/agent.env
+ExecStart=/usr/local/bin/v2_agent
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

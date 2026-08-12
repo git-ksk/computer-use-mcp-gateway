@@ -1315,11 +1315,14 @@ mod tests {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(1),
                 max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
             },
             HubProvisionedMaterial {
                 hub_identity: HubIdentity::generate(),
                 grant_authority: GrantAuthority::generate(),
                 device_verifier: device_identity.verifying_key(),
+                device_rotation: None,
             },
         )
         .unwrap();

@@ -3,7 +3,7 @@
 //! The runtime keeps the V2 application protocol independently signed. gRPC/TLS
 //! supplies the long-lived full-duplex carrier while the Agent owns heartbeat,
 //! reconnect, grant validation, replay barriers, direct process execution, and
-//! cancellation. Cua/GUI execution is intentionally outside this shell-first slice.
+//! cancellation. An optional external Cua MCP adapter adds typed GUI capabilities.
 
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
@@ -19,6 +19,7 @@ use crate::v2_m0_transport::{
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
+use crate::v2_m1_backend::{BackendExecutionOutcome, CuaMcpAdapter, M1BackendError};
 use crate::v2_m1_filesystem::{FilesystemError, FilesystemExecutor, FilesystemPolicy};
 use crate::v2_m1_grpc::{
     decode_hub_frame, encode_agent_frame, proto::agent_control_client::AgentControlClient,
@@ -39,6 +40,52 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 const GRPC_QUEUE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
+pub struct CuaAgentConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub backend_version: String,
+    pub platform: String,
+    pub revision: u64,
+    pub connect_timeout: Duration,
+    pub tool_timeout: Duration,
+    pub reconnect_attempts: u32,
+    pub reconnect_backoff: Duration,
+}
+
+impl CuaAgentConfig {
+    fn validate(&self) -> Result<(), AgentServiceError> {
+        if self.command.trim().is_empty()
+            || self.backend_version.trim().is_empty()
+            || self.platform.trim().is_empty()
+            || self.revision == 0
+            || self.connect_timeout.is_zero()
+            || self.tool_timeout.is_zero()
+            || self.reconnect_attempts == 0
+            || self.reconnect_backoff.is_zero()
+        {
+            return Err(AgentServiceError::InvalidConfig(
+                "invalid Cua backend settings",
+            ));
+        }
+        Ok(())
+    }
+
+    fn adapter(&self) -> CuaMcpAdapter {
+        CuaMcpAdapter::new(
+            self.command.clone(),
+            self.args.clone(),
+            self.backend_version.clone(),
+            self.platform.clone(),
+            self.revision,
+            self.connect_timeout,
+            self.tool_timeout,
+            self.reconnect_attempts,
+            self.reconnect_backoff,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentServiceConfig {
     pub hub_endpoint: String,
     pub hub_domain: String,
@@ -47,6 +94,7 @@ pub struct AgentServiceConfig {
     pub state_dir: PathBuf,
     pub heartbeat_interval: Duration,
     pub reconnect: ReconnectPolicy,
+    pub cua: Option<CuaAgentConfig>,
 }
 
 impl AgentServiceConfig {
@@ -74,6 +122,9 @@ impl AgentServiceConfig {
                 "at least one allowed cwd root is required",
             ));
         }
+        if let Some(cua) = &self.cua {
+            cua.validate()?;
+        }
         Ok(())
     }
 }
@@ -84,10 +135,32 @@ pub struct AgentService {
     executor: ProcessExecutor,
     shell: ShellExecutor,
     filesystem: FilesystemExecutor,
+    cua: Option<CuaMcpAdapter>,
     trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
     execution: AgentExecutionGate,
     checkpoint: CheckpointStore,
+}
+
+fn reconcile_grant_verifiers(grants: &mut GrantLedger, material: &AgentProvisionedMaterial) {
+    let mut configured = vec![material.grant_verifier];
+    configured.extend(material.additional_grant_verifiers.iter().copied());
+    let configured_ids: std::collections::HashSet<_> = configured
+        .iter()
+        .map(crate::v2_m0::verifying_key_id)
+        .collect();
+    for verifier in configured {
+        grants.trust_verifier(verifier);
+    }
+    let existing = grants.snapshot().verifier_keys;
+    for key in existing {
+        if let Ok(verifier) = ed25519_dalek::VerifyingKey::from_bytes(&key) {
+            let key_id = crate::v2_m0::verifying_key_id(&verifier);
+            if !configured_ids.contains(&key_id) {
+                grants.retire_verifier(&key_id);
+            }
+        }
+    }
 }
 
 impl AgentService {
@@ -108,35 +181,41 @@ impl AgentService {
             FilesystemPolicy::new(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Filesystem)?,
         );
+        let cua = config.cua.as_ref().map(CuaAgentConfig::adapter);
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
             .map_err(AgentServiceError::Persistence)?;
         let (trusted_hub, grants, execution) =
             match checkpoint.load_latest::<AgentPersistentState>() {
                 Ok(state) => {
-                    let (device_id, trusted_hub, grants, execution) =
+                    let (device_id, mut trusted_hub, mut grants, execution) =
                         state.restore().map_err(AgentServiceError::Persistence)?;
                     if device_id != config.device_id {
                         return Err(AgentServiceError::CheckpointIdentityMismatch);
                     }
-                    // Hub key rotation is not yet transported by the M1 service. Until
-                    // that lands, a persisted key must still match the provisioned trust anchor.
                     if trusted_hub.verifier() != material.trusted_hub {
-                        return Err(AgentServiceError::CheckpointTrustMismatch);
+                        let rotation = material
+                            .hub_rotation
+                            .as_ref()
+                            .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
+                        trusted_hub
+                            .apply_rotation(rotation)
+                            .map_err(AgentServiceError::Trust)?;
+                        if trusted_hub.verifier() != material.trusted_hub {
+                            return Err(AgentServiceError::CheckpointTrustMismatch);
+                        }
                     }
-                    if !grants
-                        .snapshot()
-                        .verifier_keys
-                        .contains(&material.grant_verifier.to_bytes())
-                    {
-                        return Err(AgentServiceError::CheckpointGrantTrustMismatch);
-                    }
+                    reconcile_grant_verifiers(&mut grants, &material);
                     (trusted_hub, grants, execution)
                 }
-                Err(PersistenceError::NoCheckpoint) => (
-                    TrustedHubIdentity::new(material.trusted_hub),
-                    GrantLedger::new(material.grant_verifier),
-                    AgentExecutionGate::default(),
-                ),
+                Err(PersistenceError::NoCheckpoint) => {
+                    let mut grants = GrantLedger::new(material.grant_verifier);
+                    reconcile_grant_verifiers(&mut grants, &material);
+                    (
+                        TrustedHubIdentity::new(material.trusted_hub),
+                        grants,
+                        AgentExecutionGate::default(),
+                    )
+                }
                 Err(error) => return Err(AgentServiceError::Persistence(error)),
             };
         let service = Self {
@@ -145,6 +224,7 @@ impl AgentService {
             executor,
             shell,
             filesystem,
+            cua,
             trusted_hub,
             grants,
             execution,
@@ -170,18 +250,29 @@ impl AgentService {
     }
 
     pub fn capabilities(&self) -> CapabilityAdvertisement {
+        let mut supported = vec![
+            DeviceCapability::ExecuteProcess,
+            DeviceCapability::Shell,
+            DeviceCapability::ReadFile,
+            DeviceCapability::ListDirectory,
+        ];
+        let backend = if let Some(cua) = &self.cua {
+            for capability in cua.advertisement().supported {
+                if !supported.contains(&capability) {
+                    supported.push(capability);
+                }
+            }
+            "agent-native+cua"
+        } else {
+            "agent-native"
+        };
         CapabilityAdvertisement {
-            backend: "agent-native".into(),
+            backend: backend.into(),
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-            revision: 2,
-            supported: vec![
-                DeviceCapability::ExecuteProcess,
-                DeviceCapability::Shell,
-                DeviceCapability::ReadFile,
-                DeviceCapability::ListDirectory,
-            ],
+            revision: 3,
+            supported,
         }
     }
 
@@ -190,6 +281,23 @@ impl AgentService {
     pub async fn run(
         &mut self,
         mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), AgentServiceError> {
+        if let Some(cua) = &self.cua {
+            cua.connect().await.map_err(AgentServiceError::Backend)?;
+        }
+        let result = self.run_connected_lifecycle(&mut shutdown).await;
+        if let Some(cua) = &self.cua {
+            let shutdown_result = cua.shutdown().await.map_err(AgentServiceError::Backend);
+            if result.is_ok() {
+                shutdown_result?;
+            }
+        }
+        result
+    }
+
+    async fn run_connected_lifecycle(
+        &mut self,
+        shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), AgentServiceError> {
         let mut failures = 0_u32;
         loop {
@@ -209,18 +317,18 @@ impl AgentService {
                         .reconnect
                         .delay_for_attempt(failures.saturating_sub(1))
                         .map_err(|_| AgentServiceError::ReconnectExhausted)?;
-                    if sleep_or_shutdown(delay, &mut shutdown).await {
+                    if sleep_or_shutdown(delay, shutdown).await {
                         return Ok(());
                     }
                     continue;
                 }
             };
 
-            match self.run_authenticated_session(channel, &mut shutdown).await {
+            match self.run_authenticated_session(channel, shutdown).await {
                 Ok(SessionExit::Shutdown) => return Ok(()),
                 Ok(SessionExit::Reconnect) => {
                     failures = 0;
-                    if sleep_or_shutdown(self.config.reconnect.initial_delay, &mut shutdown).await {
+                    if sleep_or_shutdown(self.config.reconnect.initial_delay, shutdown).await {
                         return Ok(());
                     }
                 }
@@ -234,7 +342,7 @@ impl AgentService {
                         .reconnect
                         .delay_for_attempt(failures.saturating_sub(1))
                         .map_err(|_| AgentServiceError::ReconnectExhausted)?;
-                    if sleep_or_shutdown(delay, &mut shutdown).await {
+                    if sleep_or_shutdown(delay, shutdown).await {
                         return Ok(());
                     }
                 }
@@ -374,27 +482,39 @@ impl AgentService {
                     self.execution.finish(&completion.operation_id)
                         .map_err(AgentServiceError::Execution)?;
                     self.persist_state()?;
-                    let device_result = match completion.result {
-                        Ok(result) => result,
-                        Err(error) => DeviceResult::Error {
-                            code: operation_error_code(&error),
-                        },
-                    };
-                    let result = CommandResultEnvelope {
-                        schema_version: CONTROL_SCHEMA_VERSION,
-                        device_id: session.device_id.clone(),
-                        device_generation: session.generation,
-                        capability_revision: session.capabilities.revision,
-                        operation_id: completion.operation_id,
-                        result: device_result,
-                    };
-                    let signed = build_remote_result(
-                        &self.material.device_identity,
-                        &hello,
-                        &challenge,
-                        result,
-                    ).map_err(AgentServiceError::Protocol)?;
-                    send_agent(&outbound_tx, AgentToHub::Result(signed)).await?;
+                    match completion.outcome {
+                        AgentOperationOutcome::Result(result) => {
+                            let device_result = match result {
+                                Ok(result) => result,
+                                Err(error) => DeviceResult::Error {
+                                    code: operation_error_code(&error),
+                                },
+                            };
+                            let result = CommandResultEnvelope {
+                                schema_version: CONTROL_SCHEMA_VERSION,
+                                device_id: session.device_id.clone(),
+                                device_generation: session.generation,
+                                capability_revision: session.capabilities.revision,
+                                operation_id: completion.operation_id,
+                                result: device_result,
+                            };
+                            let signed = build_remote_result(
+                                &self.material.device_identity,
+                                &hello,
+                                &challenge,
+                                result,
+                            ).map_err(AgentServiceError::Protocol)?;
+                            send_agent(&outbound_tx, AgentToHub::Result(signed)).await?;
+                        }
+                        AgentOperationOutcome::Indeterminate => {
+                            tracing::warn!(
+                                event = "v2_agent_backend_indeterminate",
+                                operation_id = %completion.operation_id,
+                                "backend outcome is ambiguous; reconnecting without a success result"
+                            );
+                            return Ok(SessionExit::Reconnect);
+                        }
+                    }
                 }
                 message = inbound.message() => {
                     let frame = match message.map_err(AgentServiceError::Status)? {
@@ -457,10 +577,10 @@ impl AgentService {
                                             .and_then(|result| result.map(|output| DeviceResult::Process { output }).map_err(AgentOperationError::Process));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
-                                            result,
+                                            outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
-                                    Some(cancellation)
+                                    ActiveCancellation::Process(cancellation)
                                 }
                                 DeviceCommand::Shell { request } => {
                                     let cancellation = ProcessCancellation::default();
@@ -474,10 +594,10 @@ impl AgentService {
                                             .and_then(|result| result.map(|output| DeviceResult::Shell { output }).map_err(AgentOperationError::Shell));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
-                                            result,
+                                            outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
-                                    Some(cancellation)
+                                    ActiveCancellation::Process(cancellation)
                                 }
                                 DeviceCommand::ReadFile { path } => {
                                     let filesystem = self.filesystem.clone();
@@ -487,10 +607,10 @@ impl AgentService {
                                             .and_then(|result| result.map_err(AgentOperationError::Filesystem));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
-                                            result,
+                                            outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
-                                    None
+                                    ActiveCancellation::None
                                 }
                                 DeviceCommand::ListDirectory { path } => {
                                     let filesystem = self.filesystem.clone();
@@ -500,12 +620,37 @@ impl AgentService {
                                             .and_then(|result| result.map_err(AgentOperationError::Filesystem));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
-                                            result,
+                                            outcome: AgentOperationOutcome::Result(result),
                                         }).await;
                                     });
-                                    None
+                                    ActiveCancellation::None
                                 }
-                                _ => return Err(AgentServiceError::UnsupportedCommand),
+                                command @ (DeviceCommand::ListApplications
+                                | DeviceCommand::ScreenGeometry
+                                | DeviceCommand::PointerClick { .. }
+                                | DeviceCommand::PointerDrag { .. }) => {
+                                    let cua = self.cua.clone().ok_or(AgentServiceError::UnsupportedCommand)?;
+                                    let (cancel_tx, cancel_rx) = watch::channel(false);
+                                    tokio::spawn(async move {
+                                        let outcome = match cua.execute(&command, cancel_rx).await {
+                                            Ok(BackendExecutionOutcome::Completed(result)) => {
+                                                AgentOperationOutcome::Result(Ok(result))
+                                            }
+                                            Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate
+                                                | BackendExecutionOutcome::TimedOutIndeterminate) => {
+                                                AgentOperationOutcome::Indeterminate
+                                            }
+                                            Err(error) => AgentOperationOutcome::Result(Err(
+                                                AgentOperationError::Backend(error),
+                                            )),
+                                        };
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            outcome,
+                                        }).await;
+                                    });
+                                    ActiveCancellation::Backend(cancel_tx)
+                                }
                             };
                             active = Some(ActiveOperation { operation_id, cancellation });
                         }
@@ -520,13 +665,22 @@ impl AgentService {
                                     self.execution.request_cancel(&cancel.operation_id)
                                         .map_err(AgentServiceError::Execution)?;
                                     self.persist_state()?;
-                                    if let Some(cancellation) = &operation.cancellation {
-                                        cancellation.cancel();
-                                        CancellationDisposition::CancellationRequested
-                                    } else {
-                                        // Bounded filesystem observation has no mutation side effect,
-                                        // but std filesystem calls are not asynchronously interruptible.
-                                        CancellationDisposition::IndeterminateAfterPropagation
+                                    match &operation.cancellation {
+                                        ActiveCancellation::Process(cancellation) => {
+                                            cancellation.cancel();
+                                            CancellationDisposition::CancellationRequested
+                                        }
+                                        ActiveCancellation::Backend(cancellation) => {
+                                            let _ = cancellation.send(true);
+                                            // MCP cancellation propagation is not proof that a desktop
+                                            // side effect stopped. The Hub must quarantine this operation.
+                                            CancellationDisposition::IndeterminateAfterPropagation
+                                        }
+                                        ActiveCancellation::None => {
+                                            // Bounded filesystem observation has no mutation side effect,
+                                            // but std filesystem calls are not asynchronously interruptible.
+                                            CancellationDisposition::IndeterminateAfterPropagation
+                                        }
                                     }
                                 }
                                 Some(_) => return Err(AgentServiceError::CancellationMismatch),
@@ -570,13 +724,26 @@ enum SessionExit {
 #[derive(Debug)]
 struct ActiveOperation {
     operation_id: String,
-    cancellation: Option<ProcessCancellation>,
+    cancellation: ActiveCancellation,
+}
+
+#[derive(Debug)]
+enum ActiveCancellation {
+    Process(ProcessCancellation),
+    Backend(watch::Sender<bool>),
+    None,
+}
+
+#[derive(Debug)]
+enum AgentOperationOutcome {
+    Result(Result<DeviceResult, AgentOperationError>),
+    Indeterminate,
 }
 
 #[derive(Debug)]
 struct OperationCompletion {
     operation_id: String,
-    result: Result<DeviceResult, AgentOperationError>,
+    outcome: AgentOperationOutcome,
 }
 
 #[derive(Debug)]
@@ -584,6 +751,7 @@ pub enum AgentOperationError {
     Process(ProcessError),
     Shell(ShellError),
     Filesystem(FilesystemError),
+    Backend(M1BackendError),
     WorkerPanicked,
 }
 
@@ -595,8 +763,12 @@ async fn terminate_active(
     let Some(operation) = active.take() else {
         return Ok(());
     };
-    if let Some(cancellation) = &operation.cancellation {
-        cancellation.cancel();
+    match &operation.cancellation {
+        ActiveCancellation::Process(cancellation) => cancellation.cancel(),
+        ActiveCancellation::Backend(cancellation) => {
+            let _ = cancellation.send(true);
+        }
+        ActiveCancellation::None => {}
     }
     let completion = tokio::time::timeout(Duration::from_secs(5), operation_done_rx.recv())
         .await
@@ -637,7 +809,9 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         AgentOperationError::Filesystem(_)
         | AgentOperationError::Process(_)
         | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
-        AgentOperationError::WorkerPanicked => DeviceErrorCode::InternalFailure,
+        AgentOperationError::Backend(_) | AgentOperationError::WorkerPanicked => {
+            DeviceErrorCode::InternalFailure
+        }
     }
 }
 
@@ -687,10 +861,12 @@ pub enum AgentServiceError {
     Status(tonic::Status),
     Carrier(crate::v2_m1_grpc::GrpcCarrierError),
     Protocol(crate::v2_m0_transport::TransportError),
+    Trust(crate::v2_m0_trust::TrustError),
     Control(crate::v2_m0::ControlError),
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
     Filesystem(FilesystemError),
+    Backend(M1BackendError),
     Operation(AgentOperationError),
     Persistence(PersistenceError),
     UnexpectedMessage(String),
@@ -748,11 +924,91 @@ mod tests {
                 max_delay: Duration::from_secs(1),
                 max_attempts: 3,
             },
+            cua: None,
         };
         assert!(matches!(
             config.validate(),
             Err(AgentServiceError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn startup_applies_signed_hub_rotation_and_reconciles_grant_overlap() {
+        use crate::v2_m0::{DeviceIdentity, GrantAuthority};
+        use crate::v2_m0_transport::HubIdentity;
+        use crate::v2_m0_trust::build_hub_key_rotation;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "cumg-v2-agent-rotation-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let config = AgentServiceConfig {
+            hub_endpoint: "https://localhost:7443".into(),
+            hub_domain: "localhost".into(),
+            device_id: "dev-rotation".into(),
+            allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
+            state_dir: state_dir.clone(),
+            heartbeat_interval: Duration::from_secs(5),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_secs(1),
+                max_attempts: 3,
+            },
+            cua: None,
+        };
+        let device = DeviceIdentity::generate();
+        let old_hub = HubIdentity::generate();
+        let old_grant = GrantAuthority::generate();
+        let initial = AgentProvisionedMaterial {
+            device_identity: device.clone(),
+            trusted_hub: old_hub.verifier(),
+            grant_verifier: old_grant.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: vec![1],
+        };
+        let first = AgentService::new(config.clone(), initial).unwrap();
+        assert_eq!(first.trusted_hub.epoch(), 0);
+        drop(first);
+
+        let new_hub = HubIdentity::generate();
+        let new_grant = GrantAuthority::generate();
+        let rotation = build_hub_key_rotation(&old_hub, &new_hub, 1).unwrap();
+        let rotated = AgentService::new(
+            config.clone(),
+            AgentProvisionedMaterial {
+                device_identity: device.clone(),
+                trusted_hub: new_hub.verifier(),
+                grant_verifier: new_grant.verifier(),
+                additional_grant_verifiers: vec![old_grant.verifier()],
+                hub_rotation: Some(rotation),
+                tls_root_der: vec![1],
+            },
+        )
+        .unwrap();
+        assert_eq!(rotated.trusted_hub.verifier(), new_hub.verifier());
+        assert_eq!(rotated.trusted_hub.epoch(), 1);
+        let overlap = rotated.grants.snapshot().verifier_keys;
+        assert!(overlap.contains(&new_grant.verifier().to_bytes()));
+        assert!(overlap.contains(&old_grant.verifier().to_bytes()));
+        drop(rotated);
+
+        let retired = AgentService::new(
+            config,
+            AgentProvisionedMaterial {
+                device_identity: device,
+                trusted_hub: new_hub.verifier(),
+                grant_verifier: new_grant.verifier(),
+                additional_grant_verifiers: vec![],
+                hub_rotation: None,
+                tls_root_der: vec![1],
+            },
+        )
+        .unwrap();
+        let keys = retired.grants.snapshot().verifier_keys;
+        assert_eq!(keys, vec![new_grant.verifier().to_bytes()]);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]

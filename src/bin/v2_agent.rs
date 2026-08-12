@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use computer_use_mcp_gateway::{
+    v2_m0_trust::HubKeyRotation,
     v2_m1::ReconnectPolicy,
-    v2_m1_agent::{AgentService, AgentServiceConfig},
-    v2_m1_keys::load_agent_material,
+    v2_m1_agent::{AgentService, AgentServiceConfig, CuaAgentConfig},
+    v2_m1_keys::{load_agent_material, load_trusted_text, load_verifying_key},
 };
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "cumg-v2-agent")]
@@ -27,6 +27,16 @@ struct Config {
     hub_public_key_file: PathBuf,
     #[arg(long, env = "CUMG_V2_GRANT_PUBLIC_KEY_FILE")]
     grant_public_key_file: PathBuf,
+    /// Additional grant verifiers used during old/new signing-key overlap.
+    #[arg(
+        long = "additional-grant-public-key-file",
+        env = "CUMG_V2_ADDITIONAL_GRANT_PUBLIC_KEY_FILES",
+        value_delimiter = ','
+    )]
+    additional_grant_public_key_files: Vec<PathBuf>,
+    /// Signed Hub-key continuity document used only when the persisted Hub key changes.
+    #[arg(long, env = "CUMG_V2_HUB_ROTATION_FILE")]
+    hub_rotation_file: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_TLS_ROOT_DER_FILE")]
     tls_root_der_file: PathBuf,
     #[arg(long, env = "CUMG_V2_STATE_DIR")]
@@ -46,23 +56,58 @@ struct Config {
     reconnect_max_ms: u64,
     #[arg(long, env = "CUMG_V2_RECONNECT_ATTEMPTS", default_value_t = 8)]
     reconnect_attempts: u32,
+    /// Enable the external Cua MCP GUI backend by supplying its executable.
+    #[arg(long, env = "CUMG_V2_CUA_COMMAND")]
+    cua_command: Option<String>,
+    #[arg(long = "cua-arg", env = "CUMG_V2_CUA_ARGS", value_delimiter = ',')]
+    cua_args: Vec<String>,
+    #[arg(long, env = "CUMG_V2_CUA_BACKEND_VERSION", default_value = "external")]
+    cua_backend_version: String,
+    #[arg(long, env = "CUMG_V2_CUA_CONNECT_TIMEOUT_SECS", default_value_t = 10)]
+    cua_connect_timeout_secs: u64,
+    #[arg(long, env = "CUMG_V2_CUA_TOOL_TIMEOUT_SECS", default_value_t = 30)]
+    cua_tool_timeout_secs: u64,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let _observability = computer_use_mcp_gateway::v2_observability::init("cumg-v2-agent")?;
     let args = Config::parse();
-    let material = load_agent_material(
+    let mut material = load_agent_material(
         &args.device_secret_file,
         &args.hub_public_key_file,
         &args.grant_public_key_file,
         &args.tls_root_der_file,
     )
     .context("failed to load V2 Agent key/trust material")?;
+    for path in &args.additional_grant_public_key_files {
+        material
+            .additional_grant_verifiers
+            .push(load_verifying_key(path).context("failed to load additional grant verifier")?);
+    }
+    if let Some(path) = &args.hub_rotation_file {
+        let document =
+            load_trusted_text(path, 64 * 1024).context("failed to load Hub rotation document")?;
+        material.hub_rotation = Some(
+            serde_json::from_str::<HubKeyRotation>(&document)
+                .context("invalid Hub rotation document")?,
+        );
+    }
+    let cua = args.cua_command.as_ref().map(|command| CuaAgentConfig {
+        command: command.clone(),
+        args: if args.cua_args.is_empty() {
+            vec!["mcp".into()]
+        } else {
+            args.cua_args.clone()
+        },
+        backend_version: args.cua_backend_version.clone(),
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        revision: 1,
+        connect_timeout: Duration::from_secs(args.cua_connect_timeout_secs),
+        tool_timeout: Duration::from_secs(args.cua_tool_timeout_secs),
+        reconnect_attempts: 3,
+        reconnect_backoff: Duration::from_millis(200),
+    });
     let config = AgentServiceConfig {
         hub_endpoint: args.hub_endpoint,
         hub_domain: args.hub_domain,
@@ -75,6 +120,7 @@ async fn main() -> Result<()> {
             max_delay: Duration::from_millis(args.reconnect_max_ms),
             max_attempts: args.reconnect_attempts,
         },
+        cua,
     };
     let mut agent =
         AgentService::new(config, material).context("invalid V2 Agent configuration")?;

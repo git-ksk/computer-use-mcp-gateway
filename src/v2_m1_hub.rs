@@ -19,21 +19,24 @@ use crate::v2_m0_transport::{
     RemoteCancellationAck, RemoteResult, TrustedSessionClock, verify_agent_heartbeat,
     verify_agent_proof, verify_remote_cancellation_ack, verify_remote_result,
 };
+use crate::v2_m0_trust::{DeviceKeyRotation, apply_device_key_rotation};
 use crate::v2_m1_grpc::{
     decode_agent_frame, encode_hub_frame,
     proto::{AgentFrame, HubFrame, agent_control_server::AgentControl},
 };
 use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
 use ed25519_dalek::VerifyingKey;
+use opentelemetry::KeyValue;
 use rand::{RngCore, rngs::OsRng};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument as _;
 
 const SESSION_QUEUE_DEPTH: usize = 16;
 const DEFAULT_GRANT_TTL_MS: u64 = 30_000;
@@ -48,6 +51,7 @@ pub struct HubProvisionedMaterial {
     pub hub_identity: HubIdentity,
     pub grant_authority: GrantAuthority,
     pub device_verifier: VerifyingKey,
+    pub device_rotation: Option<DeviceKeyRotation>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +59,8 @@ pub struct HubServiceConfig {
     pub state_dir: std::path::PathBuf,
     pub heartbeat_timeout: Duration,
     pub max_queued_per_device: usize,
+    pub max_agent_sessions: usize,
+    pub max_agent_session_starts_per_minute: usize,
 }
 
 impl HubServiceConfig {
@@ -69,6 +75,11 @@ impl HubServiceConfig {
         if self.heartbeat_timeout.is_zero() {
             return Err(HubServiceError::InvalidConfig(
                 "heartbeat timeout must be non-zero",
+            ));
+        }
+        if self.max_agent_sessions == 0 || self.max_agent_session_starts_per_minute == 0 {
+            return Err(HubServiceError::InvalidConfig(
+                "Agent session limits must be non-zero",
             ));
         }
         Ok(())
@@ -94,6 +105,8 @@ struct HubInner {
     checkpoint: CheckpointStore,
     persistent: Mutex<PersistentHubState>,
     live: Mutex<Option<LiveSession>>,
+    session_slots: Arc<Semaphore>,
+    session_rate: crate::v2_limits::SlidingWindowRateLimit,
 }
 
 #[derive(Clone)]
@@ -204,10 +217,16 @@ impl SingleDeviceHub {
             .map_err(HubServiceError::Persistence)?;
 
         let mut identity_registry = DeviceRegistry::default();
-        let device_id = identity_registry.provision_trusted_device(material.device_verifier);
-        let (registry, admission) = match checkpoint.load_latest::<HubPersistentState>() {
+        let provisioned_device_id =
+            identity_registry.provision_trusted_device(material.device_verifier);
+        let (device_id, registry, admission) = match checkpoint.load_latest::<HubPersistentState>()
+        {
             Ok(state) => {
-                let (registry, admission) = state
+                if state.registry.devices.len() != 1 {
+                    return Err(HubServiceError::CheckpointDeviceTrustMismatch);
+                }
+                let device_id = state.registry.devices[0].device_id.clone();
+                let (mut registry, admission) = state
                     .restore(config.admission_limits())
                     .map_err(HubServiceError::Persistence)?;
                 if registry
@@ -215,11 +234,27 @@ impl SingleDeviceHub {
                     .map_err(HubServiceError::Control)?
                     != material.device_verifier
                 {
-                    return Err(HubServiceError::CheckpointDeviceTrustMismatch);
+                    let rotation = material
+                        .device_rotation
+                        .as_ref()
+                        .ok_or(HubServiceError::CheckpointDeviceTrustMismatch)?;
+                    if rotation.device_id != device_id {
+                        return Err(HubServiceError::CheckpointDeviceTrustMismatch);
+                    }
+                    apply_device_key_rotation(&mut registry, rotation, rotation.rotation_epoch)
+                        .map_err(HubServiceError::Trust)?;
+                    if registry
+                        .device_verifier(&device_id)
+                        .map_err(HubServiceError::Control)?
+                        != material.device_verifier
+                    {
+                        return Err(HubServiceError::CheckpointDeviceTrustMismatch);
+                    }
                 }
-                (registry, admission)
+                (device_id, registry, admission)
             }
             Err(PersistenceError::NoCheckpoint) => (
+                provisioned_device_id,
                 identity_registry,
                 HubAdmissionController::new(config.admission_limits())
                     .map_err(HubServiceError::Execution)?,
@@ -227,6 +262,12 @@ impl SingleDeviceHub {
             Err(error) => return Err(HubServiceError::Persistence(error)),
         };
 
+        let session_slots = Arc::new(Semaphore::new(config.max_agent_sessions));
+        let session_rate = crate::v2_limits::SlidingWindowRateLimit::new(
+            config.max_agent_session_starts_per_minute,
+            Duration::from_secs(60),
+        )
+        .map_err(|_| HubServiceError::InvalidConfig("invalid Agent session rate limit"))?;
         let inner = Arc::new(HubInner {
             config,
             material,
@@ -237,6 +278,8 @@ impl SingleDeviceHub {
                 admission,
             }),
             live: Mutex::new(None),
+            session_slots,
+            session_rate,
         });
         let service = Self {
             inner: inner.clone(),
@@ -525,6 +568,7 @@ impl SingleDeviceHub {
                                 &hello,
                                 &challenge,
                                 generation,
+                                &mut pending,
                                 &mut cancel_waiters,
                             ).await?;
                         }
@@ -689,6 +733,7 @@ impl SingleDeviceHub {
         hello: &AgentHello,
         challenge: &HubChallenge,
         generation: u64,
+        pending: &mut HashMap<String, PendingOperation>,
         cancel_waiters: &mut HashMap<
             String,
             oneshot::Sender<Result<CancellationDisposition, HubCommandError>>,
@@ -700,6 +745,30 @@ impl SingleDeviceHub {
         {
             let persistent = self.inner.persistent.lock().await;
             verify_remote_cancellation_ack(&persistent.registry, hello, challenge, &ack)?;
+        }
+        if ack.disposition == CancellationDisposition::IndeterminateAfterPropagation {
+            {
+                let mut persistent = self.inner.persistent.lock().await;
+                if matches!(
+                    persistent.admission.state(&ack.operation_id),
+                    Some(HubOperationState::Dispatched | HubOperationState::CancelRequested)
+                ) {
+                    persistent.admission.mark_indeterminate(&ack.operation_id)?;
+                    persist_locked(&self.inner, &persistent)?;
+                }
+            }
+            if let Some(operation) = pending.remove(&ack.operation_id) {
+                let _ = operation
+                    .reply
+                    .send(Err(HubCommandError::DeviceIndeterminate {
+                        operation_id: ack.operation_id.clone(),
+                    }));
+            }
+            tracing::warn!(
+                event = "v2_hub_operation_indeterminate",
+                operation_id = %ack.operation_id,
+                "backend cancellation was propagated but side-effect interruption is unproven; device quarantined"
+            );
         }
         if let Some(waiter) = cancel_waiters.remove(&ack.operation_id) {
             let _ = waiter.send(Ok(ack.disposition));
@@ -900,17 +969,43 @@ impl AgentControl for SingleDeviceHub {
         &self,
         request: Request<Streaming<AgentFrame>>,
     ) -> Result<Response<Self::OpenSessionStream>, Status> {
+        if !self.inner.session_rate.try_acquire() {
+            crate::v2_observability::increment_counter(
+                "cumg.v2.agent_session_rejected",
+                &[KeyValue::new("reason", "rate_limit")],
+            );
+            return Err(Status::resource_exhausted(
+                "Agent session start rate exceeded",
+            ));
+        }
+        let permit = self
+            .inner
+            .session_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                crate::v2_observability::increment_counter(
+                    "cumg.v2.agent_session_rejected",
+                    &[KeyValue::new("reason", "concurrency_limit")],
+                );
+                Status::resource_exhausted("Agent session concurrency exceeded")
+            })?;
+        crate::v2_observability::increment_counter("cumg.v2.agent_session_started", &[]);
         let (outbound_tx, outbound_rx) = mpsc::channel(SESSION_QUEUE_DEPTH);
         let service = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = service
-                .run_session(request.into_inner(), outbound_tx.clone())
-                .await
-            {
-                tracing::warn!(event = "v2_hub_session_error", error = ?error, "V2 Hub Agent session ended with error");
-                let _ = outbound_tx.send(Err(error.grpc_status())).await;
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                if let Err(error) = service
+                    .run_session(request.into_inner(), outbound_tx.clone())
+                    .await
+                {
+                    tracing::warn!(event = "v2_hub_session_error", error = ?error, "V2 Hub Agent session ended with error");
+                    let _ = outbound_tx.send(Err(error.grpc_status())).await;
+                }
             }
-        });
+            .instrument(tracing::info_span!("v2_agent_session")),
+        );
         Ok(Response::new(Box::pin(ReceiverStream::new(outbound_rx))))
     }
 }
@@ -1013,6 +1108,7 @@ pub enum HubServiceError {
     Control(crate::v2_m0::ControlError),
     Execution(crate::v2_m0_execution::ExecutionError),
     Transport(crate::v2_m0_transport::TransportError),
+    Trust(crate::v2_m0_trust::TrustError),
     Carrier(crate::v2_m1_grpc::GrpcCarrierError),
     Status(Status),
     WrongDevice,
@@ -1068,3 +1164,81 @@ impl fmt::Display for HubServiceError {
 }
 
 impl std::error::Error for HubServiceError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v2_m0::DeviceIdentity;
+    use crate::v2_m0_trust::build_device_key_rotation;
+
+    fn test_state_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cumg-v2-hub-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn startup_preserves_stable_device_id_across_dual_signed_device_rotation() {
+        let state_dir = test_state_dir("device-rotation");
+        let config = HubServiceConfig {
+            state_dir: state_dir.clone(),
+            heartbeat_timeout: Duration::from_secs(5),
+            max_queued_per_device: 1,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        };
+        let old_device = DeviceIdentity::generate();
+        let hub_identity = HubIdentity::generate();
+        let grants = GrantAuthority::generate();
+        let (first, _) = SingleDeviceHub::new(
+            config.clone(),
+            HubProvisionedMaterial {
+                hub_identity: hub_identity.clone(),
+                grant_authority: grants.clone(),
+                device_verifier: old_device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let stable_device_id = first.device_id().to_owned();
+        drop(first);
+
+        let new_device = DeviceIdentity::generate();
+        let rotation =
+            build_device_key_rotation(&stable_device_id, &old_device, &new_device, 1).unwrap();
+        let (rotated, _) = SingleDeviceHub::new(
+            config.clone(),
+            HubProvisionedMaterial {
+                hub_identity: hub_identity.clone(),
+                grant_authority: grants.clone(),
+                device_verifier: new_device.verifying_key(),
+                device_rotation: Some(rotation),
+            },
+        )
+        .unwrap();
+        assert_eq!(rotated.device_id(), stable_device_id);
+        drop(rotated);
+
+        let (restarted, _) = SingleDeviceHub::new(
+            config,
+            HubProvisionedMaterial {
+                hub_identity,
+                grant_authority: grants,
+                device_verifier: new_device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(restarted.device_id(), stable_device_id);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+}

@@ -93,6 +93,8 @@ impl CuaMcpAdapter {
             supported: vec![
                 DeviceCapability::ListApplications,
                 DeviceCapability::ScreenGeometry,
+                DeviceCapability::PointerClick,
+                DeviceCapability::PointerDrag,
             ],
         }
     }
@@ -130,8 +132,14 @@ impl CuaMcpAdapter {
         if raw.is_error == Some(true) {
             return Err(M1BackendError::BackendToolError);
         }
-        let value = structured_value(&raw)?;
-        let result = normalize_result(command, &value)?;
+        let result = match command {
+            DeviceCommand::PointerClick { .. } => DeviceResult::PointerClickCompleted,
+            DeviceCommand::PointerDrag { .. } => DeviceResult::PointerDragCompleted,
+            _ => {
+                let value = structured_value(&raw)?;
+                normalize_result(command, &value)?
+            }
+        };
         Ok(BackendExecutionOutcome::Completed(result))
     }
 }
@@ -142,9 +150,43 @@ fn map_command(
     match command {
         DeviceCommand::ListApplications => Ok(("list_apps", None)),
         DeviceCommand::ScreenGeometry => Ok(("get_screen_size", None)),
-        DeviceCommand::PointerClick { .. } => Err(M1BackendError::UnsupportedCommand(
-            DeviceCapability::PointerClick,
+        DeviceCommand::PointerClick { x, y, button } => Ok((
+            "click",
+            serde_json::json!({
+                "x": x,
+                "y": y,
+                "button": pointer_button_name(*button),
+                "scope": "desktop"
+            })
+            .as_object()
+            .cloned(),
         )),
+        DeviceCommand::PointerDrag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            duration_ms,
+        } => {
+            if *duration_ms == 0 || *duration_ms > 10_000 {
+                return Err(M1BackendError::InvalidRequest(
+                    "pointer drag duration must be within 1..=10000 ms",
+                ));
+            }
+            Ok((
+                "drag",
+                serde_json::json!({
+                    "from_x": from_x,
+                    "from_y": from_y,
+                    "to_x": to_x,
+                    "to_y": to_y,
+                    "duration_ms": duration_ms,
+                    "scope": "desktop"
+                })
+                .as_object()
+                .cloned(),
+            ))
+        }
         DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ExecuteProcess,
         )),
@@ -205,9 +247,11 @@ fn normalize_result(
                 scale_factor_milli: (scale * 1000.0).round() as u32,
             })
         }
-        DeviceCommand::PointerClick { .. } => Err(M1BackendError::UnsupportedCommand(
-            DeviceCapability::PointerClick,
-        )),
+        DeviceCommand::PointerClick { .. } | DeviceCommand::PointerDrag { .. } => {
+            Err(M1BackendError::MalformedResponse(
+                "interaction result should not require response normalization",
+            ))
+        }
         DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ExecuteProcess,
         )),
@@ -220,6 +264,14 @@ fn normalize_result(
         DeviceCommand::ListDirectory { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ListDirectory,
         )),
+    }
+}
+
+fn pointer_button_name(button: crate::v2_m0::PointerButton) -> &'static str {
+    match button {
+        crate::v2_m0::PointerButton::Left => "left",
+        crate::v2_m0::PointerButton::Right => "right",
+        crate::v2_m0::PointerButton::Middle => "middle",
     }
 }
 
@@ -237,6 +289,7 @@ pub enum M1BackendError {
     BackendToolError,
     MalformedResponse(&'static str),
     NumericOverflow,
+    InvalidRequest(&'static str),
     UnsupportedCommand(DeviceCapability),
 }
 

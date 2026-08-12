@@ -1,6 +1,6 @@
 # V2-M1 progress — single secure remote Agent
 
-Status: **in progress**. V2-M0 is GO; V2-M1 is not yet accepted or production-ready.
+Status: **accepted (2026-08-12)**. V2-M0 was GO; the V2-M1 single secure remote Agent acceptance gate is complete. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
 
 ## Transport migration: gRPC bidi production candidate
 
@@ -56,9 +56,12 @@ The current `v2-m1-secure-agent` implementation adds these M1 building blocks wh
 - restart snapshots for device registry, grant verifier/revocation/consumption state, Hub operation state, and Agent terminal-operation replay barriers;
 - crash-safe checkpoint files with bounded per-file size, `create_new`, flush/fsync, symlink rejection, restrictive Unix directory/file permission checks, and a bounded 64-checkpoint retention window; consumed-grant tombstones are pruned after their enforced grant expiry;
 - restart conversion of queued/pre-dispatch work to `cancelled` and dispatched/cancel-requested work to `indeterminate`, so process restart never makes ambiguous work runnable again;
-- an asynchronous Cua MCP semantic adapter that reuses the V1 request-level cancellation path, normalizes `list_apps`/`get_screen_size`, and classifies propagated cancellation or timeout as `indeterminate` rather than claiming the desktop action definitely stopped;
+- an optional asynchronous Cua MCP semantic adapter integrated into the long-lived Agent runtime. It exposes typed `ListApplications`, `ScreenGeometry`, `PointerClick`, and bounded `PointerDrag`, reuses request-level MCP cancellation, and classifies propagated cancellation or timeout as `indeterminate` rather than claiming a desktop side effect definitely stopped;
 - Hub-side device quarantine for `indeterminate` operations: a different operation on the same device is rejected until an explicit resolution records the ambiguous operation as confirmed completed or confirmed not executed;
-- a separate key-material boundary for Agent device, Hub transport, and grant-signing Ed25519 secrets plus public trust anchors: secret files are created with restrictive permissions, symlinks and weak permissions fail closed, and TLS root material is loaded separately from replay checkpoints.
+- a separate key-material boundary for Agent device, Hub application identity, grant-signing identity, and TLS material: secret files are created with restrictive permissions, symlinks and weak permissions fail closed, Hub/device key replacement requires signed continuity, grant verifier rotation supports a bounded old/new overlap, and TLS certificate renewal remains an ACME/service-manager concern rather than a custom protocol;
+- overload controls at the M1 service boundaries: Agent session starts and active sessions are bounded with standard gRPC resource-exhaustion errors, northbound MCP requests are shed with HTTP 429/503 before OAuth work, and these guards compose with the existing per-device operation admission controller;
+- OpenTelemetry/OTLP traces and metrics using standard OTel endpoint/protocol/header/timeout environment variables, with command payloads, argv, file contents, screenshots, clipboard data, bearer tokens, and private credentials excluded from default telemetry;
+- OS-native service packaging: a hardened systemd Hub service uses encrypted systemd credentials for long-lived application keys, Linux Agents have a user-service template, and macOS Agents use a LaunchAgent so Cua/TCC remains in the interactive user session.
 
 The persisted replay/trust checkpoint intentionally contains **no private signing keys**. File-based key provisioning is now defined and tested, but a production deployment may still choose an OS keychain, HSM/KMS, or another reviewed secret store instead of filesystem secrets. Persisting public trust and replay state is necessary for fail-closed restart semantics, but is not a substitute for private-key custody.
 
@@ -72,14 +75,18 @@ Northbound tests now cover RFC 9728 path-inserted metadata, HTTPS-only resource/
 
 A separate operator-controlled M1 backend run on 2026-08-11 connected the asynchronous `CuaMcpAdapter` to Cua Driver 0.19.3 through its MCP transport. `ListApplications` normalized to an application count of 77 and `ScreenGeometry` normalized to 1920×1080 points with scale factor 1.0; the PoC did not emit the raw application list. This proves the asynchronous semantic adapter against the real backend for observe operations, not real-Cua cancellation.
 
-## Still required before V2-M1 acceptance
+## V2-M1 acceptance result
 
-The `v2_agent` process now integrates the direct process executor, gRPC/TLS outbound lifecycle, heartbeat timeout/reconnect behavior, cancellation, the Agent-side file-based key/trust boundary, and restart-safe replay checkpoints. Remaining M1 work is narrower, but there are still production blockers:
+The remaining M1 blockers were closed on 2026-08-12. The final gate and command-level evidence are recorded in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
 
-- add OS-specific service packaging/installation (for example launchd/systemd) around the now-runnable long-lived `v2_agent` process;
-- integrate the Hub-side key boundary into the operator-facing Hub service and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;
-- productionize the now-implemented northbound OAuth protected-resource adapter against the selected authorization server, including deployment credentials/rotation, reverse-proxy HTTPS/rate limits, and an interoperability run with the intended real MCP clients;
-- run cancellation acceptance against real Cua desktop operations; the deterministic MCP fixture already proves exact-request propagation and indeterminate quarantine, but it cannot prove a real desktop action stopped;
-- add deployment-level connection/rate limits and operational observability for the M1 service boundary.
+The production boundary now follows the standard-first decision:
 
-Do not start V2-M2 multi-machine routing until the single-device M1 acceptance path is complete.
+- ordinary Hub TLS certificate renewal is delegated to ACME; the deploy hook validates the certificate/private-key pair and atomically installs regular files before service restart;
+- Linux Hub application keys use systemd encrypted credentials, while Agent key files remain behind strict local file permissions and signed continuity rules; no private key is stored in replay checkpoints or repository configuration;
+- Hub/device identity replacement uses the existing signed continuity proofs, and grant signing uses a 5-minute-maximum old/new verifier overlap before retirement;
+- Agent session starts/active sessions and northbound MCP requests have bounded overload shedding with standard gRPC/HTTP errors; pre-TLS handshake flood control remains the responsibility of the standard network edge/firewall/reverse proxy rather than a custom transport;
+- OTLP traces/metrics are opt-in through standard OpenTelemetry variables and omit sensitive operation payloads by default;
+- launchd/systemd own restart/config/log lifecycle;
+- real Cua Driver 0.19.3 cancellation was exercised through the actual V2 Hub↔Agent gRPC/TLS runtime. A 10-second desktop drag was cancelled in flight; the downstream MCP cancellation was propagated, the result remained `IndeterminateAfterPropagation`, the originating operation became `DeviceIndeterminate`, and subsequent work stayed quarantined instead of being replayed.
+
+V2-M1 acceptance is a milestone claim, not a claim that every deployment is automatically secure. Operators still need a reviewed authorization server configuration, a TLS/network edge with appropriate handshake/rate controls, protected secret custody, OS permissions/TCC, and deployment-specific monitoring. Multi-machine routing, SPIFFE/SPIRE adoption, native GUI backends, and fleet-wide workload identity remain V2-M2/later work.

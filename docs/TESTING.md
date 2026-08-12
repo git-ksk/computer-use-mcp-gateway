@@ -51,7 +51,7 @@ These thresholds are regression guards, not capacity or production-performance c
 @modelcontextprotocol/conformance@0.2.0-alpha.11
 ```
 
-CI requires Node 20+ and asks the pinned runner to load both frozen requirement revisions tracked by this project:
+CI requires Node 22+ and asks the pinned runner to load both frozen requirement revisions tracked by this project:
 
 ```text
 2025-11-25
@@ -181,6 +181,28 @@ launch fresh TextEdit
 ```
 
 Execution of this lane is intentionally left to the operator. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
+
+## V2-M1 final acceptance
+
+The V2-M1 gate is recorded in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). Run the deterministic portion explicitly on Rust 1.88 even if another toolchain is the local default:
+
+```bash
+cargo +1.88.0 fmt --check
+cargo +1.88.0 check --locked --all-targets
+cargo +1.88.0 test --locked --all-targets
+cargo +1.88.0 clippy --locked --all-targets
+python3 scripts/check_docs.py
+```
+
+The real-Cua cancellation test is intentionally ignored in normal test discovery because it performs a real desktop action. On the dedicated, logged-in, TCC-granted macOS acceptance machine:
+
+```bash
+CUMG_V2_CUA_CANCEL_E2E_ACK=1 CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" cargo +1.88.0 test --locked   --test v2_m1_cua_cancellation_e2e -- --ignored --nocapture
+```
+
+The test must observe `IndeterminateAfterPropagation`, resolve the original Hub operation to `DeviceIndeterminate`, and reject subsequent work through the same device quarantine. A merely delivered cancellation notification is not sufficient evidence of non-execution.
+
+Packaging/lifecycle acceptance also includes `plutil -lint` on the LaunchAgent template, shell syntax plus valid/mismatched certificate fixtures for the ACME deploy hook, and throwaway `v2_keyctl` generation/rotation outside the repository. The systemd unit must additionally be run through `systemd-analyze verify` on the target Linux distribution or Linux release CI because the macOS desktop acceptance host cannot execute systemd's semantic verifier.
 
 ## Running smoke locally
 

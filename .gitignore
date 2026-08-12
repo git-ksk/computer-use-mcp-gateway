@@ -4,3 +4,12 @@
 .env.*
 !.env.example
 *.log
+
+# Generated private key / credential material must never enter the public repo.
+*.key
+*.key.pem
+*.private.pem
+*.p12
+*.pfx
+*.secret
+secrets/

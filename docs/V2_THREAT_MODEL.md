@@ -212,16 +212,18 @@ Normal audit events may contain stable identifiers such as device ID, generation
 
 They should not contain raw screenshots, raw backend output, raw command arguments, clipboard values, typed text, credentials, or full accessibility trees. Debug capture that intentionally includes such content is a separate high-sensitivity mode and must not be enabled implicitly.
 
-## V2-M1 residual requirements before production remote use
+## V2-M1 acceptance and residual deployment responsibilities
 
-M1 now proves an outbound long-lived Agent lifecycle over TLS-protected gRPC, a deployable single-device Hub daemon, exact-capability grants for Agent-native operations, generation-bounded replay state, restart-safe checkpoints, bounded read-only filesystem observation, and live process-tree cancellation. It is still **not production-ready**.
+The V2-M1 implementation gate passed on 2026-08-12. The M1 code now includes verified northbound principal construction, production key/certificate lifecycle procedures, bounded service connection/rate shedding, bounded replay pruning, real-Cua cancellation quarantine, OpenTelemetry/OTLP integration, and OS service packaging. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
 
-Before a remote Agent is exposed as a product service, M1 must at minimum add and verify:
+The threat model still requires the deployment to preserve these external responsibilities:
 
-- real northbound authentication integration that constructs `AuthenticatedClientPrincipal` only from verified identity-provider output;
-- production private-key/certificate custody and rotation; private signing keys remain outside replay checkpoints;
-- Hub-side connection/TLS-handshake/rate limits and operational observability;
-- bounded pruning or generation-rollover semantics for terminal Agent operation tombstones;
-- no filesystem sandbox claim for arbitrary process or shell execution: `allowed_cwd_root` constrains cwd but does not prevent process argv or shell syntax from addressing other filesystem paths. `ExecuteProcess` and `Shell` are separate exact `Dangerous` capabilities. The read-only `ReadFile`/`ListDirectory` capabilities are path-bounded and symlink-escape checked, but do not constrain either execution capability;
-- live cancellation acceptance for Cua desktop operations and explicit handling when a GUI backend cannot prove interruption;
-- OS-specific service packaging and reviewed state/key directory locations.
+- the public authorization server/introspection endpoint and the Hub's configured issuer/resource/audience must be reviewed as one trust boundary;
+- raw TCP/TLS handshake floods must be constrained by the host firewall/security group and, where used, a reviewed reverse proxy/load balancer. Application-layer limits intentionally begin after the transport is accepted;
+- application-key recovery material and systemd/macOS credential files must be protected outside the repository. Loss of an old Hub/device key cannot be silently converted into an ordinary continuity rotation;
+- `ExecuteProcess` and `Shell` remain exact `Dangerous` capabilities, not filesystem sandboxes; cwd/root checks do not constrain arbitrary process argv or shell syntax;
+- macOS GUI automation still depends on the operator-controlled Cua/TCC trust boundary; a compromised Agent or desktop backend remains outside the non-compromise guarantees stated above;
+- default telemetry must remain payload-free. Enabling collector/proxy body logging or high-sensitivity debug capture creates a separate sensitive-data boundary;
+- an `indeterminate` operation must remain quarantined until explicit resolution. Network recovery, backend reconnect, or service restart is not permission to replay it.
+
+These are deployment assumptions/residual risks, not missing V2-M1 protocol features. Multi-machine identity, fleet attestation, and native GUI adapters are intentionally deferred to later milestones.

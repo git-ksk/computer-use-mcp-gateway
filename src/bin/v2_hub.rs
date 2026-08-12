@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use computer_use_mcp_gateway::{
+    v2_m0_trust::DeviceKeyRotation,
     v2_m1_grpc::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
     },
@@ -18,7 +19,6 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 const MAX_OAUTH_SECRET_BYTES: u64 = 16 * 1024;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
@@ -35,6 +35,9 @@ struct Args {
     grant_secret_file: PathBuf,
     #[arg(long, env = "CUMG_V2_DEVICE_PUBLIC_KEY_FILE")]
     device_public_key_file: PathBuf,
+    /// Signed device-key continuity document used only when enrolled key changes.
+    #[arg(long, env = "CUMG_V2_DEVICE_ROTATION_FILE")]
+    device_rotation_file: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_TLS_CERT_PEM_FILE")]
     tls_cert_pem_file: PathBuf,
     #[arg(long, env = "CUMG_V2_TLS_KEY_PEM_FILE")]
@@ -45,6 +48,14 @@ struct Args {
     heartbeat_timeout_secs: u64,
     #[arg(long, env = "CUMG_V2_MAX_QUEUED_PER_DEVICE", default_value_t = 8)]
     max_queued_per_device: usize,
+    #[arg(long, env = "CUMG_V2_MAX_AGENT_SESSIONS", default_value_t = 2)]
+    max_agent_sessions: usize,
+    #[arg(
+        long,
+        env = "CUMG_V2_MAX_AGENT_SESSION_STARTS_PER_MINUTE",
+        default_value_t = 30
+    )]
+    max_agent_session_starts_per_minute: usize,
 
     /// Optional loopback listener for the protected northbound MCP HTTP endpoint.
     /// Keep this loopback-only and terminate public HTTPS in a reviewed reverse proxy.
@@ -76,6 +87,14 @@ struct Args {
         default_value_t = 5
     )]
     oauth_introspection_timeout_secs: u64,
+    #[arg(long, env = "CUMG_V2_MAX_NORTHBOUND_CONCURRENCY", default_value_t = 16)]
+    max_northbound_concurrency: usize,
+    #[arg(
+        long,
+        env = "CUMG_V2_MAX_NORTHBOUND_REQUESTS_PER_MINUTE",
+        default_value_t = 120
+    )]
+    max_northbound_requests_per_minute: usize,
 }
 
 struct NorthboundRuntime {
@@ -87,11 +106,7 @@ struct NorthboundRuntime {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let _observability = computer_use_mcp_gateway::v2_observability::init("cumg-v2-hub")?;
     let args = Args::parse();
     ensure!(
         args.heartbeat_timeout_secs > 0,
@@ -102,6 +117,16 @@ async fn main() -> Result<()> {
         "CUMG_V2_OAUTH_INTROSPECTION_TIMEOUT_SECS must be greater than zero"
     );
 
+    let device_rotation = if let Some(path) = &args.device_rotation_file {
+        let document = load_trusted_text(path, 64 * 1024)
+            .context("failed to load device rotation document")?;
+        Some(
+            serde_json::from_str::<DeviceKeyRotation>(&document)
+                .context("invalid device rotation document")?,
+        )
+    } else {
+        None
+    };
     let material = HubProvisionedMaterial {
         hub_identity: load_hub_identity(&args.hub_secret_file)
             .context("failed to load Hub Ed25519 identity")?,
@@ -109,6 +134,7 @@ async fn main() -> Result<()> {
             .context("failed to load grant-signing identity")?,
         device_verifier: load_verifying_key(&args.device_public_key_file)
             .context("failed to load enrolled Agent public key")?,
+        device_rotation,
     };
     let (cert_pem, key_pem) =
         load_tls_server_identity(&args.tls_cert_pem_file, &args.tls_key_pem_file)
@@ -118,6 +144,8 @@ async fn main() -> Result<()> {
             state_dir: args.state_dir.clone(),
             heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
             max_queued_per_device: args.max_queued_per_device,
+            max_agent_sessions: args.max_agent_sessions,
+            max_agent_session_starts_per_minute: args.max_agent_session_starts_per_minute,
         },
         material,
     )
@@ -255,11 +283,20 @@ fn build_northbound_runtime(
         .context("invalid OAuth token introspection configuration")?;
     let metadata_url = mcp_config.metadata_url().to_owned();
     let resource = mcp_config.resource().to_owned();
+    let overload = computer_use_mcp_gateway::v2_limits::HttpOverloadGuard::new(
+        args.max_northbound_concurrency,
+        args.max_northbound_requests_per_minute,
+    )
+    .context("invalid V2 northbound connection/rate limits")?;
     let router = build_northbound_router(
         V2NorthboundMcp::new(handle, policy),
         mcp_config,
         Arc::new(verifier),
-    );
+    )
+    .layer(axum::middleware::from_fn_with_state(
+        overload,
+        computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+    ));
     Ok(Some(NorthboundRuntime {
         bind,
         router,

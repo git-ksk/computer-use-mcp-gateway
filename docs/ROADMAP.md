@@ -157,10 +157,10 @@ Only after V2-M0 GO:
 - [x] outbound Agent connection over the accepted encrypted M1 channel
 - [x] gRPC bidirectional streaming transport candidate over TLS, preserving the existing signed application protocol during migration
 - [x] reusable outbound lifecycle and encrypted multi-session reconnect acceptance
-- [x] operator-facing long-lived Agent process lifecycle (`v2_agent`) with outbound gRPC/TLS, bounded reconnect, heartbeat liveness, Ctrl-C shutdown, and non-blocking process cancellation; OS-specific service packaging remains deployment work
+- [x] operator-facing long-lived Agent process lifecycle (`v2_agent`) with outbound gRPC/TLS, bounded reconnect, heartbeat liveness, Ctrl-C shutdown, non-blocking process cancellation, and packaged launchd/systemd service definitions
 - [x] separate file-based key/trust-anchor provisioning boundary with fail-closed filesystem checks
 - [x] Agent replay/trust checkpoint wired into the long-lived service so consumed grants and terminal/in-flight operation IDs survive process restart before execution can replay
-- [ ] production secret-store/certificate rotation integration for the deployed service
+- [x] production TLS/secret lifecycle: ACME deploy-hook integration for ordinary server certificates, systemd encrypted credentials for long-lived Linux Hub application keys, fail-closed file custody elsewhere, and signed Hub/device/grant rotation procedures
 - [x] operator-facing single-device Hub gRPC service (`v2_hub`) for the always-on VM target, with persisted generation/admission state, heartbeat timeout, exact-capability grant issuance, bounded queueing, cancellation, reconnect cleanup, and TLS key/certificate loading
 - [x] standard northbound MCP Authorization protected-resource boundary on `v2_hub` using RFC 9728 discovery + OAuth bearer validation through RFC 7662 introspection, reducing verified identity to `AuthenticatedClientPrincipal` before the existing principal -> device -> exact-capability policy; bearer tokens never cross the Hub-Agent boundary
 - [x] bound replay state across reconnects: Agent and Hub terminal tombstones are pruned at authenticated generation rollover, while indeterminate Hub operations are retained until explicit resolution; grant-consumption tombstones are expiry-pruned and checkpoint files use bounded retention
@@ -169,17 +169,22 @@ Only after V2-M0 GO:
 - [x] versioned capability advertisement with revision/generation tracking
 - [x] per-device operation lease / serialization ownership
 - [x] bounded per-device queueing/load shedding before work reaches the Agent
+- [x] Agent-session and northbound MCP connection/rate shedding using standard gRPC `RESOURCE_EXHAUSTED` and HTTP `429`/`503`, composed with rather than replacing operation admission
+- [x] OpenTelemetry/OTLP traces and metrics via standard `OTEL_EXPORTER_OTLP_*` configuration with sensitive operation payloads excluded by default
+- [x] Linux systemd and macOS launchd packaging around the existing runtimes; service managers own restart/config/log lifecycle instead of a bespoke supervisor
 - [x] short-lived capability-grant validation with an Agent-enforced 5-minute maximum lifetime and exact `DeviceCapability` scoping for M1 Agent-native operations
 - [x] fail-closed stale/offline-agent and stale-capability behavior
 - [x] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
 - [x] explicit higher-risk `Shell` capability for shell syntax/pipelines, distinct from structured argv execution and requiring an exact `DeviceCapability::Shell` grant. The Agent invokes a fixed OS shell (`/bin/sh -c` on Unix, `cmd.exe /D /S /C` on Windows), bounds command size/output/time, applies the same cwd/environment policy as `ExecuteProcess`, and supervises/cancels the full process tree; this is not a filesystem sandbox
 - [x] bounded read-only filesystem observation surface (`ReadFile` / `ListDirectory`) with exact capability grants, canonical path/root checks, symlink-escape rejection, bounded file bytes/directory entries, and command-local coarse errors; `ExecuteProcess` remains `Dangerous` and its argv is explicitly **not** filesystem-sandboxed
-- [ ] clean live cancellation/disconnect semantics across all execution backends
+- [x] clean live cancellation/disconnect semantics across all M1 execution backends
   - [x] Agent-native process cancellation while the gRPC stream remains responsive; child is killed/waited and the operation ID becomes terminal before reconnect
   - [x] exact downstream cancellation propagation + indeterminate device quarantine in deterministic MCP acceptance
-  - [ ] real-Cua desktop cancellation acceptance
+  - [x] real-Cua desktop cancellation acceptance: live Cua Driver 0.19.3 drag cancellation is propagated to the exact downstream request and remains `indeterminate`, with Hub quarantine verified end-to-end
 - [x] Cua adapter behind the backend capability contract with adapter conformance coverage
-- [ ] keep GUI/computer-use behind a pluggable adapter boundary: Cua remains the initial GUI backend; native GUI backends are a later step and must not block shell-first M1 utility
+- [x] keep GUI/computer-use behind a pluggable adapter boundary: Cua is the optional initial GUI backend in the long-lived Agent; native GUI backends remain a later step
+
+> **V2-M1 acceptance (2026-08-12): PASS.** The single secure remote Agent milestone is accepted after Rust 1.88 regression, signed key-rotation tests, production TLS/secret lifecycle checks, overload/OTLP integration, launchd/systemd packaging review, and a real Cua Driver 0.19.3 cancellation E2E that preserves `indeterminate` quarantine. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). This does not authorize skipping external edge controls or advancing multi-machine semantics without the V2-M2 review.
 
 ### V2-M2: multi-machine Hub
 

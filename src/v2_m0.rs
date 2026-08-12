@@ -28,6 +28,7 @@ pub enum DeviceCapability {
     ListApplications,
     ScreenGeometry,
     PointerClick,
+    PointerDrag,
     ExecuteProcess,
     Shell,
     ReadFile,
@@ -41,7 +42,7 @@ impl DeviceCapability {
             | Self::ScreenGeometry
             | Self::ReadFile
             | Self::ListDirectory => CapabilityClass::Observe,
-            Self::PointerClick => CapabilityClass::Interact,
+            Self::PointerClick | Self::PointerDrag => CapabilityClass::Interact,
             // Direct process and free-form shell execution can mutate arbitrary
             // local state and are therefore never implied by observe/interact access.
             Self::ExecuteProcess | Self::Shell => CapabilityClass::Dangerous,
@@ -117,6 +118,13 @@ pub enum DeviceCommand {
         y: i32,
         button: PointerButton,
     },
+    PointerDrag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+        duration_ms: u64,
+    },
     ExecuteProcess {
         request: ProcessRequest,
     },
@@ -137,6 +145,7 @@ impl DeviceCommand {
             Self::ListApplications => DeviceCapability::ListApplications,
             Self::ScreenGeometry => DeviceCapability::ScreenGeometry,
             Self::PointerClick { .. } => DeviceCapability::PointerClick,
+            Self::PointerDrag { .. } => DeviceCapability::PointerDrag,
             Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
             Self::Shell { .. } => DeviceCapability::Shell,
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
@@ -874,6 +883,7 @@ pub enum DeviceResult {
         scale_factor_milli: u32,
     },
     PointerClickCompleted,
+    PointerDragCompleted,
     Process {
         output: ProcessOutput,
     },
@@ -902,6 +912,10 @@ impl DeviceResult {
                 | (
                     Self::PointerClickCompleted,
                     DeviceCommand::PointerClick { .. }
+                )
+                | (
+                    Self::PointerDragCompleted,
+                    DeviceCommand::PointerDrag { .. }
                 )
                 | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
                 | (Self::Shell { .. }, DeviceCommand::Shell { .. })
