@@ -296,7 +296,7 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     );
 
     let mut agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
-    let mut agent_b = AgentService::new(config_b, material_b)?;
+    let mut agent_b = AgentService::new(config_b.clone(), material_b.clone())?;
     let (a_shutdown_tx, a_shutdown_rx) = watch::channel(false);
     let (b_shutdown_tx, b_shutdown_rx) = watch::channel(false);
     let mut a_task = tokio::spawn(async move { agent_a.run(a_shutdown_rx).await });
@@ -447,6 +447,8 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     // independent P0 checkpoints before allowing either Agent to reconnect.
     server_b.abort();
     let _ = server_b.await;
+    let _ = b_shutdown_tx.send(true);
+    let _ = b_task.await;
     drop(handle_a);
     drop(handle_b);
     drop(hub);
@@ -512,6 +514,9 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
     let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
     a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
+    let mut restarted_agent_b = AgentService::new(config_b.clone(), material_b.clone())?;
+    let (b2_shutdown_tx, b2_shutdown_rx) = watch::channel(false);
+    let b_task = tokio::spawn(async move { restarted_agent_b.run(b2_shutdown_rx).await });
 
     let a_generation_after_hub_restart =
         wait_new_generation(&handle_a, a_generation_after_reconnect)
@@ -579,7 +584,7 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     assert_eq!(handle_a.resolution_records().await.len(), 1);
 
     a3_shutdown_tx.send(true)?;
-    b_shutdown_tx.send(true)?;
+    b2_shutdown_tx.send(true)?;
     let _ = a_task.await?;
     let _ = b_task.await?;
     server_a.abort();
