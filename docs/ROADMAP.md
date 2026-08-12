@@ -162,15 +162,17 @@ Only after the P0 core is strong should multi-device work advance beyond the min
 
 M2 acceptance requires:
 
-1. [ ] Device A enters `indeterminate` after an ambiguous state-changing action and remains quarantined.
-2. [ ] Device B remains independently usable by another authorized principal.
-3. [ ] Another principal cannot acquire, inherit, or replace Device A's unresolved ownership.
-4. [ ] Hub restart preserves independent A/B state.
-5. [ ] reconnect/failover does not replay Device A's ambiguous operation.
-6. [ ] stale device/Agent/capability generations cannot route or finalize old work.
-7. [ ] queues/load shedding do not bypass per-device ownership invariants.
+1. [x] Device A enters `indeterminate` after an ambiguous state-changing action and remains quarantined.
+2. [x] Device B remains independently usable by another authorized principal.
+3. [x] Another principal cannot acquire, inherit, or replace Device A's unresolved ownership.
+4. [x] Hub restart preserves independent A/B state.
+5. [x] reconnect/failover does not replay Device A's ambiguous operation.
+6. [x] stale device/Agent/capability generations cannot route or finalize old work.
+7. [x] queues/load shedding do not bypass per-device ownership invariants.
 
 A machine registry, device list, or successful routing to two machines is **not** sufficient M2 acceptance evidence.
+
+P1 fixed-set proof accepted boundary: the implementation composes existing per-device P0 Hubs with independent checkpoints and no shared fleet scheduler. A fresh physical real-Cua P1 rerun remains open on the trusted main-only desktop lane and must not be inferred from deterministic CI.
 
 ## V2-M3 — backend portability and OSS integration
 
@@ -178,10 +180,10 @@ After the uncertainty-aware core and multi-device invariant proof pass:
 
 ### Backend portability
 
-- [ ] integrate a second backend or deterministic reference executor with materially different cancellation/result behavior;
-- [ ] require adapters to provide evidence for terminal versus ambiguous classification;
-- [ ] prove the operation-state machine remains unchanged across backends;
-- [ ] map unsupported evidence conservatively to `indeterminate` rather than backend-specific guesses.
+- [x] integrate a second backend or deterministic reference executor with materially different cancellation/result behavior;
+- [x] require adapters to provide evidence for terminal versus ambiguous classification;
+- [x] prove the operation-state machine remains unchanged across backends;
+- [x] map unsupported evidence conservatively to `indeterminate` rather than backend-specific guesses.
 
 ### Replace/reuse generic infrastructure
 

@@ -346,3 +346,13 @@ Before implementing a new subsystem, ask in this order:
 **NO-GO by default:** build a general agent authorization protocol, general physical-device fabric, generic fleet manager, remote-desktop product, or multi-machine router merely because those features are technically possible.
 
 If another maintained OSS later provides equivalent per-desktop operation ownership, fencing, durable `indeterminate` quarantine, explicit resolution, and no-auto-replay semantics, reevaluate integration or retirement instead of defending sunk cost.
+
+### P1 proof status — fixed-set composition only
+
+The P1 proof implements the minimum composition required by Priorities 4 and 5 without changing the P0 operation state machine. `FixedMultiDeviceHub` is an immutable map of explicitly provisioned stable device IDs to existing `SingleDeviceHub` services/handles, with a distinct checkpoint directory per device. It is not device discovery, a fleet registry, a shared scheduler, or a product routing plane.
+
+The proof demonstrates that Device A may remain durably quarantined under one principal while Device B continues native shell work under another principal; A reconnect advances only A's generation; A partition does not block B; Hub reconstruction restores the two checkpoints independently; and the old ambiguous A operation is never automatically replayed. Stale/wrong-owner settlement is rejected by the unchanged P0 fences.
+
+Backend portability is proved with a deterministic process-like reference executor whose cancellation/result contract materially differs from Cua. Proven not-started/clean termination may map to an existing terminal evidence class; an unprovable post-commit outcome maps to `indeterminate`. The same operation identity, owner, generation, quarantine, explicit resolution, receipt, and no-replay core is used for both backends.
+
+A fresh physical real-Cua P1 rerun remains an acceptance follow-up because that lane is intentionally main-only on the trusted macOS desktop runner. This does not justify broadening P1 into fleet or backend product work.

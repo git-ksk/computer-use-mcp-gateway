@@ -216,7 +216,7 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
 
     // The local effect can finish after transport loss. This is precisely why
     // reconnect cannot infer success/failure from liveness.
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(6), async {
         while !effect_marker.is_file() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

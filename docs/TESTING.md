@@ -232,3 +232,21 @@ python3 scripts/check_docs.py
 ```
 
 The Cua smoke script starts its own gateway process/configuration. Do not point test harnesses at a production desktop or reuse production credentials.
+
+### V2 P1 multi-device and backend-portability proof
+
+In addition to the repository-wide locked gate, run:
+
+```bash
+cargo test --locked --test v2_p1_invariants
+cargo test --locked --test v2_p1_backend_portability
+cargo test --locked --test v2_p1_multi_device_e2e
+```
+
+`v2_p1_invariants` proves independent A/B ownership/quarantine state, restart normalization, queue cancellation on the quarantined device, wrong-owner/late/duplicate settlement rejection, and property-based stale-generation isolation.
+
+`v2_p1_backend_portability` uses a deterministic process-like second executor whose cancellation semantics can prove not-started or clean termination and can also deliberately become post-commit indeterminate. It verifies that both this executor and Cua ambiguity use the same P0 operation ID/owner/generation/quarantine/resolution/no-replay model.
+
+`v2_p1_multi_device_e2e` composes two existing `SingleDeviceHub` services in one process with independent durable state. Device A uses the Cua-shaped GUI fixture and becomes unknown/quarantined; Device B simultaneously runs native shell work under a different principal; A reconnect and partition leave B usable; Hub reconstruction restores A/B independently; explicit A resolution permits a new operation while marker counts prove the old GUI action was not replayed.
+
+A fresh physical real-Cua P1 regression is **not** claimed by these deterministic lanes. The operator-controlled TCC-granted macOS workflow remains main-only by design; keep that item open until the final P1 code is exercised there.
