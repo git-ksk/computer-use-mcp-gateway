@@ -1,5 +1,6 @@
 name: V2 P1 Validation Fixup
 
+# Temporary validation-only workflow. Revision 2: trigger CI on the fixed proof tree.
 on:
   pull_request:
 
