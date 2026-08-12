@@ -1,6 +1,6 @@
 name: V2 P1 Validation Fixup
 
-# Temporary validation-only workflow. Revision 5: separate partition proof from Agent-process restart.
+# Temporary validation-only workflow. Revision 6: rerun hosted gates after the restart fixture fix.
 on:
   pull_request:
 
