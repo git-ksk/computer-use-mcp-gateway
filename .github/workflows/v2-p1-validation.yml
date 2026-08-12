@@ -1,0 +1,40 @@
+name: V2 P1 Validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.88.0
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+
+      - name: Test all targets
+        run: cargo test --locked --all-targets
+
+      - name: Clippy all targets
+        run: cargo clippy --locked --all-targets
+
+      - name: P1 multi-device invariants
+        run: cargo test --locked --test v2_p1_invariants
+
+      - name: P1 second-backend conformance
+        run: cargo test --locked --test v2_p1_backend_portability
+
+      - name: P1 multi-device crash partition E2E
+        run: cargo test --locked --test v2_p1_multi_device_e2e
