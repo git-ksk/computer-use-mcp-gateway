@@ -2,7 +2,7 @@
 
 A lightweight Rust gateway that exposes a local computer-use MCP backend through a policy-controlled MCP Streamable HTTP endpoint.
 
-> Status: **V1 closed / pre-alpha (2026-08-11)**. The gateway connects to Cua over MCP stdio, applies a fail-closed capability boundary, and keeps the network listener on localhost by default. Automated checks, trusted real-desktop E2E, and representative Cloudflare Access/Tunnel + ChatGPT remote dogfood are complete; see [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md).
+> Status: **V1 closed / V2-M1 accepted (2026-08-12)**. V1 is the hardened MCP↔Cua gateway. V2 is now deliberately narrowed to an uncertainty-aware execution-safety layer for delegated control of stateful interactive desktops; see [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md).
 
 ## Start here
 
@@ -187,11 +187,14 @@ See [`docs/TESTING.md`](docs/TESTING.md) for the exact guarantees and limits.
 - **[`docs/CLIENTS.md`](docs/CLIENTS.md)** — MCP client configuration, including local and authenticated remote examples
 - **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** — symptom-based setup/debugging guide
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — localhost-first remote deployment and reverse-proxy requirements
-- [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md) — the two operator-controlled checks remaining before formal V1 closure
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, cancellation, metrics, and gated V2 boundary
+- [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md) — V1 closure evidence
+- [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md) — canonical V2 product boundary and core-first priority
+- [`docs/V2_STANDARDIZATION.md`](docs/V2_STANDARDIZATION.md) — standard/OSS replacement boundary versus custom uncertainty-aware execution semantics
+- [`docs/V2_M1_ACCEPTANCE.md`](docs/V2_M1_ACCEPTANCE.md) — accepted single secure remote Agent evidence
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, cancellation, metrics, and V2 boundary
 - [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, policy, CI supply chain, and desktop-runner safety
 - [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, closeout quality gates, conformance scope, and desktop E2E
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — implementation snapshot and V2 GO/NO-GO gate; the project design report remains canonical
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — implementation snapshot; V2 positioning is further narrowed by `V2_POSITIONING.md`
 
 ## Security model
 
@@ -210,26 +213,54 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) before using the gateway on a sensiti
 
 ## V1 closure
 
-All automated/code-local closeout work is intended to be enforced by CI. Formal V1 closure requires the two operator-controlled checks in [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md):
+V1 was closed on 2026-08-11 after automated/code-local checks plus trusted real-desktop and Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood. See [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md).
 
-1. execute the trusted macOS GUI E2E on the dedicated TCC-granted test Mac;
-2. complete representative Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood.
+Do not expand V1 indefinitely merely because adjacent backend features are technically possible.
 
-Do not start V2 simply because implementation work is complete.
+## V2 direction
 
-## V2 candidate
+V2-M0 and V2-M1 are complete. The final competitor review narrowed the project further before V2-M2.
 
-V2 is **not** automatically a generic Hub + Agent / multi-machine expansion. The roadmap gates major V2 work on a competitor-gap PoC and an explicit GO/NO-GO decision.
+CUMG is **not** trying to win the broad category of vendor-neutral physical-device control planes. That space already overlaps materially with projects such as SINT Protocol and Arm Device Connect, in addition to OpenClaw, OAHL, QuickDesk, Obot, and delegated-authorization systems.
 
-The candidate direction is a **secure delegated device capability control plane**:
+The V2 core is:
 
 ```text
-MCP client --MCP--> Hub --authenticated typed command/grant protocol--> outbound Agent --> backend
+external authorization
+        |
+        v
+specific desktop + exact capability
+        |
+        v
+operation ID + exclusive ownership + fencing
+        |
+        v
+state-changing action
+        |
+        v
+ambiguous outcome?
+        |
+        +--> no  -> terminal
+        |
+        +--> yes -> indeterminate -> quarantine -> explicit resolution
 ```
 
-The intended differentiation is capability-control semantics—device identity, short-lived grants, operation leases, replay/cancellation safety, and policy evidence—not another screenshot/input engine or remote-desktop transport.
+An ambiguous state-changing operation is never automatically replayed because a client, Hub, Agent, transport, backend, or device reconnects.
 
-Cua remains the first backend, but the Hub-to-Agent contract must remain backend- and transport-neutral. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+### Core-first priority
+
+Future V2 work should prioritize, in order:
+
+1. hardening operation-state transitions and stale-result fencing;
+2. making `indeterminate` quarantine and explicit resolution first-class, durable, and crash-safe;
+3. proving ownership across reconnect/restart and competing principals;
+4. proving the same invariants across multiple independent desktops;
+5. proving backend portability with a second backend/reference executor;
+6. only then expanding fleet UX, broad discovery, routing convenience, dashboards, or orchestration.
+
+Generic authentication, delegated authorization, device fabric/registry, fleet routing, telemetry, TLS lifecycle, and service supervision should use standards or maintained OSS when that can be done without weakening these invariants.
+
+See [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md) and [`docs/V2_STANDARDIZATION.md`](docs/V2_STANDARDIZATION.md).
 
 ## License
 
