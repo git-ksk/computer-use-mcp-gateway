@@ -1,6 +1,6 @@
 name: V2 P1 Validation Fixup
 
-# Temporary validation-only workflow. Revision 2: trigger CI on the fixed proof tree.
+# Temporary validation-only workflow. Revision 3: separate partition proof from Agent-process restart.
 on:
   pull_request:
 
@@ -16,7 +16,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.ref }}
 
-      - name: Apply known E2E fixture fixes
+      - name: Apply P1 Hub-restart fixture lifecycle fix
         shell: bash
         run: |
           python3 - <<'PY'
@@ -24,31 +24,96 @@ jobs:
           p = Path("tests/v2_p1_multi_device_e2e.rs")
           text = p.read_text()
 
-          replacements = [
-              (
-                  ".start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)\n            .await,",
-                  ".start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)\n            .await?\n            .wait()\n            .await,",
-              ),
-              (
-                  "agent_material(\n        device_a_identity,",
-                  "agent_material(\n        device_a_identity.clone(),",
-              ),
-              (
-                  "agent_material(device_b_identity, &hub_b_identity, &grants_b, cert_der)",
-                  "agent_material(device_b_identity.clone(), &hub_b_identity, &grants_b, cert_der)",
-              ),
-          ]
-          for old, new in replacements:
-              if old in text:
-                  text = text.replace(old, new, 1)
-              elif new not in text:
-                  raise SystemExit(f"E2E fixup anchor missing: {old!r}")
+          partition_anchor = '''    assert_eq!(
+              handle_a
+                  .desktop_quarantine()
+                  .await
+                  .map(|q| (q.operation_id, q.owner, q.device_generation)),
+              Some((ambiguous_a.clone(), alice.clone(), a_generation))
+          );
+
+          // Crash the remaining Hub route, then reconstruct the fixed set from the two
+          '''
+          partition_replacement = '''    assert_eq!(
+              handle_a
+                  .desktop_quarantine()
+                  .await
+                  .map(|q| (q.operation_id, q.owner, q.device_generation)),
+              Some((ambiguous_a.clone(), alice.clone(), a_generation))
+          );
+
+          // The partition invariant is now proven. Stop this Agent process cleanly
+          // before the Hub crash so the next phase independently proves durable
+          // restart/reconnect from the same Agent checkpoint rather than relying on
+          // tonic's exact stream-abort status classification.
+          let _ = a2_shutdown_tx.send(true);
+          let _ = a_task.await;
+
+          // Crash the remaining Hub route, then reconstruct the fixed set from the two
+          '''
+          if partition_anchor in text:
+              text = text.replace(partition_anchor, partition_replacement, 1)
+          elif partition_replacement not in text:
+              raise SystemExit("partition lifecycle anchor missing")
+
+          reconnect_anchor = '''    server_b = tokio::spawn(async move {
+              Server::builder()
+                  .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(b_cert, b_key)))?
+                  .add_service(
+                      AgentControlServer::new(service_b)
+                          .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+                          .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
+                  )
+                  .serve_with_incoming(incoming_b)
+                  .await
+          });
+
+          let a_generation_after_hub_restart =
+          '''
+          reconnect_replacement = '''    server_b = tokio::spawn(async move {
+              Server::builder()
+                  .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(b_cert, b_key)))?
+                  .add_service(
+                      AgentControlServer::new(service_b)
+                          .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+                          .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
+                  )
+                  .serve_with_incoming(incoming_b)
+                  .await
+          });
+
+          // Recreate A from its durable Agent checkpoint after the Hub is back. The
+          // earlier phase already proved an isolated live reconnect while B stayed at
+          // the same generation; this phase proves crash/restart recovery and no replay.
+          let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
+          let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
+          a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
+
+          let a_generation_after_hub_restart =
+          '''
+          if reconnect_anchor in text:
+              text = text.replace(reconnect_anchor, reconnect_replacement, 1)
+          elif reconnect_replacement not in text:
+              raise SystemExit("post-restart Agent anchor missing")
+
+          cleanup_old = '''    a2_shutdown_tx.send(true)?;
+              b_shutdown_tx.send(true)?;
+          '''
+          cleanup_new = '''    a3_shutdown_tx.send(true)?;
+              b_shutdown_tx.send(true)?;
+          '''
+          if cleanup_old in text:
+              text = text.replace(cleanup_old, cleanup_new, 1)
+          elif cleanup_new not in text:
+              raise SystemExit("cleanup sender anchor missing")
+
           p.write_text(text)
           PY
+          cargo fmt
           if ! git diff --quiet; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add tests/v2_p1_multi_device_e2e.rs
-            git commit -m "test(v2): fix P1 multi-device fixture ownership"
+            git commit -m "test(v2): separate partition and restart Agent lifecycles"
             git push origin HEAD:${{ github.event.pull_request.head.ref }}
           fi
