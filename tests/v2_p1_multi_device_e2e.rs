@@ -437,6 +437,12 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
         Some((ambiguous_a.clone(), alice.clone(), a_generation))
     );
 
+    // The partition invariant is now proven. Stop this Agent process cleanly
+    // before the Hub crash. The restart phase then proves recovery from the
+    // same durable Agent checkpoint independently of tonic abort classification.
+    let _ = a2_shutdown_tx.send(true);
+    let _ = a_task.await;
+
     // Crash the remaining Hub route, then reconstruct the fixed set from the two
     // independent P0 checkpoints before allowing either Agent to reconnect.
     server_b.abort();
@@ -500,6 +506,12 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
             .serve_with_incoming(incoming_b)
             .await
     });
+
+    // Recreate A from its durable Agent checkpoint after the Hub is back. The
+    // earlier phase already proved isolated reconnect while B kept its generation.
+    let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
+    let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
+    a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
 
     let a_generation_after_hub_restart =
         wait_new_generation(&handle_a, a_generation_after_reconnect)
@@ -566,7 +578,7 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     assert_eq!(line_count(&cancel_marker)?, 1);
     assert_eq!(handle_a.resolution_records().await.len(), 1);
 
-    a2_shutdown_tx.send(true)?;
+    a3_shutdown_tx.send(true)?;
     b_shutdown_tx.send(true)?;
     let _ = a_task.await?;
     let _ = b_task.await?;
