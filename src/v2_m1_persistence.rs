@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-pub const M1_STATE_SCHEMA_VERSION: u16 = 2;
+pub const M1_STATE_SCHEMA_VERSION: u16 = 4;
 pub const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
 pub const MAX_RETAINED_CHECKPOINTS: usize = 64;
 
@@ -97,8 +97,12 @@ impl HubPersistentState {
         limits: AdmissionLimits,
     ) -> Result<(DeviceRegistry, HubAdmissionController), PersistenceError> {
         validate_state_schema(self.schema_version)?;
-        let registry =
+        let mut registry =
             DeviceRegistry::from_snapshot(self.registry).map_err(PersistenceError::Control)?;
+        // A Hub process restart destroys every live transport session. Persisted
+        // capability advertisements remain useful as history, but must not make
+        // the device appear online until a fresh authenticated Agent reconnects.
+        registry.mark_all_offline();
         let admission = HubAdmissionController::restore_after_restart(limits, self.admission)
             .map_err(PersistenceError::Execution)?;
         Ok((registry, admission))
@@ -425,11 +429,21 @@ mod tests {
         assert_eq!(
             restored_execution.begin(OperationRef {
                 device_id: "dev-a".into(),
-                device_generation: 3,
+                device_generation: 2,
                 operation_id: "op-active".into(),
             }),
             Err(crate::v2_m0_execution::ExecutionError::OperationReplay)
         );
+        // Generation 3 is a fresh authenticated session; stale generation-2
+        // commands are rejected before the Agent execution gate, so its old
+        // operation tombstone can be dropped safely.
+        restored_execution
+            .begin(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 3,
+                operation_id: "op-active".into(),
+            })
+            .unwrap();
     }
 
     #[test]

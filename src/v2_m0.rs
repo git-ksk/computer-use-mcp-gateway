@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 1;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 1;
+pub const CONTROL_SCHEMA_VERSION: u16 = 2;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 2;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,12 +29,17 @@ pub enum DeviceCapability {
     ScreenGeometry,
     PointerClick,
     ExecuteProcess,
+    ReadFile,
+    ListDirectory,
 }
 
 impl DeviceCapability {
     pub fn class(self) -> CapabilityClass {
         match self {
-            Self::ListApplications | Self::ScreenGeometry => CapabilityClass::Observe,
+            Self::ListApplications
+            | Self::ScreenGeometry
+            | Self::ReadFile
+            | Self::ListDirectory => CapabilityClass::Observe,
             Self::PointerClick => CapabilityClass::Interact,
             // Direct process execution can mutate arbitrary local state and is
             // therefore never implied by observe/interact access.
@@ -78,6 +83,21 @@ pub struct ProcessOutput {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub kind: DirectoryEntryKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceCommand {
@@ -91,6 +111,12 @@ pub enum DeviceCommand {
     ExecuteProcess {
         request: ProcessRequest,
     },
+    ReadFile {
+        path: String,
+    },
+    ListDirectory {
+        path: String,
+    },
 }
 
 impl DeviceCommand {
@@ -100,6 +126,8 @@ impl DeviceCommand {
             Self::ScreenGeometry => DeviceCapability::ScreenGeometry,
             Self::PointerClick { .. } => DeviceCapability::PointerClick,
             Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
+            Self::ReadFile { .. } => DeviceCapability::ReadFile,
+            Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
         }
     }
 
@@ -251,6 +279,44 @@ impl DeviceRegistry {
         }
         let revoked = snapshot.revoked_device_ids.into_iter().collect();
         Ok(Self { devices, revoked })
+    }
+
+    /// Offline administrative provisioning for a device public key that was
+    /// transferred through an operator-controlled trust channel. Runtime
+    /// enrollment should still use challenge/proof when keys are introduced in-band.
+    pub fn provision_trusted_device(&mut self, verifying_key: VerifyingKey) -> String {
+        let key_bytes = verifying_key.to_bytes();
+        let device_id = format!("dev_{}", hex(&key_bytes));
+        self.devices
+            .entry(device_id.clone())
+            .or_insert(EnrolledDevice {
+                verifying_key,
+                generation: 0,
+                capabilities: None,
+            });
+        device_id
+    }
+
+    pub fn device_verifier(&self, device_id: &str) -> Result<VerifyingKey, ControlError> {
+        self.devices
+            .get(device_id)
+            .map(|device| device.verifying_key)
+            .ok_or(ControlError::UnknownDevice)
+    }
+
+    pub fn disconnect(&mut self, device_id: &str) -> Result<(), ControlError> {
+        let device = self
+            .devices
+            .get_mut(device_id)
+            .ok_or(ControlError::UnknownDevice)?;
+        device.capabilities = None;
+        Ok(())
+    }
+
+    pub fn mark_all_offline(&mut self) {
+        for device in self.devices.values_mut() {
+            device.capabilities = None;
+        }
     }
 
     pub fn enrollment_challenge() -> [u8; 32] {
@@ -773,6 +839,16 @@ pub fn validate_command_session(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceErrorCode {
+    InvalidRequest,
+    PermissionDenied,
+    NotFound,
+    IoFailure,
+    InternalFailure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceResult {
@@ -788,6 +864,17 @@ pub enum DeviceResult {
     Process {
         output: ProcessOutput,
     },
+    FileContents {
+        bytes: Vec<u8>,
+        truncated: bool,
+    },
+    DirectoryEntries {
+        entries: Vec<DirectoryEntry>,
+        truncated: bool,
+    },
+    Error {
+        code: DeviceErrorCode,
+    },
 }
 
 impl DeviceResult {
@@ -801,6 +888,12 @@ impl DeviceResult {
                     DeviceCommand::PointerClick { .. }
                 )
                 | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
+                | (Self::FileContents { .. }, DeviceCommand::ReadFile { .. })
+                | (
+                    Self::DirectoryEntries { .. },
+                    DeviceCommand::ListDirectory { .. }
+                )
+                | (Self::Error { .. }, _)
         )
     }
 }

@@ -139,7 +139,7 @@ Controls already proven in M0:
 - a signed Hub time anchors grant-expiry evaluation to monotonic elapsed time on the Agent;
 - connection loss after dispatch becomes an indeterminate terminal Hub state and is never automatically replayed.
 
-Current M1 evidence includes TLS-protected gRPC bidirectional streaming with pinned certificate trust/domain validation plus independent Ed25519 application authentication. The earlier raw-TLS transport remains a regression/reference implementation and is TLS 1.3-only with a dedicated ALPN. Residual deployment risk remains: the operator-facing Hub daemon, public endpoint hardening, connection/rate limits, and production certificate lifecycle are not yet implemented, so the integration tests are not a production exposure claim.
+Current M1 evidence includes TLS-protected gRPC bidirectional streaming with pinned certificate trust/domain validation plus independent Ed25519 application authentication. The earlier raw-TLS transport remains a regression/reference implementation and is TLS 1.3-only with a dedicated ALPN. An operator-facing single-device `v2_hub` daemon now exists and is covered together with `v2_agent` by an end-to-end TLS/gRPC test. Residual deployment risk remains: public endpoint hardening, connection/TLS-handshake rate limits, real northbound authentication, and production certificate lifecycle are not yet complete, so this is not yet a production exposure claim.
 
 ### Replay and stale-state attacker
 
@@ -151,6 +151,8 @@ Controls:
 - capability revisions are checked on every command/result;
 - operation IDs are retained as terminal/indeterminate state and cannot be silently reused; M1 still needs bounded pruning/rollover semantics for terminal Agent tombstones during extremely long-lived generations;
 - handshake proof replay fails against fresh nonces.
+
+Completed/cancelled replay tombstones are bounded by authenticated device generation. A fresh generation makes older signed commands stale before they reach the execution gate, so old terminal IDs may be pruned. `Indeterminate` Hub operations are intentionally exempt from this pruning and continue to quarantine the device until explicit operator resolution.
 
 ### Denial of service
 
@@ -210,15 +212,14 @@ They should not contain raw screenshots, raw backend output, raw command argumen
 
 ## V2-M1 residual requirements before production remote use
 
-M1 now proves an outbound long-lived Agent lifecycle over TLS-protected gRPC, exact-capability grants for Agent-native process execution, restart-safe replay checkpoints, and live process-tree cancellation. It is still **not production-ready**.
+M1 now proves an outbound long-lived Agent lifecycle over TLS-protected gRPC, a deployable single-device Hub daemon, exact-capability grants for Agent-native operations, generation-bounded replay state, restart-safe checkpoints, bounded read-only filesystem observation, and live process-tree cancellation. It is still **not production-ready**.
 
 Before a remote Agent is exposed as a product service, M1 must at minimum add and verify:
 
-- an operator-facing single-device Hub gRPC daemon for the always-on VM target; current gRPC Hub implementations are integration-test fixtures;
 - real northbound authentication integration that constructs `AuthenticatedClientPrincipal` only from verified identity-provider output;
 - production private-key/certificate custody and rotation; private signing keys remain outside replay checkpoints;
 - Hub-side connection/TLS-handshake/rate limits and operational observability;
 - bounded pruning or generation-rollover semantics for terminal Agent operation tombstones;
-- explicit filesystem confinement semantics before making any sandbox claim: `allowed_cwd_root` constrains cwd but does not prevent process argv from addressing other filesystem paths;
+- no filesystem sandbox claim for arbitrary process execution: `allowed_cwd_root` constrains cwd but does not prevent process argv from addressing other filesystem paths. The separate read-only `ReadFile`/`ListDirectory` capabilities are path-bounded and symlink-escape checked, but do not constrain `ExecuteProcess`;
 - live cancellation acceptance for Cua desktop operations and explicit handling when a GUI backend cannot prove interruption;
 - OS-specific service packaging and reviewed state/key directory locations.

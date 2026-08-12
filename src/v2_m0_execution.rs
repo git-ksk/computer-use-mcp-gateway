@@ -365,6 +365,38 @@ impl HubAdmissionController {
             .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
     }
 
+    /// Drop replay tombstones that belong to older authenticated generations
+    /// once a newer generation is current. Indeterminate operations are retained
+    /// regardless of age because they quarantine the device until an operator
+    /// explicitly resolves the ambiguous side effect.
+    pub fn prune_terminal_before_generation(
+        &mut self,
+        device_id: &str,
+        current_generation: u64,
+    ) -> Result<usize, ExecutionError> {
+        if device_id.trim().is_empty() || current_generation == 0 {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        let remove: Vec<_> = self
+            .operations
+            .iter()
+            .filter(|(_, operation)| {
+                operation.operation.device_id == device_id
+                    && operation.operation.device_generation < current_generation
+                    && matches!(
+                        operation.state,
+                        HubOperationState::Completed | HubOperationState::Cancelled
+                    )
+            })
+            .map(|(operation_id, _)| operation_id.clone())
+            .collect();
+        let count = remove.len();
+        for operation_id in remove {
+            self.operations.remove(&operation_id);
+        }
+        Ok(count)
+    }
+
     pub fn state(&self, operation_id: &str) -> Option<HubOperationState> {
         self.operations.get(operation_id).map(|op| op.state)
     }
@@ -442,12 +474,14 @@ pub enum AgentOperationState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentExecutionSnapshot {
+    pub replay_generation: Option<u64>,
     pub terminal_operation_ids: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct AgentExecutionGate {
     active: Option<(OperationRef, AgentOperationState)>,
+    replay_generation: Option<u64>,
     terminal_operation_ids: HashSet<String>,
 }
 
@@ -461,6 +495,11 @@ impl AgentExecutionGate {
         terminal_operation_ids.sort();
         terminal_operation_ids.dedup();
         AgentExecutionSnapshot {
+            replay_generation: self
+                .active
+                .as_ref()
+                .map(|(active, _)| active.device_generation)
+                .or(self.replay_generation),
             terminal_operation_ids,
         }
     }
@@ -470,16 +509,42 @@ impl AgentExecutionGate {
             .terminal_operation_ids
             .iter()
             .any(|operation_id| operation_id.trim().is_empty())
+            || (!snapshot.terminal_operation_ids.is_empty() && snapshot.replay_generation.is_none())
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
         Ok(Self {
             active: None,
+            replay_generation: snapshot.replay_generation,
             terminal_operation_ids: snapshot.terminal_operation_ids.into_iter().collect(),
         })
     }
 
+    /// Advance the replay barrier to the authenticated device generation.
+    /// Commands from older generations are rejected by session validation before
+    /// reaching this gate, so retaining their terminal IDs provides no additional
+    /// replay protection and would otherwise grow without bound across reconnects.
+    pub fn prepare_generation(&mut self, generation: u64) -> Result<(), ExecutionError> {
+        if generation == 0 {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        if let Some((active, _)) = &self.active {
+            if active.device_generation != generation {
+                return Err(ExecutionError::GenerationChangeWhileActive);
+            }
+        }
+        if self.replay_generation != Some(generation) {
+            if self.active.is_some() {
+                return Err(ExecutionError::GenerationChangeWhileActive);
+            }
+            self.terminal_operation_ids.clear();
+            self.replay_generation = Some(generation);
+        }
+        Ok(())
+    }
+
     pub fn begin(&mut self, operation: OperationRef) -> Result<(), ExecutionError> {
+        self.prepare_generation(operation.device_generation)?;
         if self
             .terminal_operation_ids
             .contains(&operation.operation_id)
@@ -536,6 +601,7 @@ pub enum ExecutionError {
     UnknownOperation,
     InvalidTransition,
     AgentBusy,
+    GenerationChangeWhileActive,
     DeviceIndeterminate { operation_id: String },
     InvalidSnapshot,
 }
@@ -693,6 +759,39 @@ mod tests {
     }
 
     #[test]
+    fn hub_terminal_tombstones_are_pruned_by_generation_but_indeterminate_is_retained() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 0,
+        };
+        let mut hub = HubAdmissionController::new(limits).unwrap();
+        for index in 0..128 {
+            let id = format!("done-{index}");
+            hub.admit(op("dev-a", 1, &id)).unwrap();
+            hub.mark_dispatched(&id).unwrap();
+            hub.complete(&id, false).unwrap();
+        }
+        hub.admit(op("dev-a", 1, "ambiguous")).unwrap();
+        hub.mark_dispatched("ambiguous").unwrap();
+        hub.mark_indeterminate("ambiguous").unwrap();
+        assert_eq!(
+            hub.prune_terminal_before_generation("dev-a", 2).unwrap(),
+            128
+        );
+        assert_eq!(hub.state("done-0"), None);
+        assert_eq!(
+            hub.state("ambiguous"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert_eq!(
+            hub.admit(op("dev-a", 2, "new")),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "ambiguous".into()
+            })
+        );
+    }
+
+    #[test]
     fn hub_restart_snapshot_never_restores_in_flight_work_as_runnable() {
         let limits = AdmissionLimits {
             max_global_active: 2,
@@ -751,10 +850,30 @@ mod tests {
         let snapshot = gate.snapshot_for_restart();
         let mut restored = AgentExecutionGate::restore_after_restart(snapshot).unwrap();
         assert_eq!(
-            restored.begin(op("dev-a", 2, "a1")),
+            restored.begin(op("dev-a", 1, "a1")),
             Err(ExecutionError::OperationReplay)
         );
-        restored.begin(op("dev-a", 2, "a2")).unwrap();
+        // A fresh authenticated generation safely prunes the prior generation's
+        // terminal tombstones because stale generation-1 commands fail session validation.
+        restored.begin(op("dev-a", 2, "a1")).unwrap();
+    }
+
+    #[test]
+    fn agent_replay_tombstones_are_pruned_on_generation_advance() {
+        let mut gate = AgentExecutionGate::default();
+        for index in 0..128 {
+            let id = format!("g1-{index}");
+            gate.begin(op("dev-a", 1, &id)).unwrap();
+            gate.finish(&id).unwrap();
+        }
+        assert_eq!(
+            gate.snapshot_for_restart().terminal_operation_ids.len(),
+            128
+        );
+        gate.prepare_generation(2).unwrap();
+        let snapshot = gate.snapshot_for_restart();
+        assert_eq!(snapshot.replay_generation, Some(2));
+        assert!(snapshot.terminal_operation_ids.is_empty());
     }
 
     #[test]
@@ -769,9 +888,9 @@ mod tests {
         assert!(gate.cancellation_requested("a1"));
         gate.finish("a1").unwrap();
         assert_eq!(
-            gate.begin(op("dev-a", 2, "a1")),
+            gate.begin(op("dev-a", 1, "a1")),
             Err(ExecutionError::OperationReplay)
         );
-        gate.begin(op("dev-a", 2, "a2")).unwrap();
+        gate.begin(op("dev-a", 2, "a1")).unwrap();
     }
 }

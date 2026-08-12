@@ -25,6 +25,20 @@ pub struct AgentProvisionedMaterial {
     pub tls_root_der: Vec<u8>,
 }
 
+pub const MAX_TLS_IDENTITY_BYTES: u64 = 1024 * 1024;
+
+pub fn load_tls_server_identity(
+    certificate_pem_file: &Path,
+    private_key_pem_file: &Path,
+) -> Result<(Vec<u8>, Vec<u8>), KeyMaterialError> {
+    validate_regular_file(certificate_pem_file, FileSensitivity::PublicTrustAnchor)?;
+    validate_regular_file(private_key_pem_file, FileSensitivity::Secret)?;
+    Ok((
+        read_bounded(certificate_pem_file, MAX_TLS_IDENTITY_BYTES)?,
+        read_bounded(private_key_pem_file, MAX_TLS_IDENTITY_BYTES)?,
+    ))
+}
+
 pub fn load_agent_material(
     device_secret_file: &Path,
     hub_public_key_file: &Path,
@@ -319,6 +333,41 @@ mod tests {
         symlink(&secret_path, &link).unwrap();
         assert!(matches!(
             load_device_identity(&link),
+            Err(KeyMaterialError::UnsafePath)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_server_identity_requires_secret_key_permissions_and_regular_files() {
+        let directory = temp_directory("tls-server");
+        let cert = directory.join("server.pem");
+        let key = directory.join("server.key");
+        fs::write(
+            &cert,
+            b"-----BEGIN CERTIFICATE-----\nplaceholder\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        fs::write(
+            &key,
+            b"-----BEGIN PRIVATE KEY-----\nplaceholder\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cert, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_tls_server_identity(&cert, &key).is_ok());
+
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            load_tls_server_identity(&cert, &key),
+            Err(KeyMaterialError::UnsafeSecretPermissions)
+        ));
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = directory.join("server-link.key");
+        symlink(&key, &link).unwrap();
+        assert!(matches!(
+            load_tls_server_identity(&cert, &link),
             Err(KeyMaterialError::UnsafePath)
         ));
         fs::remove_dir_all(directory).unwrap();

@@ -101,6 +101,28 @@ mod tests {
     }
 
     #[test]
+    fn bounded_filesystem_result_fits_signed_json_carrier() {
+        use crate::v2_m0::{CONTROL_SCHEMA_VERSION, CommandResultEnvelope, DeviceResult};
+        use crate::v2_m0_transport::{AgentToHub, HUB_AGENT_SCHEMA_VERSION, RemoteResult};
+        let result = AgentToHub::Result(RemoteResult {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            result: CommandResultEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: "dev-test".into(),
+                device_generation: 1,
+                capability_revision: 1,
+                operation_id: "op-filesystem".into(),
+                result: DeviceResult::FileContents {
+                    bytes: vec![255; crate::v2_m1_filesystem::DEFAULT_MAX_FILE_BYTES],
+                    truncated: true,
+                },
+            },
+            signature: vec![0; 64],
+        });
+        encode_agent_frame(&result).unwrap();
+    }
+
+    #[test]
     fn protobuf_carrier_transport_limit_includes_envelope_overhead() {
         let frame = AgentFrame {
             signed_message_json: vec![0; MAX_GRPC_APPLICATION_MESSAGE_BYTES],

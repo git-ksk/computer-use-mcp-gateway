@@ -7,8 +7,8 @@
 
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
-    CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceResult, DeviceSession,
-    GrantLedger,
+    CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
+    DeviceSession, GrantLedger,
 };
 use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
 use crate::v2_m0_transport::{
@@ -19,6 +19,7 @@ use crate::v2_m0_transport::{
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
+use crate::v2_m1_filesystem::{FilesystemError, FilesystemExecutor, FilesystemPolicy};
 use crate::v2_m1_grpc::{
     decode_hub_frame, encode_agent_frame, proto::agent_control_client::AgentControlClient,
 };
@@ -80,6 +81,7 @@ pub struct AgentService {
     config: AgentServiceConfig,
     material: AgentProvisionedMaterial,
     executor: ProcessExecutor,
+    filesystem: FilesystemExecutor,
     trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
     execution: AgentExecutionGate,
@@ -95,6 +97,10 @@ impl AgentService {
         let executor = ProcessExecutor::new(
             ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Process)?,
+        );
+        let filesystem = FilesystemExecutor::new(
+            FilesystemPolicy::new(config.allowed_cwd_roots.clone())
+                .map_err(AgentServiceError::Filesystem)?,
         );
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
             .map_err(AgentServiceError::Persistence)?;
@@ -131,6 +137,7 @@ impl AgentService {
             config,
             material,
             executor,
+            filesystem,
             trusted_hub,
             grants,
             execution,
@@ -162,7 +169,11 @@ impl AgentService {
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
             revision: 1,
-            supported: vec![DeviceCapability::ExecuteProcess],
+            supported: vec![
+                DeviceCapability::ExecuteProcess,
+                DeviceCapability::ReadFile,
+                DeviceCapability::ListDirectory,
+            ],
         }
     }
 
@@ -276,6 +287,12 @@ impl AgentService {
             generation: accepted.device_generation,
             capabilities: hello.capabilities.clone(),
         };
+        self.execution
+            .prepare_generation(session.generation)
+            .map_err(AgentServiceError::Execution)?;
+        // Persist the generation rollover before accepting work so replay
+        // tombstones from prior generations can be safely discarded on disk.
+        self.persist_state()?;
         let trusted_clock = TrustedSessionClock::new(accepted.hub_time_ms);
 
         self.run_session_loop(
@@ -308,22 +325,22 @@ impl AgentService {
         let mut pending_heartbeat: Option<(u64, Instant)> = None;
         let heartbeat_deadline = self.config.heartbeat_interval.saturating_mul(3);
 
-        let (process_done_tx, mut process_done_rx) = mpsc::channel::<ProcessCompletion>(1);
-        let mut active: Option<ActiveProcess> = None;
+        let (operation_done_tx, mut operation_done_rx) = mpsc::channel::<OperationCompletion>(1);
+        let mut active: Option<ActiveOperation> = None;
 
         let session_result = async {
             loop {
                 tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+                        terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
                         self.persist_state()?;
                         return Ok(SessionExit::Shutdown);
                     }
                 }
                 _ = heartbeat.tick() => {
                     if pending_heartbeat.as_ref().is_some_and(|(_, sent)| sent.elapsed() >= heartbeat_deadline) {
-                        terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+                        terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
                         self.persist_state()?;
                         return Ok(SessionExit::Reconnect);
                     }
@@ -340,23 +357,28 @@ impl AgentService {
                         pending_heartbeat = Some((heartbeat_sequence, Instant::now()));
                     }
                 }
-                completion = process_done_rx.recv(), if active.is_some() => {
-                    let completion = completion.ok_or(AgentServiceError::ProcessWorkerClosed)?;
-                    let expected = active.take().ok_or(AgentServiceError::ProcessStateMismatch)?;
+                completion = operation_done_rx.recv(), if active.is_some() => {
+                    let completion = completion.ok_or(AgentServiceError::OperationWorkerClosed)?;
+                    let expected = active.take().ok_or(AgentServiceError::OperationStateMismatch)?;
                     if completion.operation_id != expected.operation_id {
-                        return Err(AgentServiceError::ProcessStateMismatch);
+                        return Err(AgentServiceError::OperationStateMismatch);
                     }
                     self.execution.finish(&completion.operation_id)
                         .map_err(AgentServiceError::Execution)?;
                     self.persist_state()?;
-                    let output = completion.output.map_err(AgentServiceError::Process)?;
+                    let device_result = match completion.result {
+                        Ok(result) => result,
+                        Err(error) => DeviceResult::Error {
+                            code: operation_error_code(&error),
+                        },
+                    };
                     let result = CommandResultEnvelope {
                         schema_version: CONTROL_SCHEMA_VERSION,
                         device_id: session.device_id.clone(),
                         device_generation: session.generation,
                         capability_revision: session.capabilities.revision,
                         operation_id: completion.operation_id,
-                        result: DeviceResult::Process { output },
+                        result: device_result,
                     };
                     let signed = build_remote_result(
                         &self.material.device_identity,
@@ -370,7 +392,7 @@ impl AgentService {
                     let frame = match message.map_err(AgentServiceError::Status)? {
                         Some(frame) => frame,
                         None => {
-                            terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+                            terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
                             self.persist_state()?;
                             return Ok(SessionExit::Reconnect);
                         }
@@ -402,37 +424,65 @@ impl AgentService {
                             if active.is_some() {
                                 return Err(AgentServiceError::AgentBusy);
                             }
-                            let request = match &remote.command.command {
-                                DeviceCommand::ExecuteProcess { request } => request.clone(),
-                                _ => return Err(AgentServiceError::UnsupportedCommand),
-                            };
                             let operation = OperationRef {
                                 device_id: session.device_id.clone(),
                                 device_generation: session.generation,
                                 operation_id: remote.command.operation_id.clone(),
                             };
                             self.execution.begin(operation).map_err(AgentServiceError::Execution)?;
-                            // Persist the active operation before spawning the child. A crash
+                            // Persist the active operation before starting any local work. A crash
                             // after this fsync restores the operation ID as terminal.
                             self.persist_state()?;
-                            let cancellation = ProcessCancellation::default();
-                            let worker_cancel = cancellation.clone();
-                            let executor = self.executor.clone();
                             let operation_id = remote.command.operation_id.clone();
                             let worker_operation_id = operation_id.clone();
-                            let done = process_done_tx.clone();
-                            tokio::spawn(async move {
-                                let output = tokio::task::spawn_blocking(move || {
-                                    executor.execute(&request, &worker_cancel)
-                                }).await
-                                    .map_err(|_| ProcessError::ReaderPanicked)
-                                    .and_then(|result| result);
-                                let _ = done.send(ProcessCompletion {
-                                    operation_id: worker_operation_id,
-                                    output,
-                                }).await;
-                            });
-                            active = Some(ActiveProcess { operation_id, cancellation });
+                            let done = operation_done_tx.clone();
+                            let cancellation = match remote.command.command {
+                                DeviceCommand::ExecuteProcess { request } => {
+                                    let cancellation = ProcessCancellation::default();
+                                    let worker_cancel = cancellation.clone();
+                                    let executor = self.executor.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            executor.execute(&request, &worker_cancel)
+                                        }).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map(|output| DeviceResult::Process { output }).map_err(AgentOperationError::Process));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            result,
+                                        }).await;
+                                    });
+                                    Some(cancellation)
+                                }
+                                DeviceCommand::ReadFile { path } => {
+                                    let filesystem = self.filesystem.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || filesystem.read_file(&path)).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map_err(AgentOperationError::Filesystem));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            result,
+                                        }).await;
+                                    });
+                                    None
+                                }
+                                DeviceCommand::ListDirectory { path } => {
+                                    let filesystem = self.filesystem.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || filesystem.list_directory(&path)).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map_err(AgentOperationError::Filesystem));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            result,
+                                        }).await;
+                                    });
+                                    None
+                                }
+                                _ => return Err(AgentServiceError::UnsupportedCommand),
+                            };
+                            active = Some(ActiveOperation { operation_id, cancellation });
                         }
                         HubToAgent::Cancel(cancel) => {
                             verify_remote_cancel(&hello, &challenge, &cancel, &self.trusted_hub.verifier())
@@ -441,12 +491,18 @@ impl AgentService {
                                 return Err(AgentServiceError::CancellationMismatch);
                             }
                             let disposition = match active.as_ref() {
-                                Some(process) if process.operation_id == cancel.operation_id => {
-                                    process.cancellation.cancel();
+                                Some(operation) if operation.operation_id == cancel.operation_id => {
                                     self.execution.request_cancel(&cancel.operation_id)
                                         .map_err(AgentServiceError::Execution)?;
                                     self.persist_state()?;
-                                    CancellationDisposition::CancellationRequested
+                                    if let Some(cancellation) = &operation.cancellation {
+                                        cancellation.cancel();
+                                        CancellationDisposition::CancellationRequested
+                                    } else {
+                                        // Bounded filesystem observation has no mutation side effect,
+                                        // but std filesystem calls are not asynchronously interruptible.
+                                        CancellationDisposition::IndeterminateAfterPropagation
+                                    }
                                 }
                                 Some(_) => return Err(AgentServiceError::CancellationMismatch),
                                 None => return Err(AgentServiceError::CancellationMismatch),
@@ -473,7 +529,7 @@ impl AgentService {
         // child before returning an error, then persist the terminal replay
         // barrier before the outer lifecycle can reconnect or exit.
         if session_result.is_err() && active.is_some() {
-            terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+            terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
             self.persist_state()?;
         }
         session_result
@@ -487,39 +543,72 @@ enum SessionExit {
 }
 
 #[derive(Debug)]
-struct ActiveProcess {
+struct ActiveOperation {
     operation_id: String,
-    cancellation: ProcessCancellation,
+    cancellation: Option<ProcessCancellation>,
 }
 
 #[derive(Debug)]
-struct ProcessCompletion {
+struct OperationCompletion {
     operation_id: String,
-    output: Result<crate::v2_m0::ProcessOutput, ProcessError>,
+    result: Result<DeviceResult, AgentOperationError>,
+}
+
+#[derive(Debug)]
+pub enum AgentOperationError {
+    Process(ProcessError),
+    Filesystem(FilesystemError),
+    WorkerPanicked,
 }
 
 async fn terminate_active(
-    active: &mut Option<ActiveProcess>,
-    process_done_rx: &mut mpsc::Receiver<ProcessCompletion>,
+    active: &mut Option<ActiveOperation>,
+    operation_done_rx: &mut mpsc::Receiver<OperationCompletion>,
     execution: &mut AgentExecutionGate,
 ) -> Result<(), AgentServiceError> {
-    let Some(process) = active.take() else {
+    let Some(operation) = active.take() else {
         return Ok(());
     };
-    process.cancellation.cancel();
-    let completion = tokio::time::timeout(Duration::from_secs(5), process_done_rx.recv())
-        .await
-        .map_err(|_| AgentServiceError::ProcessTerminationTimeout)?
-        .ok_or(AgentServiceError::ProcessWorkerClosed)?;
-    if completion.operation_id != process.operation_id {
-        return Err(AgentServiceError::ProcessStateMismatch);
+    if let Some(cancellation) = &operation.cancellation {
+        cancellation.cancel();
     }
-    // The direct child was killed and waited by ProcessExecutor. Keep the ID terminal
-    // across reconnect so an ambiguous transport outcome cannot cause replay.
+    let completion = tokio::time::timeout(Duration::from_secs(5), operation_done_rx.recv())
+        .await
+        .map_err(|_| AgentServiceError::OperationTerminationTimeout)?
+        .ok_or(AgentServiceError::OperationWorkerClosed)?;
+    if completion.operation_id != operation.operation_id {
+        return Err(AgentServiceError::OperationStateMismatch);
+    }
+    // Process descendants have been killed/waited by ProcessExecutor. Read-only
+    // filesystem operations are bounded and awaited before the replay ID is
+    // terminalized.
     execution
-        .abandon_on_disconnect(&process.operation_id)
+        .abandon_on_disconnect(&operation.operation_id)
         .map_err(AgentServiceError::Execution)?;
     Ok(())
+}
+
+fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
+    match error {
+        AgentOperationError::Filesystem(FilesystemError::PathDenied) => {
+            DeviceErrorCode::PermissionDenied
+        }
+        AgentOperationError::Filesystem(
+            FilesystemError::InvalidPath | FilesystemError::NotFile | FilesystemError::NotDirectory,
+        ) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Filesystem(FilesystemError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            DeviceErrorCode::NotFound
+        }
+        AgentOperationError::Filesystem(FilesystemError::Io(_))
+        | AgentOperationError::Process(ProcessError::Io(_))
+        | AgentOperationError::Process(ProcessError::Spawn(_)) => DeviceErrorCode::IoFailure,
+        AgentOperationError::Filesystem(_) | AgentOperationError::Process(_) => {
+            DeviceErrorCode::InvalidRequest
+        }
+        AgentOperationError::WorkerPanicked => DeviceErrorCode::InternalFailure,
+    }
 }
 
 async fn send_agent(
@@ -571,6 +660,8 @@ pub enum AgentServiceError {
     Control(crate::v2_m0::ControlError),
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
+    Filesystem(FilesystemError),
+    Operation(AgentOperationError),
     Persistence(PersistenceError),
     UnexpectedMessage(String),
     HeartbeatAckMismatch,
@@ -579,9 +670,9 @@ pub enum AgentServiceError {
     UnsupportedCommand,
     InboundClosed,
     OutboundClosed,
-    ProcessWorkerClosed,
-    ProcessStateMismatch,
-    ProcessTerminationTimeout,
+    OperationWorkerClosed,
+    OperationStateMismatch,
+    OperationTerminationTimeout,
     ReconnectExhausted,
     CheckpointIdentityMismatch,
     CheckpointTrustMismatch,

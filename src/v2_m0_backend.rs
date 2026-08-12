@@ -166,6 +166,16 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::ExecuteProcess,
                 ));
             }
+            DeviceCommand::ReadFile { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::ReadFile,
+                ));
+            }
+            DeviceCommand::ListDirectory { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::ListDirectory,
+                ));
+            }
         };
         validate_adapter_result(command, &result)?;
         Ok(result)

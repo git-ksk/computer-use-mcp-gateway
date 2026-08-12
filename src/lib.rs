@@ -12,4 +12,6 @@ pub mod v2_m1_persistence;
 pub mod v2_m1_process;
 pub mod v2_m1_tls;
 
+pub mod v2_m1_filesystem;
 pub mod v2_m1_grpc;
+pub mod v2_m1_hub;

@@ -161,8 +161,8 @@ Only after V2-M0 GO:
 - [x] separate file-based key/trust-anchor provisioning boundary with fail-closed filesystem checks
 - [x] Agent replay/trust checkpoint wired into the long-lived service so consumed grants and terminal/in-flight operation IDs survive process restart before execution can replay
 - [ ] production secret-store/certificate rotation integration for the deployed service
-- [ ] operator-facing single-device Hub gRPC service for the always-on VM target; current gRPC Hub implementations are integration-test fixtures, not a deployable Hub daemon
-- [ ] bound/prune terminal operation replay tombstones within a very long-lived generation; grant-consumption tombstones are expiry-pruned and checkpoint files are retained in a bounded window, but terminal operation IDs can still grow until a generation rollover
+- [x] operator-facing single-device Hub gRPC service (`v2_hub`) for the always-on VM target, with persisted generation/admission state, heartbeat timeout, exact-capability grant issuance, bounded queueing, cancellation, reconnect cleanup, and TLS key/certificate loading
+- [x] bound replay state across reconnects: Agent and Hub terminal tombstones are pruned at authenticated generation rollover, while indeterminate Hub operations are retained until explicit resolution; grant-consumption tombstones are expiry-pruned and checkpoint files use bounded retention
 - [x] heartbeat/reconnect semantics with bounded backoff
 - [x] one-device routing
 - [x] versioned capability advertisement with revision/generation tracking
@@ -172,7 +172,7 @@ Only after V2-M0 GO:
 - [x] fail-closed stale/offline-agent and stale-capability behavior
 - [x] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
 - [ ] explicit higher-risk shell-command capability for shell syntax/pipelines; keep it distinct from structured argv execution and require an exact shell capability grant rather than inheriting generic `Dangerous` authorization
-- [ ] bounded filesystem capability surface required by shell workflows, with path/policy controls rather than unrestricted implicit filesystem authority; `allowed_cwd_root` is not a filesystem sandbox and process argv may still address paths outside the cwd
+- [x] bounded read-only filesystem observation surface (`ReadFile` / `ListDirectory`) with exact capability grants, canonical path/root checks, symlink-escape rejection, bounded file bytes/directory entries, and command-local coarse errors; `ExecuteProcess` remains `Dangerous` and its argv is explicitly **not** filesystem-sandboxed
 - [ ] clean live cancellation/disconnect semantics across all execution backends
   - [x] Agent-native process cancellation while the gRPC stream remains responsive; child is killed/waited and the operation ID becomes terminal before reconnect
   - [x] exact downstream cancellation propagation + indeterminate device quarantine in deterministic MCP acceptance
