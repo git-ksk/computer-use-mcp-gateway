@@ -1,226 +1,187 @@
 # V2 standard-first boundaries
 
-Status: **accepted design direction (2026-08-12)**. This document records the long-term boundary between standards the project should adopt and custom control semantics that remain part of the product.
+Status: **accepted design direction, narrowed after final competitor review (2026-08-12)**.
+
+This document records the long-term boundary between standards/OSS the project should adopt and custom semantics that remain part of the CUMG core.
+
+Canonical product positioning is in [`V2_POSITIONING.md`](V2_POSITIONING.md).
 
 ## Decision
 
-V2 follows a **standard-first, custom-semantics-only-where-needed** rule.
+V2 follows a **standard-first, uncertainty-core-only** rule.
 
-Do not build custom infrastructure merely because the current single-device implementation can. Prefer maintained standards for transport, northbound authentication, observability, certificate lifecycle, and operating-system service management. Keep project-specific protocol semantics only where the relevant standards do not define the safety property this control plane needs.
+Do not build custom infrastructure merely because the current implementation can. Prefer maintained standards or OSS for authentication, delegated authorization, device fabric/registry, transport, certificate lifecycle, observability, service management, and generic policy/fleet concerns.
+
+Keep project-specific semantics only where they are required to preserve safe ownership of state-changing operations on an interactive desktop whose real-world side effects may become uncertain.
 
 The target layering is:
 
 ```text
-MCP Client
-   |
-   | MCP Authorization / OAuth
-   v
-Hub
-   |
-   +-- authenticated principal + local policy
-   +-- admission / replay / indeterminate state
-   +-- short-lived exact device-capability grant
-   |
-   | gRPC bidirectional streaming
-   | TLS; workload identity remains replaceable
-   v
-Agent
-   |
-   +-- exact grant enforcement
-   +-- replay barrier / generation checks
-   +-- bounded execution and cancellation
-   +-- backend-neutral capability surface
+MCP / OAuth / OIDC / IAM / delegated-auth / external policy
+                         |
+                  principal adapter
+                         |
+                  +-------------+
+                  |  CUMG CORE  |
+                  | operation ID|
+                  | ownership   |
+                  | fencing/gen |
+                  | replay      |
+                  | indeterminate
+                  | quarantine  |
+                  | resolution  |
+                  +------+------+ 
+                         |
+                   backend adapter
+                    /      |      \
+                  Cua    native   other
 ```
 
-## Standards to prefer
+## What standards and OSS should own
 
-### Northbound MCP authentication
+### Northbound authentication and delegated authorization
 
-Use the MCP Authorization model and its OAuth-based protected-resource semantics rather than inventing a separate public authentication protocol.
+Use MCP Authorization/OAuth, OIDC, IAM-like systems, or maintained delegated-authorization/capability systems rather than inventing another general public authorization protocol.
 
-The Hub should adapt the validated northbound identity into `AuthenticatedClientPrincipal`, then apply the existing local principal -> device -> exact capability authorization policy.
-
-The OAuth access token is **not** a Hub-to-Agent credential and must not be forwarded to the Agent. Northbound client authorization and southbound Agent grants are separate trust domains.
-
-Long-term boundary:
+The Hub reduces validated identity/authority to the local execution question:
 
 ```text
-OAuth / MCP Authorization
-        |
-        v
-AuthenticatedClientPrincipal
-        |
-        v
-Hub authorization policy
-        |
-        v
-short-lived exact DeviceCapability grant
+principal -> stable desktop -> exact DeviceCapability
 ```
 
-The internal exact-capability grant remains necessary because OAuth scopes do not define this project's generation, replay, one-shot grant, per-device operation, or ambiguous-execution semantics.
+Northbound credentials are **not** Agent credentials and must never be forwarded southbound as a substitute for a device-scoped execution grant.
+
+Generic scope/expiry/revocation/delegation machinery is replaceable. What must survive replacement is the binding from authorized intent to the CUMG operation-ownership state machine.
+
+### Device fabric, registry, and fleet concerns
+
+Do not treat device discovery, registry, multi-tenant fleet state, generic reservation, or agent/device messaging as proprietary value.
+
+Maintained systems such as Arm Device Connect or future equivalents may provide these layers if they preserve CUMG fencing, operation identity, quarantine, and replay invariants.
+
+A fleet layer may route an operation to a desktop; it must not become authoritative for whether an ambiguous prior operation is safe to forget or reuse.
 
 ### Hub-Agent transport
 
-Keep gRPC bidirectional streaming over TLS as the production transport candidate. Keep the application command/grant semantics transport-neutral.
+Keep application semantics transport-neutral. gRPC bidirectional streaming over TLS remains the current production transport candidate, and the raw TLS + signed-JSON implementation remains useful as a regression/reference transport.
 
-The raw TLS + signed-JSON implementation remains useful as a regression/reference transport, not as the long-term production framing standard.
+Use standard gRPC status where it represents transport/auth/resource failures. Do not map an uncertain physical side effect to an ordinary transport status and then lose the durable operation state.
 
-Use gRPC's standard status model where it matches the failure being represented, including authentication, authorization, resource exhaustion, cancellation, and availability failures. Do not invent duplicate transport error vocabularies when a gRPC status already expresses the same boundary.
+### TLS and workload identity
 
-### TLS certificate lifecycle
+Prefer ACME or other standard certificate automation for ordinary TLS lifecycle.
 
-Prefer standard certificate automation such as ACME for publicly terminated Hub TLS where applicable. Do not build a bespoke certificate-renewal protocol merely to rotate ordinary server certificates.
+Keep workload/device identity replaceable behind interfaces. Provisioned Ed25519 remains acceptable where already proven, while SPIFFE/X.509, KMS/HSM-backed signing, or other reviewed identity implementations may replace credential plumbing later.
 
-Application identity and grant-signing rotation remain separate from TLS certificate renewal.
-
-### Workload identity / SPIFFE
-
-Do **not** require SPIRE for the current single-Hub/small-Agent M1 deployment. Adding SPIRE Server/Agent infrastructure now may cost more operational complexity than it removes.
-
-However, the identity design must not become permanently coupled to provisioned Ed25519 files. Introduce or preserve abstraction boundaries so a future identity verifier/provider can support alternatives such as SPIFFE X.509-SVID without rewriting operation, grant, replay, or execution semantics.
-
-Conceptually, identity should be replaceable behind interfaces equivalent to:
-
-```text
-AgentIdentity / AgentIdentityVerifier
-    +-- provisioned Ed25519
-    +-- future SPIFFE/X.509 identity
-
-GrantIssuer / GrantVerifier
-    +-- local Ed25519 signer
-    +-- future KMS/HSM-backed signer
-```
-
-SPIFFE/SPIRE becomes worth serious adoption when V2-M2 introduces enough machines, environments, or trust domains that manual/provisioned workload identity becomes an operational liability.
+Credential replacement must not rewrite the operation-ownership state machine.
 
 ### Observability
 
-Prefer OpenTelemetry/OTLP as the long-term logs/metrics/traces integration model instead of growing a project-specific telemetry protocol.
+Prefer OpenTelemetry/OTLP. Use `cumg.*` attributes only for genuinely project-specific execution-safety concepts such as operation state, ownership generation, quarantine, or resolution.
 
-Use standard semantic attributes where possible and add `cumg.*` attributes only for concepts that are genuinely specific to this control plane, such as capability, device generation, operation state, or indeterminate quarantine.
-
-Never include raw shell commands, argv, file contents, screenshots, clipboard contents, credentials, or other sensitive operation payloads in default telemetry.
+Never include raw commands, argv, screenshots, clipboard contents, file contents, credentials, or other sensitive operation payloads in default telemetry.
 
 ### Service management
 
-Use operating-system service managers rather than implementing a custom supervisor:
+Use operating-system service managers such as launchd and systemd. Do not build a custom process supervisor as product functionality.
 
-- macOS: launchd / LaunchAgent where the Agent needs the interactive user session;
-- Linux: systemd;
-- other platforms: the platform-native service mechanism when added.
+### Generic policy engines
 
-The service package should own restart policy, state/secret directory permissions, environment/config loading, log routing, and upgrade/restart procedures without changing Agent protocol semantics.
-
-### Rate and connection limits
-
-Use standard HTTP/gRPC failure semantics, but keep the actual admission policy local to the Hub.
-
-Token-bucket/rate-window details are implementation choices. Existing Hub concurrency, queue, lease, and load-shedding semantics remain authoritative for whether work is admitted. Rate limits must compose with them rather than create a second conflicting scheduler.
+External policy engines may answer whether a principal is allowed to request a capability. They do not replace CUMG's physical operation ownership, ambiguous-outcome handling, or quarantine state.
 
 ## Custom semantics to keep
 
-The following are intentionally project-owned unless a mature standard later provides equivalent semantics **without weakening the current safety guarantees**:
+The project-owned core is now intentionally narrow:
 
-- exact `DeviceCapability` authorization and one-shot short-lived grants;
-- device generation and capability revision checks;
-- explicit operation IDs;
-- per-device lease / admission ownership;
-- replay rejection and bounded replay tombstones;
-- restart conversion of ambiguous in-flight work into fail-closed state;
-- `indeterminate` operation state and device quarantine;
-- explicit resolution of ambiguous execution outcomes;
-- no automatic replay of possibly state-changing work;
-- cancellation semantics that distinguish requested cancellation from proven non-execution / proven termination;
-- backend-neutral typed command/result semantics;
-- policy evidence without logging sensitive operation payloads.
+- explicit operation IDs for state-changing desktop work;
+- exclusive per-desktop operation ownership;
+- lease/fencing/generation semantics required to preserve that ownership;
+- stale-result rejection after generation or ownership changes;
+- replay barriers for state-changing work;
+- restart-safe ambiguous in-flight state;
+- durable `indeterminate` operation state;
+- device quarantine tied to the ambiguous operation;
+- explicit, auditable resolution before reuse;
+- no automatic replay of ambiguous state-changing work;
+- cancellation semantics that distinguish a cancellation request from proven non-execution or proven termination;
+- backend-neutral evidence sufficient to classify an operation as terminal or ambiguous;
+- privacy-preserving policy/operation/outcome evidence.
 
-These are not replacements for OAuth, gRPC, TLS, or SPIFFE. They sit above or beside those standards and encode the delegated-device safety properties that those standards do not provide.
+Exact capability grants remain part of the execution boundary, but generic delegated-authorization machinery around them is not assumed to be proprietary and may be replaced by maintained standards/OSS.
 
-## Identity decision
+## Why broader control-plane claims are no longer sufficient
 
-The existing independently signed Ed25519 application messages remain acceptable for M1. Do not remove them merely because TLS authenticates the carrier: they currently provide transport-independent application identity and bind session/command/result/cancellation semantics.
+The final competitor review found substantial overlap beyond the original survey:
 
-At the same time, do not make Ed25519 file provisioning a permanent architectural requirement. Separate:
+- **SINT Protocol** covers vendor-neutral physical-AI governance, capability tokens, action identity/claims, revocation, replay defense, edge enforcement, evidence, and fail-closed authority semantics.
+- **Arm Device Connect** covers vendor-neutral physical-device discovery, registry, cryptographic identity, ACLs, distributed state, multi-tenant operation, and agent/device invocation.
+- OpenClaw, OAHL, QuickDesk, Obot, Grantex/Open Agent Auth-class systems, and related projects cover additional Computer Use, reservation, governance, and delegated-authorization surfaces.
 
-1. **identity semantics** — who is the Hub/Agent and what message/session is authenticated;
-2. **credential implementation** — Ed25519 file, OS key store, KMS/HSM, SPIFFE SVID, or another reviewed mechanism.
+Therefore “vendor-neutral device control plane”, “scoped grants”, “device leases”, “physical-device governance”, “multi-machine”, or “MCP for remote devices” are not sufficient differentiation claims.
 
-Future migration may replace the credential implementation without replacing operation-state semantics.
+The durable custom boundary is the **interactive-desktop uncertainty state machine**: preserve who owns an operation and fail closed when its side effects cannot be proven.
+
+## Real desktop cancellation
+
+Transport-level cancellation can use standard MCP/gRPC mechanisms, but real desktop cancellation acceptance remains execution-backend specific.
+
+A cancellation request is not proof that a click, drag, keystroke, process, or other state-changing desktop effect did not execute.
+
+If the backend cannot prove non-execution or clean termination:
+
+```text
+operation -> indeterminate -> device quarantine -> explicit resolution
+```
+
+Do not convert that uncertainty into success, ordinary failure, or retryable transport error.
+
+V2-M1 already demonstrated this with real Cua Driver cancellation and Hub-side quarantine. Future work should strengthen and generalize that invariant rather than dilute it behind broader fleet/control-plane features.
+
+## Migration policy
+
+Classify existing implementation into four buckets:
+
+1. **Keep** — uncertainty-aware desktop operation ownership and recovery semantics.
+2. **Adapt** — useful current implementations behind replaceable interfaces.
+3. **Retire/replace** — custom infrastructure superseded by a maintained standard or OSS after equivalent safety is proven.
+4. **Reuse externally** — consume adjacent OSS behind adapters instead of rebuilding its product surface.
+
+Do not rewrite for architecture fashion. Any replacement must preserve or improve the existing security property and retain regression evidence.
+
+## Core-first implementation order
+
+After V2-M1, prioritize work in this order:
+
+1. harden operation-state transitions and stale-result fencing;
+2. make quarantine and explicit resolution first-class, durable, and crash-safe;
+3. prove ownership across reconnect, Hub restart, Agent restart, and competing principals;
+4. prove the same invariants across multiple independent desktops;
+5. prove backend portability with a second execution backend or deterministic reference backend;
+6. only then expand fleet UX, broad discovery, routing convenience, dashboards, or orchestration.
+
+A machine registry is not an M2 success condition by itself.
 
 ## What must not be collapsed together
 
 Do not collapse these boundaries merely to reduce code:
 
-- MCP/OAuth client authorization and Hub-to-Agent grants;
-- TLS certificate identity and application operation authorization;
-- gRPC cancellation and proof that a real desktop side effect stopped;
-- rate limiting and operation admission/lease ownership;
+- northbound OAuth/delegated authorization and Agent execution credentials;
+- TLS identity and operation ownership;
+- gRPC/MCP cancellation and proof that a real desktop effect stopped;
+- device liveness and permission to reuse a quarantined desktop;
+- generic fleet reservation and ownership of an ambiguous desktop operation;
 - observability identifiers and raw operation payload logging.
 
-In particular, **never forward a northbound OAuth bearer token to an Agent** as a substitute for an Agent-scoped capability grant.
-
-## Real Cua cancellation
-
-Transport-level cancellation can use standard MCP/gRPC mechanisms, but real desktop cancellation acceptance remains backend-specific.
-
-A cancellation request is not proof that a click, drag, keystroke sequence, or other desktop side effect did not execute. If the backend cannot provide sufficient evidence, retain the current `indeterminate` outcome and device quarantine rather than converting uncertainty into success.
-
-This is an intentional custom safety semantic, not missing standardization work.
-
-## Migration policy
-
-Existing custom implementation should be classified into three buckets during future work:
-
-1. **Keep** — product-specific safety semantics listed above.
-2. **Adapt** — current credential/identity implementations that should sit behind replaceable interfaces.
-3. **Retire** — custom infrastructure superseded by a maintained standard, once equivalent behavior is proven by tests.
-
-Do not perform rewrites solely for architectural fashion. A standardization migration must preserve or improve the existing security property, retain regression evidence, and avoid combining unrelated protocol changes in one step.
-
-## M1 implementation order after Shell
-
-The preferred remaining M1 order is:
-
-1. northbound MCP Authorization integration using the standard OAuth-based MCP boundary;
-2. production TLS/secret lifecycle, using standard certificate automation where applicable and keeping application identity replaceable;
-3. Hub connection/rate limits plus OpenTelemetry-oriented observability;
-4. launchd/systemd packaging around the existing long-lived runtimes;
-5. real-Cua cancellation acceptance;
-6. V2-M1 acceptance review before any V2-M2 multi-machine expansion.
-
-## V2-M1 completion against this policy
-
-V2-M1 was accepted on 2026-08-12 without collapsing the boundaries above:
-
-- northbound authentication uses MCP/OAuth protected-resource semantics and still reduces identity to `AuthenticatedClientPrincipal`; bearer tokens are not forwarded southbound;
-- Hub↔Agent remains gRPC bidirectional streaming over TLS with independently signed application messages;
-- ordinary server-certificate renewal is ACME-driven, while Hub/device/grant identities retain separate signed rotation lifecycles;
-- overload shedding uses standard gRPC/HTTP failures and leaves the existing operation admission/lease controller authoritative;
-- observability uses OpenTelemetry/OTLP standard configuration rather than a project-specific telemetry transport;
-- launchd/systemd own service supervision;
-- real-Cua cancellation still resolves to `indeterminate` + quarantine when the backend cannot prove non-execution.
-
-Acceptance evidence is in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). Future work should treat this document as the architectural boundary, not as a reason to replace proven custom safety semantics with nominally standard but weaker mechanisms.
-
-## V2-M2 trigger for SPIFFE reconsideration
-
-Re-evaluate SPIFFE/SPIRE before or during V2-M2 when one or more of these become true:
-
-- machine count makes manual identity provisioning operationally significant;
-- multiple environments/trust domains require automated workload attestation;
-- short-lived workload credentials are required operationally;
-- certificate/key rotation becomes a fleet-management problem;
-- external deployments need interoperable workload identity rather than repository-specific provisioning.
-
-Until then, maintain SPIFFE-compatible architectural seams without requiring SPIRE operationally.
+In particular, **never infer that a new connection, heartbeat, backend process, or device registry lease makes an old ambiguous desktop operation safe**.
 
 ## Review rule
 
 When adding a new V2 subsystem, ask in this order:
 
-1. Is there a maintained protocol/platform standard that already owns this concern?
-2. Does adopting it preserve the project's current security property?
-3. If yes, use or adapt the standard instead of creating a parallel protocol.
-4. If no, document exactly which delegated-device semantic is missing and keep the custom surface as narrow and transport-neutral as possible.
+1. Does it directly strengthen operation ownership, fencing, ambiguous-outcome handling, quarantine, explicit resolution, or no-replay safety?
+2. If yes, treat it as core-priority work.
+3. If no, is there a maintained standard/platform/OSS that already owns the concern?
+4. If yes, integrate or replace rather than create a parallel custom implementation.
+5. If no, document the exact execution-safety property that requires custom semantics and keep the custom surface narrow, backend-neutral, and transport-neutral.
 
-This rule applies to both M1 completion and later M2/M3 work.
+If another maintained OSS later provides equivalent per-desktop operation ownership, durable `indeterminate` quarantine, explicit resolution, stale-result fencing, and no-auto-replay semantics, reevaluate integration or retirement instead of defending sunk cost.
