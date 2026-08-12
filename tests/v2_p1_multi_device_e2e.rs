@@ -367,6 +367,8 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     assert!(matches!(
         handle_a
             .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+            .await?
+            .wait()
             .await,
         Err(HubCommandError::DeviceIndeterminate { operation_id }) if operation_id == ambiguous_a
     ));
