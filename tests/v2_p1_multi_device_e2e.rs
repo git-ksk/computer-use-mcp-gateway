@@ -288,7 +288,12 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
         &grants_a,
         cert_der.clone(),
     );
-    let material_b = agent_material(device_b_identity.clone(), &hub_b_identity, &grants_b, cert_der);
+    let material_b = agent_material(
+        device_b_identity.clone(),
+        &hub_b_identity,
+        &grants_b,
+        cert_der,
+    );
 
     let mut agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
     let mut agent_b = AgentService::new(config_b, material_b)?;
