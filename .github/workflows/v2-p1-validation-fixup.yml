@@ -1,6 +1,6 @@
 name: V2 P1 Validation Fixup
 
-# Temporary validation-only workflow. Revision 7: make both Agent restart phases explicit.
+# Temporary validation-only workflow. Revision 8: make both Agent restart phases explicit.
 on:
   pull_request:
 
@@ -25,53 +25,46 @@ jobs:
           p = Path("tests/v2_p1_multi_device_e2e.rs")
           text = p.read_text()
 
-          # Keep config/material available so B can be recreated from the exact
-          # same durable Agent checkpoint after the Hub crash.
-          old = "    let mut agent_b = AgentService::new(config_b, material_b)?;"
-          new = "    let mut agent_b = AgentService::new(config_b.clone(), material_b.clone())?;"
+          old = "let mut agent_b = AgentService::new(config_b, material_b)?;"
+          new = "let mut agent_b = AgentService::new(config_b.clone(), material_b.clone())?;"
           if old in text:
               text = text.replace(old, new, 1)
           elif new not in text:
               raise SystemExit("B Agent construction anchor missing")
 
-          # B stays connected and usable through the Hub crash itself. Only after
-          # the server is down do we stop the old Agent future; the restarted
-          # phase must not depend on tonic's forced-server-abort status mapping.
-          abort_anchor = '''    server_b.abort();
-              let _ = server_b.await;
-              drop(handle_a);'''
-          abort_new = '''    server_b.abort();
-              let _ = server_b.await;
-              let _ = b_shutdown_tx.send(true);
-              let _ = b_task.await;
-              drop(handle_a);'''
+          abort_anchor = '''server_b.abort();
+          let _ = server_b.await;
+          drop(handle_a);'''
+          abort_new = '''server_b.abort();
+          let _ = server_b.await;
+          let _ = b_shutdown_tx.send(true);
+          let _ = b_task.await;
+          drop(handle_a);'''
           if abort_anchor in text:
               text = text.replace(abort_anchor, abort_new, 1)
           elif abort_new not in text:
               raise SystemExit("B Hub-crash lifecycle anchor missing")
 
-          # Recreate B from its durable Agent checkpoint once the replacement Hub
-          # is listening. Shadowing b_task is intentional: the old task was joined.
-          restart_a_anchor = '''    let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
-              let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
-              a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
+          restart_a_anchor = '''let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
+          let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
+          a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
 
-              let a_generation_after_hub_restart ='''
-          restart_b_block = '''    let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
-              let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
-              a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
-              let mut restarted_agent_b = AgentService::new(config_b.clone(), material_b.clone())?;
-              let (b2_shutdown_tx, b2_shutdown_rx) = watch::channel(false);
-              let b_task = tokio::spawn(async move { restarted_agent_b.run(b2_shutdown_rx).await });
+          let a_generation_after_hub_restart ='''
+          restart_b_block = '''let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
+          let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
+          a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
+          let mut restarted_agent_b = AgentService::new(config_b.clone(), material_b.clone())?;
+          let (b2_shutdown_tx, b2_shutdown_rx) = watch::channel(false);
+          let b_task = tokio::spawn(async move { restarted_agent_b.run(b2_shutdown_rx).await });
 
-              let a_generation_after_hub_restart ='''
+          let a_generation_after_hub_restart ='''
           if restart_a_anchor in text:
               text = text.replace(restart_a_anchor, restart_b_block, 1)
           elif "let (b2_shutdown_tx, b2_shutdown_rx)" not in text:
               raise SystemExit("B post-restart Agent anchor missing")
 
-          cleanup_old = "    a3_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;"
-          cleanup_new = "    a3_shutdown_tx.send(true)?;\n    b2_shutdown_tx.send(true)?;"
+          cleanup_old = "a3_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;"
+          cleanup_new = "a3_shutdown_tx.send(true)?;\n    b2_shutdown_tx.send(true)?;"
           if cleanup_old in text:
               text = text.replace(cleanup_old, cleanup_new, 1)
           elif cleanup_new not in text:
@@ -79,15 +72,10 @@ jobs:
 
           p.write_text(text)
 
-          # Existing P0 partition test has a real one-second side effect but the
-          # hosted runner once exhausted its three-second marker window under load.
-          # Widen only that observation window; protocol timing/invariants stay unchanged.
           q = Path("tests/v2_m1_partition_recovery.rs")
           existing = q.read_text()
-          marker_old = '''    tokio::time::timeout(Duration::from_secs(3), async {
-              while !effect_marker.is_file() {'''
-          marker_new = '''    tokio::time::timeout(Duration::from_secs(6), async {
-              while !effect_marker.is_file() {'''
+          marker_old = "tokio::time::timeout(Duration::from_secs(3), async {\n        while !effect_marker.is_file()"
+          marker_new = "tokio::time::timeout(Duration::from_secs(6), async {\n        while !effect_marker.is_file()"
           if marker_old in existing:
               existing = existing.replace(marker_old, marker_new, 1)
           elif marker_new not in existing:
