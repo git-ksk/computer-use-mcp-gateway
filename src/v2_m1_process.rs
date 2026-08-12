@@ -2,10 +2,12 @@
 //!
 //! This is deliberately separate from the GUI/backend adapter path. Requests
 //! execute an explicit program + argv in an explicit working directory. The
-//! executor never inserts `sh -c`/`cmd /C`, clears the environment by default,
-//! bounds output, and supports cooperative cancellation + hard timeout.
+//! structured entrypoint never inserts `sh -c`/`cmd /C`, clears the environment
+//! by default, bounds output, and supports cooperative cancellation + hard timeout.
+//! The crate-private shell path deliberately invokes a fixed OS shell for the
+//! separately-authorized `Shell` capability while reusing process supervision.
 
-use crate::v2_m0::{ProcessEnvVar, ProcessOutput, ProcessRequest};
+use crate::v2_m0::{ProcessEnvVar, ProcessOutput, ProcessRequest, ShellRequest};
 use crate::v2_m0_execution::{AgentExecutionGate, ExecutionError, OperationRef};
 use process_wrap::std::CommandWrap;
 #[cfg(windows)]
@@ -184,6 +186,60 @@ impl ProcessExecutor {
         cancellation: &ProcessCancellation,
     ) -> Result<ProcessOutput, ProcessError> {
         let validated = self.validate_request(request)?;
+        self.execute_validated(
+            &request.program,
+            &request.args,
+            &validated.cwd,
+            &request.env,
+            request.timeout_ms,
+            cancellation,
+        )
+    }
+
+    pub(crate) fn execute_shell(
+        &self,
+        request: &ShellRequest,
+        cancellation: &ProcessCancellation,
+    ) -> Result<ProcessOutput, ProcessError> {
+        let cwd = self.validate_common(&request.cwd, &request.env, request.timeout_ms)?;
+        #[cfg(unix)]
+        let (program, args) = (
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), request.command.clone()],
+        );
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd.exe".to_owned(),
+            vec![
+                "/D".to_owned(),
+                "/S".to_owned(),
+                "/C".to_owned(),
+                request.command.clone(),
+            ],
+        );
+        #[cfg(not(any(unix, windows)))]
+        return Err(ProcessError::ShellUnsupportedPlatform);
+
+        #[cfg(any(unix, windows))]
+        self.execute_validated(
+            &program,
+            &args,
+            &cwd,
+            &request.env,
+            request.timeout_ms,
+            cancellation,
+        )
+    }
+
+    fn execute_validated(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &[ProcessEnvVar],
+        timeout_ms: u64,
+        cancellation: &ProcessCancellation,
+    ) -> Result<ProcessOutput, ProcessError> {
         if cancellation.is_cancelled() {
             return Ok(ProcessOutput {
                 exit_code: None,
@@ -197,10 +253,10 @@ impl ProcessExecutor {
             });
         }
 
-        let mut command = Command::new(&request.program);
+        let mut command = Command::new(program);
         command
-            .args(&request.args)
-            .current_dir(&validated.cwd)
+            .args(args)
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -210,7 +266,7 @@ impl ProcessExecutor {
                 command.env(key, value);
             }
         }
-        for item in &request.env {
+        for item in env {
             command.env(&item.key, &item.value);
         }
 
@@ -218,7 +274,7 @@ impl ProcessExecutor {
         // Supervise the whole process tree, not just the direct child. On Unix
         // the child becomes a process-group leader; on Windows it is assigned
         // to a Job Object. Cancellation/timeout therefore terminates descendants
-        // spawned by build tools, package managers, or test runners as well.
+        // spawned by build tools, package managers, shell pipelines, or tests.
         let mut command = CommandWrap::from(command);
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
@@ -231,7 +287,7 @@ impl ProcessExecutor {
         let stdout_reader = thread::spawn(move || drain_bounded(stdout, max));
         let stderr_reader = thread::spawn(move || drain_bounded(stderr, max));
 
-        let timeout = Duration::from_millis(request.timeout_ms);
+        let timeout = Duration::from_millis(timeout_ms);
         let mut timed_out = false;
         let mut cancelled = false;
         let status = loop {
@@ -246,12 +302,8 @@ impl ProcessExecutor {
                 break child.wait().map_err(ProcessError::Io)?;
             }
             if let Some(status) = child.try_wait().map_err(ProcessError::Io)? {
-                // ExecuteProcess is a bounded task, not a service launcher. A
-                // top-level command may exit after spawning background work;
-                // terminate anything still attached to its process group / Job
-                // Object before releasing the Agent operation lease. ESRCH/no
-                // remaining process is a normal race, so cleanup is best-effort
-                // after the parent has already exited.
+                // Bounded Agent operations are not service launchers. Clean up
+                // anything still attached to the process group / Job Object.
                 let _ = child.start_kill();
                 break status;
             }
@@ -294,17 +346,11 @@ impl ProcessExecutor {
     }
 
     fn validate_request(&self, request: &ProcessRequest) -> Result<ValidatedRequest, ProcessError> {
-        if request.program.trim().is_empty() || request.cwd.trim().is_empty() {
+        if request.program.trim().is_empty() {
             return Err(ProcessError::InvalidRequest);
         }
         if request.args.len() > self.policy.max_args {
             return Err(ProcessError::TooManyArguments);
-        }
-        if request.env.len() > self.policy.max_env_entries {
-            return Err(ProcessError::TooManyEnvironmentEntries);
-        }
-        if request.timeout_ms == 0 || request.timeout_ms > self.policy.max_timeout_ms {
-            return Err(ProcessError::InvalidTimeout);
         }
         let name = Path::new(&request.program)
             .file_name()
@@ -314,7 +360,26 @@ impl ProcessExecutor {
         if self.policy.denied_program_names.contains(&name) {
             return Err(ProcessError::ShellProgramDenied);
         }
-        let cwd = fs::canonicalize(&request.cwd).map_err(ProcessError::Io)?;
+        let cwd = self.validate_common(&request.cwd, &request.env, request.timeout_ms)?;
+        Ok(ValidatedRequest { cwd })
+    }
+
+    fn validate_common(
+        &self,
+        cwd: &str,
+        env: &[ProcessEnvVar],
+        timeout_ms: u64,
+    ) -> Result<PathBuf, ProcessError> {
+        if cwd.trim().is_empty() {
+            return Err(ProcessError::InvalidRequest);
+        }
+        if env.len() > self.policy.max_env_entries {
+            return Err(ProcessError::TooManyEnvironmentEntries);
+        }
+        if timeout_ms == 0 || timeout_ms > self.policy.max_timeout_ms {
+            return Err(ProcessError::InvalidTimeout);
+        }
+        let cwd = fs::canonicalize(cwd).map_err(ProcessError::Io)?;
         if !cwd.is_dir() {
             return Err(ProcessError::WorkingDirectoryNotDirectory);
         }
@@ -327,7 +392,7 @@ impl ProcessExecutor {
             return Err(ProcessError::WorkingDirectoryDenied);
         }
         let mut seen = HashSet::new();
-        for ProcessEnvVar { key, value: _ } in &request.env {
+        for ProcessEnvVar { key, value: _ } in env {
             if key.is_empty() || key.contains('=') || key.contains('\0') || !seen.insert(key) {
                 return Err(ProcessError::InvalidEnvironment);
             }
@@ -335,7 +400,7 @@ impl ProcessExecutor {
                 return Err(ProcessError::EnvironmentKeyDenied(key.clone()));
             }
         }
-        Ok(ValidatedRequest { cwd })
+        Ok(cwd)
     }
 }
 
@@ -379,6 +444,7 @@ pub enum ProcessError {
     InvalidRequest,
     InvalidProgram,
     ShellProgramDenied,
+    ShellUnsupportedPlatform,
     TooManyArguments,
     TooManyEnvironmentEntries,
     InvalidTimeout,

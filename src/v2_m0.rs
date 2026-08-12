@@ -29,6 +29,7 @@ pub enum DeviceCapability {
     ScreenGeometry,
     PointerClick,
     ExecuteProcess,
+    Shell,
     ReadFile,
     ListDirectory,
 }
@@ -41,9 +42,9 @@ impl DeviceCapability {
             | Self::ReadFile
             | Self::ListDirectory => CapabilityClass::Observe,
             Self::PointerClick => CapabilityClass::Interact,
-            // Direct process execution can mutate arbitrary local state and is
-            // therefore never implied by observe/interact access.
-            Self::ExecuteProcess => CapabilityClass::Dangerous,
+            // Direct process and free-form shell execution can mutate arbitrary
+            // local state and are therefore never implied by observe/interact access.
+            Self::ExecuteProcess | Self::Shell => CapabilityClass::Dangerous,
         }
     }
 }
@@ -66,6 +67,14 @@ pub struct ProcessEnvVar {
 pub struct ProcessRequest {
     pub program: String,
     pub args: Vec<String>,
+    pub cwd: String,
+    pub env: Vec<ProcessEnvVar>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellRequest {
+    pub command: String,
     pub cwd: String,
     pub env: Vec<ProcessEnvVar>,
     pub timeout_ms: u64,
@@ -111,6 +120,9 @@ pub enum DeviceCommand {
     ExecuteProcess {
         request: ProcessRequest,
     },
+    Shell {
+        request: ShellRequest,
+    },
     ReadFile {
         path: String,
     },
@@ -126,6 +138,7 @@ impl DeviceCommand {
             Self::ScreenGeometry => DeviceCapability::ScreenGeometry,
             Self::PointerClick { .. } => DeviceCapability::PointerClick,
             Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
+            Self::Shell { .. } => DeviceCapability::Shell,
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
             Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
         }
@@ -864,6 +877,9 @@ pub enum DeviceResult {
     Process {
         output: ProcessOutput,
     },
+    Shell {
+        output: ProcessOutput,
+    },
     FileContents {
         bytes: Vec<u8>,
         truncated: bool,
@@ -888,6 +904,7 @@ impl DeviceResult {
                     DeviceCommand::PointerClick { .. }
                 )
                 | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
+                | (Self::Shell { .. }, DeviceCommand::Shell { .. })
                 | (Self::FileContents { .. }, DeviceCommand::ReadFile { .. })
                 | (
                     Self::DirectoryEntries { .. },
@@ -1310,6 +1327,19 @@ mod tests {
                 1_001,
             )
             .unwrap();
+
+        let process_for_shell = authority
+            .issue_for_device_capability("dev", DeviceCapability::ExecuteProcess, 1_000, 30_000)
+            .unwrap();
+        assert!(matches!(
+            ledger.authorize_device_capability_once(
+                &process_for_shell,
+                "dev",
+                DeviceCapability::Shell,
+                1_001,
+            ),
+            Err(ControlError::DeviceCapabilityGrantMismatch { .. })
+        ));
     }
 
     #[test]

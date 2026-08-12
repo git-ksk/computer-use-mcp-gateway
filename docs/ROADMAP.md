@@ -171,7 +171,7 @@ Only after V2-M0 GO:
 - [x] short-lived capability-grant validation with an Agent-enforced 5-minute maximum lifetime and exact `DeviceCapability` scoping for M1 Agent-native operations
 - [x] fail-closed stale/offline-agent and stale-capability behavior
 - [x] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
-- [ ] explicit higher-risk shell-command capability for shell syntax/pipelines; keep it distinct from structured argv execution and require an exact shell capability grant rather than inheriting generic `Dangerous` authorization
+- [x] explicit higher-risk `Shell` capability for shell syntax/pipelines, distinct from structured argv execution and requiring an exact `DeviceCapability::Shell` grant. The Agent invokes a fixed OS shell (`/bin/sh -c` on Unix, `cmd.exe /D /S /C` on Windows), bounds command size/output/time, applies the same cwd/environment policy as `ExecuteProcess`, and supervises/cancels the full process tree; this is not a filesystem sandbox
 - [x] bounded read-only filesystem observation surface (`ReadFile` / `ListDirectory`) with exact capability grants, canonical path/root checks, symlink-escape rejection, bounded file bytes/directory entries, and command-local coarse errors; `ExecuteProcess` remains `Dangerous` and its argv is explicitly **not** filesystem-sandboxed
 - [ ] clean live cancellation/disconnect semantics across all execution backends
   - [x] Agent-native process cancellation while the gRPC stream remains responsive; child is killed/waited and the operation ID becomes terminal before reconnect

@@ -220,6 +220,6 @@ Before a remote Agent is exposed as a product service, M1 must at minimum add an
 - production private-key/certificate custody and rotation; private signing keys remain outside replay checkpoints;
 - Hub-side connection/TLS-handshake/rate limits and operational observability;
 - bounded pruning or generation-rollover semantics for terminal Agent operation tombstones;
-- no filesystem sandbox claim for arbitrary process execution: `allowed_cwd_root` constrains cwd but does not prevent process argv from addressing other filesystem paths. The separate read-only `ReadFile`/`ListDirectory` capabilities are path-bounded and symlink-escape checked, but do not constrain `ExecuteProcess`;
+- no filesystem sandbox claim for arbitrary process or shell execution: `allowed_cwd_root` constrains cwd but does not prevent process argv or shell syntax from addressing other filesystem paths. `ExecuteProcess` and `Shell` are separate exact `Dangerous` capabilities. The read-only `ReadFile`/`ListDirectory` capabilities are path-bounded and symlink-escape checked, but do not constrain either execution capability;
 - live cancellation acceptance for Cua desktop operations and explicit handling when a GUI backend cannot prove interruption;
 - OS-specific service packaging and reviewed state/key directory locations.

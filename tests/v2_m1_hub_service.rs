@@ -2,7 +2,7 @@
 
 use anyhow::{Result, anyhow};
 use computer_use_mcp_gateway::{
-    v2_m0::{DeviceIdentity, GrantAuthority, ProcessRequest},
+    v2_m0::{DeviceIdentity, GrantAuthority, ProcessRequest, ShellRequest},
     v2_m0_transport::HubIdentity,
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig},
@@ -128,6 +128,19 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     assert_eq!(git.output.exit_code, Some(0));
     assert!(!git.output.cancelled && !git.output.timed_out);
 
+    let shell = handle
+        .execute_shell(ShellRequest {
+            command: "printf 'shell\n' | tr a-z A-Z".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 10_000,
+        })
+        .await
+        .map_err(|error| anyhow!("Hub shell execution failed: {error:?}"))?;
+    assert_eq!(shell.output.exit_code, Some(0));
+    assert_eq!(shell.output.stdout, "SHELL\n");
+    assert!(!shell.output.cancelled && !shell.output.timed_out);
+
     let (bytes, truncated) = handle
         .read_file(fs_root.join("note.txt").to_string_lossy().into_owned())
         .await?;
@@ -177,6 +190,30 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
         .await
         .map_err(|_| anyhow!("cancelled process did not complete"))??;
     assert!(cancelled.output.cancelled && !cancelled.output.timed_out);
+
+    let pending_shell = handle
+        .start_shell(ShellRequest {
+            command: "sleep 30".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 60_000,
+        })
+        .await
+        .map_err(|error| anyhow!("Hub shell sleep start failed: {error:?}"))?;
+    let shell_operation_id = pending_shell.operation_id.clone();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let shell_disposition = handle
+        .cancel(shell_operation_id)
+        .await
+        .map_err(|error| anyhow!("Hub shell cancel failed: {error:?}"))?;
+    assert_eq!(
+        shell_disposition,
+        computer_use_mcp_gateway::v2_m0_transport::CancellationDisposition::CancellationRequested
+    );
+    let cancelled_shell = tokio::time::timeout(Duration::from_secs(3), pending_shell.wait())
+        .await
+        .map_err(|_| anyhow!("cancelled shell did not complete"))??;
+    assert!(cancelled_shell.output.cancelled && !cancelled_shell.output.timed_out);
 
     let _ = shutdown_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), agent_task)

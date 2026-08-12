@@ -10,6 +10,7 @@ pub mod v2_m1_backend;
 pub mod v2_m1_keys;
 pub mod v2_m1_persistence;
 pub mod v2_m1_process;
+pub mod v2_m1_shell;
 pub mod v2_m1_tls;
 
 pub mod v2_m1_filesystem;

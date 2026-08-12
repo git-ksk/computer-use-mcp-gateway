@@ -7,7 +7,7 @@
 
 use crate::v2_m0::{
     CONTROL_SCHEMA_VERSION, CommandEnvelope, DeviceCommand, DeviceErrorCode, DeviceRegistry,
-    DeviceResult, DirectoryEntry, GrantAuthority, ProcessOutput, ProcessRequest,
+    DeviceResult, DirectoryEntry, GrantAuthority, ProcessOutput, ProcessRequest, ShellRequest,
     validate_command_result,
 };
 use crate::v2_m0_execution::{
@@ -118,6 +118,12 @@ pub struct HubProcessResult {
     pub output: ProcessOutput,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubShellResult {
+    pub operation_id: String,
+    pub output: ProcessOutput,
+}
+
 pub struct HubPendingCommand {
     pub operation_id: String,
     reply: oneshot::Receiver<Result<HubCommandResult, HubCommandError>>,
@@ -141,6 +147,25 @@ impl HubPendingProcess {
         let result = self.pending.wait().await?;
         match result.result {
             DeviceResult::Process { output } => Ok(HubProcessResult {
+                operation_id: result.operation_id,
+                output,
+            }),
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+}
+
+pub struct HubPendingShell {
+    pub operation_id: String,
+    pending: HubPendingCommand,
+}
+
+impl HubPendingShell {
+    pub async fn wait(self) -> Result<HubShellResult, HubCommandError> {
+        let result = self.pending.wait().await?;
+        match result.result {
+            DeviceResult::Shell { output } => Ok(HubShellResult {
                 operation_id: result.operation_id,
                 output,
             }),
@@ -593,7 +618,7 @@ impl SingleDeviceHub {
         let device_result = result.result.result.clone();
         let cancelled = matches!(
             &device_result,
-            DeviceResult::Process { output } if output.cancelled
+            DeviceResult::Process { output } | DeviceResult::Shell { output } if output.cancelled
         );
         let next = {
             let mut persistent = self.inner.persistent.lock().await;
@@ -796,6 +821,24 @@ impl HubHandle {
         request: ProcessRequest,
     ) -> Result<HubProcessResult, HubCommandError> {
         self.start_process(request).await?.wait().await
+    }
+
+    pub async fn start_shell(
+        &self,
+        request: ShellRequest,
+    ) -> Result<HubPendingShell, HubCommandError> {
+        let pending = self.start_command(DeviceCommand::Shell { request }).await?;
+        Ok(HubPendingShell {
+            operation_id: pending.operation_id.clone(),
+            pending,
+        })
+    }
+
+    pub async fn execute_shell(
+        &self,
+        request: ShellRequest,
+    ) -> Result<HubShellResult, HubCommandError> {
+        self.start_shell(request).await?.wait().await
     }
 
     pub async fn read_file(

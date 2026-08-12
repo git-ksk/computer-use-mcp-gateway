@@ -26,6 +26,7 @@ use crate::v2_m1_grpc::{
 use crate::v2_m1_keys::AgentProvisionedMaterial;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, PersistenceError};
 use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
+use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::fmt;
 use std::path::PathBuf;
@@ -81,6 +82,7 @@ pub struct AgentService {
     config: AgentServiceConfig,
     material: AgentProvisionedMaterial,
     executor: ProcessExecutor,
+    shell: ShellExecutor,
     filesystem: FilesystemExecutor,
     trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
@@ -95,6 +97,10 @@ impl AgentService {
     ) -> Result<Self, AgentServiceError> {
         config.validate()?;
         let executor = ProcessExecutor::new(
+            ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
+                .map_err(AgentServiceError::Process)?,
+        );
+        let shell = ShellExecutor::new(
             ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Process)?,
         );
@@ -137,6 +143,7 @@ impl AgentService {
             config,
             material,
             executor,
+            shell,
             filesystem,
             trusted_hub,
             grants,
@@ -168,9 +175,10 @@ impl AgentService {
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-            revision: 1,
+            revision: 2,
             supported: vec![
                 DeviceCapability::ExecuteProcess,
+                DeviceCapability::Shell,
                 DeviceCapability::ReadFile,
                 DeviceCapability::ListDirectory,
             ],
@@ -454,6 +462,23 @@ impl AgentService {
                                     });
                                     Some(cancellation)
                                 }
+                                DeviceCommand::Shell { request } => {
+                                    let cancellation = ProcessCancellation::default();
+                                    let worker_cancel = cancellation.clone();
+                                    let shell = self.shell.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            shell.execute(&request, &worker_cancel)
+                                        }).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map(|output| DeviceResult::Shell { output }).map_err(AgentOperationError::Shell));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            result,
+                                        }).await;
+                                    });
+                                    Some(cancellation)
+                                }
                                 DeviceCommand::ReadFile { path } => {
                                     let filesystem = self.filesystem.clone();
                                     tokio::spawn(async move {
@@ -557,6 +582,7 @@ struct OperationCompletion {
 #[derive(Debug)]
 pub enum AgentOperationError {
     Process(ProcessError),
+    Shell(ShellError),
     Filesystem(FilesystemError),
     WorkerPanicked,
 }
@@ -603,10 +629,14 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         }
         AgentOperationError::Filesystem(FilesystemError::Io(_))
         | AgentOperationError::Process(ProcessError::Io(_))
-        | AgentOperationError::Process(ProcessError::Spawn(_)) => DeviceErrorCode::IoFailure,
-        AgentOperationError::Filesystem(_) | AgentOperationError::Process(_) => {
-            DeviceErrorCode::InvalidRequest
+        | AgentOperationError::Process(ProcessError::Spawn(_))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Io(_)))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Spawn(_))) => {
+            DeviceErrorCode::IoFailure
         }
+        AgentOperationError::Filesystem(_)
+        | AgentOperationError::Process(_)
+        | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
         AgentOperationError::WorkerPanicked => DeviceErrorCode::InternalFailure,
     }
 }
