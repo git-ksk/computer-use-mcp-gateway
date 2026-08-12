@@ -22,20 +22,8 @@ jobs:
           from pathlib import Path
           p = Path("tests/v2_p1_multi_device_e2e.rs")
           text = p.read_text()
-          old = '''    assert!(matches!(
-              handle_a
-                  .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
-                  .await,
-              Err(HubCommandError::DeviceIndeterminate { operation_id }) if operation_id == ambiguous_a
-          ));'''
-          new = '''    assert!(matches!(
-              handle_a
-                  .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
-                  .await?
-                  .wait()
-                  .await,
-              Err(HubCommandError::DeviceIndeterminate { operation_id }) if operation_id == ambiguous_a
-          ));'''
+          old = ".start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)\n            .await,"
+          new = ".start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)\n            .await?\n            .wait()\n            .await,"
           if old in text:
               p.write_text(text.replace(old, new, 1))
           elif new not in text:
