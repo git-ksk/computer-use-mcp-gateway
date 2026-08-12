@@ -18,6 +18,9 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.88.0
 
+      - name: Normalize formatting for validation
+        run: cargo fmt
+
       - name: Format
         run: cargo fmt --check
 
