@@ -3,8 +3,8 @@
 use anyhow::{Result, anyhow, bail};
 use computer_use_mcp_gateway::{
     v2_m0::{
-        CONTROL_SCHEMA_VERSION, CapabilityClass, CommandEnvelope, DeviceCommand, DeviceIdentity,
-        DeviceRegistry, DeviceResult, GrantAuthority, ProcessRequest, validate_command_result,
+        CONTROL_SCHEMA_VERSION, CommandEnvelope, DeviceCommand, DeviceIdentity, DeviceRegistry,
+        DeviceResult, GrantAuthority, ProcessRequest, validate_command_result,
     },
     v2_m0_transport::{
         AgentToHub, CancellationDisposition, HubIdentity, HubToAgent, verify_agent_heartbeat,
@@ -174,9 +174,9 @@ impl AgentControl for LifecycleHub {
                         },
                     },
                 };
-                let grant = state.grant_authority.issue(
+                let grant = state.grant_authority.issue_for_device_capability(
                     &state.expected_device_id,
-                    CapabilityClass::Dangerous,
+                    computer_use_mcp_gateway::v2_m0::DeviceCapability::ExecuteProcess,
                     HUB_TIME_MS,
                     30_000,
                 )?;
@@ -360,7 +360,7 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
     let checkpoint = CheckpointStore::new(&state_dir, "agent")?;
     let persisted: AgentPersistentState = checkpoint.load_latest()?;
     assert_eq!(persisted.device_id, restart_config.device_id);
-    assert!(!persisted.grant_ledger.consumed_grant_ids.is_empty());
+    assert!(!persisted.grant_ledger.consumed_grants.is_empty());
     assert!(
         persisted
             .execution

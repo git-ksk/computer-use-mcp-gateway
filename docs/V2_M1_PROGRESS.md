@@ -31,7 +31,7 @@ self-owned Agent
        +-- future native backends  <- later
 ```
 
-Structured process execution should be the safe default: an explicit executable, argument vector, working directory, bounded environment, output limits, timeout, and cancellation semantics. Free-form shell syntax/pipelines should be a distinct higher-risk capability rather than silently treating every process request as `sh -c`. Filesystem access should likewise be explicit and policy-bounded.
+Structured process execution is the safer **API shape**: an explicit executable, argument vector, working directory, bounded environment, output limits, timeout, and cancellation semantics, with no implicit `sh -c`. It is still a `Dangerous` capability, not a sandbox: executable scripts/interpreters can run arbitrary code, and argv may name files outside the allowed cwd. The Agent therefore now requires an exact `DeviceCapability::ExecuteProcess` grant instead of accepting a class-only `Dangerous` grant. A future free-form shell command must receive its own exact capability scope. Filesystem authority remains a separate M1 gap.
 
 This ordering changes implementation priority, not the trust model. Existing TLS, identity, grants, leases, replay protection, admission control, cancellation state, and audit rules remain the security boundary for shell/process capabilities. GUI support is not removed: Cua remains available behind the adapter contract while the Agent gains direct shell utility first.
 
@@ -39,17 +39,17 @@ This ordering changes implementation priority, not the trust model. Existing TLS
 
 The current `v2-m1-secure-agent` implementation adds these M1 building blocks while preserving the M0 application-layer identity and capability controls:
 
-- TLS 1.3-only Hub↔Agent transport configuration using a pinned trust root and the dedicated `cumg-hub-agent/1` ALPN;
+- the raw-TLS regression transport is TLS 1.3-only with pinned trust and the dedicated `cumg-hub-agent/1` ALPN; the gRPC production candidate uses TLS + HTTP/2 with pinned certificate trust/domain validation and keeps Ed25519 application identity above the transport;
 - application-layer Ed25519 Hub/Agent authentication and signed session/command/result/cancellation messages remain above TLS rather than being replaced by transport identity;
 - signed Agent heartbeat and Hub acknowledgement messages bound to the authenticated connection transcript;
 - monotonically increasing heartbeat sequence enforcement, generation matching, timeout/offline detection, and bounded exponential reconnect policy;
 - a reusable outbound lifecycle runner that bounds consecutive connection/session failures, resets the failure streak after an established session, and reconnects without transferring prior session generation state;
 - an operator-facing `v2_agent` binary that loads the separate device/Hub/grant/TLS trust material, opens the outbound gRPC/TLS session, maintains signed heartbeats, reconnects with bounded exponential backoff, handles Ctrl-C shutdown, and keeps the receive loop responsive while direct process work runs on a blocking worker;
 - `v2_agent` persists Agent replay/trust checkpoints in its operator-selected state directory: consumed grants are fsynced before execution proceeds, an active operation is checkpointed before the child is spawned, and terminal operation IDs survive process restart; startup restores the latest checkpoint and fails closed on device/trust-anchor mismatch;
-- live Agent-native process cancellation over the gRPC session: a signed `Cancel` flips the process cancellation token without blocking stream receive, the direct child is killed and waited, the operation ID is made terminal, and signed cancellation/result evidence is returned;
+- live Agent-native process cancellation over the gRPC session: a signed `Cancel` flips the process cancellation token without blocking stream receive; Unix process groups and Windows Job Objects terminate the process tree, background descendants are also cleaned up when the top-level process exits, the operation ID becomes terminal, and signed cancellation/result evidence is returned;
 - one-device routing that rejects offline, wrong-device, stale-generation, stale-capability, and unsupported-capability commands;
 - restart snapshots for device registry, grant verifier/revocation/consumption state, Hub operation state, and Agent terminal-operation replay barriers;
-- append-only checkpoint files with bounded size, `create_new`, flush/fsync, symlink rejection, and restrictive Unix directory/file permission checks;
+- crash-safe checkpoint files with bounded per-file size, `create_new`, flush/fsync, symlink rejection, restrictive Unix directory/file permission checks, and a bounded 64-checkpoint retention window; consumed-grant tombstones are pruned after their enforced grant expiry;
 - restart conversion of queued/pre-dispatch work to `cancelled` and dispatched/cancel-requested work to `indeterminate`, so process restart never makes ambiguous work runnable again;
 - an asynchronous Cua MCP semantic adapter that reuses the V1 request-level cancellation path, normalizes `list_apps`/`get_screen_size`, and classifies propagated cancellation or timeout as `indeterminate` rather than claiming the desktop action definitely stopped;
 - Hub-side device quarantine for `indeterminate` operations: a different operation on the same device is rejected until an explicit resolution records the ambiguous operation as confirmed completed or confirmed not executed;
@@ -67,8 +67,11 @@ A separate operator-controlled M1 backend run on 2026-08-11 connected the asynch
 
 ## Still required before V2-M1 acceptance
 
-The `v2_agent` process now integrates the direct process executor, gRPC/TLS outbound lifecycle, heartbeat timeout/reconnect behavior, cancellation, the Agent-side file-based key/trust boundary, and restart-safe replay checkpoints. Remaining M1 work is narrower:
+The `v2_agent` process now integrates the direct process executor, gRPC/TLS outbound lifecycle, heartbeat timeout/reconnect behavior, cancellation, the Agent-side file-based key/trust boundary, and restart-safe replay checkpoints. Remaining M1 work is narrower, but there are still production blockers:
 
+- implement the operator-facing single-device Hub gRPC daemon for the always-on VM target; the current gRPC server is test-only, so `v2_agent` is not yet deployable end-to-end as a product service;
+- bound/prune terminal operation replay tombstones inside a very long-lived device generation. Checkpoint file count and consumed-grant state are now bounded/pruned, but terminal operation IDs can still accumulate until generation rollover;
+- treat `allowed_cwd_root` as working-directory policy only, not filesystem confinement. Before exposing narrower filesystem claims, add explicit path-scoped filesystem capabilities or an OS sandbox;
 - define the separate higher-risk shell-command capability and the minimum bounded filesystem surface needed for practical repository/build workflows;
 - add OS-specific service packaging/installation (for example launchd/systemd) around the now-runnable long-lived `v2_agent` process;
 - integrate the Hub-side key boundary into the operator-facing Hub service and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;

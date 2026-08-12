@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-pub const M1_STATE_SCHEMA_VERSION: u16 = 1;
+pub const M1_STATE_SCHEMA_VERSION: u16 = 2;
 pub const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
+pub const MAX_RETAINED_CHECKPOINTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentPersistentState {
@@ -143,6 +144,7 @@ impl CheckpointStore {
                     file.flush().map_err(PersistenceError::Io)?;
                     file.sync_all().map_err(PersistenceError::Io)?;
                     sync_directory(&self.directory)?;
+                    self.prune_old_checkpoints(MAX_RETAINED_CHECKPOINTS)?;
                     return Ok(path);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -212,6 +214,35 @@ impl CheckpointStore {
     fn checkpoint_path(&self, sequence: u64) -> PathBuf {
         self.directory
             .join(format!("{}-{sequence:020}.json", self.prefix))
+    }
+
+    fn prune_old_checkpoints(&self, retain: usize) -> Result<(), PersistenceError> {
+        if retain == 0 {
+            return Err(PersistenceError::InvalidRetention);
+        }
+        let mut checkpoints = Vec::new();
+        for entry in fs::read_dir(&self.directory).map_err(PersistenceError::Io)? {
+            let entry = entry.map_err(PersistenceError::Io)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(sequence) = parse_checkpoint_name(&self.prefix, name) else {
+                continue;
+            };
+            checkpoints.push((sequence, entry.path()));
+        }
+        checkpoints.sort_by_key(|(sequence, _)| *sequence);
+        let remove_count = checkpoints.len().saturating_sub(retain);
+        for (_, path) in checkpoints.into_iter().take(remove_count) {
+            let metadata = fs::symlink_metadata(&path).map_err(PersistenceError::Io)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(PersistenceError::UnsafePath);
+            }
+            fs::remove_file(path).map_err(PersistenceError::Io)?;
+        }
+        if remove_count > 0 {
+            sync_directory(&self.directory)?;
+        }
+        Ok(())
     }
 }
 
@@ -288,6 +319,7 @@ pub enum PersistenceError {
     CheckpointTooLarge,
     NoCheckpoint,
     SequenceContention,
+    InvalidRetention,
     InvalidState,
 }
 
@@ -342,6 +374,22 @@ mod tests {
         assert_eq!(latest["version"], 2);
         let count = fs::read_dir(&directory).unwrap().count();
         assert_eq!(count, 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_store_prunes_old_state_to_a_bounded_window() {
+        let directory = temp_directory("checkpoint-retention");
+        let store = CheckpointStore::new(&directory, "agent").unwrap();
+        for version in 0..(MAX_RETAINED_CHECKPOINTS + 7) {
+            store
+                .save(&serde_json::json!({"version": version}))
+                .unwrap();
+        }
+        let count = fs::read_dir(&directory).unwrap().count();
+        assert_eq!(count, MAX_RETAINED_CHECKPOINTS);
+        let latest: serde_json::Value = store.load_latest().unwrap();
+        assert_eq!(latest["version"], MAX_RETAINED_CHECKPOINTS + 6);
         fs::remove_dir_all(directory).unwrap();
     }
 

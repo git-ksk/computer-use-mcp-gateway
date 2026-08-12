@@ -244,8 +244,8 @@ impl AgentService {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<SessionExit, AgentServiceError> {
         let mut client = AgentControlClient::new(channel)
-            .max_decoding_message_size(crate::v2_m1_grpc::MAX_GRPC_APPLICATION_MESSAGE_BYTES)
-            .max_encoding_message_size(crate::v2_m1_grpc::MAX_GRPC_APPLICATION_MESSAGE_BYTES);
+            .max_decoding_message_size(crate::v2_m1_grpc::MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::v2_m1_grpc::MAX_GRPC_TRANSPORT_MESSAGE_BYTES);
         let (outbound_tx, outbound_rx) = mpsc::channel(GRPC_QUEUE_DEPTH);
         let mut inbound = client
             .open_session(ReceiverStream::new(outbound_rx))
@@ -311,8 +311,9 @@ impl AgentService {
         let (process_done_tx, mut process_done_rx) = mpsc::channel::<ProcessCompletion>(1);
         let mut active: Option<ActiveProcess> = None;
 
-        loop {
-            tokio::select! {
+        let session_result = async {
+            loop {
+                tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
@@ -391,10 +392,10 @@ impl AgentService {
                                 .map_err(AgentServiceError::Protocol)?;
                             crate::v2_m0::validate_command_session(&remote.command, &session)
                                 .map_err(AgentServiceError::Control)?;
-                            self.grants.authorize_once(
+                            self.grants.authorize_device_capability_once(
                                 &remote.grant,
                                 &session.device_id,
-                                remote.command.required_class(),
+                                remote.command.command.capability(),
                                 trusted_clock.now_ms(),
                             ).map_err(AgentServiceError::Control)?;
                             self.persist_state()?;
@@ -464,6 +465,18 @@ impl AgentService {
                 }
             }
         }
+        }.await;
+
+        // No session exit path may orphan a process. Protocol errors, stream
+        // errors, and policy failures are just as capable of tearing down the
+        // session as an explicit reconnect. Always cancel + wait the direct
+        // child before returning an error, then persist the terminal replay
+        // barrier before the outer lifecycle can reconnect or exit.
+        if session_result.is_err() && active.is_some() {
+            terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+            self.persist_state()?;
+        }
+        session_result
     }
 }
 

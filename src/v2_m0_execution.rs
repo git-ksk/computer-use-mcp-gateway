@@ -148,17 +148,16 @@ impl HubAdmissionController {
             {
                 return Err(ExecutionError::InvalidSnapshot);
             }
-            if persisted.state == HubOperationState::Indeterminate {
-                if controller
+            if persisted.state == HubOperationState::Indeterminate
+                && controller
                     .blocked_by_indeterminate
                     .insert(
                         persisted.operation.device_id.clone(),
                         persisted.operation.operation_id.clone(),
                     )
                     .is_some()
-                {
-                    return Err(ExecutionError::InvalidSnapshot);
-                }
+            {
+                return Err(ExecutionError::InvalidSnapshot);
             }
             controller.operations.insert(
                 persisted.operation.operation_id.clone(),

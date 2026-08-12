@@ -15,6 +15,10 @@ pub mod proto {
 use proto::{AgentFrame, HubFrame};
 
 pub const MAX_GRPC_APPLICATION_MESSAGE_BYTES: usize = 64 * 1024;
+// Tonic limits the encoded Protobuf message, which includes the bytes-field tag
+// and varint length in addition to the signed application payload. Keep the
+// semantic application bound at 64 KiB while allowing bounded carrier overhead.
+pub const MAX_GRPC_TRANSPORT_MESSAGE_BYTES: usize = MAX_GRPC_APPLICATION_MESSAGE_BYTES + 1024;
 
 pub fn encode_agent_frame(message: &AgentToHub) -> Result<AgentFrame, GrpcCarrierError> {
     let bytes = serde_json::to_vec(message).map_err(GrpcCarrierError::Serialization)?;
@@ -75,6 +79,7 @@ mod tests {
     use super::*;
     use crate::v2_m0::{CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement};
     use crate::v2_m0_transport::{AgentHello, HUB_AGENT_SCHEMA_VERSION};
+    use prost::Message;
 
     #[test]
     fn protobuf_carrier_round_trips_existing_signed_protocol_message() {
@@ -93,6 +98,15 @@ mod tests {
         });
         let decoded = decode_agent_frame(encode_agent_frame(&hello).unwrap()).unwrap();
         assert_eq!(decoded, hello);
+    }
+
+    #[test]
+    fn protobuf_carrier_transport_limit_includes_envelope_overhead() {
+        let frame = AgentFrame {
+            signed_message_json: vec![0; MAX_GRPC_APPLICATION_MESSAGE_BYTES],
+        };
+        assert!(frame.encoded_len() > MAX_GRPC_APPLICATION_MESSAGE_BYTES);
+        assert!(frame.encoded_len() <= MAX_GRPC_TRANSPORT_MESSAGE_BYTES);
     }
 
     #[test]

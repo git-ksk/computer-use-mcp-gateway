@@ -2,9 +2,9 @@ use anyhow::{Result, anyhow, bail};
 use computer_use_mcp_gateway::{
     v2_m0::{
         CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
-        CapabilityClass, CommandEnvelope, CommandResultEnvelope, DeviceCapability, DeviceCommand,
-        DeviceIdentity, DeviceRegistry, DeviceResult, DeviceSession, GrantAuthority, GrantLedger,
-        ProcessRequest, validate_command_result, validate_command_session,
+        CommandEnvelope, CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceIdentity,
+        DeviceRegistry, DeviceResult, DeviceSession, GrantAuthority, GrantLedger, ProcessRequest,
+        validate_command_result, validate_command_session,
     },
     v2_m0_transport::{
         AgentToHub, HubIdentity, HubToAgent, TrustedSessionClock, build_agent_heartbeat,
@@ -161,9 +161,9 @@ impl AgentControl for TestHub {
                     },
                 };
                 validate_command_session(&command, &session)?;
-                let grant = state.grant_authority.issue(
+                let grant = state.grant_authority.issue_for_device_capability(
                     &state.expected_device_id,
-                    CapabilityClass::Dangerous,
+                    DeviceCapability::ExecuteProcess,
                     HUB_TIME_MS,
                     30_000,
                 )?;
@@ -226,7 +226,7 @@ async fn connect_with_retry(endpoint: Endpoint) -> Result<Channel> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    Err(anyhow!("gRPC server did not become ready: {:?}", last))
+    Err(anyhow!("gRPC server did not become ready: {last:?}"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -349,10 +349,10 @@ async fn grpc_bidi_tls_preserves_v2_security_and_executes_agent_native_git() -> 
     verify_remote_command(&hello, &hub_challenge, &remote, &trusted_hub)?;
     validate_command_session(&remote.command, &session)?;
     let mut grants = GrantLedger::new(grant_verifier);
-    grants.authorize_once(
+    grants.authorize_device_capability_once(
         &remote.grant,
         &device_id,
-        remote.command.required_class(),
+        remote.command.command.capability(),
         trusted_clock.now_ms(),
     )?;
     let request = match &remote.command.command {

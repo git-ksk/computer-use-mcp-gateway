@@ -7,6 +7,11 @@
 
 use crate::v2_m0::{ProcessEnvVar, ProcessOutput, ProcessRequest};
 use crate::v2_m0_execution::{AgentExecutionGate, ExecutionError, OperationRef};
+use process_wrap::std::CommandWrap;
+#[cfg(windows)]
+use process_wrap::std::JobObject;
+#[cfg(unix)]
+use process_wrap::std::ProcessGroup;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
@@ -210,9 +215,18 @@ impl ProcessExecutor {
         }
 
         let started = Instant::now();
+        // Supervise the whole process tree, not just the direct child. On Unix
+        // the child becomes a process-group leader; on Windows it is assigned
+        // to a Job Object. Cancellation/timeout therefore terminates descendants
+        // spawned by build tools, package managers, or test runners as well.
+        let mut command = CommandWrap::from(command);
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
         let mut child = command.spawn().map_err(ProcessError::Spawn)?;
-        let stdout = child.stdout.take().ok_or(ProcessError::PipeUnavailable)?;
-        let stderr = child.stderr.take().ok_or(ProcessError::PipeUnavailable)?;
+        let stdout = child.stdout().take().ok_or(ProcessError::PipeUnavailable)?;
+        let stderr = child.stderr().take().ok_or(ProcessError::PipeUnavailable)?;
         let max = self.policy.max_output_bytes_per_stream;
         let stdout_reader = thread::spawn(move || drain_bounded(stdout, max));
         let stderr_reader = thread::spawn(move || drain_bounded(stderr, max));
@@ -223,15 +237,22 @@ impl ProcessExecutor {
         let status = loop {
             if cancellation.is_cancelled() {
                 cancelled = true;
-                child.kill().map_err(ProcessError::Io)?;
+                child.start_kill().map_err(ProcessError::Io)?;
                 break child.wait().map_err(ProcessError::Io)?;
             }
             if started.elapsed() >= timeout {
                 timed_out = true;
-                child.kill().map_err(ProcessError::Io)?;
+                child.start_kill().map_err(ProcessError::Io)?;
                 break child.wait().map_err(ProcessError::Io)?;
             }
             if let Some(status) = child.try_wait().map_err(ProcessError::Io)? {
+                // ExecuteProcess is a bounded task, not a service launcher. A
+                // top-level command may exit after spawning background work;
+                // terminate anything still attached to its process group / Job
+                // Object before releasing the Agent operation lease. ESRCH/no
+                // remaining process is a normal race, so cleanup is best-effort
+                // after the parent has already exited.
+                let _ = child.start_kill();
                 break status;
             }
             thread::sleep(self.policy.poll_interval);
@@ -476,6 +497,91 @@ mod tests {
             .unwrap();
         assert!(output.timed_out && !output.cancelled);
         assert!(started.elapsed() < Duration::from_secs(1));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_parent_exit_does_not_leave_background_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("normal-exit-tree");
+        let script = root.join("spawn-background");
+        let pid_file = root.join("background.pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\necho $! > {}\nexit 0\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+        let started = Instant::now();
+        let output = executor
+            .execute(
+                &request(script.to_str().unwrap(), &root, &[]),
+                &ProcessCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let child_pid = fs::read_to_string(&pid_file).unwrap().trim().to_owned();
+        thread::sleep(Duration::from_millis(30));
+        let still_alive = Command::new("/bin/kill")
+            .args(["-0", &child_pid])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(
+            !still_alive,
+            "background descendant survived operation completion"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_descendant_processes_too() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("cancel-tree");
+        let script = root.join("spawn-child");
+        let pid_file = root.join("child.pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > {}\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+        let req = request(script.to_str().unwrap(), &root, &[]);
+        let cancellation = ProcessCancellation::default();
+        let worker_cancel = cancellation.clone();
+        let worker = thread::spawn(move || executor.execute(&req, &worker_cancel).unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid = fs::read_to_string(&pid_file).unwrap().trim().to_owned();
+        cancellation.cancel();
+        let output = worker.join().unwrap();
+        assert!(output.cancelled);
+        thread::sleep(Duration::from_millis(30));
+        let still_alive = Command::new("/bin/kill")
+            .args(["-0", &child_pid])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(!still_alive, "descendant process survived cancellation");
         fs::remove_dir_all(root).unwrap();
     }
 

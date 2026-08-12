@@ -11,6 +11,7 @@ use std::fmt;
 
 pub const CONTROL_SCHEMA_VERSION: u16 = 1;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 1;
+pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -408,6 +409,8 @@ pub struct GrantPayload {
     pub grant_id: String,
     pub device_id: String,
     pub capability: CapabilityClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_capability: Option<DeviceCapability>,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -455,9 +458,12 @@ impl GrantAuthority {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<GrantToken, ControlError> {
-        if ttl_ms == 0 {
+        if ttl_ms == 0 || ttl_ms > MAX_GRANT_LIFETIME_MS {
             return Err(ControlError::InvalidGrantLifetime);
         }
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or(ControlError::InvalidGrantLifetime)?;
         let mut random = [0_u8; 16];
         OsRng.fill_bytes(&mut random);
         let payload = GrantPayload {
@@ -466,8 +472,39 @@ impl GrantAuthority {
             grant_id: format!("grant_{}", hex(&random)),
             device_id: device_id.to_owned(),
             capability,
+            device_capability: None,
             issued_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(ttl_ms),
+            expires_at_ms,
+        };
+        let bytes = canonical_grant_bytes(&payload)?;
+        let signature = self.signing_key.sign(&bytes).to_bytes().to_vec();
+        Ok(GrantToken { payload, signature })
+    }
+
+    pub fn issue_for_device_capability(
+        &self,
+        device_id: &str,
+        capability: DeviceCapability,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<GrantToken, ControlError> {
+        if ttl_ms == 0 || ttl_ms > MAX_GRANT_LIFETIME_MS {
+            return Err(ControlError::InvalidGrantLifetime);
+        }
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or(ControlError::InvalidGrantLifetime)?;
+        let mut random = [0_u8; 16];
+        OsRng.fill_bytes(&mut random);
+        let payload = GrantPayload {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            issuer_key_id: self.key_id(),
+            grant_id: format!("grant_{}", hex(&random)),
+            device_id: device_id.to_owned(),
+            capability: capability.class(),
+            device_capability: Some(capability),
+            issued_at_ms: now_ms,
+            expires_at_ms,
         };
         let bytes = canonical_grant_bytes(&payload)?;
         let signature = self.signing_key.sign(&bytes).to_bytes().to_vec();
@@ -476,17 +513,23 @@ impl GrantAuthority {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumedGrantSnapshot {
+    pub grant_id: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantLedgerSnapshot {
     pub schema_version: u16,
     pub verifier_keys: Vec<[u8; 32]>,
-    pub consumed_grant_ids: Vec<String>,
+    pub consumed_grants: Vec<ConsumedGrantSnapshot>,
     pub revoked_grant_ids: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct GrantLedger {
     verifiers: HashMap<String, VerifyingKey>,
-    consumed: HashSet<String>,
+    consumed: HashMap<String, u64>,
     revoked: HashSet<String>,
 }
 
@@ -496,7 +539,7 @@ impl GrantLedger {
         verifiers.insert(verifying_key_id(&verifier), verifier);
         Self {
             verifiers,
-            consumed: HashSet::new(),
+            consumed: HashMap::new(),
             revoked: HashSet::new(),
         }
     }
@@ -508,14 +551,21 @@ impl GrantLedger {
             .map(VerifyingKey::to_bytes)
             .collect();
         verifier_keys.sort();
-        let mut consumed_grant_ids: Vec<_> = self.consumed.iter().cloned().collect();
-        consumed_grant_ids.sort();
+        let mut consumed_grants: Vec<_> = self
+            .consumed
+            .iter()
+            .map(|(grant_id, expires_at_ms)| ConsumedGrantSnapshot {
+                grant_id: grant_id.clone(),
+                expires_at_ms: *expires_at_ms,
+            })
+            .collect();
+        consumed_grants.sort_by(|left, right| left.grant_id.cmp(&right.grant_id));
         let mut revoked_grant_ids: Vec<_> = self.revoked.iter().cloned().collect();
         revoked_grant_ids.sort();
         GrantLedgerSnapshot {
             schema_version: CONTROL_SCHEMA_VERSION,
             verifier_keys,
-            consumed_grant_ids,
+            consumed_grants,
             revoked_grant_ids,
         }
     }
@@ -535,9 +585,20 @@ impl GrantLedger {
                 .map_err(|_| ControlError::InvalidGrantLedgerSnapshot)?;
             verifiers.insert(verifying_key_id(&verifier), verifier);
         }
+        let mut consumed = HashMap::new();
+        for entry in snapshot.consumed_grants {
+            if entry.grant_id.trim().is_empty()
+                || entry.expires_at_ms == 0
+                || consumed
+                    .insert(entry.grant_id, entry.expires_at_ms)
+                    .is_some()
+            {
+                return Err(ControlError::InvalidGrantLedgerSnapshot);
+            }
+        }
         Ok(Self {
             verifiers,
-            consumed: snapshot.consumed_grant_ids.into_iter().collect(),
+            consumed,
             revoked: snapshot.revoked_grant_ids.into_iter().collect(),
         })
     }
@@ -563,6 +624,49 @@ impl GrantLedger {
         required: CapabilityClass,
         now_ms: u64,
     ) -> Result<(), ControlError> {
+        self.validate_unconsumed_grant(token, device_id, now_ms)?;
+        let payload = &token.payload;
+        if payload.capability != required {
+            return Err(ControlError::CapabilityDenied {
+                granted: payload.capability,
+                required,
+            });
+        }
+        self.consume(payload);
+        Ok(())
+    }
+
+    pub fn authorize_device_capability_once(
+        &mut self,
+        token: &GrantToken,
+        device_id: &str,
+        required: DeviceCapability,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        self.validate_unconsumed_grant(token, device_id, now_ms)?;
+        let payload = &token.payload;
+        if payload.capability != required.class() {
+            return Err(ControlError::CapabilityDenied {
+                granted: payload.capability,
+                required: required.class(),
+            });
+        }
+        if payload.device_capability != Some(required) {
+            return Err(ControlError::DeviceCapabilityGrantMismatch {
+                granted: payload.device_capability,
+                required,
+            });
+        }
+        self.consume(payload);
+        Ok(())
+    }
+
+    fn validate_unconsumed_grant(
+        &mut self,
+        token: &GrantToken,
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
         self.verify_signature(token)?;
         let payload = &token.payload;
         if payload.schema_version != CONTROL_SCHEMA_VERSION {
@@ -573,6 +677,15 @@ impl GrantLedger {
         if payload.device_id != device_id {
             return Err(ControlError::GrantDeviceMismatch);
         }
+        let lifetime = payload
+            .expires_at_ms
+            .checked_sub(payload.issued_at_ms)
+            .ok_or(ControlError::InvalidGrantLifetime)?;
+        if lifetime == 0 || lifetime > MAX_GRANT_LIFETIME_MS {
+            return Err(ControlError::InvalidGrantLifetime);
+        }
+        self.consumed
+            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
         if now_ms < payload.issued_at_ms {
             return Err(ControlError::GrantNotYetValid);
         }
@@ -582,17 +695,15 @@ impl GrantLedger {
         if self.revoked.contains(&payload.grant_id) {
             return Err(ControlError::GrantRevoked);
         }
-        if self.consumed.contains(&payload.grant_id) {
+        if self.consumed.contains_key(&payload.grant_id) {
             return Err(ControlError::GrantReplay);
         }
-        if payload.capability != required {
-            return Err(ControlError::CapabilityDenied {
-                granted: payload.capability,
-                required,
-            });
-        }
-        self.consumed.insert(payload.grant_id.clone());
         Ok(())
+    }
+
+    fn consume(&mut self, payload: &GrantPayload) {
+        self.consumed
+            .insert(payload.grant_id.clone(), payload.expires_at_ms);
     }
 
     fn verify_signature(&self, token: &GrantToken) -> Result<(), ControlError> {
@@ -878,6 +989,10 @@ pub enum ControlError {
         granted: CapabilityClass,
         required: CapabilityClass,
     },
+    DeviceCapabilityGrantMismatch {
+        granted: Option<DeviceCapability>,
+        required: DeviceCapability,
+    },
     CommandDeviceMismatch,
     StaleDeviceGeneration {
         expected: u64,
@@ -1036,6 +1151,72 @@ mod tests {
             ledger.authorize_once(&tampered, &device_id, CapabilityClass::Observe, 1_001),
             Err(ControlError::InvalidGrantSignature)
         );
+    }
+
+    #[test]
+    fn grant_lifetime_is_bounded_and_expired_consumption_tombstones_are_pruned() {
+        let authority = GrantAuthority::generate();
+        assert_eq!(
+            authority.issue(
+                "dev",
+                CapabilityClass::Observe,
+                1_000,
+                MAX_GRANT_LIFETIME_MS + 1,
+            ),
+            Err(ControlError::InvalidGrantLifetime)
+        );
+
+        let mut ledger = GrantLedger::new(authority.verifier());
+        let first = authority
+            .issue("dev", CapabilityClass::Observe, 1_000, 10)
+            .unwrap();
+        ledger
+            .authorize_once(&first, "dev", CapabilityClass::Observe, 1_001)
+            .unwrap();
+        assert_eq!(ledger.snapshot().consumed_grants.len(), 1);
+
+        let second = authority
+            .issue("dev", CapabilityClass::Observe, 1_020, 10)
+            .unwrap();
+        ledger
+            .authorize_once(&second, "dev", CapabilityClass::Observe, 1_020)
+            .unwrap();
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.consumed_grants.len(), 1);
+        assert_eq!(
+            snapshot.consumed_grants[0].grant_id,
+            second.payload.grant_id
+        );
+    }
+
+    #[test]
+    fn exact_device_capability_grants_do_not_accept_class_only_tokens() {
+        let authority = GrantAuthority::generate();
+        let mut ledger = GrantLedger::new(authority.verifier());
+        let class_only = authority
+            .issue("dev", CapabilityClass::Dangerous, 1_000, 30_000)
+            .unwrap();
+        assert!(matches!(
+            ledger.authorize_device_capability_once(
+                &class_only,
+                "dev",
+                DeviceCapability::ExecuteProcess,
+                1_001
+            ),
+            Err(ControlError::DeviceCapabilityGrantMismatch { .. })
+        ));
+
+        let exact = authority
+            .issue_for_device_capability("dev", DeviceCapability::ExecuteProcess, 1_000, 30_000)
+            .unwrap();
+        ledger
+            .authorize_device_capability_once(
+                &exact,
+                "dev",
+                DeviceCapability::ExecuteProcess,
+                1_001,
+            )
+            .unwrap();
     }
 
     #[test]

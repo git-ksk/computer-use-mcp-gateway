@@ -2,9 +2,9 @@ use anyhow::{Result, bail};
 use computer_use_mcp_gateway::{
     v2_m0::{
         CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
-        CapabilityClass, CommandEnvelope, CommandResultEnvelope, DeviceCapability, DeviceCommand,
-        DeviceIdentity, DeviceRegistry, DeviceResult, DeviceSession, GrantAuthority, GrantLedger,
-        LeaseManager, ProcessRequest, validate_command_result, validate_command_session,
+        CommandEnvelope, CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceIdentity,
+        DeviceRegistry, DeviceResult, DeviceSession, GrantAuthority, GrantLedger, LeaseManager,
+        ProcessRequest, validate_command_result, validate_command_session,
     },
     v2_m0_execution::{AdmissionDecision, AdmissionLimits, HubAdmissionController, OperationRef},
     v2_m0_transport::{
@@ -66,7 +66,7 @@ fn encrypted_agent_executes_structured_git_without_cua_or_terminal_gui() -> Resu
     let grant_verifier = grant_authority.verifier();
     let client = AuthenticatedClientPrincipal::new("test://northbound", "process-client")?;
     let mut policy = ClientAuthorizationPolicy::default();
-    policy.allow(&client, &device_id, CapabilityClass::Dangerous);
+    policy.allow_device_capability(&client, &device_id, DeviceCapability::ExecuteProcess);
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -160,11 +160,11 @@ fn encrypted_agent_executes_structured_git_without_cua_or_terminal_gui() -> Resu
             HUB_TIME_MS,
             30_000,
         )?;
-        let grant = policy.issue_grant(
+        let grant = policy.issue_device_grant(
             &client,
             &grant_authority,
             &expected_device_id,
-            CapabilityClass::Dangerous,
+            DeviceCapability::ExecuteProcess,
             HUB_TIME_MS,
             30_000,
         )?;
@@ -235,10 +235,10 @@ fn encrypted_agent_executes_structured_git_without_cua_or_terminal_gui() -> Resu
     verify_remote_command(&hello, &challenge, &remote, &trusted_hub)?;
     validate_command_session(&remote.command, &session)?;
     let mut grants = GrantLedger::new(grant_verifier);
-    grants.authorize_once(
+    grants.authorize_device_capability_once(
         &remote.grant,
         &device_id,
-        remote.command.required_class(),
+        remote.command.command.capability(),
         trusted_clock.now_ms(),
     )?;
 

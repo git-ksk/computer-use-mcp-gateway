@@ -9,8 +9,8 @@
 //! changing the logical device identifier or accepting an unproven replacement.
 
 use crate::v2_m0::{
-    CapabilityClass, ControlError, DeviceIdentity, DeviceRegistry, GrantAuthority, GrantToken,
-    verifying_key_id,
+    CapabilityClass, ControlError, DeviceCapability, DeviceIdentity, DeviceRegistry,
+    GrantAuthority, GrantToken, verifying_key_id,
 };
 use crate::v2_m0_transport::HubIdentity;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -256,6 +256,7 @@ struct ClientDeviceKey {
 #[derive(Debug, Default)]
 pub struct ClientAuthorizationPolicy {
     allowed: HashMap<ClientDeviceKey, HashSet<CapabilityClass>>,
+    allowed_device_capabilities: HashMap<ClientDeviceKey, HashSet<DeviceCapability>>,
 }
 
 impl ClientAuthorizationPolicy {
@@ -273,6 +274,44 @@ impl ClientAuthorizationPolicy {
             })
             .or_default()
             .insert(capability);
+    }
+
+    pub fn allow_device_capability(
+        &mut self,
+        principal: &AuthenticatedClientPrincipal,
+        device_id: &str,
+        capability: DeviceCapability,
+    ) {
+        self.allowed_device_capabilities
+            .entry(ClientDeviceKey {
+                issuer: principal.issuer.clone(),
+                subject: principal.subject.clone(),
+                device_id: device_id.to_owned(),
+            })
+            .or_default()
+            .insert(capability);
+    }
+
+    pub fn authorize_device_capability(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        device_id: &str,
+        capability: DeviceCapability,
+    ) -> Result<(), TrustError> {
+        let key = ClientDeviceKey {
+            issuer: principal.issuer.clone(),
+            subject: principal.subject.clone(),
+            device_id: device_id.to_owned(),
+        };
+        let allowed = self
+            .allowed_device_capabilities
+            .get(&key)
+            .is_some_and(|capabilities| capabilities.contains(&capability));
+        if allowed {
+            Ok(())
+        } else {
+            Err(TrustError::ClientDeviceCapabilityDenied)
+        }
     }
 
     pub fn authorize(
@@ -295,6 +334,21 @@ impl ClientAuthorizationPolicy {
         } else {
             Err(TrustError::ClientCapabilityDenied)
         }
+    }
+
+    pub fn issue_device_grant(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        authority: &GrantAuthority,
+        device_id: &str,
+        capability: DeviceCapability,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<GrantToken, TrustError> {
+        self.authorize_device_capability(principal, device_id, capability)?;
+        authority
+            .issue_for_device_capability(device_id, capability, now_ms, ttl_ms)
+            .map_err(TrustError::Control)
     }
 
     pub fn issue_grant(
@@ -333,6 +387,7 @@ pub enum TrustError {
     InvalidRotationSignature,
     InvalidClientPrincipal,
     ClientCapabilityDenied,
+    ClientDeviceCapabilityDenied,
 }
 
 impl fmt::Display for TrustError {
@@ -428,6 +483,30 @@ mod tests {
         assert!(matches!(
             trusted.apply_rotation(&forged),
             Err(TrustError::PreviousKeyMismatch)
+        ));
+    }
+
+    #[test]
+    fn northbound_policy_can_scope_a_grant_to_one_device_capability() {
+        let authority = GrantAuthority::generate();
+        let principal = AuthenticatedClientPrincipal::new("issuer", "subject").unwrap();
+        let mut policy = ClientAuthorizationPolicy::default();
+        policy.allow_device_capability(&principal, "dev", DeviceCapability::ExecuteProcess);
+        assert!(
+            policy
+                .issue_device_grant(
+                    &principal,
+                    &authority,
+                    "dev",
+                    DeviceCapability::ExecuteProcess,
+                    1_000,
+                    30_000,
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            policy.authorize(&principal, "dev", CapabilityClass::Dangerous),
+            Err(TrustError::ClientCapabilityDenied)
         ));
     }
 

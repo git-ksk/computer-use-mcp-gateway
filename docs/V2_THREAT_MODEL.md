@@ -1,6 +1,6 @@
 # V2 threat model
 
-Status: **V2-M0 trust-model baseline**.
+Status: **V2-M1 trust-model baseline**. M0 assumptions remain the foundation; M1 transport/process controls and residual deployment gaps are reflected below.
 
 This document defines the security claims and non-claims for the delegated device capability control plane. It is intentionally stricter than a feature list: a control is not considered effective against a component that owns the key or execution surface needed to bypass that control.
 
@@ -10,8 +10,8 @@ V2 should provide these properties when the Hub, Agent, and backend are operatin
 
 1. an Agent proves possession of the currently enrolled device key before a Hub accepts the connection;
 2. an Agent authenticates a pinned Hub transport identity before accepting Hub commands;
-3. an authenticated northbound client principal may receive a grant only for explicitly authorized device/capability pairs;
-4. a short-lived grant cannot be widened from one semantic capability class to another;
+3. an authenticated northbound client principal may receive a grant only for explicitly authorized device/capability pairs; M1 Agent-native operations use exact `DeviceCapability` scope rather than class-only authority;
+4. a short-lived grant cannot be widened from one semantic capability class or exact M1 device capability to another;
 5. stale device generations, stale capability revisions, consumed/revoked/expired grants, and unknown signing keys fail closed;
 6. Hub and Agent key rotation require continuity proof rather than silent key replacement;
 7. one device executes at most one operation at a time, while Hub admission and per-device queues remain bounded;
@@ -76,9 +76,9 @@ A client may attempt to select another device, request a stronger capability, re
 Controls:
 
 - the Hub consumes an already-authenticated principal identity rather than trusting a client-supplied device identity as authorization;
-- authorization is an exact `principal -> device -> capability class` mapping;
+- M0 supports `principal -> device -> capability class`; M1 Agent-native operations additionally support exact `principal -> device -> DeviceCapability` authorization and reject class-only grants at the Agent boundary;
 - the client does not receive Agent device keys or Hub transport keys;
-- grants are short-lived, signed, device-bound, class-bound, and one-shot in the current PoC;
+- grants are signed, device-bound, one-shot, and Agent-enforced to a maximum five-minute lifetime; M1 Agent-native grants are also bound to the exact device capability;
 - global admission and per-device queues are bounded;
 - the Hub-Agent protocol exposes typed semantic commands rather than arbitrary Cua tool names/arguments.
 
@@ -139,7 +139,7 @@ Controls already proven in M0:
 - a signed Hub time anchors grant-expiry evaluation to monotonic elapsed time on the Agent;
 - connection loss after dispatch becomes an indeterminate terminal Hub state and is never automatically replayed.
 
-Residual risk: the current live network PoC uses loopback TCP and therefore makes **no confidentiality claim**. M1 remote transport must use authenticated TLS or an equivalently reviewed encrypted tunnel. Application signatures are not a substitute for transport confidentiality.
+Current M1 evidence includes TLS-protected gRPC bidirectional streaming with pinned certificate trust/domain validation plus independent Ed25519 application authentication. The earlier raw-TLS transport remains a regression/reference implementation and is TLS 1.3-only with a dedicated ALPN. Residual deployment risk remains: the operator-facing Hub daemon, public endpoint hardening, connection/rate limits, and production certificate lifecycle are not yet implemented, so the integration tests are not a production exposure claim.
 
 ### Replay and stale-state attacker
 
@@ -149,7 +149,7 @@ Controls:
 - unknown/retired grant-signing keys fail closed;
 - device generation changes on reconnect and credential rotation;
 - capability revisions are checked on every command/result;
-- operation IDs are retained as terminal/indeterminate state and cannot be silently reused;
+- operation IDs are retained as terminal/indeterminate state and cannot be silently reused; M1 still needs bounded pruning/rollover semantics for terminal Agent tombstones during extremely long-lived generations;
 - handshake proof replay fails against fresh nonces.
 
 ### Denial of service
@@ -172,13 +172,13 @@ Rules:
 
 - cancellation before dispatch prevents Agent execution;
 - cancellation after dispatch is a signed Hub->Agent request and signed Agent acknowledgement;
-- an Agent keeps terminal operation IDs to reject local replay during its lifetime;
+- an Agent persists terminal operation IDs across restart to reject local replay; the retained set is not yet bounded inside one very long-lived generation and is an M1 acceptance item;
 - a Hub connection loss after dispatch marks the operation `indeterminate`;
 - `indeterminate`, `completed`, and `cancelled` operation IDs cannot be re-admitted;
 - an `indeterminate` operation quarantines its device at Hub admission, so a different operation is also rejected until explicit resolution;
 - reconnect does not transfer an existing generation-bound operation lease.
 
-The Cua MCP adapter propagates cancellation to the exact in-flight downstream request ID, but propagation is not treated as proof that a desktop side effect stopped. A propagated cancellation or timeout therefore maps to an `indeterminate` disposition and device quarantine. Lack of a backend-level proof of non-execution must never be interpreted as successful cancellation.
+Agent-native process cancellation is stronger than GUI-backend cancellation: Unix process groups and Windows Job Objects terminate the supervised process tree, and background descendants are also cleaned up when the top-level process completes. The Cua MCP adapter instead propagates cancellation to the exact in-flight downstream request ID, but propagation is not treated as proof that a desktop side effect stopped. A propagated cancellation or timeout therefore maps to an `indeterminate` disposition and device quarantine. Lack of a backend-level proof of non-execution must never be interpreted as successful cancellation.
 
 ## Key rotation
 
@@ -208,15 +208,17 @@ Normal audit events may contain stable identifiers such as device ID, generation
 
 They should not contain raw screenshots, raw backend output, raw command arguments, clipboard values, typed text, credentials, or full accessibility trees. Debug capture that intentionally includes such content is a separate high-sensitivity mode and must not be enabled implicitly.
 
-## V2-M0 residual requirements before production remote use
+## V2-M1 residual requirements before production remote use
 
-A V2-M0 GO decision means the differentiated control-plane semantics justify proceeding to M1. It does **not** mean the PoC is production-ready.
+M1 now proves an outbound long-lived Agent lifecycle over TLS-protected gRPC, exact-capability grants for Agent-native process execution, restart-safe replay checkpoints, and live process-tree cancellation. It is still **not production-ready**.
 
-Before a remote Agent is exposed outside a loopback/test environment, M1 must at minimum add and verify:
+Before a remote Agent is exposed as a product service, M1 must at minimum add and verify:
 
-- compose the implemented TLS 1.3/pinned-trust transport wrapper with the complete authenticated Hub-Agent protocol in one end-to-end connection;
+- an operator-facing single-device Hub gRPC daemon for the always-on VM target; current gRPC Hub implementations are integration-test fixtures;
 - real northbound authentication integration that constructs `AuthenticatedClientPrincipal` only from verified identity-provider output;
-- production private-key/certificate custody and rotation; public trust/revocation/terminal replay checkpoints are implemented, but private signing keys are intentionally not stored in those JSON checkpoints;
-- long-lived heartbeat/reconnect operation using the implemented bounded-backoff and timeout state machines;
-- live cancellation behavior for each backend operation class and explicit handling when a backend cannot interrupt safely;
-- deployment-level rate limiting, secret storage, and observability.
+- production private-key/certificate custody and rotation; private signing keys remain outside replay checkpoints;
+- Hub-side connection/TLS-handshake/rate limits and operational observability;
+- bounded pruning or generation-rollover semantics for terminal Agent operation tombstones;
+- explicit filesystem confinement semantics before making any sandbox claim: `allowed_cwd_root` constrains cwd but does not prevent process argv from addressing other filesystem paths;
+- live cancellation acceptance for Cua desktop operations and explicit handling when a GUI backend cannot prove interruption;
+- OS-specific service packaging and reviewed state/key directory locations.
