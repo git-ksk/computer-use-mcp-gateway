@@ -159,6 +159,7 @@ Only after V2-M0 GO:
 - [x] reusable outbound lifecycle and encrypted multi-session reconnect acceptance
 - [x] operator-facing long-lived Agent process lifecycle (`v2_agent`) with outbound gRPC/TLS, bounded reconnect, heartbeat liveness, Ctrl-C shutdown, and non-blocking process cancellation; OS-specific service packaging remains deployment work
 - [x] separate file-based key/trust-anchor provisioning boundary with fail-closed filesystem checks
+- [x] Agent replay/trust checkpoint wired into the long-lived service so consumed grants and terminal/in-flight operation IDs survive process restart before execution can replay
 - [ ] production secret-store/certificate rotation integration for the deployed service
 - [x] heartbeat/reconnect semantics with bounded backoff
 - [x] one-device routing

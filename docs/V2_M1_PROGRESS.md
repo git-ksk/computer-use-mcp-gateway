@@ -45,6 +45,7 @@ The current `v2-m1-secure-agent` implementation adds these M1 building blocks wh
 - monotonically increasing heartbeat sequence enforcement, generation matching, timeout/offline detection, and bounded exponential reconnect policy;
 - a reusable outbound lifecycle runner that bounds consecutive connection/session failures, resets the failure streak after an established session, and reconnects without transferring prior session generation state;
 - an operator-facing `v2_agent` binary that loads the separate device/Hub/grant/TLS trust material, opens the outbound gRPC/TLS session, maintains signed heartbeats, reconnects with bounded exponential backoff, handles Ctrl-C shutdown, and keeps the receive loop responsive while direct process work runs on a blocking worker;
+- `v2_agent` persists Agent replay/trust checkpoints in its operator-selected state directory: consumed grants are fsynced before execution proceeds, an active operation is checkpointed before the child is spawned, and terminal operation IDs survive process restart; startup restores the latest checkpoint and fails closed on device/trust-anchor mismatch;
 - live Agent-native process cancellation over the gRPC session: a signed `Cancel` flips the process cancellation token without blocking stream receive, the direct child is killed and waited, the operation ID is made terminal, and signed cancellation/result evidence is returned;
 - one-device routing that rejects offline, wrong-device, stale-generation, stale-capability, and unsupported-capability commands;
 - restart snapshots for device registry, grant verifier/revocation/consumption state, Hub operation state, and Agent terminal-operation replay barriers;
@@ -66,11 +67,10 @@ A separate operator-controlled M1 backend run on 2026-08-11 connected the asynch
 
 ## Still required before V2-M1 acceptance
 
-The `v2_agent` process now integrates the direct process executor, gRPC/TLS outbound lifecycle, heartbeat timeout/reconnect behavior, cancellation, and the Agent-side file-based key/trust boundary. Remaining M1 work is narrower:
+The `v2_agent` process now integrates the direct process executor, gRPC/TLS outbound lifecycle, heartbeat timeout/reconnect behavior, cancellation, the Agent-side file-based key/trust boundary, and restart-safe replay checkpoints. Remaining M1 work is narrower:
 
 - define the separate higher-risk shell-command capability and the minimum bounded filesystem surface needed for practical repository/build workflows;
 - add OS-specific service packaging/installation (for example launchd/systemd) around the now-runnable long-lived `v2_agent` process;
-- wire the existing Agent replay/trust checkpoint into `v2_agent` startup and mutation boundaries so process restart preserves consumed grants and terminal operation IDs, not only reconnect within one process lifetime;
 - integrate the Hub-side key boundary into the operator-facing Hub service and document the chosen production secret-store/certificate rotation procedure; the repository does not commit generated private keys;
 - integrate a real northbound authenticated identity source with `AuthenticatedClientPrincipal` rather than constructing the principal inside a PoC;
 - run cancellation acceptance against real Cua desktop operations; the deterministic MCP fixture already proves exact-request propagation and indeterminate quarantine, but it cannot prove a real desktop action stopped;

@@ -20,6 +20,7 @@ use computer_use_mcp_gateway::{
         },
     },
     v2_m1_keys::AgentProvisionedMaterial,
+    v2_m1_persistence::{AgentPersistentState, CheckpointStore},
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use std::{
@@ -326,11 +327,17 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
         grant_verifier: grant_authority.verifier(),
         tls_root_der: cert_der,
     };
+    let material_for_restart = material.clone();
+    let state_dir = std::env::temp_dir().join(format!(
+        "cumg-agent-service-state-{}",
+        rand::random::<u64>()
+    ));
     let config = AgentServiceConfig {
         hub_endpoint: format!("https://localhost:{}", address.port()),
         hub_domain: "localhost".into(),
         device_id,
         allowed_cwd_roots: vec![cwd],
+        state_dir: state_dir.clone(),
         heartbeat_interval: Duration::from_millis(50),
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(5),
@@ -338,6 +345,7 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
             max_attempts: 4,
         },
     };
+    let restart_config = config.clone();
     let mut agent = AgentService::new(config, material)?;
     tokio::time::timeout(Duration::from_secs(8), agent.run(shutdown_rx))
         .await
@@ -347,7 +355,23 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
     assert_eq!(observed.generations, vec![1, 2]);
     assert!(observed.cancellation_ack && observed.cancelled_result);
     assert_eq!(sessions.load(Ordering::SeqCst), 2);
+    drop(observed);
+
+    let checkpoint = CheckpointStore::new(&state_dir, "agent")?;
+    let persisted: AgentPersistentState = checkpoint.load_latest()?;
+    assert_eq!(persisted.device_id, restart_config.device_id);
+    assert!(!persisted.grant_ledger.consumed_grant_ids.is_empty());
+    assert!(
+        persisted
+            .execution
+            .terminal_operation_ids
+            .iter()
+            .any(|id| id == "agent-service-cancel-sleep")
+    );
+    // Constructor restore is the actual process-restart boundary used by v2_agent.
+    let _restored_agent = AgentService::new(restart_config, material_for_restart)?;
 
     server.abort();
+    std::fs::remove_dir_all(state_dir)?;
     Ok(())
 }

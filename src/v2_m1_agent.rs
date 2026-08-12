@@ -17,11 +17,13 @@ use crate::v2_m0_transport::{
     verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_cancel, verify_remote_command,
     verify_session_accepted,
 };
+use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
 use crate::v2_m1_grpc::{
     decode_hub_frame, encode_agent_frame, proto::agent_control_client::AgentControlClient,
 };
 use crate::v2_m1_keys::AgentProvisionedMaterial;
+use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, PersistenceError};
 use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::fmt;
@@ -40,6 +42,7 @@ pub struct AgentServiceConfig {
     pub hub_domain: String,
     pub device_id: String,
     pub allowed_cwd_roots: Vec<PathBuf>,
+    pub state_dir: PathBuf,
     pub heartbeat_interval: Duration,
     pub reconnect: ReconnectPolicy,
 }
@@ -77,8 +80,10 @@ pub struct AgentService {
     config: AgentServiceConfig,
     material: AgentProvisionedMaterial,
     executor: ProcessExecutor,
+    trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
     execution: AgentExecutionGate,
+    checkpoint: CheckpointStore,
 }
 
 impl AgentService {
@@ -91,14 +96,63 @@ impl AgentService {
             ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Process)?,
         );
-        let grants = GrantLedger::new(material.grant_verifier);
-        Ok(Self {
+        let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
+            .map_err(AgentServiceError::Persistence)?;
+        let (trusted_hub, grants, execution) =
+            match checkpoint.load_latest::<AgentPersistentState>() {
+                Ok(state) => {
+                    let (device_id, trusted_hub, grants, execution) =
+                        state.restore().map_err(AgentServiceError::Persistence)?;
+                    if device_id != config.device_id {
+                        return Err(AgentServiceError::CheckpointIdentityMismatch);
+                    }
+                    // Hub key rotation is not yet transported by the M1 service. Until
+                    // that lands, a persisted key must still match the provisioned trust anchor.
+                    if trusted_hub.verifier() != material.trusted_hub {
+                        return Err(AgentServiceError::CheckpointTrustMismatch);
+                    }
+                    if !grants
+                        .snapshot()
+                        .verifier_keys
+                        .contains(&material.grant_verifier.to_bytes())
+                    {
+                        return Err(AgentServiceError::CheckpointGrantTrustMismatch);
+                    }
+                    (trusted_hub, grants, execution)
+                }
+                Err(PersistenceError::NoCheckpoint) => (
+                    TrustedHubIdentity::new(material.trusted_hub),
+                    GrantLedger::new(material.grant_verifier),
+                    AgentExecutionGate::default(),
+                ),
+                Err(error) => return Err(AgentServiceError::Persistence(error)),
+            };
+        let service = Self {
             config,
             material,
             executor,
+            trusted_hub,
             grants,
-            execution: AgentExecutionGate::default(),
-        })
+            execution,
+            checkpoint,
+        };
+        // Establish a baseline checkpoint before accepting any command.
+        service.persist_state()?;
+        Ok(service)
+    }
+
+    fn persist_state(&self) -> Result<(), AgentServiceError> {
+        let state = AgentPersistentState::capture(
+            self.config.device_id.clone(),
+            &self.trusted_hub,
+            &self.grants,
+            &self.execution,
+        )
+        .map_err(AgentServiceError::Persistence)?;
+        self.checkpoint
+            .save(&state)
+            .map_err(AgentServiceError::Persistence)?;
+        Ok(())
     }
 
     pub fn capabilities(&self) -> CapabilityAdvertisement {
@@ -205,7 +259,7 @@ impl AgentService {
             HubToAgent::Challenge(challenge) => challenge,
             other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
         };
-        verify_hub_challenge(&hello, &challenge, &self.material.trusted_hub)
+        verify_hub_challenge(&hello, &challenge, &self.trusted_hub.verifier())
             .map_err(AgentServiceError::Protocol)?;
         let proof = build_agent_proof(&self.material.device_identity, &hello, &challenge)
             .map_err(AgentServiceError::Protocol)?;
@@ -215,7 +269,7 @@ impl AgentService {
             HubToAgent::Accepted(accepted) => accepted,
             other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
         };
-        verify_session_accepted(&hello, &challenge, &accepted, &self.material.trusted_hub)
+        verify_session_accepted(&hello, &challenge, &accepted, &self.trusted_hub.verifier())
             .map_err(AgentServiceError::Protocol)?;
         let session = DeviceSession {
             device_id: self.config.device_id.clone(),
@@ -262,12 +316,14 @@ impl AgentService {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+                        self.persist_state()?;
                         return Ok(SessionExit::Shutdown);
                     }
                 }
                 _ = heartbeat.tick() => {
                     if pending_heartbeat.as_ref().is_some_and(|(_, sent)| sent.elapsed() >= heartbeat_deadline) {
                         terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+                        self.persist_state()?;
                         return Ok(SessionExit::Reconnect);
                     }
                     if pending_heartbeat.is_none() {
@@ -291,6 +347,7 @@ impl AgentService {
                     }
                     self.execution.finish(&completion.operation_id)
                         .map_err(AgentServiceError::Execution)?;
+                    self.persist_state()?;
                     let output = completion.output.map_err(AgentServiceError::Process)?;
                     let result = CommandResultEnvelope {
                         schema_version: CONTROL_SCHEMA_VERSION,
@@ -313,12 +370,13 @@ impl AgentService {
                         Some(frame) => frame,
                         None => {
                             terminate_active(&mut active, &mut process_done_rx, &mut self.execution).await?;
+                            self.persist_state()?;
                             return Ok(SessionExit::Reconnect);
                         }
                     };
                     match decode_hub_frame(frame).map_err(AgentServiceError::Carrier)? {
                         HubToAgent::HeartbeatAck(ack) => {
-                            verify_hub_heartbeat_ack(&hello, &challenge, &ack, &self.material.trusted_hub)
+                            verify_hub_heartbeat_ack(&hello, &challenge, &ack, &self.trusted_hub.verifier())
                                 .map_err(AgentServiceError::Protocol)?;
                             let Some((expected, _)) = pending_heartbeat else {
                                 return Err(AgentServiceError::HeartbeatAckMismatch);
@@ -329,7 +387,7 @@ impl AgentService {
                             pending_heartbeat = None;
                         }
                         HubToAgent::Command(remote) => {
-                            verify_remote_command(&hello, &challenge, &remote, &self.material.trusted_hub)
+                            verify_remote_command(&hello, &challenge, &remote, &self.trusted_hub.verifier())
                                 .map_err(AgentServiceError::Protocol)?;
                             crate::v2_m0::validate_command_session(&remote.command, &session)
                                 .map_err(AgentServiceError::Control)?;
@@ -339,6 +397,7 @@ impl AgentService {
                                 remote.command.required_class(),
                                 trusted_clock.now_ms(),
                             ).map_err(AgentServiceError::Control)?;
+                            self.persist_state()?;
                             if active.is_some() {
                                 return Err(AgentServiceError::AgentBusy);
                             }
@@ -352,6 +411,9 @@ impl AgentService {
                                 operation_id: remote.command.operation_id.clone(),
                             };
                             self.execution.begin(operation).map_err(AgentServiceError::Execution)?;
+                            // Persist the active operation before spawning the child. A crash
+                            // after this fsync restores the operation ID as terminal.
+                            self.persist_state()?;
                             let cancellation = ProcessCancellation::default();
                             let worker_cancel = cancellation.clone();
                             let executor = self.executor.clone();
@@ -372,7 +434,7 @@ impl AgentService {
                             active = Some(ActiveProcess { operation_id, cancellation });
                         }
                         HubToAgent::Cancel(cancel) => {
-                            verify_remote_cancel(&hello, &challenge, &cancel, &self.material.trusted_hub)
+                            verify_remote_cancel(&hello, &challenge, &cancel, &self.trusted_hub.verifier())
                                 .map_err(AgentServiceError::Protocol)?;
                             if cancel.device_generation != session.generation {
                                 return Err(AgentServiceError::CancellationMismatch);
@@ -382,6 +444,7 @@ impl AgentService {
                                     process.cancellation.cancel();
                                     self.execution.request_cancel(&cancel.operation_id)
                                         .map_err(AgentServiceError::Execution)?;
+                                    self.persist_state()?;
                                     CancellationDisposition::CancellationRequested
                                 }
                                 Some(_) => return Err(AgentServiceError::CancellationMismatch),
@@ -495,6 +558,7 @@ pub enum AgentServiceError {
     Control(crate::v2_m0::ControlError),
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
+    Persistence(PersistenceError),
     UnexpectedMessage(String),
     HeartbeatAckMismatch,
     CancellationMismatch,
@@ -506,6 +570,9 @@ pub enum AgentServiceError {
     ProcessStateMismatch,
     ProcessTerminationTimeout,
     ReconnectExhausted,
+    CheckpointIdentityMismatch,
+    CheckpointTrustMismatch,
+    CheckpointGrantTrustMismatch,
 }
 
 impl AgentServiceError {
@@ -540,6 +607,7 @@ mod tests {
             hub_domain: "localhost".into(),
             device_id: "dev-a".into(),
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
+            state_dir: std::env::temp_dir().join("cumg-v2-agent-config-test"),
             heartbeat_interval: Duration::from_secs(5),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),

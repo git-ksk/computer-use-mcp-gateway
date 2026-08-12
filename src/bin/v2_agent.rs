@@ -29,6 +29,8 @@ struct Config {
     grant_public_key_file: PathBuf,
     #[arg(long, env = "CUMG_V2_TLS_ROOT_DER_FILE")]
     tls_root_der_file: PathBuf,
+    #[arg(long, env = "CUMG_V2_STATE_DIR")]
+    state_dir: PathBuf,
     #[arg(
         long = "allowed-cwd-root",
         env = "CUMG_V2_ALLOWED_CWD_ROOTS",
@@ -66,6 +68,7 @@ async fn main() -> Result<()> {
         hub_domain: args.hub_domain,
         device_id: args.device_id,
         allowed_cwd_roots: args.allowed_cwd_roots,
+        state_dir: args.state_dir,
         heartbeat_interval: Duration::from_secs(args.heartbeat_secs),
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(args.reconnect_initial_ms),
