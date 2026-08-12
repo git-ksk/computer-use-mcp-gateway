@@ -25,7 +25,12 @@ CUMG does **not** claim differentiation merely because it is:
 
 Those areas already have substantial OSS and standards coverage. Projects such as SINT Protocol and Arm Device Connect materially overlap the broader “vendor-neutral physical-device execution/governance” category, while OpenClaw, OAHL, QuickDesk, Obot, and delegated-authorization projects cover additional adjacent layers.
 
-The defensible CUMG boundary is narrower: **exclusive ownership and fail-closed recovery for state-changing operations on an interactive desktop when execution outcome becomes ambiguous**.
+The final review also found two especially relevant execution-safety references:
+
+- **ROSClaw** already implements a closely related physical-execution contract for embodied agents: exact permits, Agent Sessions, finite deadlines, exclusive resource/body leases, durable action transitions, restart recovery, interrupted-real-action recovery, operator acknowledgement, generation disarming, and no replay/resume of the old physical action.
+- **Agent libOS** provides closely related durable external-effect semantics: persist intent before provider execution, consume/reserve authority before the side effect boundary, retain an `unknown` effect after ambiguous failure, and prevent duplicate/replayed settlement across restart.
+
+Therefore CUMG must not claim that lease/recovery/no-replay or durable ambiguous-effect theory is unique. The defensible boundary is the **interactive-desktop specialization and integration** of those classes of safety semantics: exclusive ownership and fail-closed recovery for state-changing operations on a shared desktop session when execution outcome becomes ambiguous.
 
 ## Core scenario
 
@@ -152,6 +157,40 @@ Native platform adapters, OpenClaw-backed execution, or other implementations ma
 
 A backend may prove clean termination and avoid quarantine. If it cannot, CUMG stays conservative.
 
+## Design reuse policy
+
+CUMG should **reuse proven execution-safety ideas without inheriting unrelated product scope**.
+
+### ROSClaw
+
+Treat ROSClaw as the primary reference for physical execution ownership and recovery semantics, not as a codebase to fork by default.
+
+The conceptual mapping is intentionally reviewed:
+
+| CUMG | ROSClaw analogue |
+| --- | --- |
+| desktop/device | Body/resource |
+| `DeviceCapability` | Capability / exact Permit scope |
+| operation ID | Action ID |
+| operation owner / principal session | Agent Session / actor |
+| desktop lease | Action/resource/body lease |
+| generation fencing | daemon generation / DISARMED recovery boundary |
+| replay barrier | idempotency + no old Action ID replay |
+| `indeterminate` | interrupted REAL action with unknown outcome |
+| quarantine | recovery-required / DISARMED physical boundary |
+| explicit resolution | operator `acknowledge-recovery` |
+| result evidence | `ExecutionReceipt` |
+
+Before changing the CUMG state machine, compare the proposed semantics against ROSClaw and adopt the stronger behavior where it fits interactive desktops.
+
+Do **not** long-lived-fork ROSClaw merely to add a desktop body. ROSClaw is evolving into a broader embodied Agent OS with robot/runtime/sandbox/memory/team concerns that are outside CUMG's deliberately narrow scope. A future compatibility experiment or `DesktopBody`/adapter proof is welcome if it can be isolated without importing that product surface.
+
+### Agent libOS
+
+Treat Agent libOS as a reference for durable ambiguous external-effect accounting: persist intent before the effect boundary, reserve/consume authority before dispatch, retain unknown effects across crash/restart, and guard finalization from duplicate settlement.
+
+CUMG should borrow these invariants where they strengthen the desktop operation state machine, but retain the additional desktop-level requirement that an unresolved ambiguous GUI operation can quarantine the shared interactive session from competing principals.
+
 ## Keep / adapt / retire / reuse
 
 ### Keep: project-owned core
@@ -206,6 +245,8 @@ CUMG should be willing to consume or integrate with maintained OSS rather than r
 
 Important projects/categories to monitor include:
 
+- **ROSClaw** — closest reference for physical action ownership, exclusive leases, interrupted-action recovery and no-resume/no-replay semantics;
+- **Agent libOS** — closest reference for durable unknown external effects and guarded post-crash settlement;
 - **SINT Protocol** — capability tokens, physical-AI governance, action identity/replay/evidence and edge authority;
 - **Arm Device Connect** — vendor-neutral physical-device discovery, identity, registry, ACL, multi-tenant state and agent/device connectivity;
 - **OpenClaw** — agent runtime, paired nodes and Computer Use execution;
@@ -220,6 +261,8 @@ Integration is preferred whenever the external component can remain outside the 
 
 | Project/category | Strong overlap | Boundary CUMG should retain |
 | --- | --- | --- |
+| ROSClaw | exact permits, Agent Sessions, exclusive physical-resource leases, durable action ledger, restart recovery, unknown interrupted REAL actions, operator recovery acknowledgement, no old-action replay | lightweight interactive-desktop specialization, shared GUI-session fencing, external desktop principal/auth integration, desktop/backend evidence semantics |
+| Agent libOS | durable pending external-effect intent, authority reservation before effects, `unknown` ambiguous effect state, guarded finalization and crash recovery | quarantine of the shared interactive desktop/session and competing-principal ownership semantics |
 | SINT Protocol | capability tokens, physical execution governance, action claims, replay defense, revocation, edge enforcement, terminal evidence | interactive-desktop ambiguous side-effect state, persistent quarantine, and explicit safe reuse resolution |
 | Arm Device Connect | vendor-neutral device fabric, identity, registry, ACL, distributed state, multi-tenant agent/device invocation | desktop operation ownership and uncertainty state machine rather than generic fleet/device connectivity |
 | OpenClaw | paired nodes, multi-node control, Computer Use, command/capability policy, cancellation | external-principal binding plus conservative ambiguous desktop-operation recovery |
@@ -233,6 +276,16 @@ The project must assume these neighbors will improve. Differentiation should the
 ## Core-first implementation priority
 
 Future implementation order is deliberately **core-first**.
+
+### Priority 0 — reference-model gap analysis
+
+Before expanding or redesigning the state machine, perform a one-to-one comparison against ROSClaw's action/session/permit/lease/recovery/receipt model and Agent libOS's external-effect persistence/finalization model.
+
+- identify semantics CUMG already matches;
+- adopt stronger proven semantics where they fit desktops;
+- document desktop-specific deviations explicitly rather than accidentally diverging;
+- do not fork or import unrelated embodied-Agent/runtime scope;
+- keep a future compatibility/adapter experiment possible.
 
 ### Priority 1 — harden the operation state machine
 
