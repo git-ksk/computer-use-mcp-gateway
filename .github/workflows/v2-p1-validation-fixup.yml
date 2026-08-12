@@ -1,6 +1,6 @@
 name: V2 P1 Validation Fixup
 
-# Temporary validation-only workflow. Revision 3: separate partition proof from Agent-process restart.
+# Temporary validation-only workflow. Revision 4: separate partition proof from Agent-process restart.
 on:
   pull_request:
 
@@ -24,87 +24,47 @@ jobs:
           p = Path("tests/v2_p1_multi_device_e2e.rs")
           text = p.read_text()
 
-          partition_anchor = '''    assert_eq!(
-              handle_a
-                  .desktop_quarantine()
-                  .await
-                  .map(|q| (q.operation_id, q.owner, q.device_generation)),
-              Some((ambiguous_a.clone(), alice.clone(), a_generation))
-          );
+          stop_anchor = '''        Some((ambiguous_a.clone(), alice.clone(), a_generation))
+              );
 
-          // Crash the remaining Hub route, then reconstruct the fixed set from the two
-          '''
-          partition_replacement = '''    assert_eq!(
-              handle_a
-                  .desktop_quarantine()
-                  .await
-                  .map(|q| (q.operation_id, q.owner, q.device_generation)),
-              Some((ambiguous_a.clone(), alice.clone(), a_generation))
-          );
+              // Crash the remaining Hub route'''
+          stop_new = '''        Some((ambiguous_a.clone(), alice.clone(), a_generation))
+              );
 
-          // The partition invariant is now proven. Stop this Agent process cleanly
-          // before the Hub crash so the next phase independently proves durable
-          // restart/reconnect from the same Agent checkpoint rather than relying on
-          // tonic's exact stream-abort status classification.
-          let _ = a2_shutdown_tx.send(true);
-          let _ = a_task.await;
+              // The partition invariant is now proven. Stop this Agent process cleanly
+              // before the Hub crash. The restart phase then proves recovery from the
+              // same durable Agent checkpoint independently of tonic abort classification.
+              let _ = a2_shutdown_tx.send(true);
+              let _ = a_task.await;
 
-          // Crash the remaining Hub route, then reconstruct the fixed set from the two
-          '''
-          if partition_anchor in text:
-              text = text.replace(partition_anchor, partition_replacement, 1)
-          elif partition_replacement not in text:
-              raise SystemExit("partition lifecycle anchor missing")
+              // Crash the remaining Hub route'''
+          if stop_anchor in text:
+              text = text.replace(stop_anchor, stop_new, 1)
+          elif "let _ = a2_shutdown_tx.send(true);" not in text:
+              raise SystemExit("partition stop anchor missing")
 
-          reconnect_anchor = '''    server_b = tokio::spawn(async move {
-              Server::builder()
-                  .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(b_cert, b_key)))?
-                  .add_service(
-                      AgentControlServer::new(service_b)
-                          .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
-                          .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
-                  )
-                  .serve_with_incoming(incoming_b)
-                  .await
-          });
+          reconnect_anchor = '''    let a_generation_after_hub_restart =
+              wait_new_generation(&handle_a, a_generation_after_reconnect)'''
+          reconnect_new = '''    // Recreate A from its durable Agent checkpoint after the Hub is back. The
+              // earlier phase already proved isolated reconnect while B kept its generation.
+              let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
+              let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
+              a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
 
-          let a_generation_after_hub_restart =
-          '''
-          reconnect_replacement = '''    server_b = tokio::spawn(async move {
-              Server::builder()
-                  .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(b_cert, b_key)))?
-                  .add_service(
-                      AgentControlServer::new(service_b)
-                          .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
-                          .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
-                  )
-                  .serve_with_incoming(incoming_b)
-                  .await
-          });
-
-          // Recreate A from its durable Agent checkpoint after the Hub is back. The
-          // earlier phase already proved an isolated live reconnect while B stayed at
-          // the same generation; this phase proves crash/restart recovery and no replay.
-          let mut restarted_agent_a = AgentService::new(config_a.clone(), material_a.clone())?;
-          let (a3_shutdown_tx, a3_shutdown_rx) = watch::channel(false);
-          a_task = tokio::spawn(async move { restarted_agent_a.run(a3_shutdown_rx).await });
-
-          let a_generation_after_hub_restart =
-          '''
+              let a_generation_after_hub_restart =
+              wait_new_generation(&handle_a, a_generation_after_reconnect)'''
           if reconnect_anchor in text:
-              text = text.replace(reconnect_anchor, reconnect_replacement, 1)
-          elif reconnect_replacement not in text:
-              raise SystemExit("post-restart Agent anchor missing")
+              text = text.replace(reconnect_anchor, reconnect_new, 1)
+          elif "let (a3_shutdown_tx, a3_shutdown_rx)" not in text:
+              raise SystemExit("post-restart reconnect anchor missing")
 
-          cleanup_old = '''    a2_shutdown_tx.send(true)?;
-              b_shutdown_tx.send(true)?;
-          '''
-          cleanup_new = '''    a3_shutdown_tx.send(true)?;
-              b_shutdown_tx.send(true)?;
-          '''
-          if cleanup_old in text:
-              text = text.replace(cleanup_old, cleanup_new, 1)
-          elif cleanup_new not in text:
+          if "    a2_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;" in text:
+              text = text.replace(
+                  "    a2_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;",
+                  "    a3_shutdown_tx.send(true)?;\n    b_shutdown_tx.send(true)?;",
+                  1,
+              )
+          elif "a3_shutdown_tx.send(true)?;" not in text:
               raise SystemExit("cleanup sender anchor missing")
 
           p.write_text(text)
