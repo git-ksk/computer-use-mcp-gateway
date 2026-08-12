@@ -1,226 +1,228 @@
 # Roadmap
 
-This file is a repository snapshot of implementation status. The project design report remains the canonical long-term roadmap.
+This file is the implementation roadmap snapshot. Historical acceptance detail lives in the milestone acceptance/progress documents.
+
+Canonical V2 product boundary: [`V2_POSITIONING.md`](V2_POSITIONING.md).  
+Standard/OSS boundary: [`V2_STANDARDIZATION.md`](V2_STANDARDIZATION.md).
 
 ## Positioning rule
 
-V1 is a hardened MCP-to-computer-use gateway. V2 must **not** proceed merely because multi-machine routing is technically possible.
+V1 is a hardened MCP-to-computer-use gateway.
 
-The ecosystem already contains substantial overlap in computer-use engines, daemon/session policy, AI-native remote desktop, remote-device MCP access, and multi-device orchestration. The V2 candidate is therefore a **secure delegated device capability control plane**. Its differentiation must come from identity, grants, leases, replay/cancellation safety, policy evidence, and backend-neutral control semantics rather than screen transport or computer-use execution itself.
+V2 is **not** a generic multi-machine MCP bridge, remote-desktop product, delegated-authorization protocol, or broad vendor-neutral physical-device control plane.
 
-Before major V2 implementation, V2-M0 must demonstrate one concrete security/control workflow that the compared existing products do not already satisfy cleanly. If that gap cannot be demonstrated, pause V2 rather than building another remote-device orchestrator.
+The final competitor review on 2026-08-12 found material overlap in the broader category, including SINT Protocol, Arm Device Connect, OpenClaw, OAHL, QuickDesk, Obot, and delegated-authorization systems.
+
+The project-specific V2 boundary is therefore narrower:
+
+> **uncertainty-aware execution safety for delegated control of stateful interactive desktops**
+
+The core invariant is:
+
+```text
+external principal
+      |
+specific desktop + exact capability
+      |
+operation ID + exclusive ownership + fencing
+      |
+state-changing desktop action
+      |
+cancel / timeout / disconnect / lost response
+      |
+can non-execution or termination be proven?
+      |
+  yes -> terminal
+  no  -> indeterminate -> quarantine -> explicit resolution
+```
+
+An ambiguous state-changing operation is never automatically replayed because a client, Hub, Agent, transport, backend, or device reconnects.
 
 ## V1 — Remote MCP Gateway
 
-### M0: repository skeleton
-- [x] independent Rust repository
-- [x] architecture boundary documented
-- [x] Cua backend selected
-- [x] MCP 2026-07-28 / rmcp 3.x selected
-- [x] localhost-first security posture
+**Status: closed 2026-08-11.**
 
-### M1: Cua backend adapter
-- [x] start/connect to `cua-driver mcp`
-- [x] discover and dynamically rediscover tools
-- [x] forward `tools/call`
-- [x] preserve backend MCP content/result envelopes when proxying
-- [x] graceful child shutdown
-- [x] readiness health probe
-- [x] bounded reconnect with exponential backoff
-- [x] connection and operation timeouts
-- [x] serialize desktop operations across clients
-- [x] never replay a failed state-changing tool call automatically
+V1 established the hardened local/remote MCP boundary around Cua:
 
-### M2: Streamable HTTP MCP server
-- [x] expose `/mcp` through MCP Streamable HTTP
-- [x] support the `2025-11-25` stateful lifecycle in compatibility smoke tests
-- [x] support the `2026-07-28` stateless lifecycle in compatibility smoke tests
-- [x] reject unsafe Origin values
-- [x] reject unsafe Host authorities / DNS rebinding attempts
-- [x] bind to localhost by default
-- [x] integrate the pinned official MCP conformance runner for V1-applicable server-boundary scenarios
-- [x] explicitly propagate upstream cancellation to the downstream MCP request ID and test it
+- localhost-first Streamable HTTP MCP;
+- Host/Origin protection;
+- deny-by-default exact tool policy;
+- conservative semantic classification;
+- backend timeouts/reconnect without automatic replay of failed state-changing calls;
+- serialized physical desktop operations;
+- downstream cancellation propagation;
+- privacy-preserving audit metadata;
+- real-Cua Linux/macOS/Windows smoke coverage;
+- trusted macOS desktop E2E;
+- Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood;
+- conformance, soak, and resource regression gates.
 
-> Passing the repository's dual-protocol smoke tests plus the selected official conformance scenarios is **not** a full MCP conformance certification. The upstream frozen requirement sets include capabilities and fixture-specific scenarios that this tools-only gateway intentionally does not advertise.
+See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for acceptance evidence.
 
-### M3: policy and observability
-- [x] deny-by-default tool allowlist / denylist
-- [x] explicit `*` opt-in for every discovered backend tool
-- [x] optional Cua argument-level policy layer
-- [x] per-call timeout
-- [x] structured audit metadata
-- [x] no sensitive argument/result logging by default
-- [x] semantic tool classification (`observe` / `interact` / `system` / `dangerous`), with unknown tools classified conservatively as `dangerous`
-- [x] gateway-owned backend child PID / cumulative CPU seconds / RSS health metrics
+Do not add V1 features solely to duplicate maintained backend functionality.
 
-### M4: CI and dogfood
-- [x] Rust fmt/check/test CI with `Cargo.lock` and `--locked`
-- [x] real-Cua smoke on Linux, macOS, and Windows
-- [x] dual lifecycle smoke (`2025-11-25`, `2026-07-28`)
-- [x] malicious Host/Origin rejection smoke
-- [x] pinned Cua installer SHA-256 verification
-- [x] pinned Cua release payload SHA-256 verification
-- [x] installed `cua-driver` binary identity verification against the verified payload
-- [x] manual trusted self-hosted macOS desktop E2E workflow
-- [x] trusted real-desktop E2E executed on a TCC-granted operator-controlled Mac (completed 2026-08-11)
-- [x] Cloudflare Tunnel + Access deployment dogfood for this gateway (completed 2026-08-11)
-- [x] ChatGPT remote MCP connection dogfood for this gateway (completed 2026-08-11)
-- [x] idle gateway CPU/RAM regression benchmark in hosted Linux CI
-- [x] deterministic 100-call `tools/call` soak test through the real gateway/backend-MCP path
+## V2-M0 — competitor-gap PoC + trust model
 
-### V1 finite completion gate
+**Status: GO, 2026-08-11.**
 
-V1 acceptance is complete. V1 was closed on 2026-08-11 after automated/code-local checks plus operator-controlled real-desktop and remote-access acceptance:
+M0 proved the initial single-device delegated-capability control semantics:
 
-- [x] pinned official MCP conformance runner integrated for V1-applicable server-boundary scenarios
-- [x] downstream cancellation propagation explicitly tested/guaranteed
-- [x] semantic dangerous-tool classification available
-- [x] trusted real-desktop E2E executed on a TCC-granted operator-controlled Mac (2026-08-11)
-- [x] representative Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood completed (2026-08-11)
-- [x] idle resource benchmark completed
-- [x] 100-call soak test completed
+- cryptographic device identity;
+- outbound authenticated Agent connectivity;
+- principal -> device -> exact capability authorization;
+- short-lived grants and replay rejection;
+- explicit operation IDs;
+- per-device lease/serialization ownership;
+- generation/capability revision checks;
+- bounded admission and backpressure;
+- signed cancellation/result semantics;
+- reconnect rules that cannot silently transfer in-flight ownership;
+- backend-neutral adapter contract;
+- threat model for compromised Hub, Agent, backend, and client.
 
-See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the recorded acceptance evidence. V1 is closed; do not add V1 features solely to duplicate capabilities that Cua or another backend already provides upstream. V2-M0 retains its independent GO/NO-GO gate.
+See [`V2_M0_POC.md`](V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
 
-## V2 — Secure delegated device capability control plane candidate
+## V2-M1 — single secure remote Agent
 
-Conceptual boundary:
+**Status: PASS, 2026-08-12.**
 
-```text
-MCP client
-   |
-   v
-Hub
-   |
-   | authenticated, backend-neutral command/grant protocol
-   v
-outbound Agent
-   |
-   v
-pluggable computer-use backend (Cua first)
-```
+M1 established the production-candidate single-device foundation:
 
-Cua remains an important backend. Cua-specific tool names or transport behavior must not become the permanent Hub↔Agent protocol.
+- gRPC bidirectional streaming over TLS while preserving transport-neutral application semantics;
+- standard MCP Authorization/OAuth northbound boundary;
+- OAuth bearer token non-forwarding;
+- separate Hub/device/grant/TLS identity lifecycles;
+- restart-safe replay/trust checkpoints;
+- bounded queueing, rate/connection shedding, and per-device ownership;
+- OpenTelemetry/OTLP observability;
+- launchd/systemd packaging;
+- Agent-native process/shell/read-only-filesystem capabilities;
+- Cua behind a backend adapter contract;
+- real Cua Driver 0.19.3 cancellation E2E where cancellation propagation does **not** imply non-execution;
+- `indeterminate` outcome + device quarantine when the backend cannot prove a safe terminal result.
 
-### V2-M0: competitor-gap PoC + trust model — GO/NO-GO gate
+See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
 
-> **V2-M0 implementation note (2026-08-11):** the control plane now includes outbound mutually authenticated Agent connectivity, signed connection-bound session/command/cancellation/result messages, signed-Hub-time grant clocking, northbound principal authorization, continuity-proven Hub/Agent/grant-key rotation, bounded Hub/Agent execution control, and a backend-neutral adapter contract. The explicit M0 decision is **GO to V2-M1**, not production-ready. Remote confidentiality and real deployment auth/persistence remain M1 requirements. See [`V2_M0_POC.md`](V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+### Post-M1 correction
 
-Before building a general Hub or multi-machine router:
+M1 proved useful semantics, but the final competitor review showed that broader claims such as these are not sufficient differentiation by themselves:
 
-- [x] document overlap/gaps against Cua upstream and representative remote-device / AI-remote-control MCP products
-- [x] define one concrete delegated-capability scenario that is not already cleanly satisfied by those products
-- [x] prove that scenario end-to-end with one device, including the outbound authenticated Agent hop
-- [x] record an explicit GO/NO-GO decision based on the PoC rather than project momentum
+- vendor-neutral physical-device control plane;
+- scoped/expiring capability grants;
+- action IDs and replay defense;
+- device identity/registry/fleet state;
+- device reservation/lease;
+- generic physical-AI governance;
+- multi-machine routing.
 
-Candidate PoC evidence:
+Accordingly, subsequent work must prioritize the narrower uncertainty-aware desktop execution core rather than broadening the control-plane surface.
 
-1. [x] enroll one device with a cryptographic device identity;
-2. [x] Agent establishes outbound-only authenticated connectivity where practical;
-3. [x] issue a short-lived `observe` capability grant;
-4. [x] reject an `interact` action until a separate grant/approval exists;
-5. [x] hold one operation lease so conflicting control of the same desktop fails closed;
-6. [x] reject replay of a consumed, revoked, or expired grant;
-7. [x] emit audit evidence for device/grant/policy/outcome without storing raw screenshots, tool arguments, or results;
-8. [x] prove reconnect cannot silently transfer an in-flight action lease.
+## V2-M2 — uncertainty-aware core hardening
 
-Trust/protocol design required before GO:
+**Primary tracking issue: #24.**
 
-- [x] device identity and enrollment model
-- [x] separate MCP client→Hub authentication/authorization from Hub↔Agent authentication and key rotation, so the control plane can answer who may use which capability on which device
-- [x] typed, versioned command/result schema independent of transport and backend
-- [x] capability advertisement/negotiation model that includes `backend`, `backend_version`, `platform`, and `capability_schema_version`
-- [x] capability revision/generation semantics so the Hub can detect stale discovery after Agent reconnects, backend upgrades, or policy-surface changes
-- [x] fail-closed handling for capabilities not explicitly understood by the Hub/Agent contract
-- [x] backend-adapter conformance tests that normalize backend/platform-specific tool behavior without leaking Cua-specific names or transport semantics into the Hub↔Agent protocol
-- [x] short-lived grant format, expiry, revocation, and replay rules
-- [x] operation IDs and lease ownership semantics
-- [x] bounded backpressure across Hub global limits, per-device queue/lease ownership, and Agent single-operation execution
-- [x] cancellation and reconnect semantics
-- [x] audit identifiers and policy-decision evidence
-- [x] threat model covering compromised Hub, Agent, backend, and MCP client
+M2 is no longer “build a multi-machine Hub” as a feature milestone. The first objective is to make the M1 operation-safety semantics explicit, durable, and difficult to violate.
 
-**V2-M0 decision (2026-08-11): GO to V2-M1.** The PoC establishes a narrower capability-control gap worth pursuing: explicit client→device→capability authorization, independently verifiable short-lived grants, continuity-proven Hub/Agent/grant-key rotation, generation-bound leases, bounded admission, signed cancellation/result semantics, replay-safe ambiguous outcomes, and a backend-neutral adapter boundary. This is a GO to build the **single secure remote Agent** slice only; it is not a production-readiness claim and does not authorize skipping M1 encrypted transport, real northbound auth integration, persistence, or live backend cancellation acceptance. See [`V2_M0_POC.md`](V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+### P0: authoritative operation state machine
 
-If later M1 evidence shows these controls do not provide a meaningful operational advantage over maintained alternatives, revisit the decision rather than continuing by momentum.
+- [ ] define one reviewed operation-state model for dispatch, running, cancellation, terminal outcomes, and `indeterminate`;
+- [ ] define evidence required to prove non-execution or clean termination;
+- [ ] ensure timeout/cancel/disconnect/lost-result paths cannot collapse uncertainty into ordinary failure;
+- [ ] reject late/stale results after session/device/ownership generation changes;
+- [ ] prevent duplicate terminal finalization;
+- [ ] add invariant/property coverage for illegal transitions;
+- [ ] keep replay/tombstone state bounded without forgetting unresolved ambiguity.
 
-### V2-M1: single secure remote Agent
+### P0: first-class quarantine and explicit resolution
 
-Only after V2-M0 GO:
+- [ ] persist quarantine independently of connection/session lifetime;
+- [ ] bind quarantine to the exact ambiguous operation and device generation;
+- [ ] expose an explicit, auditable resolution path;
+- [ ] record resolver principal, operation ID, decision, and relevant evidence metadata;
+- [ ] ensure resolution can never replay the old operation;
+- [ ] crash/restart test while quarantined;
+- [ ] crash/restart test during resolution;
+- [ ] deny normal work until the exact ambiguous state is resolved.
 
-> **M1 implementation note (2026-08-12):** the raw-TLS regression transport is TLS 1.3-only with pinned trust + dedicated ALPN. The production-candidate gRPC transport uses TLS + HTTP/2 with pinned certificate trust/domain validation while the independent Ed25519 application identity remains mandatory; a minimum TLS-version policy for the deployed gRPC endpoint must be documented rather than inferred from the raw-TLS PoC. The foundation also includes signed heartbeat messages, bounded reconnect policy, one-device routing, restart-safe public trust/replay checkpoints, and end-to-end process execution/cancellation evidence. See [`V2_M1_PROGRESS.md`](V2_M1_PROGRESS.md).
+### P0: ownership and fencing under failure
 
-> **Shell-first product direction (2026-08-11):** the self-owned Agent is not intended to remain only a secure wrapper around Cua. Direct process/shell execution is a first-class Agent capability and is the next implementation priority. Shell/process operations must execute locally in the Agent without driving a terminal GUI or routing through Cua. GUI/computer-use remains available through the Cua adapter during the transition and can later gain native platform adapters. The preferred delivery order is **Agent core → direct process/shell → bounded filesystem capabilities → GUI via Cua → native GUI backends**.
+- [ ] competing principals cannot steal or inherit in-flight ownership;
+- [ ] reconnect cannot silently transfer old ownership;
+- [ ] Hub restart preserves quarantine/ownership decisions;
+- [ ] Agent restart preserves enough state to reject replay/stale finalization;
+- [ ] stale Agent generations cannot finalize old operations;
+- [ ] duplicate/late cancellation acknowledgements cannot clear quarantine incorrectly;
+- [ ] network partition/reconnect races are covered around dispatch and result delivery.
 
-> **Transport direction (2026-08-12):** keep Hub↔Agent application semantics transport-neutral, retain the existing raw TLS + signed-JSON implementation as a regression/reference transport, and use **gRPC bidirectional streaming over TLS with Protobuf code generation as the M1 production candidate**. The first migration slice intentionally carries the existing independently signed V2 messages inside bounded Protobuf frames so transport migration does not rewrite grants, leases, replay protection, cancellation, or Agent execution at the same time. A native-Protobuf application schema may follow incrementally. The initial Hub deployment target is a small always-on VM rather than a request-lifetime serverless runtime.
+## V2-M2 acceptance — multi-device invariant proof
 
-- [x] outbound Agent connection over the accepted encrypted M1 channel
-- [x] gRPC bidirectional streaming transport candidate over TLS, preserving the existing signed application protocol during migration
-- [x] reusable outbound lifecycle and encrypted multi-session reconnect acceptance
-- [x] operator-facing long-lived Agent process lifecycle (`v2_agent`) with outbound gRPC/TLS, bounded reconnect, heartbeat liveness, Ctrl-C shutdown, non-blocking process cancellation, and packaged launchd/systemd service definitions
-- [x] separate file-based key/trust-anchor provisioning boundary with fail-closed filesystem checks
-- [x] Agent replay/trust checkpoint wired into the long-lived service so consumed grants and terminal/in-flight operation IDs survive process restart before execution can replay
-- [x] production TLS/secret lifecycle: ACME deploy-hook integration for ordinary server certificates, systemd encrypted credentials for long-lived Linux Hub application keys, fail-closed file custody elsewhere, and signed Hub/device/grant rotation procedures
-- [x] operator-facing single-device Hub gRPC service (`v2_hub`) for the always-on VM target, with persisted generation/admission state, heartbeat timeout, exact-capability grant issuance, bounded queueing, cancellation, reconnect cleanup, and TLS key/certificate loading
-- [x] standard northbound MCP Authorization protected-resource boundary on `v2_hub` using RFC 9728 discovery + OAuth bearer validation through RFC 7662 introspection, reducing verified identity to `AuthenticatedClientPrincipal` before the existing principal -> device -> exact-capability policy; bearer tokens never cross the Hub-Agent boundary
-- [x] bound replay state across reconnects: Agent and Hub terminal tombstones are pruned at authenticated generation rollover, while indeterminate Hub operations are retained until explicit resolution; grant-consumption tombstones are expiry-pruned and checkpoint files use bounded retention
-- [x] heartbeat/reconnect semantics with bounded backoff
-- [x] one-device routing
-- [x] versioned capability advertisement with revision/generation tracking
-- [x] per-device operation lease / serialization ownership
-- [x] bounded per-device queueing/load shedding before work reaches the Agent
-- [x] Agent-session and northbound MCP connection/rate shedding using standard gRPC `RESOURCE_EXHAUSTED` and HTTP `429`/`503`, composed with rather than replacing operation admission
-- [x] OpenTelemetry/OTLP traces and metrics via standard `OTEL_EXPORTER_OTLP_*` configuration with sensitive operation payloads excluded by default
-- [x] Linux systemd and macOS launchd packaging around the existing runtimes; service managers own restart/config/log lifecycle instead of a bespoke supervisor
-- [x] short-lived capability-grant validation with an Agent-enforced 5-minute maximum lifetime and exact `DeviceCapability` scoping for M1 Agent-native operations
-- [x] fail-closed stale/offline-agent and stale-capability behavior
-- [x] first-class direct process executor in the Agent (`program` + `argv` + explicit `cwd`, bounded output, timeout/cancellation, no terminal GUI)
-- [x] explicit higher-risk `Shell` capability for shell syntax/pipelines, distinct from structured argv execution and requiring an exact `DeviceCapability::Shell` grant. The Agent invokes a fixed OS shell (`/bin/sh -c` on Unix, `cmd.exe /D /S /C` on Windows), bounds command size/output/time, applies the same cwd/environment policy as `ExecuteProcess`, and supervises/cancels the full process tree; this is not a filesystem sandbox
-- [x] bounded read-only filesystem observation surface (`ReadFile` / `ListDirectory`) with exact capability grants, canonical path/root checks, symlink-escape rejection, bounded file bytes/directory entries, and command-local coarse errors; `ExecuteProcess` remains `Dangerous` and its argv is explicitly **not** filesystem-sandboxed
-- [x] clean live cancellation/disconnect semantics across all M1 execution backends
-  - [x] Agent-native process cancellation while the gRPC stream remains responsive; child is killed/waited and the operation ID becomes terminal before reconnect
-  - [x] exact downstream cancellation propagation + indeterminate device quarantine in deterministic MCP acceptance
-  - [x] real-Cua desktop cancellation acceptance: live Cua Driver 0.19.3 drag cancellation is propagated to the exact downstream request and remains `indeterminate`, with Hub quarantine verified end-to-end
-- [x] Cua adapter behind the backend capability contract with adapter conformance coverage
-- [x] keep GUI/computer-use behind a pluggable adapter boundary: Cua is the optional initial GUI backend in the long-lived Agent; native GUI backends remain a later step
+Only after the P0 core is strong should multi-device work advance beyond the minimum routing needed to prove invariants.
 
-> **V2-M1 acceptance (2026-08-12): PASS.** The single secure remote Agent milestone is accepted after Rust 1.88 regression, signed key-rotation tests, production TLS/secret lifecycle checks, overload/OTLP integration, launchd/systemd packaging review, and a real Cua Driver 0.19.3 cancellation E2E that preserves `indeterminate` quarantine. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). This does not authorize skipping external edge controls or advancing multi-machine semantics without the V2-M2 review.
+M2 acceptance requires:
 
-### V2-M2: multi-machine Hub
+1. [ ] Device A enters `indeterminate` after an ambiguous state-changing action and remains quarantined.
+2. [ ] Device B remains independently usable by another authorized principal.
+3. [ ] Another principal cannot acquire, inherit, or replace Device A's unresolved ownership.
+4. [ ] Hub restart preserves independent A/B state.
+5. [ ] reconnect/failover does not replay Device A's ambiguous operation.
+6. [ ] stale device/Agent/capability generations cannot route or finalize old work.
+7. [ ] queues/load shedding do not bypass per-device ownership invariants.
 
-- [ ] machine registry
-- [ ] explicit machine selection/routing
-- [ ] per-machine policy and capability ceiling
-- [ ] client identity → device → capability authorization at the Hub boundary
-- [ ] concurrent execution across independent machines while retaining per-machine serialization
-- [ ] global Hub concurrency/rate limits plus bounded per-device queues
-- [ ] stale/offline device and stale-capability-generation handling that fails closed
-- [ ] backend-neutral capability discovery including backend/platform/version metadata
-- [ ] audit trail without raw screenshots/arguments/results by default
+A machine registry, device list, or successful routing to two machines is **not** sufficient M2 acceptance evidence.
 
-### V2-M3: delegated approvals
+## V2-M3 — backend portability and OSS integration
 
-- [ ] semantic capability classes (`observe`, `interact`, `system`, `dangerous`)
-- [ ] optional approval boundary for dangerous capabilities
-- [ ] short-lived delegated grants instead of blanket backend exposure
-- [ ] explicit grant expiry/revocation/replay semantics
-- [ ] policy-decision evidence in audit metadata
+After the uncertainty-aware core and multi-device invariant proof pass:
 
-## V3 — Pluggable native backends
+### Backend portability
 
-- [ ] backend capability contract
-- [ ] macOS native adapter
-- [ ] Windows native adapter
-- [ ] Linux native adapter
-- [ ] Cua remains supported as a backend
+- [ ] integrate a second backend or deterministic reference executor with materially different cancellation/result behavior;
+- [ ] require adapters to provide evidence for terminal versus ambiguous classification;
+- [ ] prove the operation-state machine remains unchanged across backends;
+- [ ] map unsupported evidence conservatively to `indeterminate` rather than backend-specific guesses.
 
-V3 adapters must remain behind the same backend-neutral capability contract established by V2. Do not couple the Hub↔Agent command model to Cua-specific wire details.
+### Replace/reuse generic infrastructure
+
+Review maintained standards/OSS before expanding custom implementations:
+
+- [ ] delegated authorization / capability token systems, including SINT/Grantex/Open Agent Auth-class integrations where appropriate;
+- [ ] device registry/fabric/fleet state, including Arm Device Connect or equivalent where appropriate;
+- [ ] OpenClaw or other Computer Use runtimes behind backend adapters where useful;
+- [ ] workload identity such as SPIFFE when operational scale warrants it;
+- [ ] generic policy engines rather than growing a project-specific policy language.
+
+Replacement is allowed only after regression evidence proves the uncertainty-aware execution invariant is preserved or improved.
+
+## Later product/fleet work
+
+Only after M2/M3 core acceptance should the project prioritize convenience/product surface such as:
+
+- fleet dashboard/UX;
+- broad device discovery;
+- routing convenience;
+- orchestration/workflows;
+- richer approval UX;
+- additional native GUI adapters.
+
+These features are optional consumers of the core, not the core itself.
 
 ## Explicit non-goals
 
-- building a new screenshot/input computer-use engine
-- building screen streaming or a general remote desktop UI
-- claiming differentiation merely because multiple machines can be routed
-- exposing a Cua-specific protocol as the permanent Hub↔Agent API
-- blanket long-lived device-control credentials
-- automatic replay of ambiguous state-changing computer-use calls
+- building a new screenshot/input computer-use engine;
+- building screen streaming or a general remote desktop UI;
+- building another generic agent authorization protocol;
+- building another generic physical-device fabric/registry when maintained OSS can serve the role;
+- claiming differentiation merely because multiple machines can be routed;
+- claiming differentiation merely because grants are scoped/short-lived or devices have leases;
+- exposing a Cua-specific protocol as the permanent Hub-Agent contract;
+- blanket long-lived device-control credentials;
+- automatic replay of ambiguous state-changing work;
+- treating reconnect, heartbeat, backend restart, or device liveness as proof that an old ambiguous operation is safe to forget.
+
+## GO / NO-GO rule
+
+**GO:** strengthen and prove operation ownership, stale-result fencing, ambiguity handling, quarantine, explicit resolution, and no-auto-replay for delegated interactive-desktop control.
+
+**NO-GO by default:** broaden into generic auth, physical-device fabric, fleet management, remote desktop, or orchestration merely because those features are technically possible.
+
+If maintained OSS later provides equivalent per-desktop ownership, durable `indeterminate` quarantine, explicit resolution, stale-result fencing, and no-auto-replay semantics, reevaluate integration or retirement rather than defending sunk cost.
