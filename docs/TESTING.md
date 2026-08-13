@@ -169,18 +169,30 @@ Do not replace pinned release URLs with a mutable `latest` or convenience instal
 
 The dedicated runner must be a test machine, logged into a real macOS GUI session, preconfigured with CuaDriver Accessibility and Screen Recording permissions, and isolated from untrusted pull-request execution.
 
-The fixture performs:
+The workflow performs two physical acceptance fixtures from trusted `main`:
 
 ```text
+V1 desktop fixture:
 launch fresh TextEdit
     → screenshot evidence
     → click editor
     → type unique marker
     → independently read accessibility state
     → verify marker
+
+V2 P1 execution-safety fixture:
+real Cua state-changing operation
+    → cancellation propagated but outcome unprovable
+    → indeterminate + exact durable quarantine
+    → Hub and Agent restart
+    → newer Agent generation reconnects
+    → old operation remains quarantined with no terminal receipt/replay
+    → competing principal remains blocked
+    → explicit audited resolution
+    → safe reuse with a new operation ID
 ```
 
-Execution of this lane is intentionally left to the operator. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
+The final P1 physical acceptance passed on 2026-08-13 against `main` commit `e4eb464` in Desktop E2E run `31655691675`. The dedicated runner may be registered ephemerally, but the workflow must remain manual, `main`-only, and isolated from untrusted pull-request execution. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the original desktop procedure and [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) for the V2 invariant.
 
 ## V2-M1 final acceptance
 
@@ -249,4 +261,13 @@ cargo test --locked --test v2_p1_multi_device_e2e
 
 `v2_p1_multi_device_e2e` composes two existing `SingleDeviceHub` services in one process with independent durable state. Device A uses the Cua-shaped GUI fixture and becomes unknown/quarantined; Device B simultaneously runs native shell work under a different principal; A reconnect and partition leave B usable; Hub reconstruction restores A/B independently; explicit A resolution permits a new operation while marker counts prove the old GUI action was not replayed.
 
-A fresh physical real-Cua P1 regression is **not** claimed by these deterministic lanes. The operator-controlled TCC-granted macOS workflow remains main-only by design; keep that item open until the final P1 code is exercised there.
+These deterministic lanes are supplemented by the main-only physical acceptance above. P1 no longer carries a physical real-Cua residual: the final P1 code passed run `31655691675` on 2026-08-13. Future changes to the Computer Use adapter seam must rerun the same trusted desktop workflow before claiming equivalent physical regression.
+
+### V2 P2 replacement-seam regression
+
+P2 adds two focused unit regressions in addition to the existing P1 suites:
+
+- `v2_m1_northbound::tests::replaceable_authorizer_keeps_exact_principal_device_capability_boundary` proves a replacement authorizer still denies wrong principal, wrong device, and wrong capability;
+- `v2_m1_agent::tests::custom_computer_use_backend_is_injected_without_changing_native_capabilities` proves an alternate Computer Use backend can be injected without replacing Agent-native capabilities or the surrounding execution gate.
+
+The existing `v2_p1_backend_portability` test remains the semantic guard: backend-specific cancellation behavior must converge on the same authoritative operation/quarantine/resolution model. Any P2 Computer Use backend change also requires the final main-only real-Cua regression because compile-time interface compatibility is not evidence of physical cancellation behavior. See [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
