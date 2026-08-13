@@ -100,6 +100,14 @@ V2-M1 passed its single-secure-Agent acceptance gate on 2026-08-12. The producti
 
 The post-M1 P0 hardening makes that ambiguity boundary explicit in an authoritative operation ledger. Authenticated issuer/subject ownership and Agent generation both fence settlement; dispatched uncertainty persists as an exact-operation desktop quarantine across reconnect/restart; queued pre-ambiguity work is cancelled instead of resumed; and reuse requires an explicit, auditable, persistence-gated resolution. The recovery evidence string is bounded metadata and must not contain raw desktop content, commands, results, or secrets. See [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
 
+### V2 payload-safe observability
+
+V2 diagnostic output is a security boundary. Default tracing events and OTel metrics must not contain raw `DeviceCommand`/`DeviceResult` values, process stdout/stderr, shell text/argv/environment values, file paths or contents from operation payloads, OAuth bearer tokens or introspection secrets, exact grants, protocol signatures, or private key material. Error and Debug formatting used by the V2 Hub/Agent/backend/persistence boundary is reduced to stable error codes; unexpected signed protocol messages are represented by their message kind rather than by `Debug`-formatting the object. OAuth debug representations redact the introspection client secret and authenticated principal.
+
+`operation_id`, stable `device_id` and Agent `generation` may appear in structured logs because they are needed to correlate safety state, but they are never metric labels. Principal issuer/subject is not logged by default. OTel metric attributes are restricted to closed domains such as capability, outcome, reason and persistence component. Request paths, tool/command names, principals and identifiers must not be added as metric attributes.
+
+Higher verbosity through `RUST_LOG` does not relax the payload-free policy. Do not compensate for a diagnostic gap by logging command/result objects or underlying provider exceptions; add a bounded `error_code` or event field instead. External collectors, reverse proxies and service managers must likewise avoid body/header capture that would defeat the application boundary. See [`DEPLOYMENT.md`](DEPLOYMENT.md#overload-and-observability) for the event/metric taxonomy and incident correlation keys.
+
 ## V2 P1 fixed-set multi-device security review
 
 P1 adds only fixed composition around the P0 core. The security review covers the requested cross-device failure classes:

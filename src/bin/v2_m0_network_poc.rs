@@ -102,7 +102,7 @@ fn main() -> Result<()> {
 
     let hello = match read_frame::<_, AgentToHub>(&mut stream)? {
         AgentToHub::Hello(hello) => hello,
-        other => bail!("expected Agent hello, got {other:?}"),
+        other => bail!("expected Agent hello, got {}", other.kind()),
     };
     if hello.device_id != device_id {
         bail!("Agent hello used an unexpected device id");
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
 
     let proof = match read_frame::<_, AgentToHub>(&mut stream)? {
         AgentToHub::Proof(proof) => proof,
-        other => bail!("expected Agent proof, got {other:?}"),
+        other => bail!("expected Agent proof, got {}", other.kind()),
     };
     verify_agent_proof(&registry, &hello, &challenge, &proof)?;
 
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
 
     let remote_result = match read_frame::<_, AgentToHub>(&mut stream)? {
         AgentToHub::Result(result) => result,
-        other => bail!("expected Agent result, got {other:?}"),
+        other => bail!("expected Agent result, got {}", other.kind()),
     };
     verify_remote_result(&registry, &hello, &challenge, &remote_result)?;
     validate_command_result(&command, &remote_result.result)?;
@@ -292,7 +292,7 @@ fn run_agent(
 
     let challenge = match read_frame::<_, HubToAgent>(&mut stream)? {
         HubToAgent::Challenge(challenge) => challenge,
-        other => bail!("expected Hub challenge, got {other:?}"),
+        other => bail!("expected Hub challenge, got {}", other.kind()),
     };
     verify_hub_challenge(&hello, &challenge, &trusted_hub)?;
 
@@ -301,7 +301,7 @@ fn run_agent(
 
     let accepted = match read_frame::<_, HubToAgent>(&mut stream)? {
         HubToAgent::Accepted(accepted) => accepted,
-        other => bail!("expected Hub acceptance, got {other:?}"),
+        other => bail!("expected Hub acceptance, got {}", other.kind()),
     };
     verify_session_accepted(&hello, &challenge, &accepted, &trusted_hub)?;
     let trusted_clock = TrustedSessionClock::new(accepted.hub_time_ms);
@@ -316,7 +316,7 @@ fn run_agent(
 
     let remote = match read_frame::<_, HubToAgent>(&mut stream)? {
         HubToAgent::Command(remote) => remote,
-        other => bail!("expected Hub command, got {other:?}"),
+        other => bail!("expected Hub command, got {}", other.kind()),
     };
     verify_remote_command(&hello, &challenge, &remote, &trusted_hub)?;
     validate_command_session(&remote.command, &session)?;

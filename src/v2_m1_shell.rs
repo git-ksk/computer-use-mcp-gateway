@@ -7,6 +7,7 @@
 
 use crate::v2_m0::{ProcessOutput, ShellRequest};
 use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
+use crate::v2_observability::SafeErrorCode;
 use std::fmt;
 
 const MAX_SHELL_COMMAND_BYTES: usize = 16 * 1024;
@@ -40,16 +41,31 @@ impl ShellExecutor {
     }
 }
 
-#[derive(Debug)]
 pub enum ShellError {
     InvalidCommand,
     CommandTooLarge,
     Process(ProcessError),
 }
 
+impl SafeErrorCode for ShellError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::InvalidCommand => "shell_invalid_command",
+            Self::CommandTooLarge => "shell_command_too_large",
+            Self::Process(_) => "shell_process_error",
+        }
+    }
+}
+
+impl fmt::Debug for ShellError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.safe_error_code())
+    }
+}
+
 impl fmt::Display for ShellError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(self.safe_error_code())
     }
 }
 

@@ -30,6 +30,7 @@ use crate::v2_m1_keys::AgentProvisionedMaterial;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, PersistenceError};
 use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
+use crate::v2_observability::SafeErrorCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::fmt;
 use std::path::PathBuf;
@@ -270,10 +271,14 @@ impl AgentService {
             &self.grants,
             &self.execution,
         )
-        .map_err(AgentServiceError::Persistence)?;
-        self.checkpoint
-            .save(&state)
-            .map_err(AgentServiceError::Persistence)?;
+        .map_err(|error| {
+            record_agent_persistence_failure(&self.config.device_id, &error);
+            AgentServiceError::Persistence(error)
+        })?;
+        if let Err(error) = self.checkpoint.save(&state) {
+            record_agent_persistence_failure(&self.config.device_id, &error);
+            return Err(AgentServiceError::Persistence(error));
+        }
         Ok(())
     }
 
@@ -313,10 +318,17 @@ impl AgentService {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), AgentServiceError> {
         if let Some(computer_use) = &self.computer_use {
-            computer_use
-                .connect()
-                .await
-                .map_err(AgentServiceError::Backend)?;
+            if let Err(error) = computer_use.connect().await {
+                tracing::error!(
+                    event = "v2_backend_failure",
+                    device_id = %self.config.device_id,
+                    backend = %computer_use.advertisement().backend,
+                    outcome = "failed",
+                    error_code = error.safe_error_code(),
+                    "Computer Use backend connection failed"
+                );
+                return Err(AgentServiceError::Backend(error));
+            }
         }
         let result = self.run_connected_lifecycle(&mut shutdown).await;
         if let Some(computer_use) = &self.computer_use {
@@ -346,8 +358,26 @@ impl AgentService {
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     if failures >= self.config.reconnect.max_attempts {
+                        crate::v2_observability::reconnect_exhausted();
+                        tracing::error!(
+                            event = "v2_agent_reconnect_exhausted",
+                            device_id = %self.config.device_id,
+                            reconnect_attempt = failures,
+                            outcome = "exhausted",
+                            error_code = error.safe_error_code(),
+                            "Agent Hub connection retries exhausted"
+                        );
                         return Err(error);
                     }
+                    crate::v2_observability::reconnect_attempt();
+                    tracing::warn!(
+                        event = "v2_agent_reconnect",
+                        device_id = %self.config.device_id,
+                        reconnect_attempt = failures,
+                        outcome = "scheduled",
+                        error_code = error.safe_error_code(),
+                        "Agent Hub connection failed; reconnect scheduled"
+                    );
                     let delay = self
                         .config
                         .reconnect
@@ -364,6 +394,15 @@ impl AgentService {
                 Ok(SessionExit::Shutdown) => return Ok(()),
                 Ok(SessionExit::Reconnect) => {
                     failures = 0;
+                    crate::v2_observability::reconnect_attempt();
+                    tracing::warn!(
+                        event = "v2_agent_reconnect",
+                        device_id = %self.config.device_id,
+                        reconnect_attempt = 1_u32,
+                        outcome = "scheduled",
+                        error_code = "authenticated_session_reconnect",
+                        "authenticated Agent session requested reconnect"
+                    );
                     if sleep_or_shutdown(self.config.reconnect.initial_delay, shutdown).await {
                         return Ok(());
                     }
@@ -371,8 +410,26 @@ impl AgentService {
                 Err(error) if error.reconnectable() => {
                     failures = failures.saturating_add(1);
                     if failures >= self.config.reconnect.max_attempts {
+                        crate::v2_observability::reconnect_exhausted();
+                        tracing::error!(
+                            event = "v2_agent_reconnect_exhausted",
+                            device_id = %self.config.device_id,
+                            reconnect_attempt = failures,
+                            outcome = "exhausted",
+                            error_code = error.safe_error_code(),
+                            "Agent session reconnect retries exhausted"
+                        );
                         return Err(error);
                     }
+                    crate::v2_observability::reconnect_attempt();
+                    tracing::warn!(
+                        event = "v2_agent_reconnect",
+                        device_id = %self.config.device_id,
+                        reconnect_attempt = failures,
+                        outcome = "scheduled",
+                        error_code = error.safe_error_code(),
+                        "Agent session transport failed; reconnect scheduled"
+                    );
                     let delay = self
                         .config
                         .reconnect
@@ -382,7 +439,16 @@ impl AgentService {
                         return Ok(());
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::error!(
+                        event = "v2_agent_session_error",
+                        device_id = %self.config.device_id,
+                        outcome = "ended",
+                        error_code = error.safe_error_code(),
+                        "Agent session ended with a non-reconnectable error"
+                    );
+                    return Err(error);
+                }
             }
         }
     }
@@ -420,7 +486,7 @@ impl AgentService {
         send_agent(&outbound_tx, AgentToHub::Hello(hello.clone())).await?;
         let challenge = match next_hub(&mut inbound).await? {
             HubToAgent::Challenge(challenge) => challenge,
-            other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
+            other => return Err(unexpected_hub_message("challenge", &other)),
         };
         verify_hub_challenge(&hello, &challenge, &self.trusted_hub.verifier())
             .map_err(AgentServiceError::Protocol)?;
@@ -430,10 +496,18 @@ impl AgentService {
 
         let accepted = match next_hub(&mut inbound).await? {
             HubToAgent::Accepted(accepted) => accepted,
-            other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
+            other => return Err(unexpected_hub_message("accepted", &other)),
         };
         verify_session_accepted(&hello, &challenge, &accepted, &self.trusted_hub.verifier())
             .map_err(AgentServiceError::Protocol)?;
+        tracing::info!(
+            event = "v2_agent_session_accepted",
+            device_id = %self.config.device_id,
+            generation = accepted.device_generation,
+            backend = %hello.capabilities.backend,
+            outcome = "accepted",
+            "Hub accepted Agent session"
+        );
         let session = DeviceSession {
             device_id: self.config.device_id.clone(),
             generation: accepted.device_generation,
@@ -494,6 +568,14 @@ impl AgentService {
                     if pending_heartbeat.as_ref().is_some_and(|(_, sent)| sent.elapsed() >= heartbeat_deadline) {
                         terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
                         self.persist_state()?;
+                        tracing::warn!(
+                            event = "v2_agent_heartbeat_timeout",
+                            device_id = %session.device_id,
+                            generation = session.generation,
+                            outcome = "reconnect",
+                            error_code = "heartbeat_timeout",
+                            "Hub heartbeat acknowledgement deadline expired"
+                        );
                         return Ok(SessionExit::Reconnect);
                     }
                     if pending_heartbeat.is_none() {
@@ -525,9 +607,20 @@ impl AgentService {
                         AgentOperationOutcome::Result(result) => {
                             let device_result = match result {
                                 Ok(result) => result,
-                                Err(error) => DeviceResult::Error {
-                                    code: operation_error_code(&error),
-                                },
+                                Err(error) => {
+                                    tracing::warn!(
+                                        event = "v2_agent_operation_failed",
+                                        operation_id = %completion.operation_id,
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "failed",
+                                        error_code = agent_operation_error_code(&error),
+                                        "Agent operation failed without logging command or result payload"
+                                    );
+                                    DeviceResult::Error {
+                                        code: operation_error_code(&error),
+                                    }
+                                }
                             };
                             let result = CommandResultEnvelope {
                                 schema_version: CONTROL_SCHEMA_VERSION,
@@ -553,9 +646,17 @@ impl AgentService {
                                     // this transport generation alive so that acknowledgement
                                     // cannot be lost merely because the local worker completed
                                     // first; the Hub quarantine blocks all further work.
+                                    crate::v2_observability::backend_failure(
+                                        crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
+                                    );
                                     tracing::warn!(
                                         event = "v2_agent_backend_indeterminate",
                                         operation_id = %completion.operation_id,
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "indeterminate",
+                                        indeterminate_reason = "cancellation_unproven",
+                                        error_code = "backend_cancellation_ambiguous",
                                         "backend cancellation outcome is ambiguous; keeping session alive after signed quarantine acknowledgement"
                                     );
                                 }
@@ -566,6 +667,11 @@ impl AgentService {
                                     tracing::warn!(
                                         event = "v2_agent_backend_indeterminate",
                                         operation_id = %completion.operation_id,
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "indeterminate",
+                                        indeterminate_reason = "backend_timed_out",
+                                        error_code = "backend_timeout_ambiguous",
                                         "backend timed out with ambiguous outcome; reconnecting without a success result"
                                     );
                                     return Ok(SessionExit::Reconnect);
@@ -772,7 +878,7 @@ impl AgentService {
                             ).map_err(AgentServiceError::Protocol)?;
                             send_agent(&outbound_tx, AgentToHub::CancellationAck(ack)).await?;
                         }
-                        other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
+                        other => return Err(unexpected_hub_message("session_message", &other)),
                     }
                 }
             }
@@ -873,6 +979,16 @@ async fn terminate_active(
     Ok(())
 }
 
+fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
+    match error {
+        AgentOperationError::Process(error) => error.safe_error_code(),
+        AgentOperationError::Shell(error) => error.safe_error_code(),
+        AgentOperationError::Filesystem(error) => error.safe_error_code(),
+        AgentOperationError::Backend(error) => error.safe_error_code(),
+        AgentOperationError::WorkerPanicked => "operation_worker_panicked",
+    }
+}
+
 fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
     match error {
         AgentOperationError::Filesystem(FilesystemError::PathDenied) => {
@@ -900,6 +1016,33 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
             DeviceErrorCode::InternalFailure
         }
     }
+}
+
+fn unexpected_hub_message(expected: &'static str, message: &HubToAgent) -> AgentServiceError {
+    let got = message.kind();
+    tracing::warn!(
+        event = "v2_protocol_message_rejected",
+        outcome = "rejected",
+        error_code = "unexpected_message",
+        expected_message = expected,
+        message_kind = got,
+        "unexpected Hub protocol message rejected"
+    );
+    AgentServiceError::UnexpectedMessage { expected, got }
+}
+
+fn record_agent_persistence_failure(device_id: &str, error: &PersistenceError) {
+    crate::v2_observability::persistence_failure(
+        crate::v2_observability::PersistenceComponent::Agent,
+    );
+    tracing::error!(
+        event = "v2_persistence_failure",
+        device_id,
+        outcome = "failed",
+        error_code = error.safe_error_code(),
+        component = "agent",
+        "Agent checkpoint persistence failed"
+    );
 }
 
 async fn send_agent(
@@ -941,7 +1084,6 @@ fn der_certificate_to_pem(der: &[u8]) -> Vec<u8> {
     pem.into_bytes()
 }
 
-#[derive(Debug)]
 pub enum AgentServiceError {
     InvalidConfig(&'static str),
     Transport(tonic::transport::Error),
@@ -956,7 +1098,10 @@ pub enum AgentServiceError {
     Backend(M1BackendError),
     Operation(AgentOperationError),
     Persistence(PersistenceError),
-    UnexpectedMessage(String),
+    UnexpectedMessage {
+        expected: &'static str,
+        got: &'static str,
+    },
     HeartbeatAckMismatch,
     CancellationMismatch,
     AgentBusy,
@@ -985,9 +1130,56 @@ impl AgentServiceError {
     }
 }
 
+impl SafeErrorCode for AgentServiceError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig(_) => "invalid_config",
+            Self::Transport(_) => "hub_transport_connect_failed",
+            Self::Status(_) => "grpc_status",
+            Self::Carrier(_) => "carrier_error",
+            Self::Protocol(_) => "protocol_error",
+            Self::Trust(_) => "trust_error",
+            Self::Control(_) => "control_error",
+            Self::Execution(_) => "execution_error",
+            Self::Process(_) => "process_error",
+            Self::Filesystem(_) => "filesystem_error",
+            Self::Backend(error) => error.safe_error_code(),
+            Self::Operation(_) => "operation_error",
+            Self::Persistence(error) => error.safe_error_code(),
+            Self::UnexpectedMessage { .. } => "unexpected_message",
+            Self::HeartbeatAckMismatch => "heartbeat_ack_mismatch",
+            Self::CancellationMismatch => "cancellation_mismatch",
+            Self::AgentBusy => "agent_busy",
+            Self::UnsupportedCommand => "unsupported_command",
+            Self::InboundClosed => "inbound_closed",
+            Self::OutboundClosed => "outbound_closed",
+            Self::OperationWorkerClosed => "operation_worker_closed",
+            Self::OperationStateMismatch => "operation_state_mismatch",
+            Self::OperationTerminationTimeout => "operation_termination_timeout",
+            Self::ReconnectExhausted => "reconnect_exhausted",
+            Self::CheckpointIdentityMismatch => "checkpoint_identity_mismatch",
+            Self::CheckpointTrustMismatch => "checkpoint_trust_mismatch",
+            Self::CheckpointGrantTrustMismatch => "checkpoint_grant_trust_mismatch",
+        }
+    }
+}
+
+impl fmt::Debug for AgentServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedMessage { expected, got } => f
+                .debug_struct("unexpected_message")
+                .field("expected", expected)
+                .field("got", got)
+                .finish(),
+            _ => f.write_str(self.safe_error_code()),
+        }
+    }
+}
+
 impl fmt::Display for AgentServiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        fmt::Debug::fmt(self, f)
     }
 }
 

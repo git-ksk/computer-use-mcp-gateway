@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         .await?
     {
         BackendExecutionOutcome::Completed(DeviceResult::Applications { count }) => count,
-        other => bail!("unexpected list-applications outcome: {other:?}"),
+        other => bail!("unexpected list-applications outcome: {}", other.kind()),
     };
     let (width_points, height_points, scale_factor_milli) = match adapter
         .execute(&DeviceCommand::ScreenGeometry, cancel_rx)
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
             height_points,
             scale_factor_milli,
         }) => (width_points, height_points, scale_factor_milli),
-        other => bail!("unexpected screen-geometry outcome: {other:?}"),
+        other => bail!("unexpected screen-geometry outcome: {}", other.kind()),
     };
     adapter.shutdown().await?;
 

@@ -9,6 +9,7 @@ use crate::v2_execution_safety::{AuthoritativeOperationController, Authoritative
 use crate::v2_m0::{DeviceRegistry, DeviceRegistrySnapshot, GrantLedger, GrantLedgerSnapshot};
 use crate::v2_m0_execution::{AdmissionLimits, AgentExecutionGate, AgentExecutionSnapshot};
 use crate::v2_m0_trust::TrustedHubIdentity;
+use crate::v2_observability::SafeErrorCode;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
@@ -312,7 +313,6 @@ fn validate_state_schema(got: u16) -> Result<(), PersistenceError> {
     }
 }
 
-#[derive(Debug)]
 pub enum PersistenceError {
     Io(std::io::Error),
     Serialization(serde_json::Error),
@@ -329,9 +329,35 @@ pub enum PersistenceError {
     InvalidState,
 }
 
+impl SafeErrorCode for PersistenceError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "persistence_io",
+            Self::Serialization(_) => "persistence_serialization",
+            Self::Control(_) => "persistence_control_state",
+            Self::Execution(_) => "persistence_execution_state",
+            Self::UnsupportedSchema { .. } => "persistence_unsupported_schema",
+            Self::InvalidPrefix => "persistence_invalid_prefix",
+            Self::UnsafePath => "persistence_unsafe_path",
+            Self::UnsafePermissions => "persistence_unsafe_permissions",
+            Self::CheckpointTooLarge => "persistence_checkpoint_too_large",
+            Self::NoCheckpoint => "persistence_no_checkpoint",
+            Self::SequenceContention => "persistence_sequence_contention",
+            Self::InvalidRetention => "persistence_invalid_retention",
+            Self::InvalidState => "persistence_invalid_state",
+        }
+    }
+}
+
+impl fmt::Debug for PersistenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.safe_error_code())
+    }
+}
+
 impl fmt::Display for PersistenceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(self.safe_error_code())
     }
 }
 
@@ -491,5 +517,14 @@ mod tests {
         let result: Result<serde_json::Value, _> = store.load_latest();
         assert!(matches!(result, Err(PersistenceError::UnsafePermissions)));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn persistence_error_formatting_does_not_expose_io_path_or_contents() {
+        let marker = "/secret/path/oauth-token.txt contents=SUPER_SECRET";
+        let error = PersistenceError::Io(std::io::Error::other(marker));
+        assert_eq!(format!("{error:?}"), "persistence_io");
+        assert_eq!(error.to_string(), "persistence_io");
+        assert!(!format!("{error:?} {error}").contains(marker));
     }
 }

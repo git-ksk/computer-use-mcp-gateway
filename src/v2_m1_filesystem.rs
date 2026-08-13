@@ -6,6 +6,7 @@
 //! a Dangerous capability because program arguments can address the wider host.
 
 use crate::v2_m0::{DeviceResult, DirectoryEntry, DirectoryEntryKind};
+use crate::v2_observability::SafeErrorCode;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
@@ -139,7 +140,6 @@ impl FilesystemExecutor {
     }
 }
 
-#[derive(Debug)]
 pub enum FilesystemError {
     NoAllowedRoots,
     RootNotDirectory,
@@ -152,9 +152,31 @@ pub enum FilesystemError {
     Io(std::io::Error),
 }
 
+impl SafeErrorCode for FilesystemError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::NoAllowedRoots => "filesystem_no_allowed_roots",
+            Self::RootNotDirectory => "filesystem_root_not_directory",
+            Self::InvalidLimit => "filesystem_invalid_limit",
+            Self::InvalidPath => "filesystem_invalid_path",
+            Self::PathDenied => "filesystem_path_denied",
+            Self::NotFile => "filesystem_not_file",
+            Self::NotDirectory => "filesystem_not_directory",
+            Self::NonUtf8Name => "filesystem_non_utf8_name",
+            Self::Io(_) => "filesystem_io",
+        }
+    }
+}
+
+impl fmt::Debug for FilesystemError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.safe_error_code())
+    }
+}
+
 impl fmt::Display for FilesystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(self.safe_error_code())
     }
 }
 
