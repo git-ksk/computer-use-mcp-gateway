@@ -2,18 +2,17 @@
 
 V1 acceptance was completed on 2026-08-11. Normal CI covers automated/code-local closeout; operator-controlled acceptance covered both a trusted real macOS desktop and the authenticated Cloudflare Access/Tunnel + ChatGPT remote path.
 
-The desktop acceptance is a **product-level real-desktop check**, not a requirement to operate a permanent GitHub self-hosted runner. The same fixture may be run either directly by a trusted operator on a logged-in TCC-granted Mac or through the manual self-hosted workflow. The repository keeps `.github/workflows/desktop-e2e.yml` as a repeatable automation path for teams that maintain a dedicated runner.
+The desktop acceptance is a **product-level real-desktop check** run directly by a trusted operator on a logged-in, TCC-granted Mac. The repository no longer carries a GitHub Actions self-hosted desktop workflow; normal CI remains GitHub-hosted.
 
 ## 1. Trusted macOS desktop E2E — completed 2026-08-11
 
 The acceptance fixture is `scripts/cua_desktop_e2e.py`. It is guarded by `CUMG_DESKTOP_E2E_ACK=1` because it performs real GUI actions.
 
-Accepted execution modes:
+Accepted execution mode:
 
-- direct operator-controlled run on a trusted, logged-in macOS desktop with CuaDriver Accessibility and Screen Recording permissions; or
-- `.github/workflows/desktop-e2e.yml` via `workflow_dispatch` on a dedicated `cua-desktop-e2e` self-hosted runner.
+- direct operator-controlled run on a trusted, logged-in macOS desktop with CuaDriver Accessibility and Screen Recording permissions.
 
-The 2026-08-11 V1 closeout used the first mode. No self-hosted runner was registered or claimed as part of this evidence.
+The 2026-08-11 V1 closeout used this mode. No self-hosted runner was registered or claimed as part of this evidence.
 
 Acceptance evidence:
 

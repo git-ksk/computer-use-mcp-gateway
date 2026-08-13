@@ -15,8 +15,13 @@ Prerequisites:
 Run:
 
 ```bash
+CUMG_DESKTOP_E2E_ACK=1 \
+CUMG_V2_CUA_CANCEL_E2E_ACK=1 \
+CUMG_V2_CUA_COMMAND="$(command -v cua-driver)" \
 bash scripts/v2_desktop_acceptance.sh
 ```
+
+Both ACK variables are mandatory. The wrapper fails closed before any desktop action if either acknowledgement is missing.
 
 The wrapper verifies Cua permissions, runs the real TextEdit screenshot/click/type/readback fixture, then runs the V2 real-Cua ambiguity/restart/reconnect/no-auto-replay/explicit-resolution regression.
 

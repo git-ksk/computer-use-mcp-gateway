@@ -6,10 +6,16 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-: "${CUMG_DESKTOP_E2E_ACK:=1}"
-: "${CUMG_V2_CUA_CANCEL_E2E_ACK:=1}"
-: "${CUMG_V2_CUA_COMMAND:=$(command -v cua-driver || true)}"
+if [[ "${CUMG_DESKTOP_E2E_ACK:-}" != "1" ]]; then
+  echo "Refusing physical desktop automation without CUMG_DESKTOP_E2E_ACK=1." >&2
+  exit 1
+fi
+if [[ "${CUMG_V2_CUA_CANCEL_E2E_ACK:-}" != "1" ]]; then
+  echo "Refusing V2 ambiguity acceptance without CUMG_V2_CUA_CANCEL_E2E_ACK=1." >&2
+  exit 1
+fi
 
+: "${CUMG_V2_CUA_COMMAND:=$(command -v cua-driver || true)}"
 if [[ -z "$CUMG_V2_CUA_COMMAND" ]]; then
   echo "cua-driver was not found on PATH; set CUMG_V2_CUA_COMMAND explicitly." >&2
   exit 1
@@ -18,8 +24,9 @@ fi
 export CUMG_DESKTOP_E2E_ACK
 export CUMG_V2_CUA_CANCEL_E2E_ACK
 export CUMG_V2_CUA_COMMAND
+export PATH="$(dirname "$CUMG_V2_CUA_COMMAND"):$PATH"
 
-cua-driver permissions status
+"$CUMG_V2_CUA_COMMAND" permissions status
 cargo +1.88.0 build --locked --bin v1_gateway
 python3 scripts/cua_desktop_e2e.py
 

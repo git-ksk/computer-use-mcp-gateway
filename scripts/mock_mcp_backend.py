@@ -24,6 +24,7 @@ CALL_MARKER: str | None = None
 CANCEL_MARKER: str | None = None
 ARGS_MARKER: str | None = None
 SLOW_LIST_APPS = False
+SLOW_TYPE_TEXT = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cancel-marker")
     parser.add_argument("--args-marker")
     parser.add_argument("--slow-list-apps", action="store_true")
+    parser.add_argument("--slow-type-text", action="store_true")
     return parser.parse_args()
 
 
@@ -109,6 +111,16 @@ def handle_request(message: dict) -> None:
                         "inputSchema": {"type": "object", "additionalProperties": False},
                     },
                     {
+                        "name": "get_desktop_state",
+                        "description": "Semantic adapter fixture for desktop screenshot",
+                        "inputSchema": {"type": "object", "additionalProperties": False},
+                    },
+                    {
+                        "name": "type_text",
+                        "description": "Semantic adapter fixture for typed text",
+                        "inputSchema": {"type": "object", "additionalProperties": False},
+                    },
+                    {
                         "name": "echo_contract",
                         "description": "Records exact arguments and returns backend identity data unchanged",
                         "inputSchema": {"type": "object", "additionalProperties": True},
@@ -162,6 +174,45 @@ def handle_request(message: dict) -> None:
                         "height": 1080,
                         "scale_factor": 2.0,
                     },
+                    "isError": False,
+                },
+            )
+            return
+        if name == "get_desktop_state":
+            result(
+                request_id,
+                {
+                    "content": [
+                        {
+                            "type": "image",
+                            "data": "iVBORw0KGgo=",
+                            "mimeType": "image/png",
+                        },
+                        {"type": "text", "text": "fixture screenshot"},
+                    ],
+                    "structuredContent": {
+                        "screenshot_width": 2,
+                        "screenshot_height": 1,
+                        "screenshot_mime_type": "image/png",
+                    },
+                    "isError": False,
+                },
+            )
+            return
+        if name == "type_text":
+            arguments = params.get("arguments") or {}
+            touch(
+                ARGS_MARKER,
+                json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+            )
+            if SLOW_TYPE_TEXT:
+                pending[request_id] = name
+                touch(CALL_MARKER, str(request_id))
+                return
+            result(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": "typed"}],
                     "isError": False,
                 },
             )
@@ -225,12 +276,13 @@ def handle_notification(message: dict) -> None:
 
 
 def main() -> None:
-    global CALL_MARKER, CANCEL_MARKER, ARGS_MARKER, SLOW_LIST_APPS
+    global CALL_MARKER, CANCEL_MARKER, ARGS_MARKER, SLOW_LIST_APPS, SLOW_TYPE_TEXT
     args = parse_args()
     CALL_MARKER = args.call_marker
     CANCEL_MARKER = args.cancel_marker
     ARGS_MARKER = args.args_marker
     SLOW_LIST_APPS = args.slow_list_apps
+    SLOW_TYPE_TEXT = args.slow_type_text
 
     for line in sys.stdin:
         line = line.strip()

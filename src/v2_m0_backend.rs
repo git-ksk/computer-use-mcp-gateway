@@ -156,9 +156,24 @@ impl BackendAdapter for CuaCliAdapter {
                     scale_factor_milli: (scale * 1000.0).round() as u32,
                 }
             }
-            DeviceCommand::PointerClick { .. } | DeviceCommand::PointerDrag { .. } => {
+            DeviceCommand::Screenshot => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::Screenshot,
+                ));
+            }
+            DeviceCommand::PointerClick { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::PointerClick,
+                ));
+            }
+            DeviceCommand::PointerDrag { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::PointerDrag,
+                ));
+            }
+            DeviceCommand::TypeText { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::TypeText,
                 ));
             }
             DeviceCommand::ExecuteProcess { .. } => {

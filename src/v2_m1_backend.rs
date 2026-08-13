@@ -9,12 +9,13 @@ use crate::backend::{
 };
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
-    DeviceResult,
+    DeviceResult, MAX_SCREENSHOT_BYTES, MAX_TYPE_TEXT_BYTES,
 };
 use crate::v2_m0_transport::CancellationDisposition;
 use crate::v2_observability::SafeErrorCode;
 use anyhow::Error as AnyError;
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::Value;
 use std::fmt;
@@ -124,8 +125,10 @@ impl CuaMcpAdapter {
             supported: vec![
                 DeviceCapability::ListApplications,
                 DeviceCapability::ScreenGeometry,
+                DeviceCapability::Screenshot,
                 DeviceCapability::PointerClick,
                 DeviceCapability::PointerDrag,
+                DeviceCapability::TypeText,
             ],
         }
     }
@@ -179,6 +182,8 @@ impl CuaMcpAdapter {
         let result = match command {
             DeviceCommand::PointerClick { .. } => DeviceResult::PointerClickCompleted,
             DeviceCommand::PointerDrag { .. } => DeviceResult::PointerDragCompleted,
+            DeviceCommand::TypeText { .. } => DeviceResult::TypeTextCompleted,
+            DeviceCommand::Screenshot => normalize_screenshot_result(&raw)?,
             _ => {
                 let value = structured_value(&raw)?;
                 normalize_result(command, &value)?
@@ -217,6 +222,7 @@ fn map_command(
     match command {
         DeviceCommand::ListApplications => Ok(("list_apps", None)),
         DeviceCommand::ScreenGeometry => Ok(("get_screen_size", None)),
+        DeviceCommand::Screenshot => Ok(("get_desktop_state", None)),
         DeviceCommand::PointerClick { x, y, button } => Ok((
             "click",
             serde_json::json!({
@@ -248,6 +254,22 @@ fn map_command(
                     "to_x": to_x,
                     "to_y": to_y,
                     "duration_ms": duration_ms,
+                    "scope": "desktop"
+                })
+                .as_object()
+                .cloned(),
+            ))
+        }
+        DeviceCommand::TypeText { text } => {
+            if text.is_empty() || text.len() > MAX_TYPE_TEXT_BYTES {
+                return Err(M1BackendError::InvalidRequest(
+                    "typed text must be within 1..=32768 UTF-8 bytes",
+                ));
+            }
+            Ok((
+                "type_text",
+                serde_json::json!({
+                    "text": text,
                     "scope": "desktop"
                 })
                 .as_object()
@@ -314,11 +336,14 @@ fn normalize_result(
                 scale_factor_milli: (scale * 1000.0).round() as u32,
             })
         }
-        DeviceCommand::PointerClick { .. } | DeviceCommand::PointerDrag { .. } => {
-            Err(M1BackendError::MalformedResponse(
-                "interaction result should not require response normalization",
-            ))
-        }
+        DeviceCommand::PointerClick { .. }
+        | DeviceCommand::PointerDrag { .. }
+        | DeviceCommand::TypeText { .. } => Err(M1BackendError::MalformedResponse(
+            "interaction result should not require response normalization",
+        )),
+        DeviceCommand::Screenshot => Err(M1BackendError::MalformedResponse(
+            "screenshot result requires image-content normalization",
+        )),
         DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ExecuteProcess,
         )),
@@ -332,6 +357,63 @@ fn normalize_result(
             DeviceCapability::ListDirectory,
         )),
     }
+}
+
+fn normalize_screenshot_result(result: &CallToolResult) -> Result<DeviceResult, M1BackendError> {
+    let value = structured_value(result)?;
+    let mime_type = value
+        .get("screenshot_mime_type")
+        .and_then(Value::as_str)
+        .ok_or(M1BackendError::MalformedResponse(
+            "get_desktop_state missing screenshot_mime_type",
+        ))?;
+    if mime_type != "image/png" {
+        return Err(M1BackendError::MalformedResponse(
+            "get_desktop_state screenshot is not PNG",
+        ));
+    }
+    let width_pixels = json_u32(&value, "screenshot_width")?;
+    let height_pixels = json_u32(&value, "screenshot_height")?;
+    if width_pixels == 0 || height_pixels == 0 {
+        return Err(M1BackendError::MalformedResponse(
+            "get_desktop_state screenshot dimensions must be positive",
+        ));
+    }
+
+    let mut images = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_image());
+    let image = images.next().ok_or(M1BackendError::MalformedResponse(
+        "get_desktop_state missing image content",
+    ))?;
+    if images.next().is_some() || image.mime_type != "image/png" {
+        return Err(M1BackendError::MalformedResponse(
+            "get_desktop_state returned ambiguous image content",
+        ));
+    }
+    let max_encoded = MAX_SCREENSHOT_BYTES.div_ceil(3) * 4;
+    if image.data.len() > max_encoded {
+        return Err(M1BackendError::ScreenshotTooLarge);
+    }
+    let decoded = STANDARD
+        .decode(image.data.as_bytes())
+        .map_err(|_| M1BackendError::MalformedResponse("screenshot base64 is invalid"))?;
+    if decoded.len() > MAX_SCREENSHOT_BYTES {
+        return Err(M1BackendError::ScreenshotTooLarge);
+    }
+    if !decoded.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(M1BackendError::MalformedResponse(
+            "screenshot content is not a PNG",
+        ));
+    }
+
+    Ok(DeviceResult::Screenshot {
+        data_base64: image.data.clone(),
+        mime_type: image.mime_type.clone(),
+        width_pixels,
+        height_pixels,
+    })
 }
 
 fn pointer_button_name(button: crate::v2_m0::PointerButton) -> &'static str {
@@ -355,6 +437,7 @@ pub enum M1BackendError {
     BackendToolError,
     MalformedResponse(&'static str),
     NumericOverflow,
+    ScreenshotTooLarge,
     InvalidRequest(&'static str),
     UnsupportedCommand(DeviceCapability),
 }
@@ -366,6 +449,7 @@ impl SafeErrorCode for M1BackendError {
             Self::BackendToolError => "backend_tool_error",
             Self::MalformedResponse(_) => "backend_malformed_response",
             Self::NumericOverflow => "backend_numeric_overflow",
+            Self::ScreenshotTooLarge => "backend_screenshot_too_large",
             Self::InvalidRequest(_) => "backend_invalid_request",
             Self::UnsupportedCommand(_) => "backend_unsupported_command",
         }
@@ -405,6 +489,10 @@ mod tests {
     }
 
     fn fixture(args: Vec<String>) -> CuaMcpAdapter {
+        fixture_with_timeout(args, Duration::from_secs(30))
+    }
+
+    fn fixture_with_timeout(args: Vec<String>, tool_timeout: Duration) -> CuaMcpAdapter {
         CuaMcpAdapter::new(
             "python3",
             args,
@@ -412,7 +500,7 @@ mod tests {
             "test",
             1,
             Duration::from_secs(5),
-            Duration::from_secs(30),
+            tool_timeout,
             1,
             Duration::from_millis(10),
         )
@@ -432,7 +520,7 @@ mod tests {
         );
         assert_eq!(
             adapter
-                .execute(&DeviceCommand::ScreenGeometry, cancel_rx)
+                .execute(&DeviceCommand::ScreenGeometry, cancel_rx.clone())
                 .await
                 .unwrap(),
             BackendExecutionOutcome::Completed(DeviceResult::ScreenGeometry {
@@ -441,11 +529,35 @@ mod tests {
                 scale_factor_milli: 2000,
             })
         );
+        assert_eq!(
+            adapter
+                .execute(&DeviceCommand::Screenshot, cancel_rx.clone())
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::Screenshot {
+                data_base64: "iVBORw0KGgo=".into(),
+                mime_type: "image/png".into(),
+                width_pixels: 2,
+                height_pixels: 1,
+            })
+        );
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::TypeText {
+                        text: "fixture text".into(),
+                    },
+                    cancel_rx,
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::TypeTextCompleted)
+        );
         adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn propagated_backend_cancellation_is_classified_indeterminate() {
+    async fn type_text_propagated_cancellation_is_classified_indeterminate() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -456,7 +568,7 @@ mod tests {
             directory.join(format!("cumg-m1-cancel-{}-{nonce}", std::process::id()));
         let adapter = fixture(vec![
             "scripts/mock_mcp_backend.py".into(),
-            "--slow-list-apps".into(),
+            "--slow-type-text".into(),
             "--call-marker".into(),
             call_marker.to_string_lossy().into_owned(),
             "--cancel-marker".into(),
@@ -467,7 +579,12 @@ mod tests {
         let caller = adapter.clone();
         let call = tokio::spawn(async move {
             caller
-                .execute(&DeviceCommand::ListApplications, cancel_rx)
+                .execute(
+                    &DeviceCommand::TypeText {
+                        text: "cancel me".into(),
+                    },
+                    cancel_rx,
+                )
                 .await
         });
         wait_for_file(&call_marker).await;
@@ -494,6 +611,73 @@ mod tests {
         adapter.shutdown().await.unwrap();
         let _ = fs::remove_file(call_marker);
         let _ = fs::remove_file(cancel_marker);
+    }
+
+    #[tokio::test]
+    async fn type_text_timeout_is_classified_indeterminate() {
+        let adapter = fixture_with_timeout(
+            vec![
+                "scripts/mock_mcp_backend.py".into(),
+                "--slow-type-text".into(),
+            ],
+            Duration::from_millis(100),
+        );
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let outcome = adapter
+            .execute(
+                &DeviceCommand::TypeText {
+                    text: "timeout me".into(),
+                },
+                cancel_rx,
+            )
+            .await
+            .expect("timeout is a classified backend outcome");
+        assert_eq!(outcome, BackendExecutionOutcome::TimedOutIndeterminate);
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn screenshot_normalization_rejects_missing_or_non_png_image_content() {
+        let mut missing = CallToolResult::success(vec![rmcp::model::ContentBlock::text("summary")]);
+        missing.structured_content = Some(serde_json::json!({
+            "screenshot_width": 2,
+            "screenshot_height": 1,
+            "screenshot_mime_type": "image/png"
+        }));
+        assert!(matches!(
+            normalize_screenshot_result(&missing),
+            Err(M1BackendError::MalformedResponse(_))
+        ));
+
+        let mut wrong = CallToolResult::success(vec![rmcp::model::ContentBlock::image(
+            "iVBORw0KGgo=",
+            "image/jpeg",
+        )]);
+        wrong.structured_content = missing.structured_content.clone();
+        assert!(matches!(
+            normalize_screenshot_result(&wrong),
+            Err(M1BackendError::MalformedResponse(_))
+        ));
+    }
+
+    #[test]
+    fn cua_mapping_for_type_text_is_typed_and_bounded() {
+        let command = DeviceCommand::TypeText {
+            text: "hello".into(),
+        };
+        let (tool, args) = map_command(&command).unwrap();
+        assert_eq!(tool, "type_text");
+        assert_eq!(
+            Value::Object(args.unwrap()),
+            serde_json::json!({"text": "hello", "scope": "desktop"})
+        );
+        assert!(matches!(
+            map_command(&DeviceCommand::TypeText {
+                text: String::new()
+            }),
+            Err(M1BackendError::InvalidRequest(_))
+        ));
     }
 
     #[test]

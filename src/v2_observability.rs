@@ -231,8 +231,10 @@ pub const fn capability_name(capability: DeviceCapability) -> &'static str {
     match capability {
         DeviceCapability::ListApplications => "list_applications",
         DeviceCapability::ScreenGeometry => "screen_geometry",
+        DeviceCapability::Screenshot => "screenshot",
         DeviceCapability::PointerClick => "pointer_click",
         DeviceCapability::PointerDrag => "pointer_drag",
+        DeviceCapability::TypeText => "type_text",
         DeviceCapability::ExecuteProcess => "execute_process",
         DeviceCapability::Shell => "shell",
         DeviceCapability::ReadFile => "read_file",

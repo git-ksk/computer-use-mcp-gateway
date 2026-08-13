@@ -796,8 +796,10 @@ impl AgentService {
                                 }
                                 command @ (DeviceCommand::ListApplications
                                 | DeviceCommand::ScreenGeometry
+                                | DeviceCommand::Screenshot
                                 | DeviceCommand::PointerClick { .. }
-                                | DeviceCommand::PointerDrag { .. }) => {
+                                | DeviceCommand::PointerDrag { .. }
+                                | DeviceCommand::TypeText { .. }) => {
                                     let computer_use = self
                                         .computer_use
                                         .clone()
@@ -1223,7 +1225,11 @@ mod tests {
                 platform: "test".into(),
                 capability_schema_version: CAPABILITY_SCHEMA_VERSION,
                 revision: 1,
-                supported: vec![DeviceCapability::ScreenGeometry],
+                supported: vec![
+                    DeviceCapability::ScreenGeometry,
+                    DeviceCapability::Screenshot,
+                    DeviceCapability::TypeText,
+                ],
             }
         }
 
@@ -1313,6 +1319,12 @@ mod tests {
                 .supported
                 .contains(&DeviceCapability::ScreenGeometry)
         );
+        assert!(
+            capabilities
+                .supported
+                .contains(&DeviceCapability::Screenshot)
+        );
+        assert!(capabilities.supported.contains(&DeviceCapability::TypeText));
         let _ = std::fs::remove_dir_all(state_dir);
     }
 

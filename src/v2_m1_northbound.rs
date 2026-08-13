@@ -11,8 +11,8 @@ use crate::v2_observability::SafeErrorCode;
 use crate::{
     v2_execution_safety::OperationOwner,
     v2_m0::{
-        DeviceCapability, DeviceCommand, DeviceResult, PointerButton, ProcessEnvVar,
-        ProcessRequest, ShellRequest,
+        DeviceCapability, DeviceCommand, DeviceResult, MAX_TYPE_TEXT_BYTES, PointerButton,
+        ProcessEnvVar, ProcessRequest, ShellRequest,
     },
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
@@ -59,8 +59,10 @@ const DEFAULT_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BEARER_TOKEN_BYTES: usize = 16 * 1024;
 const TOOL_LIST_APPS: &str = "list_apps";
 const TOOL_GET_SCREEN_SIZE: &str = "get_screen_size";
+const TOOL_SCREENSHOT: &str = "screenshot";
 const TOOL_CLICK: &str = "click";
 const TOOL_DRAG: &str = "drag";
+const TOOL_TYPE_TEXT: &str = "type_text";
 const TOOL_EXECUTE_PROCESS: &str = "execute_process";
 const TOOL_SHELL: &str = "shell";
 const TOOL_READ_FILE: &str = "read_file";
@@ -824,13 +826,7 @@ impl V2NorthboundMcp {
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
         let owner = OperationOwner::from_principal(principal);
-        let read_only = matches!(
-            command,
-            DeviceCommand::ListApplications
-                | DeviceCommand::ScreenGeometry
-                | DeviceCommand::ReadFile { .. }
-                | DeviceCommand::ListDirectory { .. }
-        );
+        let read_only = command_is_read_only(&command);
         let pending = match self
             .hub
             .start_command_as_with_id(
@@ -956,6 +952,7 @@ impl ServerHandler for V2NorthboundMcp {
         let command_result: Result<DeviceCommand, McpError> = (|| match request.name.as_ref() {
             TOOL_LIST_APPS => Ok(DeviceCommand::ListApplications),
             TOOL_GET_SCREEN_SIZE => Ok(DeviceCommand::ScreenGeometry),
+            TOOL_SCREENSHOT => Ok(DeviceCommand::Screenshot),
             TOOL_CLICK => {
                 let args: ClickArgs = parse_arguments(request.arguments)?;
                 Ok(DeviceCommand::PointerClick {
@@ -979,6 +976,16 @@ impl ServerHandler for V2NorthboundMcp {
                     to_y: args.to_y,
                     duration_ms: args.duration_ms,
                 })
+            }
+            TOOL_TYPE_TEXT => {
+                let args: TypeTextArgs = parse_arguments(request.arguments)?;
+                if args.text.is_empty() || args.text.len() > MAX_TYPE_TEXT_BYTES {
+                    return Err(McpError::invalid_params(
+                        "text must be within 1..=32768 UTF-8 bytes",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::TypeText { text: args.text })
             }
             TOOL_EXECUTE_PROCESS => {
                 let args: ExecuteProcessArgs = parse_arguments(request.arguments)?;
@@ -1024,10 +1031,43 @@ impl ServerHandler for V2NorthboundMcp {
         let result = self
             .execute_command(&auth.principal, operation_id, command, usage, &context)
             .await?;
-        let value = serde_json::to_string(&result)
-            .map_err(|_| McpError::internal_error("Failed to serialize device result", None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(value)]).into())
+        match result {
+            DeviceResult::Screenshot {
+                data_base64,
+                mime_type,
+                width_pixels,
+                height_pixels,
+            } => {
+                let metadata = json!({
+                    "width_pixels": width_pixels,
+                    "height_pixels": height_pixels,
+                    "mime_type": mime_type,
+                });
+                Ok(CallToolResult::success(vec![
+                    ContentBlock::image(data_base64, "image/png"),
+                    ContentBlock::text(metadata.to_string()),
+                ])
+                .into())
+            }
+            other => {
+                let value = serde_json::to_string(&other).map_err(|_| {
+                    McpError::internal_error("Failed to serialize device result", None)
+                })?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(value)]).into())
+            }
+        }
     }
+}
+
+fn command_is_read_only(command: &DeviceCommand) -> bool {
+    matches!(
+        command,
+        DeviceCommand::ListApplications
+            | DeviceCommand::ScreenGeometry
+            | DeviceCommand::Screenshot
+            | DeviceCommand::ReadFile { .. }
+            | DeviceCommand::ListDirectory { .. }
+    )
 }
 
 fn usage_settlement_for_error(
@@ -1097,8 +1137,10 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
     match name {
         TOOL_LIST_APPS => Some(DeviceCapability::ListApplications),
         TOOL_GET_SCREEN_SIZE => Some(DeviceCapability::ScreenGeometry),
+        TOOL_SCREENSHOT => Some(DeviceCapability::Screenshot),
         TOOL_CLICK => Some(DeviceCapability::PointerClick),
         TOOL_DRAG => Some(DeviceCapability::PointerDrag),
+        TOOL_TYPE_TEXT => Some(DeviceCapability::TypeText),
         TOOL_EXECUTE_PROCESS => Some(DeviceCapability::ExecuteProcess),
         TOOL_SHELL => Some(DeviceCapability::Shell),
         TOOL_READ_FILE => Some(DeviceCapability::ReadFile),
@@ -1118,6 +1160,12 @@ fn all_tools() -> Vec<Tool> {
         Tool::new(
             TOOL_GET_SCREEN_SIZE,
             "Read desktop screen geometry through the enrolled computer-use backend.",
+            object_schema(vec![], &[]),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_SCREENSHOT,
+            "Capture the enrolled device primary display as a bounded PNG image.",
             object_schema(vec![], &[]),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
@@ -1147,6 +1195,12 @@ fn all_tools() -> Vec<Tool> {
                 ],
                 &["from_x", "from_y", "to_x", "to_y", "duration_ms"],
             ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_TYPE_TEXT,
+            "Type text into the current foreground desktop application.",
+            object_schema(vec![("text", bounded_text_schema())], &["text"]),
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
@@ -1226,12 +1280,22 @@ fn string_map_schema() -> Value {
     json!({ "type": "object", "additionalProperties": { "type": "string" } })
 }
 
+fn bounded_text_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": MAX_TYPE_TEXT_BYTES })
+}
+
 fn signed_integer_schema() -> Value {
     json!({ "type": "integer" })
 }
 
 fn positive_integer_schema() -> Value {
     json!({ "type": "integer", "minimum": 1 })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypeTextArgs {
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1265,6 +1329,7 @@ fn parse_pointer_button(value: Option<&str>) -> Result<PointerButton, McpError> 
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecuteProcessArgs {
     program: String,
     #[serde(default)]
@@ -1276,6 +1341,7 @@ struct ExecuteProcessArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShellArgs {
     command: String,
     cwd: String,
@@ -1285,6 +1351,7 @@ struct ShellArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PathArgs {
     path: String,
 }
@@ -1492,6 +1559,27 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert_eq!(visible, vec![TOOL_READ_FILE.to_owned()]);
+        assert!(!visible.contains(&TOOL_SCREENSHOT.to_owned()));
+        assert!(!visible.contains(&TOOL_TYPE_TEXT.to_owned()));
+    }
+
+    #[test]
+    fn exact_screenshot_authorization_does_not_expose_type_text() {
+        let principal = AuthenticatedClientPrincipal::new("https://auth.example", "u1").unwrap();
+        let mut policy = ClientAuthorizationPolicy::default();
+        policy.allow_device_capability(&principal, "dev-a", DeviceCapability::Screenshot);
+        let visible: Vec<_> = all_tools()
+            .into_iter()
+            .filter(|tool| {
+                tool_capability(tool.name.as_ref()).is_some_and(|capability| {
+                    policy
+                        .authorize_device_capability(&principal, "dev-a", capability)
+                        .is_ok()
+                })
+            })
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(visible, vec![TOOL_SCREENSHOT.to_owned()]);
     }
 
     #[derive(Debug)]
@@ -1826,8 +1914,10 @@ mod tests {
         let mappings = [
             (TOOL_LIST_APPS, DeviceCapability::ListApplications),
             (TOOL_GET_SCREEN_SIZE, DeviceCapability::ScreenGeometry),
+            (TOOL_SCREENSHOT, DeviceCapability::Screenshot),
             (TOOL_CLICK, DeviceCapability::PointerClick),
             (TOOL_DRAG, DeviceCapability::PointerDrag),
+            (TOOL_TYPE_TEXT, DeviceCapability::TypeText),
             (TOOL_EXECUTE_PROCESS, DeviceCapability::ExecuteProcess),
             (TOOL_SHELL, DeviceCapability::Shell),
             (TOOL_READ_FILE, DeviceCapability::ReadFile),
@@ -1859,8 +1949,49 @@ mod tests {
     }
 
     #[test]
+    fn type_text_arguments_fail_closed_before_dispatch() {
+        assert!(
+            parse_arguments::<TypeTextArgs>(Some(
+                serde_json::json!({"text": "ok", "shell": "echo nope"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<TypeTextArgs>(serde_json::json!({"text": "ok"})).is_ok());
+    }
+
+    #[test]
+    fn screenshot_failure_is_read_only_but_type_text_is_mutating_for_accounting() {
+        assert!(command_is_read_only(&DeviceCommand::Screenshot));
+        assert!(!command_is_read_only(&DeviceCommand::TypeText {
+            text: "x".into(),
+        }));
+        let remote = HubCommandError::Remote(crate::v2_m0::DeviceErrorCode::InternalFailure);
+        assert_eq!(
+            usage_settlement_for_error(
+                true,
+                command_is_read_only(&DeviceCommand::Screenshot),
+                &remote
+            ),
+            (UsageSettlement::Zero, "proven_no_effect")
+        );
+        assert_eq!(
+            usage_settlement_for_error(
+                true,
+                command_is_read_only(&DeviceCommand::TypeText { text: "x".into() }),
+                &remote,
+            ),
+            (UsageSettlement::Full, "dispatched_conservative")
+        );
+    }
+
+    #[test]
     fn usage_outcome_mapping_is_conservative_after_dispatch() {
         let remote = HubCommandError::Remote(crate::v2_m0::DeviceErrorCode::InternalFailure);
+        // Screenshot is read-only: a verified remote failure proves no business
+        // side effect. TypeText is mutable: any dispatched failure is charged fully.
         assert_eq!(
             usage_settlement_for_error(false, false, &HubCommandError::Rejected),
             (UsageSettlement::Zero, "pre_dispatch_rejected")
