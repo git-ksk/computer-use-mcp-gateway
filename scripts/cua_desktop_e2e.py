@@ -29,7 +29,7 @@ PROTOCOL_VERSION = "2025-11-25"
 
 
 def gateway_binary() -> Path:
-    path = Path("target/debug/computer-use-mcp-gateway")
+    path = Path("target/debug/v1_gateway")
     if not path.exists():
         raise RuntimeError(f"gateway binary missing: {path}")
     return path.resolve()
