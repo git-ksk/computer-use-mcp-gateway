@@ -131,7 +131,8 @@ async fn wait_generation(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "main-only trusted macOS/TCC P1 acceptance; run explicitly with CUMG_V2_CUA_CANCEL_E2E_ACK=1"]
-async fn real_cua_indeterminate_survives_restart_without_replay_and_requires_resolution() -> Result<()> {
+async fn real_cua_indeterminate_survives_restart_without_replay_and_requires_resolution()
+-> Result<()> {
     if std::env::var("CUMG_V2_CUA_CANCEL_E2E_ACK").as_deref() != Ok("1") {
         return Err(anyhow!(
             "refusing real desktop action without CUMG_V2_CUA_CANCEL_E2E_ACK=1"
@@ -157,8 +158,7 @@ async fn real_cua_indeterminate_survives_restart_without_replay_and_requires_res
     let fixture = root.join("V2-P1-Cua-Restart-Fixture.txt");
     prepare_textedit_fixture(&fixture)?;
 
-    let CertifiedKey { cert, signing_key } =
-        generate_simple_self_signed(vec!["localhost".into()])?;
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_pem = cert.pem();
     let cert_der = cert.der().to_vec();
     let key_pem = signing_key.serialize_pem();
@@ -242,7 +242,10 @@ async fn real_cua_indeterminate_survives_restart_without_replay_and_requires_res
         .await?
         .wait()
         .await?;
-    assert!(matches!(geometry.result, DeviceResult::ScreenGeometry { .. }));
+    assert!(matches!(
+        geometry.result,
+        DeviceResult::ScreenGeometry { .. }
+    ));
 
     // A long same-point drag gives the physical Cua backend a live state-changing
     // operation with a large cancellation window without materially moving the cursor.
