@@ -30,6 +30,7 @@ use crate::v2_m1_grpc::{
 };
 use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
 use crate::v2_observability::SafeErrorCode;
+use crate::v2_usage::UsageLease;
 use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
 use std::collections::{HashMap, VecDeque};
@@ -203,6 +204,7 @@ enum HubRequest {
         operation_id: String,
         owner: OperationOwner,
         command: DeviceCommand,
+        usage: Option<UsageLease>,
         reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
     },
     Cancel {
@@ -215,8 +217,14 @@ enum HubRequest {
 struct PendingOperation {
     owner: OperationOwner,
     command: DeviceCommand,
+    usage: Option<UsageLease>,
     envelope: Option<CommandEnvelope>,
     reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
+}
+
+enum DispatchOutcome {
+    Sent,
+    Rejected(CompletionDecision),
 }
 
 impl SingleDeviceHub {
@@ -472,7 +480,7 @@ impl SingleDeviceHub {
                         return Ok(());
                     };
                     match request {
-                        HubRequest::Execute { operation_id, owner, command, reply } => {
+                        HubRequest::Execute { operation_id, owner, command, usage, reply } => {
                             if pending.contains_key(&operation_id) {
                                 let _ = reply.send(Err(HubCommandError::OperationReplay));
                                 continue;
@@ -530,12 +538,13 @@ impl SingleDeviceHub {
                             pending.insert(operation_id.clone(), PendingOperation {
                                 owner,
                                 command,
+                                usage,
                                 envelope: None,
                                 reply,
                             });
                             match decision {
                                 AdmissionDecision::StartNow(operation) => {
-                                    self.dispatch_operation(
+                                    if let DispatchOutcome::Rejected(next) = self.dispatch_operation(
                                         &outbound,
                                         &hello,
                                         &challenge,
@@ -544,7 +553,19 @@ impl SingleDeviceHub {
                                         session_clock,
                                         &operation.operation_id,
                                         &mut pending,
-                                    ).await?;
+                                    ).await? {
+                                        self.dispatch_next(
+                                            next,
+                                            &outbound,
+                                            &hello,
+                                            &challenge,
+                                            generation,
+                                            capability_revision,
+                                            session_clock,
+                                            &mut pending,
+                                            &mut queue_order,
+                                        ).await?;
+                                    }
                                 }
                                 AdmissionDecision::Queued { .. } => queue_order.push_back(operation_id),
                             }
@@ -693,17 +714,24 @@ impl SingleDeviceHub {
         session_clock: &TrustedSessionClock,
         operation_id: &str,
         pending: &mut HashMap<String, PendingOperation>,
-    ) -> Result<(), HubServiceError> {
-        let operation = pending
-            .get_mut(operation_id)
-            .ok_or(HubServiceError::PendingOperationMissing)?;
+    ) -> Result<DispatchOutcome, HubServiceError> {
+        let (owner, device_command, usage) = {
+            let operation = pending
+                .get(operation_id)
+                .ok_or(HubServiceError::PendingOperationMissing)?;
+            (
+                operation.owner.clone(),
+                operation.command.clone(),
+                operation.usage.clone(),
+            )
+        };
         let command = CommandEnvelope {
             schema_version: CONTROL_SCHEMA_VERSION,
             device_id: self.inner.device_id.clone(),
             device_generation: generation,
             capability_revision,
             operation_id: operation_id.to_owned(),
-            command: operation.command.clone(),
+            command: device_command,
         };
         let grant = self
             .inner
@@ -724,6 +752,42 @@ impl SingleDeviceHub {
             grant,
         )?;
 
+        // Usage accounting is deliberately outside the authoritative execution
+        // controller. It is marked liable only after CUMG admission has selected
+        // this operation for execution and before either the durable Dispatched
+        // transition or any Agent-visible bytes can occur.
+        if let Some(usage) = usage.as_ref()
+            && let Err(error) = usage.mark_liable().await
+        {
+            tracing::warn!(
+                event = "v2_usage_mark_liable_failed",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "cancelled_before_dispatch",
+                error_code = error.safe_error_code(),
+                "usage liability transition failed; Agent dispatch blocked"
+            );
+            let next = {
+                let mut persistent = self.inner.persistent.lock().await;
+                let decision = persistent.execution.request_cancel(
+                    operation_id,
+                    &owner,
+                    generation,
+                    unix_time_ms()?,
+                )?;
+                persist_locked(&self.inner, &persistent)?;
+                match decision {
+                    CancellationDecision::CancelledBeforeDispatch { next } => next,
+                    _ => return Err(HubServiceError::StateBusy),
+                }
+            };
+            if let Some(operation) = pending.remove(operation_id) {
+                let _ = operation.reply.send(Err(HubCommandError::UsageUnavailable));
+            }
+            return Ok(DispatchOutcome::Rejected(next));
+        }
+
         // Persist `Dispatched` before putting bytes on the network. A crash after
         // this point can conservatively restore as indeterminate, but can never
         // restore a command that may have executed as runnable.
@@ -731,15 +795,21 @@ impl SingleDeviceHub {
             let mut persistent = self.inner.persistent.lock().await;
             persistent.execution.mark_dispatched(
                 operation_id,
-                &operation.owner,
+                &owner,
                 generation,
                 unix_time_ms()?,
             )?;
             persist_locked(&self.inner, &persistent)?;
         }
         let capability = command.command.capability();
-        operation.envelope = Some(command);
+        pending
+            .get_mut(operation_id)
+            .ok_or(HubServiceError::PendingOperationMissing)?
+            .envelope = Some(command);
         send_hub(outbound, HubToAgent::Command(remote)).await?;
+        if let Some(usage) = usage.as_ref() {
+            usage.mark_dispatched();
+        }
         tracing::info!(
             event = "v2_operation_dispatched",
             operation_id,
@@ -749,7 +819,7 @@ impl SingleDeviceHub {
             outcome = "dispatched",
             "operation dispatched to Agent"
         );
-        Ok(())
+        Ok(DispatchOutcome::Sent)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -894,19 +964,25 @@ impl SingleDeviceHub {
         pending: &mut HashMap<String, PendingOperation>,
         queue_order: &mut VecDeque<String>,
     ) -> Result<(), HubServiceError> {
-        if let CompletionDecision::StartNext(operation) = next {
+        let mut next = next;
+        while let CompletionDecision::StartNext(operation) = next {
             queue_order.retain(|queued| queued != &operation.operation_id);
-            self.dispatch_operation(
-                outbound,
-                hello,
-                challenge,
-                generation,
-                capability_revision,
-                session_clock,
-                &operation.operation_id,
-                pending,
-            )
-            .await?;
+            match self
+                .dispatch_operation(
+                    outbound,
+                    hello,
+                    challenge,
+                    generation,
+                    capability_revision,
+                    session_clock,
+                    &operation.operation_id,
+                    pending,
+                )
+                .await?
+            {
+                DispatchOutcome::Sent => break,
+                DispatchOutcome::Rejected(following) => next = following,
+            }
         }
         Ok(())
     }
@@ -1173,7 +1249,30 @@ impl HubHandle {
         owner: OperationOwner,
         command: DeviceCommand,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        let operation_id = random_operation_id();
+        self.start_command_as_with_id(owner, random_operation_id(), command, None)
+            .await
+    }
+
+    /// Allocates the CUMG logical operation identity before accounting admission.
+    /// The same value is passed unchanged to MCPUsage as `operationId`.
+    pub fn new_operation_id(&self) -> String {
+        random_operation_id()
+    }
+
+    pub async fn start_command_as_with_id(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        usage: Option<UsageLease>,
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        if operation_id.is_empty()
+            || usage
+                .as_ref()
+                .is_some_and(|lease| lease.operation_id() != operation_id)
+        {
+            return Err(HubCommandError::Rejected);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let tx = {
             let live = self.inner.live.lock().await;
@@ -1185,6 +1284,7 @@ impl HubHandle {
             operation_id: operation_id.clone(),
             owner,
             command,
+            usage,
             reply: reply_tx,
         })
         .await
@@ -1521,6 +1621,7 @@ pub enum HubCommandError {
     UnknownOperation,
     DeviceIndeterminate { operation_id: String },
     Rejected,
+    UsageUnavailable,
     Remote(DeviceErrorCode),
     UnexpectedResult,
     Indeterminate,
@@ -1538,6 +1639,7 @@ impl SafeErrorCode for HubCommandError {
             Self::UnknownOperation => "unknown_operation",
             Self::DeviceIndeterminate { .. } | Self::Indeterminate => "device_indeterminate",
             Self::Rejected => "rejected",
+            Self::UsageUnavailable => "usage_unavailable",
             Self::Remote(_) => "remote_error",
             Self::UnexpectedResult => "unexpected_result",
         }
@@ -1824,5 +1926,34 @@ mod tests {
                 assert!(block.contains(field), "{event} missing {field}");
             }
         }
+    }
+
+    #[test]
+    fn usage_liability_boundary_precedes_cumg_dispatched_and_agent_send() {
+        let source = include_str!("v2_m1_hub.rs");
+        let start = source.find("async fn dispatch_operation(").unwrap();
+        let end = source[start..]
+            .find("async fn handle_result(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let block = &source[start..end];
+        let liable = block.find("usage.mark_liable().await").unwrap();
+        let durable_dispatch = block.find("persistent.execution.mark_dispatched(").unwrap();
+        let agent_send = block
+            .find("send_hub(outbound, HubToAgent::Command(remote)).await?")
+            .unwrap();
+        let effect_possible = block.find("usage.mark_dispatched()").unwrap();
+        assert!(liable < durable_dispatch);
+        assert!(durable_dispatch < agent_send);
+        assert!(agent_send < effect_possible);
+        assert!(block.contains("CancellationDecision::CancelledBeforeDispatch"));
+    }
+
+    #[test]
+    fn usage_accounting_is_not_part_of_execution_safety_state_machine() {
+        let safety = include_str!("v2_execution_safety.rs");
+        assert!(!safety.contains("v2_usage"));
+        assert!(!safety.contains("UsageController"));
+        assert!(!safety.contains("UsageLease"));
     }
 }

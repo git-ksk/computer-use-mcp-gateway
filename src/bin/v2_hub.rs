@@ -14,6 +14,7 @@ use computer_use_mcp_gateway::{
         NorthboundMcpConfig, NorthboundPolicyDocument, OAuthIntrospectionConfig,
         OAuthIntrospectionVerifier, V2NorthboundMcp, build_northbound_router,
     },
+    v2_usage::{McpUsageController, UsageManager},
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::watch;
@@ -95,6 +96,12 @@ struct Args {
         default_value_t = 120
     )]
     max_northbound_requests_per_minute: usize,
+    /// Optional loopback-only mcp-usage-control sidecar endpoint. When omitted,
+    /// V2 uses the no-op accounting controller and preserves pre-integration behavior.
+    #[arg(long, env = "CUMG_V2_USAGE_ENDPOINT")]
+    usage_endpoint: Option<String>,
+    #[arg(long, env = "CUMG_V2_USAGE_TIMEOUT_SECS", default_value_t = 2)]
+    usage_timeout_secs: u64,
 }
 
 struct NorthboundRuntime {
@@ -115,6 +122,10 @@ async fn main() -> Result<()> {
     ensure!(
         args.oauth_introspection_timeout_secs > 0,
         "CUMG_V2_OAUTH_INTROSPECTION_TIMEOUT_SECS must be greater than zero"
+    );
+    ensure!(
+        args.usage_timeout_secs > 0,
+        "CUMG_V2_USAGE_TIMEOUT_SECS must be greater than zero"
     );
 
     let device_rotation = if let Some(path) = &args.device_rotation_file {
@@ -158,6 +169,7 @@ async fn main() -> Result<()> {
         bind = %args.bind,
         device_id = %device_id,
         northbound_mcp_enabled = northbound.is_some(),
+        usage_accounting_enabled = args.usage_endpoint.is_some(),
         "starting single-device V2 Hub"
     );
 
@@ -219,6 +231,7 @@ fn build_northbound_runtime(
         args.oauth_introspection_client_secret_file.is_some(),
         args.oauth_required_scopes.is_some(),
         args.northbound_policy_file.is_some(),
+        args.usage_endpoint.is_some(),
     ]
     .into_iter()
     .any(|value| value);
@@ -288,8 +301,16 @@ fn build_northbound_runtime(
         args.max_northbound_requests_per_minute,
     )
     .context("invalid V2 northbound connection/rate limits")?;
+    let usage = if let Some(endpoint) = args.usage_endpoint.as_deref() {
+        UsageManager::new(Arc::new(
+            McpUsageController::new(endpoint, Duration::from_secs(args.usage_timeout_secs))
+                .context("invalid loopback MCPUsage sidecar configuration")?,
+        ))
+    } else {
+        UsageManager::noop()
+    };
     let router = build_northbound_router(
-        V2NorthboundMcp::new(handle, policy),
+        V2NorthboundMcp::new_with_usage(handle, policy, usage),
         mcp_config,
         Arc::new(verifier),
     )

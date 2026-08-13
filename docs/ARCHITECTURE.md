@@ -1,6 +1,8 @@
 # Architecture
 
-## V1
+V2 Hub + V2 Agent is the recommended runtime. V1 is retained as `v1_gateway` for regression/reference.
+
+## V1 legacy/reference
 
 The gateway is both an MCP server and an MCP client.
 
@@ -131,6 +133,24 @@ On macOS, Cua may proxy through its supported application/daemon lifecycle, so t
 The gateway is not an internet authentication service. Remote deployments keep the process on loopback and place authenticated TLS termination in front of it. The `/mcp` boundary additionally validates Host authorities and browser Origin values.
 
 Tool exposure is deny-by-default. Cua's own policy engine can provide a second, argument-aware capability ceiling.
+
+## V2 runtime and optional accounting seam
+
+The actual northbound runtime is now the V2 Hub. The default binary and the explicit `v2_hub` binary share that entrypoint; `v2_agent` remains a separate outbound desktop process. The old single-process V1 entrypoint is preserved as `v1_gateway`.
+
+The usage seam is deliberately outside the authoritative execution controller:
+
+```text
+OAuth verify -> verified issuer+subject -> reserve(1)
+  -> exact DeviceCapability authorization
+  -> CUMG admission / ownership / generation / quarantine
+  -> markLiable()
+  -> persisted Dispatched -> Agent send
+```
+
+`UsageController` has Noop and local-sidecar implementations. The lease carries accounting state only; `v2_execution_safety` does not depend on it. A `markLiable()` failure cancels through the existing pre-dispatch CUMG transition instead of adding a new safety-state branch. Settlement failures are best-effort accounting failures after the execution decision and never trigger business-operation replay.
+
+The bridge is CUMG-owned, loopback-only, and sends no bearer token or tool payload. The initial implementation uses `mcp-usage-control` `MemoryUsageStore`; see [`V2_USAGE_ACCOUNTING.md`](V2_USAGE_ACCOUNTING.md).
 
 ## V2 accepted boundary
 

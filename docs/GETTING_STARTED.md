@@ -1,6 +1,6 @@
 # Getting started
 
-This guide takes a new user from a clean machine to a locally reachable `computer-use-mcp-gateway` endpoint. Get the local path working first. Add a remote tunnel only after local health and MCP discovery work.
+This guide takes a new user from a clean machine to the recommended **V2 Hub + V2 Agent** runtime. V1 remains available as `v1_gateway` for regression/reference, but `cargo run` now starts the V2 Hub and intentionally requires explicit trust/TLS material.
 
 ## What you need
 
@@ -211,88 +211,86 @@ cargo build --locked
 
 `Cargo.lock` is committed and normal builds use `--locked` so the dependency graph is reproducible.
 
-## 6. Start the gateway locally
+## 6. Provision the V2 identities and TLS boundary
 
-The shortest cross-platform path is to pass the initial allowlist as a CLI option instead of loading a shell-specific `.env` file.
-
-### macOS / Linux
+V2 deliberately does not have the old V1 one-line startup because the Hub/Agent trust split is part of the safety model. Create separate Hub, grant, and device identities with `v2_keyctl`; keep secret files outside the repository:
 
 ```bash
-cargo run --locked -- \
-  --allow-tools list_apps,list_windows,get_accessibility_tree,get_screen_size
+cargo run --locked --bin v2_keyctl -- generate-hub /secure/cumg/hub.key /secure/cumg/hub.pub
+cargo run --locked --bin v2_keyctl -- generate-grant /secure/cumg/grant.key /secure/cumg/grant.pub
+cargo run --locked --bin v2_keyctl -- generate-device /secure/cumg/device.key /secure/cumg/device.pub
 ```
 
-### Windows PowerShell
+Use a normal TLS certificate lifecycle for the Hub gRPC endpoint. For Linux service deployment, follow [`../packaging/README.md`](../packaging/README.md) and [`DEPLOYMENT.md`](DEPLOYMENT.md); they define the key placement, TLS root, state directories, and continuity rules. Do not collapse Hub, grant, device, and TLS keys into one credential.
 
-```powershell
-cargo run --locked -- --allow-tools "list_apps,list_windows,get_accessibility_tree,get_screen_size"
-```
+## 7. Start the V2 Hub
 
-Keep this terminal open. The default endpoints are:
-
-```text
-MCP     http://127.0.0.1:8100/mcp
-Health  http://127.0.0.1:8100/healthz
-```
-
-For persistent configuration, copy `.env.example` and set environment variables using the mechanism appropriate for your OS or process manager. The CLI also exposes the same core settings; run:
+The default binary is now the V2 Hub. `v2_hub` remains as an explicit equivalent binary for service packaging:
 
 ```bash
 cargo run --locked -- --help
+# equivalent explicit entrypoint:
+cargo run --locked --bin v2_hub -- --help
 ```
 
-## 7. Check local readiness
+Configure the required Hub/grant/device-public/TLS/state paths plus the Agent-facing gRPC bind. To expose northbound MCP, also configure the loopback `CUMG_V2_MCP_BIND`, canonical public HTTPS resource, OAuth introspection settings, and exact principal -> device -> `DeviceCapability` policy from [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
-### macOS / Linux
+The northbound MCP is not a raw Cua proxy. The current typed V2 contract exposes the existing exact capabilities `list_apps`, `get_screen_size`, `click`, `drag`, `execute_process`, `shell`, `read_file`, and `list_directory`, filtered by the authenticated capability policy.
+
+## 8. Start the V2 Agent on the controlled desktop
+
+The desktop runs a separate outbound Agent:
 
 ```bash
-curl --fail http://127.0.0.1:8100/healthz
+cargo run --locked --bin v2_agent -- --help
 ```
 
-### Windows PowerShell
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8100/healthz
-```
-
-A ready gateway returns the equivalent of:
-
-```json
-{"status":"ok","backend":"ready"}
-```
-
-A successful `/healthz` response means the gateway considers the backend connection ready. It does not prove that every desktop permission and every Cua tool is usable.
-
-## 8. Connect an MCP client
-
-Use MCP **Streamable HTTP** and point the client at:
+Configure the Hub endpoint/domain, stable device ID, device secret, Hub/grant public keys, TLS root, state directory, and allowed cwd roots. To use Cua for the GUI capabilities, configure:
 
 ```text
-http://127.0.0.1:8100/mcp
+CUMG_V2_CUA_COMMAND=cua-driver
+CUMG_V2_CUA_ARGS=mcp
 ```
 
-For Codex CLI, the Codex IDE extension, and ChatGPT desktop's MCP-server settings, see [`CLIENTS.md`](CLIENTS.md). ChatGPT web cannot use this localhost URL directly; remote access requires an authenticated HTTPS endpoint or another product-supported secure tunnel mechanism.
+Cua stays behind the Agent over MCP stdio. On macOS, keep the Agent/Cua in the logged-in user session and do not bypass TCC prompts or move GUI automation into a headless system daemon.
 
-## 9. Add capabilities deliberately
+## 9. Optional runtime usage quota
 
-The gateway exposes no tools when `CUMG_ALLOW_TOOLS` is empty. Add only the tools your workflow needs. For example, a local test that needs interaction might explicitly include selected input tools rather than opening the entire backend surface.
+With no `CUMG_V2_USAGE_ENDPOINT`, V2 uses `NoopUsageController` and Node is not required.
 
-`CUMG_ALLOW_TOOLS=*` means **every discovered backend tool**. Do not use it merely to make setup easier, especially on a remotely reachable gateway.
+To enable the optional local MemoryUsageStore sidecar, follow [`V2_USAGE_ACCOUNTING.md`](V2_USAGE_ACCOUNTING.md). The Hub endpoint must be literal loopback, for example:
 
-For argument-level restrictions, use Cua's native policy engine as a second layer. Start from [`../examples/cua-policy.yaml`](../examples/cua-policy.yaml) and configure `CUA_DRIVER_POLICY_FILE` after reviewing it for your machine.
+```text
+CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/
+CUMG_V2_USAGE_TIMEOUT_SECS=2
+```
 
-## 10. Make it remote only after local success
+This is non-durable runtime/session quota, not billing. Restarting the packaged Hub+sidecar lifecycle resets usage state but never clears CUMG's durable `indeterminate` quarantine.
 
-Once all of these are true:
+## 10. Verify before remote exposure
 
-- `cua-driver doctor` is satisfactory;
-- `cua-driver call list_apps` works;
-- `/healthz` reports `backend: ready`;
-- a local MCP client can list the expected policy-filtered tools;
+Before exposing the northbound MCP resource, verify all of these independently:
 
-then follow [`DEPLOYMENT.md`](DEPLOYMENT.md) to place an authenticated TLS reverse proxy/tunnel in front of the still-loopback-bound gateway.
+- `cua-driver call list_apps` works on the desktop;
+- the V2 Agent connects with the expected stable device and a fresh generation;
+- northbound OAuth produces only the intended issuer+subject principal;
+- `tools/list` contains only capabilities granted by the exact policy;
+- a harmless V2 Cua-backed operation such as `list_apps` or `get_screen_size` succeeds;
+- optional usage accounting increments only when enabled;
+- reconnect does not clear any unresolved CUMG quarantine.
 
-Do not expose `127.0.0.1:8100` by changing it to `0.0.0.0` just to make remote access work.
+Then use [`DEPLOYMENT.md`](DEPLOYMENT.md) for the reviewed reverse-proxy/TLS path. Keep the northbound MCP listener loopback-only.
+
+## Legacy V1 local regression path
+
+For regression/reference only, the former single-process instructions remain available through the explicit `v1_gateway` binary:
+
+```bash
+cargo run --locked --bin v1_gateway -- \
+  --allow-tools list_apps,list_windows,get_accessibility_tree,get_screen_size
+```
+
+Its default endpoints remain `http://127.0.0.1:8100/mcp` and `/healthz`. V1's dynamic 54-tool Cua surface and exact-name allow/deny model are intentionally not copied into the V2 exact-capability contract.
 
 ## If something fails
 

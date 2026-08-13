@@ -1,4 +1,7 @@
-mod backend;
+pub mod backend;
+pub mod config;
+pub mod gateway;
+pub mod policy;
 pub mod v2_m0;
 pub mod v2_m0_backend;
 pub mod v2_m0_execution;
@@ -23,3 +26,5 @@ pub mod v2_limits;
 pub mod v2_multi_device;
 pub mod v2_observability;
 pub mod v2_reference_backend;
+
+pub mod v2_usage;
