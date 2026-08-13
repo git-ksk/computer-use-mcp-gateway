@@ -86,11 +86,7 @@ fn ten_thousand_operations_with_reconnect_churn_keep_v2_state_and_rss_bounded() 
 
         for offset in 0..OPERATIONS_PER_GENERATION {
             let index = generation_index * OPERATIONS_PER_GENERATION + offset;
-            let operation = operation(
-                "desktop-a",
-                format!("resource-soak-{index:05}"),
-                generation,
-            );
+            let operation = operation("desktop-a", format!("resource-soak-{index:05}"), generation);
             let now_ms = u64::try_from(index).unwrap().saturating_mul(4) + 10;
 
             assert!(matches!(
@@ -143,7 +139,8 @@ fn ten_thousand_operations_with_reconnect_churn_keep_v2_state_and_rss_bounded() 
         // Simulate process restart and the authenticated reconnect generation
         // advance. Production calls the same Hub compaction hook when a new
         // Agent session is accepted.
-        hub = AuthoritativeOperationController::restore_after_restart(limits, hub_snapshot).unwrap();
+        hub =
+            AuthoritativeOperationController::restore_after_restart(limits, hub_snapshot).unwrap();
         agent = AgentExecutionGate::restore_after_restart(agent_snapshot).unwrap();
 
         let next_generation = generation + 1;
@@ -152,7 +149,12 @@ fn ten_thousand_operations_with_reconnect_churn_keep_v2_state_and_rss_bounded() 
             .unwrap();
         assert_eq!(removed, OPERATIONS_PER_GENERATION);
         agent.prepare_generation(next_generation).unwrap();
-        assert!(agent.snapshot_for_restart().terminal_operation_ids.is_empty());
+        assert!(
+            agent
+                .snapshot_for_restart()
+                .terminal_operation_ids
+                .is_empty()
+        );
 
         assert_eq!(
             hub.state(&quarantine_operation.operation_id),
