@@ -4,6 +4,7 @@ This file is the implementation roadmap snapshot. Historical acceptance detail l
 
 Canonical V2 product boundary: [`V2_POSITIONING.md`](V2_POSITIONING.md).  
 Standard/OSS boundary: [`V2_STANDARDIZATION.md`](V2_STANDARDIZATION.md).
+P2 replacement-seam review: [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
 
 ## Positioning rule
 
@@ -172,7 +173,7 @@ M2 acceptance requires:
 
 A machine registry, device list, or successful routing to two machines is **not** sufficient M2 acceptance evidence.
 
-P1 fixed-set proof accepted boundary: the implementation composes existing per-device P0 Hubs with independent checkpoints and no shared fleet scheduler. A fresh physical real-Cua P1 rerun remains open on the trusted main-only desktop lane and must not be inferred from deterministic CI.
+P1 fixed-set proof accepted boundary: the implementation composes existing per-device P0 Hubs with independent checkpoints and no shared fleet scheduler. Final physical acceptance also passed on 2026-08-13 against `main` commit `e4eb464` in Desktop E2E run `31655691675`, including durable quarantine across Hub/Agent restart, newer-generation reconnect without replay, explicit resolution, and reuse.
 
 ## V2-M3 — backend portability and OSS integration
 
@@ -189,13 +190,14 @@ After the uncertainty-aware core and multi-device invariant proof pass:
 
 Review maintained standards/OSS before expanding custom implementations:
 
-- [ ] delegated authorization / capability token systems, including SINT/Grantex/Open Agent Auth-class integrations where appropriate;
-- [ ] device registry/fabric/fleet state, including Arm Device Connect or equivalent where appropriate;
-- [ ] OpenClaw or other Computer Use runtimes behind backend adapters where useful;
-- [ ] workload identity such as SPIFFE when operational scale warrants it;
-- [ ] generic policy engines rather than growing a project-specific policy language.
+- [x] delegated authorization candidates reviewed; add the exact `DeviceCapabilityAuthorizer` seam, keep existing OAuth/introspection and in-process policy as defaults, and defer SINT/Grantex/Open Agent Auth dependencies;
+- [x] device registry/fabric candidates reviewed; defer Arm Device Connect and keep immutable fixed-set composition because a generic discovery/failover plane is not yet safer or necessary;
+- [x] Computer Use runtime candidates reviewed; add `ComputerUseBackendAdapter`, keep direct Cua as the default, and defer OpenClaw integration until it provides a concrete operational advantage;
+- [x] ROSClaw reviewed for compatibility/invariant reuse only; do not fork or import its broader robotics runtime/state machine;
+- [x] SPIFFE reviewed and deferred until dynamic workload/trust-domain scale justifies its operational cost;
+- [x] OPA/Cedar-class generic policy engines reviewed and deferred while authorization remains an exact principal/device/capability tuple.
 
-Replacement is allowed only after regression evidence proves the uncertainty-aware execution invariant is preserved or improved.
+The P2 review is accepted when these decisions and narrow seams pass regression. A checked review item does **not** mean the external system was adopted. Replacement remains conditional on evidence that the uncertainty-aware execution invariant is preserved or improved. See [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
 
 ## Later product/fleet work
 

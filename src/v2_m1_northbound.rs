@@ -656,15 +656,46 @@ fn oauth_error_response(
 #[derive(Clone)]
 pub struct V2NorthboundMcp {
     hub: HubHandle,
-    policy: Arc<ClientAuthorizationPolicy>,
+    authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
+}
+
+/// Replacement seam for delegated authorization and generic policy engines.
+///
+/// Implementations only decide the exact authenticated-principal/device/capability tuple.
+/// They do not own CUMG operation identity, desktop ownership, grants, settlement, or
+/// quarantine resolution.
+pub trait DeviceCapabilityAuthorizer: Send + Sync {
+    fn authorize_device_capability(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        device_id: &str,
+        capability: DeviceCapability,
+    ) -> Result<(), TrustError>;
+}
+
+impl DeviceCapabilityAuthorizer for ClientAuthorizationPolicy {
+    fn authorize_device_capability(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        device_id: &str,
+        capability: DeviceCapability,
+    ) -> Result<(), TrustError> {
+        ClientAuthorizationPolicy::authorize_device_capability(
+            self, principal, device_id, capability,
+        )
+    }
 }
 
 impl V2NorthboundMcp {
     pub fn new(hub: HubHandle, policy: ClientAuthorizationPolicy) -> Self {
-        Self {
-            hub,
-            policy: Arc::new(policy),
-        }
+        Self::new_with_authorizer(hub, Arc::new(policy))
+    }
+
+    pub fn new_with_authorizer(
+        hub: HubHandle,
+        authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
+    ) -> Self {
+        Self { hub, authorizer }
     }
 
     fn auth_context(
@@ -684,7 +715,7 @@ impl V2NorthboundMcp {
         principal: &AuthenticatedClientPrincipal,
         capability: DeviceCapability,
     ) -> Result<(), McpError> {
-        self.policy
+        self.authorizer
             .authorize_device_capability(principal, self.hub.device_id(), capability)
             .map_err(|_| McpError::invalid_request("Device capability is not authorized", None))
     }
@@ -694,7 +725,7 @@ impl V2NorthboundMcp {
             .into_iter()
             .filter(|tool| {
                 tool_capability(tool.name.as_ref()).is_some_and(|capability| {
-                    self.policy
+                    self.authorizer
                         .authorize_device_capability(principal, self.hub.device_id(), capability)
                         .is_ok()
                 })
@@ -1147,6 +1178,62 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert_eq!(visible, vec![TOOL_READ_FILE.to_owned()]);
+    }
+
+    #[derive(Debug)]
+    struct ExactTestAuthorizer {
+        principal: AuthenticatedClientPrincipal,
+        device_id: String,
+        capability: DeviceCapability,
+    }
+
+    impl DeviceCapabilityAuthorizer for ExactTestAuthorizer {
+        fn authorize_device_capability(
+            &self,
+            principal: &AuthenticatedClientPrincipal,
+            device_id: &str,
+            capability: DeviceCapability,
+        ) -> Result<(), TrustError> {
+            if principal == &self.principal
+                && device_id == self.device_id
+                && capability == self.capability
+            {
+                Ok(())
+            } else {
+                Err(TrustError::ClientDeviceCapabilityDenied)
+            }
+        }
+    }
+
+    #[test]
+    fn replaceable_authorizer_keeps_exact_principal_device_capability_boundary() {
+        let principal = AuthenticatedClientPrincipal::new("https://auth.example", "u1").unwrap();
+        let authorizer = ExactTestAuthorizer {
+            principal: principal.clone(),
+            device_id: "dev-a".into(),
+            capability: DeviceCapability::ReadFile,
+        };
+        assert!(
+            authorizer
+                .authorize_device_capability(&principal, "dev-a", DeviceCapability::ReadFile)
+                .is_ok()
+        );
+        assert!(
+            authorizer
+                .authorize_device_capability(&principal, "dev-a", DeviceCapability::Shell)
+                .is_err()
+        );
+        assert!(
+            authorizer
+                .authorize_device_capability(&principal, "dev-b", DeviceCapability::ReadFile)
+                .is_err()
+        );
+        let other = AuthenticatedClientPrincipal::new("https://auth.example", "u2").unwrap();
+        assert!(
+            authorizer
+                .authorize_device_capability(&other, "dev-a", DeviceCapability::ReadFile)
+                .is_err()
+        );
     }
 
     #[derive(Clone)]

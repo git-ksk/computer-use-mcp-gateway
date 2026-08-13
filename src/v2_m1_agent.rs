@@ -19,7 +19,9 @@ use crate::v2_m0_transport::{
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
-use crate::v2_m1_backend::{BackendExecutionOutcome, CuaMcpAdapter, M1BackendError};
+use crate::v2_m1_backend::{
+    BackendExecutionOutcome, ComputerUseBackendAdapter, CuaMcpAdapter, M1BackendError,
+};
 use crate::v2_m1_filesystem::{FilesystemError, FilesystemExecutor, FilesystemPolicy};
 use crate::v2_m1_grpc::{
     decode_hub_frame, encode_agent_frame, proto::agent_control_client::AgentControlClient,
@@ -31,6 +33,7 @@ use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -135,7 +138,7 @@ pub struct AgentService {
     executor: ProcessExecutor,
     shell: ShellExecutor,
     filesystem: FilesystemExecutor,
-    cua: Option<CuaMcpAdapter>,
+    computer_use: Option<Arc<dyn ComputerUseBackendAdapter>>,
     trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
     execution: AgentExecutionGate,
@@ -169,6 +172,32 @@ impl AgentService {
         material: AgentProvisionedMaterial,
     ) -> Result<Self, AgentServiceError> {
         config.validate()?;
+        let computer_use = config
+            .cua
+            .as_ref()
+            .map(|cua| Arc::new(cua.adapter()) as Arc<dyn ComputerUseBackendAdapter>);
+        Self::build(config, material, computer_use)
+    }
+
+    pub fn new_with_computer_use_backend(
+        config: AgentServiceConfig,
+        material: AgentProvisionedMaterial,
+        backend: Arc<dyn ComputerUseBackendAdapter>,
+    ) -> Result<Self, AgentServiceError> {
+        if config.cua.is_some() {
+            return Err(AgentServiceError::InvalidConfig(
+                "custom Computer Use backend conflicts with Cua config",
+            ));
+        }
+        config.validate()?;
+        Self::build(config, material, Some(backend))
+    }
+
+    fn build(
+        config: AgentServiceConfig,
+        material: AgentProvisionedMaterial,
+        computer_use: Option<Arc<dyn ComputerUseBackendAdapter>>,
+    ) -> Result<Self, AgentServiceError> {
         let executor = ProcessExecutor::new(
             ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Process)?,
@@ -181,7 +210,6 @@ impl AgentService {
             FilesystemPolicy::new(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Filesystem)?,
         );
-        let cua = config.cua.as_ref().map(CuaAgentConfig::adapter);
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
             .map_err(AgentServiceError::Persistence)?;
         let (trusted_hub, grants, execution) =
@@ -224,7 +252,7 @@ impl AgentService {
             executor,
             shell,
             filesystem,
-            cua,
+            computer_use,
             trusted_hub,
             grants,
             execution,
@@ -256,18 +284,20 @@ impl AgentService {
             DeviceCapability::ReadFile,
             DeviceCapability::ListDirectory,
         ];
-        let backend = if let Some(cua) = &self.cua {
-            for capability in cua.advertisement().supported {
+        let backend = if let Some(computer_use) = &self.computer_use {
+            let advertisement = computer_use.advertisement();
+            let backend = format!("agent-native+{}", advertisement.backend);
+            for capability in advertisement.supported {
                 if !supported.contains(&capability) {
                     supported.push(capability);
                 }
             }
-            "agent-native+cua"
+            backend
         } else {
-            "agent-native"
+            "agent-native".to_owned()
         };
         CapabilityAdvertisement {
-            backend: backend.into(),
+            backend,
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
@@ -282,12 +312,18 @@ impl AgentService {
         &mut self,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), AgentServiceError> {
-        if let Some(cua) = &self.cua {
-            cua.connect().await.map_err(AgentServiceError::Backend)?;
+        if let Some(computer_use) = &self.computer_use {
+            computer_use
+                .connect()
+                .await
+                .map_err(AgentServiceError::Backend)?;
         }
         let result = self.run_connected_lifecycle(&mut shutdown).await;
-        if let Some(cua) = &self.cua {
-            let shutdown_result = cua.shutdown().await.map_err(AgentServiceError::Backend);
+        if let Some(computer_use) = &self.computer_use {
+            let shutdown_result = computer_use
+                .shutdown()
+                .await
+                .map_err(AgentServiceError::Backend);
             if result.is_ok() {
                 shutdown_result?;
             }
@@ -656,10 +692,13 @@ impl AgentService {
                                 | DeviceCommand::ScreenGeometry
                                 | DeviceCommand::PointerClick { .. }
                                 | DeviceCommand::PointerDrag { .. }) => {
-                                    let cua = self.cua.clone().ok_or(AgentServiceError::UnsupportedCommand)?;
+                                    let computer_use = self
+                                        .computer_use
+                                        .clone()
+                                        .ok_or(AgentServiceError::UnsupportedCommand)?;
                                     let (cancel_tx, cancel_rx) = watch::channel(false);
                                     tokio::spawn(async move {
-                                        let outcome = match cua.execute(&command, cancel_rx).await {
+                                        let outcome = match computer_use.execute(&command, cancel_rx).await {
                                             Ok(BackendExecutionOutcome::Completed(result)) => {
                                                 AgentOperationOutcome::Result(Ok(result))
                                             }
@@ -978,6 +1017,111 @@ mod tests {
             config.validate(),
             Err(AgentServiceError::InvalidConfig(_))
         ));
+    }
+
+    #[derive(Debug)]
+    struct FakeComputerUseBackend;
+
+    #[async_trait::async_trait]
+    impl ComputerUseBackendAdapter for FakeComputerUseBackend {
+        fn advertisement(&self) -> CapabilityAdvertisement {
+            CapabilityAdvertisement {
+                backend: "fake-cu".into(),
+                backend_version: "1".into(),
+                platform: "test".into(),
+                capability_schema_version: CAPABILITY_SCHEMA_VERSION,
+                revision: 1,
+                supported: vec![DeviceCapability::ScreenGeometry],
+            }
+        }
+
+        async fn connect(&self) -> Result<(), M1BackendError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), M1BackendError> {
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            command: &DeviceCommand,
+            _cancellation: watch::Receiver<bool>,
+        ) -> Result<BackendExecutionOutcome, M1BackendError> {
+            match command {
+                DeviceCommand::ScreenGeometry => Ok(BackendExecutionOutcome::Completed(
+                    DeviceResult::ScreenGeometry {
+                        width_points: 1,
+                        height_points: 1,
+                        scale_factor_milli: 1_000,
+                    },
+                )),
+                _ => Err(M1BackendError::UnsupportedCommand(command.capability())),
+            }
+        }
+    }
+
+    #[test]
+    fn custom_computer_use_backend_is_injected_without_changing_native_capabilities() {
+        use crate::v2_m0::{DeviceIdentity, GrantAuthority};
+        use crate::v2_m0_transport::HubIdentity;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "cumg-v2-agent-custom-backend-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let config = AgentServiceConfig {
+            hub_endpoint: "https://localhost:7443".into(),
+            hub_domain: "localhost".into(),
+            device_id: "dev-custom-backend".into(),
+            allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
+            state_dir: state_dir.clone(),
+            heartbeat_interval: Duration::from_secs(5),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_secs(1),
+                max_attempts: 3,
+            },
+            cua: None,
+        };
+        let device = DeviceIdentity::generate();
+        let hub = HubIdentity::generate();
+        let grant = GrantAuthority::generate();
+        let material = AgentProvisionedMaterial {
+            device_identity: device,
+            trusted_hub: hub.verifier(),
+            grant_verifier: grant.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: vec![1],
+        };
+        let service = AgentService::new_with_computer_use_backend(
+            config,
+            material,
+            Arc::new(FakeComputerUseBackend),
+        )
+        .unwrap();
+        let capabilities = service.capabilities();
+        assert_eq!(capabilities.backend, "agent-native+fake-cu");
+        assert!(
+            capabilities
+                .supported
+                .contains(&DeviceCapability::ExecuteProcess)
+        );
+        assert!(capabilities.supported.contains(&DeviceCapability::Shell));
+        assert!(capabilities.supported.contains(&DeviceCapability::ReadFile));
+        assert!(
+            capabilities
+                .supported
+                .contains(&DeviceCapability::ListDirectory)
+        );
+        assert!(
+            capabilities
+                .supported
+                .contains(&DeviceCapability::ScreenGeometry)
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]

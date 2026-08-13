@@ -241,6 +241,8 @@ Candidates include:
 
 A replacement is acceptable only after regression evidence shows that the CUMG execution-safety invariant is preserved or improved.
 
+The 2026-08-13 P2 review and concrete adoption decisions are recorded in [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md). It adds narrow authorization and Computer Use backend seams, but no external dependency or new control plane.
+
 ### Reuse externally
 
 CUMG should be willing to consume or integrate with maintained OSS rather than reimplement overlapping surfaces.
@@ -355,4 +357,4 @@ The proof demonstrates that Device A may remain durably quarantined under one pr
 
 Backend portability is proved with a deterministic process-like reference executor whose cancellation/result contract materially differs from Cua. Proven not-started/clean termination may map to an existing terminal evidence class; an unprovable post-commit outcome maps to `indeterminate`. The same operation identity, owner, generation, quarantine, explicit resolution, receipt, and no-replay core is used for both backends.
 
-A fresh physical real-Cua P1 rerun remains an acceptance follow-up because that lane is intentionally main-only on the trusted macOS desktop runner. This does not justify broadening P1 into fleet or backend product work.
+P1 physical acceptance completed on 2026-08-13 against trusted `main` commit `e4eb464` in Desktop E2E run `31655691675`. The real-Cua lane proved ambiguity -> durable quarantine -> Hub/Agent restart and generation advance without replay -> exact explicit resolution -> safe reuse. The workflow remained manual, `main`-only, and executed on an ephemeral TCC-granted macOS runner. This closes the P1 residual without broadening P1 into fleet or backend product work.

@@ -13,6 +13,7 @@ use crate::v2_m0::{
 };
 use crate::v2_m0_transport::CancellationDisposition;
 use anyhow::Error as AnyError;
+use async_trait::async_trait;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::Value;
 use std::fmt;
@@ -35,6 +36,27 @@ impl BackendExecutionOutcome {
             }
         }
     }
+}
+
+/// Replacement seam for a typed Computer Use executor.
+///
+/// Implementations must return `Completed` only when their backend contract has enough
+/// evidence for an ordinary result. Cancellation or timeout after a side effect may have
+/// started must remain an indeterminate outcome; the CUMG Agent/Hub own quarantine and
+/// explicit resolution.
+#[async_trait]
+pub trait ComputerUseBackendAdapter: Send + Sync {
+    fn advertisement(&self) -> CapabilityAdvertisement;
+
+    async fn connect(&self) -> Result<(), M1BackendError>;
+
+    async fn shutdown(&self) -> Result<(), M1BackendError>;
+
+    async fn execute(
+        &self,
+        command: &DeviceCommand,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError>;
 }
 
 #[derive(Clone)]
@@ -141,6 +163,29 @@ impl CuaMcpAdapter {
             }
         };
         Ok(BackendExecutionOutcome::Completed(result))
+    }
+}
+
+#[async_trait]
+impl ComputerUseBackendAdapter for CuaMcpAdapter {
+    fn advertisement(&self) -> CapabilityAdvertisement {
+        CuaMcpAdapter::advertisement(self)
+    }
+
+    async fn connect(&self) -> Result<(), M1BackendError> {
+        CuaMcpAdapter::connect(self).await
+    }
+
+    async fn shutdown(&self) -> Result<(), M1BackendError> {
+        CuaMcpAdapter::shutdown(self).await
+    }
+
+    async fn execute(
+        &self,
+        command: &DeviceCommand,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        CuaMcpAdapter::execute(self, command, cancellation).await
     }
 }
 

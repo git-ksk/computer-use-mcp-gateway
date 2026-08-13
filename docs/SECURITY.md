@@ -77,6 +77,8 @@ A desktop runner with macOS Accessibility and Screen Recording grants is a high-
 
 Use a dedicated test Mac rather than a daily-use workstation, and never execute untrusted pull-request code on that runner. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the final operator-controlled acceptance procedure.
 
+P1 final physical acceptance ran on 2026-08-13 against trusted `main` commit `e4eb464` as Desktop E2E run `31655691675`. The runner was registered ephemerally with the dedicated label, executed only the trusted `main` checkout, and automatically unregistered after the job. The V2 P1 step required exact quarantine to survive Hub/Agent restart and generation advance with no replay before explicit resolution and reuse.
+
 ## CI supply chain
 
 Normal CI has read-only repository permissions and locked Rust dependency resolution. Before real-Cua smoke, CI verifies the pinned Cua installer, platform release payload, and installed executable identity so the installed binary must match the independently verified release payload.
@@ -112,3 +114,16 @@ P1 adds only fixed composition around the P0 core. The security review covers th
 - **compromised backend evidence:** unchanged trust boundary. A malicious authenticated Agent/backend may falsely claim terminal evidence or perform side effects outside CUMG. The reference executor proves adapter classification rules for conforming backends; it is not remote attestation or Byzantine proof.
 
 The proof intentionally does not add generic authorization, mutable device enrollment/discovery, a fleet scheduler, new policy language, native GUI backends, or a ROSClaw fork.
+
+## V2 P2 replacement-seam security boundary
+
+P2 does not delegate the execution-safety authority to an external authorization system, policy engine, device fabric, or Computer Use runtime. The detailed review is in [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
+
+The two new seams are intentionally one-way and narrow:
+
+- `DeviceCapabilityAuthorizer` may answer only whether one authenticated principal may use one exact `DeviceCapability` on one stable device ID. It cannot create/settle an operation, change ownership/generation, clear quarantine, or forward a northbound bearer token to the Agent.
+- `ComputerUseBackendAdapter` may advertise typed capabilities and return the existing `BackendExecutionOutcome`. It cannot own the Hub ledger or resolution path. A cancellation, timeout, disconnect, or other post-side-effect uncertainty without sufficient backend evidence must remain `indeterminate` and flow into the unchanged Hub quarantine path.
+
+A future SINT/Grantex/Open Agent Auth/OPA/Cedar adapter must fail closed when its authorization state is unavailable or ambiguous. A future Arm Device Connect or other fabric integration must treat discovery and liveness as routing inputs only: they are never proof of ownership, safe settlement, or safe reuse. A future OpenClaw or other Computer Use adapter must remain an executor under the CUMG operation ID and fences rather than introducing a second authoritative action lifecycle.
+
+The existing compromised-backend boundary still applies. A malicious authenticated backend can lie about a claimed result or act outside CUMG; the adapter seam does not create remote attestation. P2 is designed to avoid making that trust boundary larger.
