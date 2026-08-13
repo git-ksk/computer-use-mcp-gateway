@@ -22,11 +22,22 @@ jobs:
           ref: main
           persist-credentials: false
 
+      - name: Establish trusted runner tool paths
+        shell: bash
+        run: |
+          printf '%s\n' \
+            "$HOME/.cargo/bin" \
+            "$HOME/.local/bin" \
+            "/opt/homebrew/bin" \
+            "/usr/local/bin" \
+            >> "$GITHUB_PATH"
+          test -x "$HOME/.cargo/bin/rustup"
+
       - name: Install Rust 1.88
         shell: bash
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
+          "$HOME/.cargo/bin/rustup" toolchain install 1.88.0 --profile minimal
+          "$HOME/.cargo/bin/rustup" default 1.88.0
 
       - name: Verify preconfigured Cua Driver
         shell: bash
