@@ -27,6 +27,8 @@ python3 scripts/v1_conformance.py
 
 V2 observability hardening also has deterministic regressions for payload-safe protocol rejection, safe backend/persistence/OAuth debug formatting, indeterminate/resolution correlation fields, and the closed low-cardinality metric attribute set. The protocol fixture deliberately embeds stdout, stderr and signature markers and captures tracing output; none may appear in the event or rendered error. Existing execution-safety tests remain the semantic gate for operation ownership, generation fencing, durable indeterminate quarantine, explicit resolution and no automatic replay.
 
+V2 usage integration adds deterministic tests for Noop compatibility, 0/1-unit lease state, denied reservation, the `markLiable -> persisted Dispatched -> Agent send` ordering, and the architectural rule that the execution-safety module has no usage dependency. The CUMG-owned Node sidecar has a separate source-level test against the real `mcp-usage-control` `MemoryUsageStore` covering allow, zero settlement/release, full settlement, quota exhaustion, duplicate `operationId`, restart state loss, and rejection of accidental payload fields.
+
 For an observability/operations change, run the stricter local gate before spending CI capacity:
 
 ```bash
@@ -101,6 +103,17 @@ For each OS, CI:
 8. runs real-Cua MCP smoke for `2026-07-28`.
 
 The smoke harness exercises the actual Gateway → `cua-driver mcp` path, backend tool discovery, `/healthz`, northbound MCP lifecycle behavior, tool filtering, deny-policy behavior, backend resource telemetry availability where supported, and rejection of malicious Host/Origin values.
+
+### Optional MCPUsage sidecar test
+
+The sidecar is intentionally not published as a package. To test it against a checked-out/built `mcp-usage-control` core, point the module specifier at that local ESM build:
+
+```bash
+CUMG_MCP_USAGE_CONTROL_MODULE=file:///absolute/path/to/mcp-usage-control/packages/core/dist/index.js \
+  node --test integrations/mcp-usage-control-sidecar/server.test.mjs
+```
+
+This test demonstrates MemoryUsageStore semantics only; it is not a durable billing test. Restart intentionally resets the in-memory quota.
 
 ## Documentation CI
 

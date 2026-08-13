@@ -7,13 +7,16 @@
 //! policy. Southbound Hub/Agent messages continue to carry only typed commands
 //! and short-lived exact capability grants.
 
+use crate::v2_observability::SafeErrorCode;
 use crate::{
     v2_execution_safety::OperationOwner,
     v2_m0::{
-        DeviceCapability, DeviceCommand, DeviceResult, ProcessEnvVar, ProcessRequest, ShellRequest,
+        DeviceCapability, DeviceCommand, DeviceResult, PointerButton, ProcessEnvVar,
+        ProcessRequest, ShellRequest,
     },
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
+    v2_usage::{UsageError, UsageLease, UsageManager, UsageOperation, UsageSettlement},
 };
 use async_trait::async_trait;
 use axum::{
@@ -54,6 +57,10 @@ use tracing::warn;
 
 const DEFAULT_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BEARER_TOKEN_BYTES: usize = 16 * 1024;
+const TOOL_LIST_APPS: &str = "list_apps";
+const TOOL_GET_SCREEN_SIZE: &str = "get_screen_size";
+const TOOL_CLICK: &str = "click";
+const TOOL_DRAG: &str = "drag";
 const TOOL_EXECUTE_PROCESS: &str = "execute_process";
 const TOOL_SHELL: &str = "shell";
 const TOOL_READ_FILE: &str = "read_file";
@@ -699,6 +706,7 @@ fn oauth_error_response(
 pub struct V2NorthboundMcp {
     hub: HubHandle,
     authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
+    usage: UsageManager,
 }
 
 /// Replacement seam for delegated authorization and generic policy engines.
@@ -730,14 +738,34 @@ impl DeviceCapabilityAuthorizer for ClientAuthorizationPolicy {
 
 impl V2NorthboundMcp {
     pub fn new(hub: HubHandle, policy: ClientAuthorizationPolicy) -> Self {
-        Self::new_with_authorizer(hub, Arc::new(policy))
+        Self::new_with_authorizer_and_usage(hub, Arc::new(policy), UsageManager::noop())
+    }
+
+    pub fn new_with_usage(
+        hub: HubHandle,
+        policy: ClientAuthorizationPolicy,
+        usage: UsageManager,
+    ) -> Self {
+        Self::new_with_authorizer_and_usage(hub, Arc::new(policy), usage)
     }
 
     pub fn new_with_authorizer(
         hub: HubHandle,
         authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
     ) -> Self {
-        Self { hub, authorizer }
+        Self::new_with_authorizer_and_usage(hub, authorizer, UsageManager::noop())
+    }
+
+    pub fn new_with_authorizer_and_usage(
+        hub: HubHandle,
+        authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
+        usage: UsageManager,
+    ) -> Self {
+        Self {
+            hub,
+            authorizer,
+            usage,
+        }
     }
 
     fn auth_context(
@@ -790,21 +818,74 @@ impl V2NorthboundMcp {
     async fn execute_command(
         &self,
         principal: &AuthenticatedClientPrincipal,
+        operation_id: String,
         command: DeviceCommand,
+        usage: UsageLease,
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
         let owner = OperationOwner::from_principal(principal);
-        let pending = self
+        let read_only = matches!(
+            command,
+            DeviceCommand::ListApplications
+                | DeviceCommand::ScreenGeometry
+                | DeviceCommand::ReadFile { .. }
+                | DeviceCommand::ListDirectory { .. }
+        );
+        let pending = match self
             .hub
-            .start_command_as(owner.clone(), command)
+            .start_command_as_with_id(
+                owner.clone(),
+                operation_id.clone(),
+                command,
+                Some(usage.clone()),
+            )
             .await
-            .map_err(hub_error_to_mcp)?;
-        let operation_id = pending.operation_id.clone();
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                settle_usage_best_effort(&usage, UsageSettlement::Zero, "pre_dispatch_rejected")
+                    .await;
+                return Err(hub_error_to_mcp(error));
+            }
+        };
         let mut wait = Box::pin(pending.wait());
         tokio::select! {
-            result = &mut wait => result.map(|result| result.result).map_err(hub_error_to_mcp),
+            result = &mut wait => {
+                match result {
+                    Ok(result) => {
+                        let settlement = if usage.was_dispatched() {
+                            UsageSettlement::Full
+                        } else {
+                            UsageSettlement::Zero
+                        };
+                        let outcome = if usage.was_dispatched() { "completed" } else { "pre_dispatch_no_effect" };
+                        settle_usage_best_effort(&usage, settlement, outcome).await;
+                        Ok(result.result)
+                    }
+                    Err(error) => {
+                        let (settlement, outcome) =
+                            usage_settlement_for_error(usage.was_dispatched(), read_only, &error);
+                        settle_usage_best_effort(&usage, settlement, outcome).await;
+                        Err(hub_error_to_mcp(error))
+                    }
+                }
+            },
             _ = context.ct.cancelled() => {
-                let _ = self.hub.cancel_as(owner, operation_id).await;
+                let cancellation = self.hub.cancel_as(owner, operation_id).await;
+                let (settlement, outcome) = if usage.was_dispatched() {
+                    (UsageSettlement::Full, "cancelled_after_dispatch")
+                } else {
+                    (UsageSettlement::Zero, "cancelled_before_dispatch")
+                };
+                settle_usage_best_effort(&usage, settlement, outcome).await;
+                if let Err(error) = cancellation {
+                    warn!(
+                        event = "v2_northbound_cancel_failed",
+                        outcome = "original_call_cancelled",
+                        error_code = error.safe_error_code(),
+                        "CUMG cancellation request failed; execution safety state remains authoritative"
+                    );
+                }
                 Err(McpError::invalid_request("Tool call was cancelled", None))
             }
         }
@@ -852,12 +933,56 @@ impl ServerHandler for V2NorthboundMcp {
         let auth = Self::auth_context(&context)?;
         let capability = tool_capability(request.name.as_ref())
             .ok_or_else(|| McpError::invalid_params("Unknown V2 Hub tool", None))?;
-        self.authorize(&auth.principal, capability)?;
+        let operation_id = self.hub.new_operation_id();
+        // OAuth has already reduced the bearer token to this verified issuer +
+        // subject. Usage admission receives only that principal identity and the
+        // tool name; request arguments and bearer material never cross the seam.
+        let usage = self
+            .usage
+            .reserve(UsageOperation {
+                operation_id: operation_id.clone(),
+                issuer: auth.principal.issuer.clone(),
+                subject: auth.principal.subject.clone(),
+                tool: request.name.to_string(),
+            })
+            .await
+            .map_err(usage_error_to_mcp)?;
 
-        let command = match request.name.as_ref() {
+        if let Err(error) = self.authorize(&auth.principal, capability) {
+            settle_usage_best_effort(&usage, UsageSettlement::Zero, "authorization_denied").await;
+            return Err(error);
+        }
+
+        let command_result: Result<DeviceCommand, McpError> = (|| match request.name.as_ref() {
+            TOOL_LIST_APPS => Ok(DeviceCommand::ListApplications),
+            TOOL_GET_SCREEN_SIZE => Ok(DeviceCommand::ScreenGeometry),
+            TOOL_CLICK => {
+                let args: ClickArgs = parse_arguments(request.arguments)?;
+                Ok(DeviceCommand::PointerClick {
+                    x: args.x,
+                    y: args.y,
+                    button: parse_pointer_button(args.button.as_deref())?,
+                })
+            }
+            TOOL_DRAG => {
+                let args: DragArgs = parse_arguments(request.arguments)?;
+                if args.duration_ms == 0 || args.duration_ms > 10_000 {
+                    return Err(McpError::invalid_params(
+                        "duration_ms must be within 1..=10000",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::PointerDrag {
+                    from_x: args.from_x,
+                    from_y: args.from_y,
+                    to_x: args.to_x,
+                    to_y: args.to_y,
+                    duration_ms: args.duration_ms,
+                })
+            }
             TOOL_EXECUTE_PROCESS => {
                 let args: ExecuteProcessArgs = parse_arguments(request.arguments)?;
-                DeviceCommand::ExecuteProcess {
+                Ok(DeviceCommand::ExecuteProcess {
                     request: ProcessRequest {
                         program: args.program,
                         args: args.args,
@@ -865,36 +990,92 @@ impl ServerHandler for V2NorthboundMcp {
                         env: env_map(args.env),
                         timeout_ms: args.timeout_ms,
                     },
-                }
+                })
             }
             TOOL_SHELL => {
                 let args: ShellArgs = parse_arguments(request.arguments)?;
-                DeviceCommand::Shell {
+                Ok(DeviceCommand::Shell {
                     request: ShellRequest {
                         command: args.command,
                         cwd: args.cwd,
                         env: env_map(args.env),
                         timeout_ms: args.timeout_ms,
                     },
-                }
+                })
             }
             TOOL_READ_FILE => {
                 let args: PathArgs = parse_arguments(request.arguments)?;
-                DeviceCommand::ReadFile { path: args.path }
+                Ok(DeviceCommand::ReadFile { path: args.path })
             }
             TOOL_LIST_DIRECTORY => {
                 let args: PathArgs = parse_arguments(request.arguments)?;
-                DeviceCommand::ListDirectory { path: args.path }
+                Ok(DeviceCommand::ListDirectory { path: args.path })
             }
-            _ => return Err(McpError::invalid_params("Unknown V2 Hub tool", None)),
+            _ => Err(McpError::invalid_params("Unknown V2 Hub tool", None)),
+        })();
+        let command = match command_result {
+            Ok(command) => command,
+            Err(error) => {
+                settle_usage_best_effort(&usage, UsageSettlement::Zero, "invalid_arguments").await;
+                return Err(error);
+            }
         };
 
         let result = self
-            .execute_command(&auth.principal, command, &context)
+            .execute_command(&auth.principal, operation_id, command, usage, &context)
             .await?;
         let value = serde_json::to_string(&result)
             .map_err(|_| McpError::internal_error("Failed to serialize device result", None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(value)]).into())
+    }
+}
+
+fn usage_settlement_for_error(
+    dispatched: bool,
+    read_only: bool,
+    error: &HubCommandError,
+) -> (UsageSettlement, &'static str) {
+    if !dispatched {
+        return (UsageSettlement::Zero, "pre_dispatch_rejected");
+    }
+    if read_only && matches!(error, HubCommandError::Remote(_)) {
+        // A verified remote failure of a read-only operation is the intentionally
+        // narrow current post-dispatch path where no state-changing effect can be
+        // attributed to the business operation.
+        return (UsageSettlement::Zero, "proven_no_effect");
+    }
+    // Any dispatched mutable-operation failure, timeout/disconnect, or
+    // indeterminate state is charged fully. Accounting never authorizes replay.
+    (UsageSettlement::Full, "dispatched_conservative")
+}
+
+async fn settle_usage_best_effort(
+    usage: &UsageLease,
+    settlement: UsageSettlement,
+    outcome: &'static str,
+) {
+    if let Err(error) = usage.settle(settlement, outcome).await {
+        // Settlement/reconciliation is intentionally separated from execution.
+        // Never clear quarantine, retry a business operation, or hide a completed
+        // result because the optional accounting sidecar is unavailable.
+        warn!(
+            event = "v2_usage_settlement_failed",
+            operation_id = usage.operation_id(),
+            outcome,
+            error_code = error.safe_error_code(),
+            "usage settlement failed; CUMG execution state remains authoritative"
+        );
+    }
+}
+
+fn usage_error_to_mcp(error: UsageError) -> McpError {
+    match error {
+        UsageError::Denied(_) => McpError::invalid_request("Usage quota denied", None),
+        UsageError::Unavailable
+        | UsageError::InvalidResponse
+        | UsageError::InvalidConfiguration => {
+            McpError::internal_error("Usage accounting is temporarily unavailable", None)
+        }
     }
 }
 
@@ -906,6 +1087,7 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
             "Device execution state is indeterminate"
         }
         HubCommandError::CancelledBeforeDispatch => "Operation was cancelled before dispatch",
+        HubCommandError::UsageUnavailable => "Usage accounting is temporarily unavailable",
         _ => "Device operation was rejected or could not be completed",
     };
     McpError::invalid_request(message, None)
@@ -913,6 +1095,10 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
 
 fn tool_capability(name: &str) -> Option<DeviceCapability> {
     match name {
+        TOOL_LIST_APPS => Some(DeviceCapability::ListApplications),
+        TOOL_GET_SCREEN_SIZE => Some(DeviceCapability::ScreenGeometry),
+        TOOL_CLICK => Some(DeviceCapability::PointerClick),
+        TOOL_DRAG => Some(DeviceCapability::PointerDrag),
         TOOL_EXECUTE_PROCESS => Some(DeviceCapability::ExecuteProcess),
         TOOL_SHELL => Some(DeviceCapability::Shell),
         TOOL_READ_FILE => Some(DeviceCapability::ReadFile),
@@ -923,6 +1109,46 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
 
 fn all_tools() -> Vec<Tool> {
     vec![
+        Tool::new(
+            TOOL_LIST_APPS,
+            "List applications through the enrolled computer-use backend.",
+            object_schema(vec![], &[]),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_GET_SCREEN_SIZE,
+            "Read desktop screen geometry through the enrolled computer-use backend.",
+            object_schema(vec![], &[]),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_CLICK,
+            "Click desktop coordinates through the enrolled computer-use backend.",
+            object_schema(
+                vec![
+                    ("x", signed_integer_schema()),
+                    ("y", signed_integer_schema()),
+                    ("button", string_schema()),
+                ],
+                &["x", "y"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_DRAG,
+            "Drag the desktop pointer through the enrolled computer-use backend.",
+            object_schema(
+                vec![
+                    ("from_x", signed_integer_schema()),
+                    ("from_y", signed_integer_schema()),
+                    ("to_x", signed_integer_schema()),
+                    ("to_y", signed_integer_schema()),
+                    ("duration_ms", positive_integer_schema()),
+                ],
+                &["from_x", "from_y", "to_x", "to_y", "duration_ms"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_EXECUTE_PROCESS,
             "Execute a structured local process on the enrolled device.",
@@ -1000,8 +1226,42 @@ fn string_map_schema() -> Value {
     json!({ "type": "object", "additionalProperties": { "type": "string" } })
 }
 
+fn signed_integer_schema() -> Value {
+    json!({ "type": "integer" })
+}
+
 fn positive_integer_schema() -> Value {
     json!({ "type": "integer", "minimum": 1 })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClickArgs {
+    x: i32,
+    y: i32,
+    button: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DragArgs {
+    from_x: i32,
+    from_y: i32,
+    to_x: i32,
+    to_y: i32,
+    duration_ms: u64,
+}
+
+fn parse_pointer_button(value: Option<&str>) -> Result<PointerButton, McpError> {
+    match value.unwrap_or("left") {
+        "left" => Ok(PointerButton::Left),
+        "right" => Ok(PointerButton::Right),
+        "middle" => Ok(PointerButton::Middle),
+        _ => Err(McpError::invalid_params(
+            "button must be left, right, or middle",
+            None,
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1559,5 +1819,67 @@ mod tests {
         let token_debug = format!("{token:?}");
         assert!(!token_debug.contains("PRIVATE_SUBJECT_DO_NOT_LOG"));
         assert!(token_debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn northbound_exposes_existing_exact_cua_capabilities_without_generic_raw_tool() {
+        let mappings = [
+            (TOOL_LIST_APPS, DeviceCapability::ListApplications),
+            (TOOL_GET_SCREEN_SIZE, DeviceCapability::ScreenGeometry),
+            (TOOL_CLICK, DeviceCapability::PointerClick),
+            (TOOL_DRAG, DeviceCapability::PointerDrag),
+            (TOOL_EXECUTE_PROCESS, DeviceCapability::ExecuteProcess),
+            (TOOL_SHELL, DeviceCapability::Shell),
+            (TOOL_READ_FILE, DeviceCapability::ReadFile),
+            (TOOL_LIST_DIRECTORY, DeviceCapability::ListDirectory),
+        ];
+        for (tool, capability) in mappings {
+            assert_eq!(tool_capability(tool), Some(capability));
+        }
+        let names: Vec<_> = all_tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(names.len(), mappings.len());
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "raw_cua" || name == "call_tool")
+        );
+    }
+
+    #[test]
+    fn pointer_button_and_drag_bounds_fail_closed() {
+        assert_eq!(parse_pointer_button(None).unwrap(), PointerButton::Left);
+        assert_eq!(
+            parse_pointer_button(Some("right")).unwrap(),
+            PointerButton::Right
+        );
+        assert!(parse_pointer_button(Some("primary")).is_err());
+    }
+
+    #[test]
+    fn usage_outcome_mapping_is_conservative_after_dispatch() {
+        let remote = HubCommandError::Remote(crate::v2_m0::DeviceErrorCode::InternalFailure);
+        assert_eq!(
+            usage_settlement_for_error(false, false, &HubCommandError::Rejected),
+            (UsageSettlement::Zero, "pre_dispatch_rejected")
+        );
+        assert_eq!(
+            usage_settlement_for_error(true, true, &remote),
+            (UsageSettlement::Zero, "proven_no_effect")
+        );
+        assert_eq!(
+            usage_settlement_for_error(true, false, &remote),
+            (UsageSettlement::Full, "dispatched_conservative")
+        );
+        assert_eq!(
+            usage_settlement_for_error(true, false, &HubCommandError::Indeterminate),
+            (UsageSettlement::Full, "dispatched_conservative")
+        );
+        assert_eq!(
+            usage_settlement_for_error(true, false, &HubCommandError::SessionClosed),
+            (UsageSettlement::Full, "dispatched_conservative")
+        );
     }
 }

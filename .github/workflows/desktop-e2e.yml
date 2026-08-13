@@ -47,7 +47,7 @@ jobs:
 
       - name: Build locked gateway
         shell: bash
-        run: cargo build --locked
+        run: cargo build --locked --bin v1_gateway
 
       - name: Real desktop screenshot click type verify
         shell: bash

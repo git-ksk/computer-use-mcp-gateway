@@ -32,9 +32,9 @@ SCENARIOS = ("server-initialize", "tools-list", "dns-rebinding-protection")
 
 
 def gateway_binary() -> Path:
-    path = Path("target/debug/computer-use-mcp-gateway")
+    path = Path("target/debug/v1_gateway")
     if not path.exists():
-        raise RuntimeError(f"gateway binary missing: {path}; run cargo build --locked first")
+        raise RuntimeError(f"gateway binary missing: {path}; run cargo build --locked --bin v1_gateway first")
     return path.resolve()
 
 

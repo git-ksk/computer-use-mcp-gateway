@@ -2,7 +2,7 @@
 
 A lightweight Rust gateway that exposes a local computer-use MCP backend through a policy-controlled MCP Streamable HTTP endpoint.
 
-> Status: **V1 closed / V2 complete (2026-08-13)**. V1 is the hardened MCP↔Cua gateway. V2 adds an uncertainty-aware execution-safety layer for delegated control of stateful interactive desktops; see [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md).
+> Status: **V2 recommended runtime / V1 legacy-reference (2026-08-13)**. The default `computer-use-mcp-gateway` binary now runs the V2 Hub; desktops run the separate `v2_agent`. V1 remains available as `v1_gateway` for regression/reference. See [`docs/V2_USAGE_ACCOUNTING.md`](docs/V2_USAGE_ACCOUNTING.md) for the optional MCPUsage integration.
 
 ## Start here
 
@@ -18,72 +18,52 @@ New to the project? Follow **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md
 
 If setup fails, use **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** instead of opening the security boundary until it works.
 
-### Short local path
+### Recommended runtime
 
-Assuming Git, Rust 1.88+, and a working Cua Driver 0.19.3 are already installed:
+Build all binaries first:
 
 ```bash
 git clone https://github.com/git-ksk/computer-use-mcp-gateway.git
 cd computer-use-mcp-gateway
 cargo build --locked
-cargo run --locked -- --allow-tools list_apps,list_windows,get_accessibility_tree,get_screen_size
 ```
 
-Then check:
+The recommended deployment is **V2 Hub + V2 Agent**. Key/trust/TLS provisioning is intentionally explicit, so use [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) rather than replacing those boundaries with an insecure one-line example. `cargo run --locked -- --help` now shows the V2 Hub options; `cargo run --locked --bin v2_agent -- --help` shows the desktop Agent options.
+
+The V2 northbound MCP exposes the typed capabilities already present in the V2 contract, including the existing Cua-backed `list_apps`, `get_screen_size`, `click`, and `drag` operations. It does **not** expose a generic/raw Cua passthrough.
+
+For V1-only regression or legacy operation:
 
 ```bash
-curl --fail http://127.0.0.1:8100/healthz
+cargo run --locked --bin v1_gateway -- --allow-tools list_apps,list_windows,get_accessibility_tree,get_screen_size
 ```
 
-A ready response has `status: ok` and `backend: ready` and may include a `backend_resources` snapshot for the gateway-owned backend child process:
-
-```json
-{
-  "status": "ok",
-  "backend": "ready",
-  "backend_resources": {
-    "pid": 12345,
-    "cpu_seconds": 0.12,
-    "rss_bytes": 17817600
-  }
-}
-```
-
-The starter allowlist is non-mutating but **not non-sensitive**: application/window names and accessibility text can contain private information.
-
-Local MCP endpoint:
-
-```text
-http://127.0.0.1:8100/mcp
-```
-
-For Codex CLI/IDE, ChatGPT desktop, ChatGPT web, and generic Streamable HTTP clients, see [`docs/CLIENTS.md`](docs/CLIENTS.md).
+V1 remains source-compatible for regression but is no longer the recommended runtime.
 
 ## Architecture
 
 ```text
 MCP client
     |
-    | local Streamable HTTP
-    | or authenticated TLS proxy for remote use
+    | OAuth-protected MCP
     v
-+-----------------------------+
-| computer-use-mcp-gateway    |
-|                             |
-| Host / Origin guards        |
-| deny-by-default tool policy |
-| audit / timeout / reconnect |
-| serialized backend access   |
-+-------------|---------------+
-              |
-              | MCP stdio
-              v
-         cua-driver mcp
-              |
-      macOS / Windows / Linux
+V2 Hub northbound
+    |  optional MCPUsage reserve
+    |  CUMG authorization / ownership / generation / quarantine
+    |  optional MCPUsage markLiable
+    |
+    | gRPC bidirectional stream over TLS
+    v
+V2 Agent
+    |
+    | MCP stdio
+    v
+Cua Driver
 ```
 
-The gateway owns the MCP network/policy boundary. Cua owns desktop automation and OS-specific permissions.
+CUMG is the execution/replay/quarantine authority. Optional MCPUsage is accounting authority only and cannot clear `indeterminate`, authorize replay, or replace explicit resolution. With usage disabled, V2 uses `NoopUsageController` and requires no Node sidecar.
+
+The exact authority split, 0/1-unit settlement rules, failure semantics, and non-durable `MemoryUsageStore` boundary are documented in [`docs/V2_USAGE_ACCOUNTING.md`](docs/V2_USAGE_ACCOUNTING.md).
 
 ## V1 capabilities
 
@@ -129,7 +109,13 @@ For an additional backend-side capability ceiling, review [`examples/cua-policy.
 
 ## Configuration
 
-All settings are available through CLI/environment configuration. Run `cargo run --locked -- --help` for CLI flags. `.env.example` provides a persistent environment template.
+The default binary is the V2 Hub. Run `cargo run --locked -- --help` for its Hub/northbound options and `cargo run --locked --bin v2_agent -- --help` for Agent options. Packaged examples live under `packaging/`.
+
+Optional usage accounting is enabled only when `CUMG_V2_USAGE_ENDPOINT` is set to a literal loopback endpoint such as `http://127.0.0.1:8787/`; otherwise the Noop controller preserves normal V2 behavior. The sidecar uses a required positive `CUMG_USAGE_LIMIT_PER_PRINCIPAL` and a non-durable `MemoryUsageStore`.
+
+### Legacy V1 settings
+
+The following variables belong to `v1_gateway` and remain for regression/reference:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -153,11 +139,9 @@ V1 splits `CUMG_BACKEND_ARGS` on ASCII whitespace and does not implement shell-s
 
 ## Remote access
 
-Do **not** bind directly to `0.0.0.0` just to make the gateway remote.
+For V2, keep the northbound MCP listener loopback-only and terminate the public HTTPS resource at a reviewed proxy/load balancer. V2 validates OAuth/introspection before constructing the principal that reaches CUMG or MCPUsage. The Agent connects outbound to the Hub over the existing gRPC/TLS carrier.
 
-Keep the gateway on loopback and place an authenticated TLS reverse proxy/tunnel in front of it. [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) includes a Cloudflare Access/Tunnel path and explains the Host/Origin guard configuration.
-
-The gateway does not provide public authentication itself in V1.
+The older Cloudflare/V1 deployment guidance remains documented for `v1_gateway`; do not confuse that legacy path with the recommended V2 OAuth boundary. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Development
 

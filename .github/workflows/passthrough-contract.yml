@@ -24,7 +24,7 @@ jobs:
         run: python3 -m py_compile scripts/mock_mcp_backend.py scripts/v1_passthrough_contract.py
 
       - name: Build gateway
-        run: cargo build --locked
+        run: cargo build --locked --bin v1_gateway
 
       - name: Verify transparent session and identity passthrough
         run: python3 scripts/v1_passthrough_contract.py

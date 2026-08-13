@@ -1,5 +1,6 @@
 [package]
 name = "computer-use-mcp-gateway"
+default-run = "computer-use-mcp-gateway"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"

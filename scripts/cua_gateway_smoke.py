@@ -85,7 +85,7 @@ def assert_pinned_tool_surface(names: list[str]) -> None:
 
 def gateway_binary() -> Path:
     suffix = ".exe" if os.name == "nt" else ""
-    path = Path("target") / "debug" / f"computer-use-mcp-gateway{suffix}"
+    path = Path("target") / "debug" / f"v1_gateway{suffix}"
     if not path.exists():
         raise RuntimeError(f"gateway binary missing: {path}")
     return path.resolve()

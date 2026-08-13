@@ -1,8 +1,8 @@
 # Deployment
 
-V1 is designed to run on the same machine as the computer-use backend and remain bound to loopback. Remote access comes from a separate authenticated TLS reverse proxy or tunnel.
+V2 Hub + V2 Agent is the recommended deployment. The later V1 sections remain for `v1_gateway` regression/reference only.
 
-Get the local path working with [`GETTING_STARTED.md`](GETTING_STARTED.md) before following this guide.
+Get the V2 trust/key path working with [`GETTING_STARTED.md`](GETTING_STARTED.md) before exposing either listener.
 
 ## V2-M1 deployment boundary
 
@@ -43,6 +43,12 @@ sudo systemd-creds encrypt --name=grant-secret /secure/admin/grant.key   /etc/cr
 Keep the recovery/rotation copy in the operator's normal secret manager. Do not retain plaintext administrative copies in the checkout. The service receives `%d/hub-secret`, `%d/grant-secret`, and `%d/tls-key` paths; private bytes are not environment-variable values.
 
 For northbound OAuth introspection, use the optional encrypted-credential drop-in in `packaging/systemd/cumg-v2-hub-oauth-credential.conf.example` rather than putting the client secret in `hub.env`.
+
+#### Optional MemoryUsageStore sidecar
+
+Usage accounting is disabled by default. To enable it, install `packaging/systemd/cumg-v2-usage-sidecar.service`, copy `usage.env.example` outside the repository, build/install `mcp-usage-control` core from source locally, and install the optional `cumg-v2-hub-usage.conf.example` drop-in. The Hub then uses `CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/`.
+
+The drop-in couples the sidecar lifecycle to Hub restart; therefore an explicit packaged Hub restart recreates the non-durable MemoryUsageStore. If you manually supervise Hub and sidecar separately, a Hub-only restart does not reset a still-running sidecar. In either case, usage reset never clears CUMG operation/quarantine checkpoints. Do not use this Memory store as a financial ledger. See [`V2_USAGE_ACCOUNTING.md`](V2_USAGE_ACCOUNTING.md).
 
 ### TLS renewal
 
@@ -91,7 +97,7 @@ For an incident, correlate Hub and Agent by `device_id` + `generation`, then fol
 
 See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md) for the final security gate and [`../packaging/README.md`](../packaging/README.md) for lifecycle details.
 
-## Required topology
+## V1 legacy/reference topology
 
 ```text
 Remote MCP client
