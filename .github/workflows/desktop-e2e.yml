@@ -40,7 +40,13 @@ jobs:
 
       - name: Real desktop screenshot click type verify
         shell: bash
-        run: python3 scripts/cua_desktop_e2e.py
+        run: |
+          # Cua launch_app is background-only. Put the trusted runner on the ordinary
+          # macOS Desktop immediately before the fixture so TextEdit opens on the
+          # current Space and its Accessibility tree is observable.
+          /usr/bin/osascript -e 'tell application "Finder" to activate'
+          sleep 1
+          python3 scripts/cua_desktop_e2e.py
 
       - name: V2 P1 real-Cua ambiguity restart recovery
         shell: bash
