@@ -199,6 +199,8 @@ Review maintained standards/OSS before expanding custom implementations:
 
 The P2 review is accepted when these decisions and narrow seams pass regression. A checked review item does **not** mean the external system was adopted. Replacement remains conditional on evidence that the uncertainty-aware execution invariant is preserved or improved. See [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
 
+Final P2 integration acceptance remains **open** until the merged `main` code passes the trusted main-only real-Cua Desktop E2E. Do not infer that physical proof from branch CI or deterministic backend tests.
+
 ## Later product/fleet work
 
 Only after M2/M3 core acceptance should the project prioritize convenience/product surface such as:

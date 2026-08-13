@@ -1,6 +1,6 @@
 # V2 P2 replacement and integration seams
 
-Status: **accepted on 2026-08-13. P2 adds narrow replacement seams but adopts no new external runtime, authorization protocol, device fabric, workload-identity system, or policy engine.**
+Status: **replacement review accepted on 2026-08-13; final P2 acceptance remains pending until the merged main code passes the trusted real-Cua regression. P2 adds narrow replacement seams but adopts no new external runtime, authorization protocol, device fabric, workload-identity system, or policy engine.**
 
 Canonical product boundary: [`V2_POSITIONING.md`](V2_POSITIONING.md). Authoritative execution-safety model: [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). Primary tracker: Issue #24.
 
