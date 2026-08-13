@@ -302,6 +302,30 @@ pub enum HubToAgent {
     HeartbeatAck(HubHeartbeatAck),
 }
 
+impl AgentToHub {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello(_) => "hello",
+            Self::Proof(_) => "proof",
+            Self::Result(_) => "result",
+            Self::CancellationAck(_) => "cancellation_ack",
+            Self::Heartbeat(_) => "heartbeat",
+        }
+    }
+}
+
+impl HubToAgent {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Challenge(_) => "challenge",
+            Self::Accepted(_) => "accepted",
+            Self::Command(_) => "command",
+            Self::Cancel(_) => "cancel",
+            Self::HeartbeatAck(_) => "heartbeat_ack",
+        }
+    }
+}
+
 pub fn verify_hub_challenge(
     hello: &AgentHello,
     challenge: &HubChallenge,

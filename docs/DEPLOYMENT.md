@@ -67,7 +67,27 @@ Customize `packaging/launchd/com.github.git-ksk.cumg-v2-agent.plist`, replacing 
 
 The Hub defaults to bounded Agent sessions/session starts and bounded northbound MCP request concurrency/rate. Excess Agent sessions use gRPC `RESOURCE_EXHAUSTED`; excess northbound requests use HTTP 429 or 503. Keep external firewall/reverse-proxy limits as the outer control.
 
-OTLP is opt-in through standard OpenTelemetry variables. `OTEL_EXPORTER_OTLP_ENDPOINT` enables traces and metrics; signal-specific endpoint variables enable only that signal. The packaged build uses the standard OTLP `grpc` transport. Default telemetry intentionally excludes command bodies, argv, file contents, screenshots, clipboard data, bearer tokens and credentials.
+OTLP is opt-in through standard OpenTelemetry variables. `OTEL_EXPORTER_OTLP_ENDPOINT` enables traces and metrics; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` enable individual signals; `OTEL_SDK_DISABLED=true` disables export. The packaged build uses the standard OTLP `grpc` transport. Default telemetry intentionally excludes command/result bodies, argv, stdout/stderr, file contents, screenshots, clipboard data, bearer tokens, OAuth introspection secrets, grants, signatures and private key material. Protocol failures log only a message kind plus safe error metadata, never the full signed protocol object.
+
+V2 structured events use control-plane correlation fields only when available. The principal incident keys are `operation_id`, `device_id` and `generation`; `capability`, `outcome`, `error_code`, `indeterminate_reason`, `reconnect_attempt` and `backend` add bounded diagnostic context. Authenticated principal issuer/subject is not emitted by default. The main event families cover Agent session start/accept/supersede/end/reconnect/exhaustion, operation admission/dispatch/terminal failure or completion, cancellation request/acknowledgement, indeterminate/quarantine/resolution, persistence failure, authorization failure, overload rejection, backend ambiguity/timeout and stale result/session rejection.
+
+OTel counters intentionally expose only closed, low-cardinality attribute domains:
+
+- `cumg.v2.agent_session_started`;
+- `cumg.v2.agent_session_rejected{reason}`;
+- `cumg.v2.reconnect_attempt` and `cumg.v2.reconnect_exhausted`;
+- `cumg.v2.operation_completed{capability,outcome}`;
+- `cumg.v2.operation_indeterminate{reason}`;
+- `cumg.v2.quarantine_created` and `cumg.v2.quarantine_resolved`;
+- `cumg.v2.persistence_failure{component}`;
+- `cumg.v2.auth_failure{reason}`;
+- `cumg.v2.backend_failure{reason}`;
+- `cumg.v2.stale_result_rejected`;
+- `cumg.v2.northbound_request_rejected{reason}`.
+
+Never add `operation_id`, `device_id`, principal/subject, request path, command/tool name or other unbounded values as metric attributes. Those belong in structured logs/traces only when required for incident correlation. Collector, proxy and service-manager logging must preserve the same payload-free boundary; do not enable HTTP/gRPC body capture or Authorization-header logging around the process.
+
+For an incident, correlate Hub and Agent by `device_id` + `generation`, then follow `operation_id`. A `v2_operation_indeterminate` event must be followed by durable quarantine until a `v2_quarantine_resolved` event exists for that operation. Persistence failures expose a safe `error_code` such as `persistence_checkpoint_too_large` without a path or serialized checkpoint. Reconnect exhaustion and heartbeat timeouts are visible independently from TLS/transport connection failures. OAuth introspection unavailability is distinct from authorization denial, and a quarantine admission rejection remains `device_indeterminate` rather than being retried or auto-replayed.
 
 See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md) for the final security gate and [`../packaging/README.md`](../packaging/README.md) for lifecycle details.
 

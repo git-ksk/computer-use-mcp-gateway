@@ -25,6 +25,21 @@ python3 scripts/v1_conformance.py
 
 `cargo test --locked` includes a downstream-cancellation test that starts the deterministic MCP fixture, begins a pending tool request, cancels it, and requires the downstream `notifications/cancelled` request ID to equal the in-flight backend tool request ID. This proves cancellation propagation rather than merely dropping the gateway-side future.
 
+V2 observability hardening also has deterministic regressions for payload-safe protocol rejection, safe backend/persistence/OAuth debug formatting, indeterminate/resolution correlation fields, and the closed low-cardinality metric attribute set. The protocol fixture deliberately embeds stdout, stderr and signature markers and captures tracing output; none may appear in the event or rendered error. Existing execution-safety tests remain the semantic gate for operation ownership, generation fencing, durable indeterminate quarantine, explicit resolution and no automatic replay.
+
+For an observability/operations change, run the stricter local gate before spending CI capacity:
+
+```bash
+cargo fmt --check
+cargo check --locked --all-targets
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets
+python3 scripts/check_docs.py
+git diff --check
+```
+
+Do not weaken these tests by asserting raw payload text for diagnostics. If a new failure class needs observability, expose a safe message kind, `error_code`, bounded event field or closed metric reason instead.
+
 ### Deterministic V1 quality fixture
 
 `scripts/mock_mcp_backend.py` is a test-only stdio MCP backend. It never touches a desktop and exposes only:

@@ -67,7 +67,7 @@ Local structured logging remains available through `RUST_LOG`. OTLP export is op
 - the build uses the standard OTLP `grpc` transport transports;
 - `OTEL_SDK_DISABLED=true` disables export.
 
-Trace spans cover northbound HTTP method/path and authenticated Agent session lifetimes; overload metrics contain bounded rejection reasons. Default events and metrics do not carry raw shell commands, argv, file contents, screenshots, clipboard values, bearer tokens or private credentials. An external collector/proxy must preserve that privacy boundary rather than enabling body/payload logging around it.
+Trace spans cover the bounded northbound HTTP method field and authenticated Agent session lifetimes; overload metrics contain bounded rejection reasons. Default events and metrics do not carry raw shell commands, argv, file contents, screenshots, clipboard values, bearer tokens or private credentials. An external collector/proxy must preserve that privacy boundary rather than enabling body/payload logging around it.
 
 ## Service packaging
 

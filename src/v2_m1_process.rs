@@ -9,6 +9,7 @@
 
 use crate::v2_m0::{ProcessEnvVar, ProcessOutput, ProcessRequest, ShellRequest};
 use crate::v2_m0_execution::{AgentExecutionGate, ExecutionError, OperationRef};
+use crate::v2_observability::SafeErrorCode;
 use process_wrap::std::CommandWrap;
 #[cfg(windows)]
 use process_wrap::std::JobObject;
@@ -437,7 +438,6 @@ fn drain_bounded<R: Read>(mut reader: R, max: usize) -> Result<BoundedBytes, Pro
     })
 }
 
-#[derive(Debug)]
 pub enum ProcessError {
     NoAllowedWorkingDirectories,
     InvalidPolicyLimit,
@@ -459,9 +459,40 @@ pub enum ProcessError {
     Execution(ExecutionError),
 }
 
+impl SafeErrorCode for ProcessError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::NoAllowedWorkingDirectories => "process_no_allowed_working_directories",
+            Self::InvalidPolicyLimit => "process_invalid_policy_limit",
+            Self::InvalidRequest => "process_invalid_request",
+            Self::InvalidProgram => "process_invalid_program",
+            Self::ShellProgramDenied => "process_shell_program_denied",
+            Self::ShellUnsupportedPlatform => "process_shell_unsupported_platform",
+            Self::TooManyArguments => "process_too_many_arguments",
+            Self::TooManyEnvironmentEntries => "process_too_many_environment_entries",
+            Self::InvalidTimeout => "process_invalid_timeout",
+            Self::WorkingDirectoryNotDirectory => "process_working_directory_not_directory",
+            Self::WorkingDirectoryDenied => "process_working_directory_denied",
+            Self::InvalidEnvironment => "process_invalid_environment",
+            Self::EnvironmentKeyDenied(_) => "process_environment_key_denied",
+            Self::Spawn(_) => "process_spawn_failed",
+            Self::PipeUnavailable => "process_pipe_unavailable",
+            Self::ReaderPanicked => "process_reader_panicked",
+            Self::Io(_) => "process_io",
+            Self::Execution(_) => "process_execution",
+        }
+    }
+}
+
+impl fmt::Debug for ProcessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.safe_error_code())
+    }
+}
+
 impl fmt::Display for ProcessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(self.safe_error_code())
     }
 }
 

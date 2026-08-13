@@ -178,7 +178,7 @@ fn valid_scope_token(scope: &str) -> bool {
             .all(|byte| matches!(*byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthIntrospectionConfig {
     pub issuer: String,
     pub resource: String,
@@ -186,6 +186,19 @@ pub struct OAuthIntrospectionConfig {
     pub client_id: String,
     pub client_secret: String,
     pub timeout: Duration,
+}
+
+impl fmt::Debug for OAuthIntrospectionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthIntrospectionConfig")
+            .field("issuer", &self.issuer)
+            .field("resource", &self.resource)
+            .field("endpoint", &self.endpoint)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl OAuthIntrospectionConfig {
@@ -346,10 +359,19 @@ fn unix_time_secs() -> Result<u64, std::time::SystemTimeError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VerifiedAccessToken {
     pub principal: AuthenticatedClientPrincipal,
     pub scopes: HashSet<String>,
+}
+
+impl fmt::Debug for VerifiedAccessToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedAccessToken")
+            .field("principal", &"[REDACTED]")
+            .field("scope_count", &self.scopes.len())
+            .finish()
+    }
 }
 
 #[async_trait]
@@ -523,6 +545,9 @@ async fn oauth_resource_guard(
     let token = match bearer_token(request.headers()) {
         Ok(Some(token)) => token,
         Ok(None) => {
+            crate::v2_observability::auth_failure(
+                crate::v2_observability::AuthFailureReason::InvalidToken,
+            );
             let challenge = bearer_challenge(&state.config, None);
             return oauth_error_response(
                 StatusCode::UNAUTHORIZED,
@@ -543,6 +568,9 @@ async fn oauth_resource_guard(
     let verified = match state.verifier.verify(token).await {
         Ok(verified) => verified,
         Err(TokenVerificationError::InvalidToken) => {
+            crate::v2_observability::auth_failure(
+                crate::v2_observability::AuthFailureReason::InvalidToken,
+            );
             let challenge = bearer_challenge(&state.config, Some("invalid_token"));
             return oauth_error_response(
                 StatusCode::UNAUTHORIZED,
@@ -552,8 +580,13 @@ async fn oauth_resource_guard(
             );
         }
         Err(TokenVerificationError::Unavailable | TokenVerificationError::InvalidConfiguration) => {
+            crate::v2_observability::auth_failure(
+                crate::v2_observability::AuthFailureReason::Unavailable,
+            );
             warn!(
                 event = "v2_northbound_auth_unavailable",
+                outcome = "denied",
+                error_code = "oauth_introspection_unavailable",
                 "OAuth token validation unavailable"
             );
             return oauth_error_response(
@@ -571,6 +604,15 @@ async fn oauth_resource_guard(
         .iter()
         .all(|scope| verified.scopes.contains(scope))
     {
+        crate::v2_observability::auth_failure(
+            crate::v2_observability::AuthFailureReason::InsufficientScope,
+        );
+        warn!(
+            event = "v2_northbound_auth_denied",
+            outcome = "denied",
+            error_code = "insufficient_scope",
+            "OAuth token lacks required resource scope"
+        );
         let challenge = bearer_challenge(&state.config, Some("insufficient_scope"));
         return oauth_error_response(
             StatusCode::FORBIDDEN,
@@ -717,7 +759,19 @@ impl V2NorthboundMcp {
     ) -> Result<(), McpError> {
         self.authorizer
             .authorize_device_capability(principal, self.hub.device_id(), capability)
-            .map_err(|_| McpError::invalid_request("Device capability is not authorized", None))
+            .map_err(|_| {
+                crate::v2_observability::auth_failure(
+                    crate::v2_observability::AuthFailureReason::AuthorizationDenied,
+                );
+                warn!(
+                    event = "v2_northbound_auth_denied",
+                    capability = crate::v2_observability::capability_name(capability),
+                    outcome = "denied",
+                    error_code = "capability_not_authorized",
+                    "northbound principal is not authorized for device capability"
+                );
+                McpError::invalid_request("Device capability is not authorized", None)
+            })
     }
 
     fn tools_for(&self, principal: &AuthenticatedClientPrincipal) -> Vec<Tool> {
@@ -1478,5 +1532,32 @@ mod tests {
         task.abort();
         drop(hub);
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn oauth_debug_representations_redact_secret_and_principal() {
+        let secret = "INTROSPECTION_SECRET_DO_NOT_LOG";
+        let config = OAuthIntrospectionConfig::new(
+            "https://auth.example",
+            "https://hub.example/mcp",
+            "https://auth.example/introspect",
+            "client-id",
+            secret,
+        );
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("[REDACTED]"));
+
+        let token = VerifiedAccessToken {
+            principal: AuthenticatedClientPrincipal::new(
+                "https://auth.example",
+                "PRIVATE_SUBJECT_DO_NOT_LOG",
+            )
+            .unwrap(),
+            scopes: ["mcp:use".to_owned()].into_iter().collect(),
+        };
+        let token_debug = format!("{token:?}");
+        assert!(!token_debug.contains("PRIVATE_SUBJECT_DO_NOT_LOG"));
+        assert!(token_debug.contains("[REDACTED]"));
     }
 }

@@ -109,20 +109,29 @@ pub async fn enforce_http_limits(
     let span = tracing::info_span!(
         "v2_northbound_http_request",
         http.request.method = %request.method(),
-        url.path = request.uri().path(),
     );
     async move {
         if !guard.rate.try_acquire() {
-            crate::v2_observability::increment_counter(
-                "cumg.v2.northbound_request_rejected",
-                &[opentelemetry::KeyValue::new("reason", "rate_limit")],
+            crate::v2_observability::northbound_request_rejected(
+                crate::v2_observability::RequestRejectReason::RateLimit,
+            );
+            tracing::warn!(
+                event = "v2_northbound_request_rejected",
+                outcome = "rejected",
+                error_code = "rate_limit",
+                "northbound request rate limit exceeded"
             );
             return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
         }
         let Ok(permit) = guard.slots.clone().try_acquire_owned() else {
-            crate::v2_observability::increment_counter(
-                "cumg.v2.northbound_request_rejected",
-                &[opentelemetry::KeyValue::new("reason", "concurrency_limit")],
+            crate::v2_observability::northbound_request_rejected(
+                crate::v2_observability::RequestRejectReason::ConcurrencyLimit,
+            );
+            tracing::warn!(
+                event = "v2_northbound_request_rejected",
+                outcome = "rejected",
+                error_code = "concurrency_limit",
+                "northbound request concurrency limit exceeded"
             );
             return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         };

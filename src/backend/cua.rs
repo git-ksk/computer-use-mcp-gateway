@@ -45,7 +45,6 @@ pub struct CuaBackend {
 impl std::fmt::Debug for CuaBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CuaBackend")
-            .field("command", &self.command)
             .field("arg_count", &self.args.len())
             .field("connect_timeout", &self.connect_timeout)
             .field("tool_timeout", &self.tool_timeout)
@@ -166,10 +165,12 @@ impl CuaBackend {
     async fn recover_after_failure(&self) {
         self.close_current().await;
         if let Err(error) = self.connect_with_backoff().await {
+            let _ = error;
             warn!(
-                event = "backend_reconnect",
+                event = "v2_backend_reconnect",
+                backend = "cua",
                 outcome = "failed",
-                error = %error,
+                error_code = "backend_reconnect_failed",
                 "Cua MCP backend recovery failed"
             );
         }
@@ -304,10 +305,11 @@ impl ComputerUseBackend for CuaBackend {
         match self.list_tools_once().await {
             Ok(tools) => Ok(tools),
             Err(first_error) => {
+                let _ = first_error;
                 self.recover_after_failure().await;
-                self.list_tools_once().await.with_context(|| {
-                    format!("Cua MCP tool discovery failed after reconnect: {first_error:#}")
-                })
+                self.list_tools_once()
+                    .await
+                    .context("Cua MCP tool discovery failed after reconnect")
             }
         }
     }

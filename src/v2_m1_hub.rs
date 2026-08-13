@@ -29,8 +29,8 @@ use crate::v2_m1_grpc::{
     proto::{AgentFrame, HubFrame, agent_control_server::AgentControl},
 };
 use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
+use crate::v2_observability::SafeErrorCode;
 use ed25519_dalek::VerifyingKey;
-use opentelemetry::KeyValue;
 use rand::{RngCore, rngs::OsRng};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -321,17 +321,34 @@ impl SingleDeviceHub {
     ) -> Result<(), HubServiceError> {
         let hello = match next_agent(&mut inbound).await? {
             AgentToHub::Hello(hello) => hello,
-            other => return Err(HubServiceError::UnexpectedMessage(format!("{other:?}"))),
+            other => return Err(unexpected_agent_message("hello", &other)),
         };
         if hello.device_id != self.inner.device_id {
+            crate::v2_observability::agent_session_rejected(
+                crate::v2_observability::SessionRejectReason::WrongDevice,
+            );
+            tracing::warn!(
+                event = "v2_agent_session_rejected",
+                device_id = %self.inner.device_id,
+                outcome = "rejected",
+                error_code = "wrong_device",
+                "Agent session identity rejected"
+            );
             return Err(HubServiceError::WrongDevice);
         }
+        tracing::info!(
+            event = "v2_agent_session_start",
+            device_id = %self.inner.device_id,
+            backend = %hello.capabilities.backend,
+            outcome = "started",
+            "Agent session handshake started"
+        );
         let challenge = self.inner.material.hub_identity.challenge(&hello)?;
         send_hub(&outbound, HubToAgent::Challenge(challenge.clone())).await?;
 
         let proof = match next_agent(&mut inbound).await? {
             AgentToHub::Proof(proof) => proof,
-            other => return Err(HubServiceError::UnexpectedMessage(format!("{other:?}"))),
+            other => return Err(unexpected_agent_message("proof", &other)),
         };
 
         let session = {
@@ -358,6 +375,14 @@ impl SingleDeviceHub {
             accepted_hub_time_ms,
         )?;
         send_hub(&outbound, HubToAgent::Accepted(accepted)).await?;
+        tracing::info!(
+            event = "v2_agent_session_accepted",
+            device_id = %self.inner.device_id,
+            generation = session.generation,
+            backend = %hello.capabilities.backend,
+            outcome = "accepted",
+            "Agent session accepted"
+        );
         // Use the same monotonic-derived Hub clock for all grants in this
         // session. Re-reading wall time for each grant can make issued_at appear
         // a few milliseconds in the future relative to the Agent's signed
@@ -375,6 +400,13 @@ impl SingleDeviceHub {
             })
         };
         if let Some(prior) = prior {
+            tracing::info!(
+                event = "v2_agent_session_superseded",
+                device_id = %self.inner.device_id,
+                generation = prior.generation,
+                outcome = "superseded",
+                "older Agent session superseded by a newer generation"
+            );
             let _ = prior.supersede.send(true);
         }
 
@@ -420,6 +452,14 @@ impl SingleDeviceHub {
         loop {
             tokio::select! {
                 _ = &mut heartbeat_deadline => {
+                    tracing::warn!(
+                        event = "v2_hub_heartbeat_timeout",
+                        device_id = %self.inner.device_id,
+                        generation,
+                        outcome = "reconnect",
+                        error_code = "heartbeat_timeout",
+                        "Agent heartbeat deadline expired"
+                    );
                     return Err(HubServiceError::HeartbeatTimeout);
                 }
                 changed = supersede_rx.changed() => {
@@ -460,10 +500,33 @@ impl SingleDeviceHub {
                             let decision = match decision {
                                 Ok(decision) => decision,
                                 Err(error) => {
+                                    tracing::warn!(
+                                        event = "v2_operation_rejected",
+                                        operation_id = %operation_id,
+                                        device_id = %self.inner.device_id,
+                                        generation,
+                                        capability = crate::v2_observability::capability_name(command.capability()),
+                                        outcome = "rejected",
+                                        error_code = error.safe_error_code(),
+                                        "operation admission rejected"
+                                    );
                                     let _ = reply.send(Err(error));
                                     continue;
                                 }
                             };
+                            let admission_outcome = match &decision {
+                                AdmissionDecision::StartNow(_) => "start_now",
+                                AdmissionDecision::Queued { .. } => "queued",
+                            };
+                            tracing::info!(
+                                event = "v2_operation_admitted",
+                                operation_id = %operation_id,
+                                device_id = %self.inner.device_id,
+                                generation,
+                                capability = crate::v2_observability::capability_name(command.capability()),
+                                outcome = admission_outcome,
+                                "operation admitted"
+                            );
                             pending.insert(operation_id.clone(), PendingOperation {
                                 owner,
                                 command,
@@ -511,6 +574,14 @@ impl SingleDeviceHub {
                             };
                             match decision {
                                 CancellationDecision::CancelledBeforeDispatch { next } => {
+                                    tracing::info!(
+                                        event = "v2_cancellation_requested",
+                                        operation_id = %operation_id,
+                                        device_id = %self.inner.device_id,
+                                        generation,
+                                        outcome = "cancelled_before_dispatch",
+                                        "operation cancelled before dispatch"
+                                    );
                                     if let Some(operation) = pending.remove(&operation_id) {
                                         let _ = operation.reply.send(Err(HubCommandError::CancelledBeforeDispatch));
                                     }
@@ -529,6 +600,14 @@ impl SingleDeviceHub {
                                     ).await?;
                                 }
                                 CancellationDecision::SendCancellation(operation) => {
+                                    tracing::info!(
+                                        event = "v2_cancellation_requested",
+                                        operation_id = %operation.operation_id,
+                                        device_id = %self.inner.device_id,
+                                        generation,
+                                        outcome = "propagated",
+                                        "cancellation requested for dispatched operation"
+                                    );
                                     let remote = self.inner.material.hub_identity.remote_cancel(
                                         &hello,
                                         &challenge,
@@ -596,7 +675,7 @@ impl SingleDeviceHub {
                                 &mut cancel_waiters,
                             ).await?;
                         }
-                        other => return Err(HubServiceError::UnexpectedMessage(format!("{other:?}"))),
+                        other => return Err(unexpected_agent_message("session_message", &other)),
                     }
                 }
             }
@@ -658,8 +737,19 @@ impl SingleDeviceHub {
             )?;
             persist_locked(&self.inner, &persistent)?;
         }
+        let capability = command.command.capability();
         operation.envelope = Some(command);
-        send_hub(outbound, HubToAgent::Command(remote)).await
+        send_hub(outbound, HubToAgent::Command(remote)).await?;
+        tracing::info!(
+            event = "v2_operation_dispatched",
+            operation_id,
+            device_id = %self.inner.device_id,
+            generation,
+            capability = crate::v2_observability::capability_name(capability),
+            outcome = "dispatched",
+            "operation dispatched to Agent"
+        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -680,6 +770,19 @@ impl SingleDeviceHub {
             verify_remote_result(&persistent.registry, hello, challenge, &result)?;
         }
         let operation_id = result.result.operation_id.clone();
+        if !pending.contains_key(&operation_id) {
+            crate::v2_observability::stale_result_rejected();
+            tracing::warn!(
+                event = "v2_stale_result_rejected",
+                operation_id = %operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "rejected",
+                error_code = "pending_operation_missing",
+                "verified result has no pending operation in this session"
+            );
+            return Err(HubServiceError::PendingOperationMissing);
+        }
         let operation = pending
             .get(&operation_id)
             .ok_or(HubServiceError::PendingOperationMissing)?;
@@ -716,6 +819,7 @@ impl SingleDeviceHub {
                 ExecutionEvidence::VerifiedAgentResult,
             ),
         };
+        let capability = operation.command.capability();
         let (next, receipt) = {
             let mut persistent = self.inner.persistent.lock().await;
             let settled = persistent.execution.finalize(
@@ -729,6 +833,29 @@ impl SingleDeviceHub {
             persist_locked(&self.inner, &persistent)?;
             settled
         };
+        let outcome = match terminal_state {
+            HubOperationState::Completed => crate::v2_observability::OperationOutcome::Completed,
+            HubOperationState::Cancelled => crate::v2_observability::OperationOutcome::Cancelled,
+            _ => crate::v2_observability::OperationOutcome::Failed,
+        };
+        crate::v2_observability::operation_completed(capability, outcome);
+        tracing::info!(
+            event = if terminal_state == HubOperationState::Completed {
+                "v2_operation_completed"
+            } else {
+                "v2_operation_failed"
+            },
+            operation_id = %operation_id,
+            device_id = %self.inner.device_id,
+            generation,
+            capability = crate::v2_observability::capability_name(capability),
+            outcome = match outcome {
+                crate::v2_observability::OperationOutcome::Completed => "completed",
+                crate::v2_observability::OperationOutcome::Failed => "failed",
+                crate::v2_observability::OperationOutcome::Cancelled => "cancelled",
+            },
+            "operation reached a durable terminal state"
+        );
         if let Some(operation) = pending.remove(&operation_id) {
             let response = match device_result {
                 DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
@@ -804,6 +931,14 @@ impl SingleDeviceHub {
             let persistent = self.inner.persistent.lock().await;
             verify_remote_cancellation_ack(&persistent.registry, hello, challenge, &ack)?;
         }
+        tracing::info!(
+            event = "v2_cancellation_acknowledged",
+            operation_id = %ack.operation_id,
+            device_id = %self.inner.device_id,
+            generation,
+            outcome = crate::v2_observability::cancellation_disposition_name(&ack.disposition),
+            "Agent cancellation acknowledgement verified"
+        );
         if ack.disposition == CancellationDisposition::IndeterminateAfterPropagation
             && !pending.contains_key(&ack.operation_id)
         {
@@ -879,9 +1014,20 @@ impl SingleDeviceHub {
                         operation_id: ack.operation_id.clone(),
                     }));
             }
+            crate::v2_observability::operation_indeterminate(
+                IndeterminateReason::CancellationUnproven,
+            );
+            crate::v2_observability::quarantine_created();
             tracing::warn!(
-                event = "v2_hub_operation_indeterminate",
+                event = "v2_operation_indeterminate",
                 operation_id = %ack.operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "quarantined",
+                indeterminate_reason = crate::v2_observability::indeterminate_reason_name(
+                    IndeterminateReason::CancellationUnproven
+                ),
+                error_code = "cancellation_unproven",
                 "backend cancellation was propagated but side-effect interruption is unproven; device quarantined"
             );
         }
@@ -897,6 +1043,14 @@ impl SingleDeviceHub {
         if current.generation == generation {
             Ok(())
         } else {
+            tracing::warn!(
+                event = "v2_stale_session_rejected",
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "rejected",
+                error_code = "generation_mismatch",
+                "message from stale Agent session generation rejected"
+            );
             Err(HubServiceError::StaleSession)
         }
     }
@@ -928,6 +1082,7 @@ impl SingleDeviceHub {
             .into_iter()
             .filter(|operation| operation.operation.device_generation == generation)
             .collect();
+        let mut connection_lost_indeterminate = Vec::new();
         for operation in operations {
             let operation_id = operation.operation.operation_id;
             match persistent.execution.state(&operation_id) {
@@ -935,6 +1090,8 @@ impl SingleDeviceHub {
                     persistent
                         .execution
                         .mark_connection_lost(&operation_id, unix_time_ms()?)?;
+                    connection_lost_indeterminate
+                        .push((operation_id.clone(), operation.capability));
                 }
                 Some(HubOperationState::Queued | HubOperationState::ActiveNotDispatched) => {
                     let _ = persistent.execution.request_cancel(
@@ -956,7 +1113,32 @@ impl SingleDeviceHub {
         {
             persistent.registry.disconnect(&self.inner.device_id)?;
         }
-        persist_locked(&self.inner, &persistent)
+        persist_locked(&self.inner, &persistent)?;
+        for (operation_id, capability) in connection_lost_indeterminate {
+            crate::v2_observability::operation_indeterminate(IndeterminateReason::ConnectionLost);
+            crate::v2_observability::quarantine_created();
+            tracing::warn!(
+                event = "v2_operation_indeterminate",
+                operation_id = %operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                capability = crate::v2_observability::capability_name(capability),
+                outcome = "quarantined",
+                indeterminate_reason = crate::v2_observability::indeterminate_reason_name(
+                    IndeterminateReason::ConnectionLost
+                ),
+                error_code = "connection_lost",
+                "connection loss left dispatched operation indeterminate; device quarantined"
+            );
+        }
+        tracing::info!(
+            event = "v2_agent_session_ended",
+            device_id = %self.inner.device_id,
+            generation,
+            outcome = if is_current { "disconnected" } else { "superseded" },
+            "Agent session cleanup completed"
+        );
+        Ok(())
     }
 }
 
@@ -1128,7 +1310,7 @@ impl HubHandle {
             .resolve_indeterminate(
                 operation_id,
                 resolver,
-                decision,
+                decision.clone(),
                 evidence,
                 unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
             )
@@ -1141,6 +1323,16 @@ impl HubHandle {
             .map_err(|_| HubCommandError::Rejected)?;
             return Err(HubCommandError::Rejected);
         }
+        crate::v2_observability::quarantine_resolved();
+        tracing::info!(
+            event = "v2_quarantine_resolved",
+            operation_id,
+            device_id = %self.inner.device_id,
+            generation = receipt.operation.device_generation,
+            capability = crate::v2_observability::capability_name(receipt.capability),
+            outcome = crate::v2_observability::resolution_name(&decision),
+            "indeterminate operation explicitly resolved; quarantine cleared"
+        );
         Ok(receipt)
     }
 
@@ -1172,9 +1364,14 @@ impl AgentControl for SingleDeviceHub {
         request: Request<Streaming<AgentFrame>>,
     ) -> Result<Response<Self::OpenSessionStream>, Status> {
         if !self.inner.session_rate.try_acquire() {
-            crate::v2_observability::increment_counter(
-                "cumg.v2.agent_session_rejected",
-                &[KeyValue::new("reason", "rate_limit")],
+            crate::v2_observability::agent_session_rejected(
+                crate::v2_observability::SessionRejectReason::RateLimit,
+            );
+            tracing::warn!(
+                event = "v2_agent_session_rejected",
+                outcome = "rejected",
+                error_code = "rate_limit",
+                "Agent session start rate exceeded"
             );
             return Err(Status::resource_exhausted(
                 "Agent session start rate exceeded",
@@ -1186,13 +1383,18 @@ impl AgentControl for SingleDeviceHub {
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                crate::v2_observability::increment_counter(
-                    "cumg.v2.agent_session_rejected",
-                    &[KeyValue::new("reason", "concurrency_limit")],
+                crate::v2_observability::agent_session_rejected(
+                    crate::v2_observability::SessionRejectReason::ConcurrencyLimit,
+                );
+                tracing::warn!(
+                    event = "v2_agent_session_rejected",
+                    outcome = "rejected",
+                    error_code = "concurrency_limit",
+                    "Agent session concurrency exceeded"
                 );
                 Status::resource_exhausted("Agent session concurrency exceeded")
             })?;
-        crate::v2_observability::increment_counter("cumg.v2.agent_session_started", &[]);
+        crate::v2_observability::agent_session_started();
         let (outbound_tx, outbound_rx) = mpsc::channel(SESSION_QUEUE_DEPTH);
         let service = self.clone();
         tokio::spawn(
@@ -1202,7 +1404,13 @@ impl AgentControl for SingleDeviceHub {
                     .run_session(request.into_inner(), outbound_tx.clone())
                     .await
                 {
-                    tracing::warn!(event = "v2_hub_session_error", error = ?error, "V2 Hub Agent session ended with error");
+                    tracing::warn!(
+                        event = "v2_hub_session_error",
+                        device_id = %service.inner.device_id,
+                        outcome = "ended",
+                        error_code = error.safe_error_code(),
+                        "V2 Hub Agent session ended with error"
+                    );
                     let _ = outbound_tx.send(Err(error.grpc_status())).await;
                 }
             }
@@ -1217,10 +1425,20 @@ fn persist_locked(
     persistent: &PersistentHubState,
 ) -> Result<(), HubServiceError> {
     let state = HubPersistentState::capture(&persistent.registry, &persistent.execution);
-    inner
-        .checkpoint
-        .save(&state)
-        .map_err(HubServiceError::Persistence)?;
+    if let Err(error) = inner.checkpoint.save(&state) {
+        crate::v2_observability::persistence_failure(
+            crate::v2_observability::PersistenceComponent::Hub,
+        );
+        tracing::error!(
+            event = "v2_persistence_failure",
+            device_id = %inner.device_id,
+            outcome = "failed",
+            error_code = error.safe_error_code(),
+            component = "hub",
+            "Hub checkpoint persistence failed"
+        );
+        return Err(HubServiceError::Persistence(error));
+    }
     Ok(())
 }
 
@@ -1231,6 +1449,19 @@ async fn next_agent(inbound: &mut Streaming<AgentFrame>) -> Result<AgentToHub, H
         .map_err(HubServiceError::Status)?
         .ok_or(HubServiceError::InboundClosed)?;
     decode_agent_frame(frame).map_err(HubServiceError::Carrier)
+}
+
+fn unexpected_agent_message(expected: &'static str, message: &AgentToHub) -> HubServiceError {
+    let got = message.kind();
+    tracing::warn!(
+        event = "v2_protocol_message_rejected",
+        outcome = "rejected",
+        error_code = "unexpected_message",
+        expected_message = expected,
+        message_kind = got,
+        "unexpected Agent protocol message rejected"
+    );
+    HubServiceError::UnexpectedMessage { expected, got }
 }
 
 async fn send_hub(
@@ -1279,7 +1510,7 @@ fn random_operation_id() -> String {
     output
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HubCommandError {
     AgentOffline,
     SessionSuperseded,
@@ -1295,15 +1526,38 @@ pub enum HubCommandError {
     Indeterminate,
 }
 
+impl SafeErrorCode for HubCommandError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::AgentOffline => "agent_offline",
+            Self::SessionSuperseded => "session_superseded",
+            Self::SessionClosed => "session_closed",
+            Self::CancelledBeforeDispatch => "cancelled_before_dispatch",
+            Self::OperationReplay => "operation_replay",
+            Self::Busy => "busy",
+            Self::UnknownOperation => "unknown_operation",
+            Self::DeviceIndeterminate { .. } | Self::Indeterminate => "device_indeterminate",
+            Self::Rejected => "rejected",
+            Self::Remote(_) => "remote_error",
+            Self::UnexpectedResult => "unexpected_result",
+        }
+    }
+}
+
+impl fmt::Debug for HubCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.safe_error_code())
+    }
+}
+
 impl fmt::Display for HubCommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(self.safe_error_code())
     }
 }
 
 impl std::error::Error for HubCommandError {}
 
-#[derive(Debug)]
 pub enum HubServiceError {
     InvalidConfig(&'static str),
     Persistence(PersistenceError),
@@ -1318,7 +1572,10 @@ pub enum HubServiceError {
     InboundClosed,
     OutboundClosed,
     HeartbeatTimeout,
-    UnexpectedMessage(String),
+    UnexpectedMessage {
+        expected: &'static str,
+        got: &'static str,
+    },
     UnexpectedResultType,
     PendingOperationMissing,
     CheckpointDeviceTrustMismatch,
@@ -1359,9 +1616,48 @@ impl HubServiceError {
     }
 }
 
+impl SafeErrorCode for HubServiceError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig(_) => "invalid_config",
+            Self::Persistence(error) => error.safe_error_code(),
+            Self::Control(_) => "control_error",
+            Self::Execution(_) => "execution_error",
+            Self::Transport(_) => "protocol_error",
+            Self::Trust(_) => "trust_error",
+            Self::Carrier(_) => "carrier_error",
+            Self::Status(_) => "grpc_status",
+            Self::WrongDevice => "wrong_device",
+            Self::StaleSession => "stale_session",
+            Self::InboundClosed => "inbound_closed",
+            Self::OutboundClosed => "outbound_closed",
+            Self::HeartbeatTimeout => "heartbeat_timeout",
+            Self::UnexpectedMessage { .. } => "unexpected_message",
+            Self::UnexpectedResultType => "unexpected_result_type",
+            Self::PendingOperationMissing => "pending_operation_missing",
+            Self::CheckpointDeviceTrustMismatch => "checkpoint_device_trust_mismatch",
+            Self::StateBusy => "state_busy",
+            Self::SystemClockBeforeEpoch => "system_clock_before_epoch",
+        }
+    }
+}
+
+impl fmt::Debug for HubServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedMessage { expected, got } => f
+                .debug_struct("unexpected_message")
+                .field("expected", expected)
+                .field("got", got)
+                .finish(),
+            _ => f.write_str(self.safe_error_code()),
+        }
+    }
+}
+
 impl fmt::Display for HubServiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        fmt::Debug::fmt(self, f)
     }
 }
 
@@ -1442,5 +1738,91 @@ mod tests {
         .unwrap();
         assert_eq!(restarted.device_id(), stable_device_id);
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CaptureSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureSink;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureSink(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn unexpected_protocol_message_log_and_error_are_payload_free() {
+        let marker = "RAW_STDOUT_SECRET_DO_NOT_LOG";
+        let stderr_marker = "RAW_STDERR_SECRET_DO_NOT_LOG";
+        let message = AgentToHub::Result(RemoteResult {
+            schema_version: crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION,
+            result: crate::v2_m0::CommandResultEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: "dev-fixture".into(),
+                device_generation: 7,
+                capability_revision: 3,
+                operation_id: "op-fixture".into(),
+                result: DeviceResult::Process {
+                    output: ProcessOutput {
+                        exit_code: Some(1),
+                        stdout: marker.into(),
+                        stderr: stderr_marker.into(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        timed_out: false,
+                        cancelled: false,
+                        duration_ms: 1,
+                    },
+                },
+            },
+            signature: b"RAW_SIGNATURE_SECRET_DO_NOT_LOG".to_vec(),
+        });
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_writer(CaptureWriter(bytes.clone()))
+            .finish();
+        let error = tracing::subscriber::with_default(subscriber, || {
+            unexpected_agent_message("hello", &message)
+        });
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let rendered = format!("{error:?} {error}");
+        for forbidden in [marker, stderr_marker, "RAW_SIGNATURE_SECRET_DO_NOT_LOG"] {
+            assert!(!log.contains(forbidden), "log leaked marker {forbidden}");
+            assert!(
+                !rendered.contains(forbidden),
+                "safe error leaked marker {forbidden}"
+            );
+        }
+        assert!(log.contains("message_kind"));
+        assert!(log.contains("result"));
+        assert!(rendered.contains("got: \"result\"") || rendered.contains("got=result"));
+    }
+
+    #[test]
+    fn indeterminate_and_resolution_events_keep_correlation_fields() {
+        let source = include_str!("v2_m1_hub.rs");
+        for event in ["v2_operation_indeterminate", "v2_quarantine_resolved"] {
+            let start = source.find(event).expect("event exists");
+            let end = (start + 1_200).min(source.len());
+            let block = &source[start..end];
+            for field in ["operation_id", "device_id", "generation"] {
+                assert!(block.contains(field), "{event} missing {field}");
+            }
+        }
     }
 }

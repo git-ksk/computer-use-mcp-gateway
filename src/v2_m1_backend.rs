@@ -12,6 +12,7 @@ use crate::v2_m0::{
     DeviceResult,
 };
 use crate::v2_m0_transport::CancellationDisposition;
+use crate::v2_observability::SafeErrorCode;
 use anyhow::Error as AnyError;
 use async_trait::async_trait;
 use rmcp::model::{CallToolResult, JsonObject};
@@ -28,6 +29,14 @@ pub enum BackendExecutionOutcome {
 }
 
 impl BackendExecutionOutcome {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Completed(_) => "completed",
+            Self::CancellationPropagatedIndeterminate => "cancellation_propagated_indeterminate",
+            Self::TimedOutIndeterminate => "timed_out_indeterminate",
+        }
+    }
+
     pub fn cancellation_disposition(&self) -> Option<CancellationDisposition> {
         match self {
             Self::Completed(_) => None,
@@ -122,10 +131,12 @@ impl CuaMcpAdapter {
     }
 
     pub async fn connect(&self) -> Result<(), M1BackendError> {
-        self.backend
-            .connect()
-            .await
-            .map_err(M1BackendError::Backend)
+        self.backend.connect().await.map_err(|error| {
+            crate::v2_observability::backend_failure(
+                crate::v2_observability::BackendFailureReason::Connect,
+            );
+            M1BackendError::Backend(error)
+        })
     }
 
     pub async fn shutdown(&self) -> Result<(), M1BackendError> {
@@ -147,11 +158,22 @@ impl CuaMcpAdapter {
                 return Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate);
             }
             Err(error) if error.downcast_ref::<BackendCallTimedOut>().is_some() => {
+                crate::v2_observability::backend_failure(
+                    crate::v2_observability::BackendFailureReason::Timeout,
+                );
                 return Ok(BackendExecutionOutcome::TimedOutIndeterminate);
             }
-            Err(error) => return Err(M1BackendError::Backend(error)),
+            Err(error) => {
+                crate::v2_observability::backend_failure(
+                    crate::v2_observability::BackendFailureReason::Tool,
+                );
+                return Err(M1BackendError::Backend(error));
+            }
         };
         if raw.is_error == Some(true) {
+            crate::v2_observability::backend_failure(
+                crate::v2_observability::BackendFailureReason::Tool,
+            );
             return Err(M1BackendError::BackendToolError);
         }
         let result = match command {
@@ -328,7 +350,6 @@ fn json_u32(value: &Value, key: &'static str) -> Result<u32, M1BackendError> {
     u32::try_from(raw).map_err(|_| M1BackendError::NumericOverflow)
 }
 
-#[derive(Debug)]
 pub enum M1BackendError {
     Backend(AnyError),
     BackendToolError,
@@ -338,9 +359,28 @@ pub enum M1BackendError {
     UnsupportedCommand(DeviceCapability),
 }
 
+impl SafeErrorCode for M1BackendError {
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::Backend(_) => "backend_failure",
+            Self::BackendToolError => "backend_tool_error",
+            Self::MalformedResponse(_) => "backend_malformed_response",
+            Self::NumericOverflow => "backend_numeric_overflow",
+            Self::InvalidRequest(_) => "backend_invalid_request",
+            Self::UnsupportedCommand(_) => "backend_unsupported_command",
+        }
+    }
+}
+
+impl fmt::Debug for M1BackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.safe_error_code())
+    }
+}
+
 impl fmt::Display for M1BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(self.safe_error_code())
     }
 }
 
@@ -454,5 +494,17 @@ mod tests {
         adapter.shutdown().await.unwrap();
         let _ = fs::remove_file(call_marker);
         let _ = fs::remove_file(cancel_marker);
+    }
+
+    #[test]
+    fn backend_error_debug_and_display_do_not_expose_raw_exception() {
+        let marker = "Bearer SUPER_SECRET_TOKEN signature=SECRET raw_stdout=SECRET";
+        let error = M1BackendError::Backend(anyhow::anyhow!(marker));
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        assert_eq!(debug, "backend_failure");
+        assert_eq!(display, "backend_failure");
+        assert!(!debug.contains(marker));
+        assert!(!display.contains(marker));
     }
 }
