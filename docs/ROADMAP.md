@@ -173,7 +173,7 @@ M2 acceptance requires:
 
 A machine registry, device list, or successful routing to two machines is **not** sufficient M2 acceptance evidence.
 
-P1 fixed-set proof accepted boundary: the implementation composes existing per-device P0 Hubs with independent checkpoints and no shared fleet scheduler. Final physical acceptance also passed on 2026-08-13 against `main` commit `e4eb464` in Desktop E2E run `31655691675`, including durable quarantine across Hub/Agent restart, newer-generation reconnect without replay, explicit resolution, and reuse.
+P1 fixed-set proof accepted boundary: the implementation composes existing per-device P0 Hubs with independent checkpoints and no shared fleet scheduler. Final release-closeout physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`, including durable quarantine across Hub/Agent restart, newer-generation reconnect without replay, explicit resolution, and reuse.
 
 ## V2-M3 — backend portability and OSS integration
 
@@ -199,7 +199,7 @@ Review maintained standards/OSS before expanding custom implementations:
 
 The P2 review is accepted when these decisions and narrow seams pass regression. A checked review item does **not** mean the external system was adopted. Replacement remains conditional on evidence that the uncertainty-aware execution invariant is preserved or improved. See [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
 
-Final P2 integration acceptance remains **open** until the merged `main` code passes the trusted main-only real-Cua Desktop E2E. Do not infer that physical proof from branch CI or deterministic backend tests.
+Final P2 integration acceptance is **accepted / closed on 2026-08-13**. Trusted merged `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` passed Desktop E2E run `31675515516`, supplementing the deterministic replacement-seam, multi-device, backend-portability, observability, and resource-regression gates.
 
 ## Later product/fleet work
 

@@ -1,6 +1,6 @@
 # V2 P2 replacement and integration seams
 
-Status: **replacement review accepted on 2026-08-13; final P2 acceptance remains pending until the merged main code passes the trusted real-Cua regression. P2 adds narrow replacement seams but adopts no new external runtime, authorization protocol, device fabric, workload-identity system, or policy engine.**
+Status: **accepted / closed on 2026-08-13. Merged `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` passed trusted Desktop E2E run `31675515516`. P2 adds narrow replacement seams but adopts no new external runtime, authorization protocol, device fabric, workload-identity system, or policy engine.**
 
 Canonical product boundary: [`V2_POSITIONING.md`](V2_POSITIONING.md). Authoritative execution-safety model: [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). Primary tracker: Issue #24.
 
@@ -112,6 +112,6 @@ An integration is acceptable only if all of the following remain true under dete
 
 ## 7. P2 acceptance boundary
 
-P2 is complete when the replacement decision is documented, the two narrow seams compile and pass invariant regressions, the existing multi-device/backend portability tests remain green, and the final main code passes the trusted real-Cua regression.
+P2 is complete: the replacement decision is documented, the two narrow seams compile and pass invariant regressions, the existing multi-device/backend portability tests remain green, and the final merged main code passed the trusted real-Cua regression in Desktop E2E run `31675515516`.
 
 P2 does **not** require adopting an external dependency. In this review, not adopting one is the safer result: none of the evaluated systems provides a clear net improvement to the current fixed-set deployment without importing a broader control plane or weakening the separation between generic infrastructure and the CUMG execution-safety core.

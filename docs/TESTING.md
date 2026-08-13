@@ -207,7 +207,7 @@ real Cua state-changing operation
     → safe reuse with a new operation ID
 ```
 
-The final P1 physical acceptance passed on 2026-08-13 against `main` commit `e4eb464` in Desktop E2E run `31655691675`. The dedicated runner may be registered ephemerally, but the workflow must remain manual, `main`-only, and isolated from untrusted pull-request execution. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the original desktop procedure and [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) for the V2 invariant.
+The final P1 physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`. The dedicated runner may be registered ephemerally, but the workflow must remain manual, `main`-only, and isolated from untrusted pull-request execution. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the original desktop procedure and [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) for the V2 invariant.
 
 The trusted lane also establishes an ordinary visible macOS Desktop immediately before the V1 TextEdit fixture. Cua `launch_app` starts the application in the background; if the runner is sitting on a different Space, the launched TextEdit window can be off-Space and `get_window_state` can return an empty Accessibility element set even though launch/window/screenshot calls themselves succeed. This is a physical-lane precondition only and does not alter the V2 execution-safety state machine.
 
@@ -278,7 +278,7 @@ cargo test --locked --test v2_p1_multi_device_e2e
 
 `v2_p1_multi_device_e2e` composes two existing `SingleDeviceHub` services in one process with independent durable state. Device A uses the Cua-shaped GUI fixture and becomes unknown/quarantined; Device B simultaneously runs native shell work under a different principal; A reconnect and partition leave B usable; Hub reconstruction restores A/B independently; explicit A resolution permits a new operation while marker counts prove the old GUI action was not replayed.
 
-These deterministic lanes are supplemented by the main-only physical acceptance above. P1 no longer carries a physical real-Cua residual: the final P1 code passed run `31655691675` on 2026-08-13. Future changes to the Computer Use adapter seam must rerun the same trusted desktop workflow before claiming equivalent physical regression.
+These deterministic lanes are supplemented by the main-only physical acceptance above. P1 no longer carries a physical real-Cua residual: the final P1 code passed run `31675515516` on 2026-08-13. Future changes to the Computer Use adapter seam must rerun the same trusted desktop workflow before claiming equivalent physical regression.
 
 ### V2 P2 replacement-seam regression
 
