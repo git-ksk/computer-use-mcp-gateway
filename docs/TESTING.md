@@ -194,6 +194,8 @@ real Cua state-changing operation
 
 The final P1 physical acceptance passed on 2026-08-13 against `main` commit `e4eb464` in Desktop E2E run `31655691675`. The dedicated runner may be registered ephemerally, but the workflow must remain manual, `main`-only, and isolated from untrusted pull-request execution. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the original desktop procedure and [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) for the V2 invariant.
 
+The trusted lane also establishes an ordinary visible macOS Desktop immediately before the V1 TextEdit fixture. Cua `launch_app` starts the application in the background; if the runner is sitting on a different Space, the launched TextEdit window can be off-Space and `get_window_state` can return an empty Accessibility element set even though launch/window/screenshot calls themselves succeed. This is a physical-lane precondition only and does not alter the V2 execution-safety state machine.
+
 ## V2-M1 final acceptance
 
 The V2-M1 gate is recorded in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). Run the deterministic portion explicitly on Rust 1.88 even if another toolchain is the local default:
