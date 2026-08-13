@@ -12,6 +12,8 @@ use std::fmt;
 pub const CONTROL_SCHEMA_VERSION: u16 = 2;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 2;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
+pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
+pub const MAX_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,8 +29,10 @@ pub enum CapabilityClass {
 pub enum DeviceCapability {
     ListApplications,
     ScreenGeometry,
+    Screenshot,
     PointerClick,
     PointerDrag,
+    TypeText,
     ExecuteProcess,
     Shell,
     ReadFile,
@@ -40,9 +44,10 @@ impl DeviceCapability {
         match self {
             Self::ListApplications
             | Self::ScreenGeometry
+            | Self::Screenshot
             | Self::ReadFile
             | Self::ListDirectory => CapabilityClass::Observe,
-            Self::PointerClick | Self::PointerDrag => CapabilityClass::Interact,
+            Self::PointerClick | Self::PointerDrag | Self::TypeText => CapabilityClass::Interact,
             // Direct process and free-form shell execution can mutate arbitrary
             // local state and are therefore never implied by observe/interact access.
             Self::ExecuteProcess | Self::Shell => CapabilityClass::Dangerous,
@@ -113,6 +118,7 @@ pub struct DirectoryEntry {
 pub enum DeviceCommand {
     ListApplications,
     ScreenGeometry,
+    Screenshot,
     PointerClick {
         x: i32,
         y: i32,
@@ -124,6 +130,9 @@ pub enum DeviceCommand {
         to_x: i32,
         to_y: i32,
         duration_ms: u64,
+    },
+    TypeText {
+        text: String,
     },
     ExecuteProcess {
         request: ProcessRequest,
@@ -144,8 +153,10 @@ impl DeviceCommand {
         match self {
             Self::ListApplications => DeviceCapability::ListApplications,
             Self::ScreenGeometry => DeviceCapability::ScreenGeometry,
+            Self::Screenshot => DeviceCapability::Screenshot,
             Self::PointerClick { .. } => DeviceCapability::PointerClick,
             Self::PointerDrag { .. } => DeviceCapability::PointerDrag,
+            Self::TypeText { .. } => DeviceCapability::TypeText,
             Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
             Self::Shell { .. } => DeviceCapability::Shell,
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
@@ -882,8 +893,15 @@ pub enum DeviceResult {
         height_points: u32,
         scale_factor_milli: u32,
     },
+    Screenshot {
+        data_base64: String,
+        mime_type: String,
+        width_pixels: u32,
+        height_pixels: u32,
+    },
     PointerClickCompleted,
     PointerDragCompleted,
+    TypeTextCompleted,
     Process {
         output: ProcessOutput,
     },
@@ -909,6 +927,7 @@ impl DeviceResult {
             (self, command),
             (Self::Applications { .. }, DeviceCommand::ListApplications)
                 | (Self::ScreenGeometry { .. }, DeviceCommand::ScreenGeometry)
+                | (Self::Screenshot { .. }, DeviceCommand::Screenshot)
                 | (
                     Self::PointerClickCompleted,
                     DeviceCommand::PointerClick { .. }
@@ -917,6 +936,7 @@ impl DeviceResult {
                     Self::PointerDragCompleted,
                     DeviceCommand::PointerDrag { .. }
                 )
+                | (Self::TypeTextCompleted, DeviceCommand::TypeText { .. })
                 | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
                 | (Self::Shell { .. }, DeviceCommand::Shell { .. })
                 | (Self::FileContents { .. }, DeviceCommand::ReadFile { .. })
@@ -1311,6 +1331,53 @@ mod tests {
             snapshot.consumed_grants[0].grant_id,
             second.payload.grant_id
         );
+    }
+
+    #[test]
+    fn screenshot_is_observe_and_type_text_is_interact() {
+        assert_eq!(
+            DeviceCapability::Screenshot.class(),
+            CapabilityClass::Observe
+        );
+        assert_eq!(
+            DeviceCapability::TypeText.class(),
+            CapabilityClass::Interact
+        );
+        assert_eq!(
+            DeviceCommand::Screenshot.capability(),
+            DeviceCapability::Screenshot
+        );
+        assert_eq!(
+            DeviceCommand::TypeText { text: "x".into() }.capability(),
+            DeviceCapability::TypeText
+        );
+    }
+
+    #[test]
+    fn exact_screenshot_grant_does_not_authorize_type_text() {
+        let authority = GrantAuthority::generate();
+        let mut ledger = GrantLedger::new(authority.verifier());
+        let screenshot = authority
+            .issue_for_device_capability("dev", DeviceCapability::Screenshot, 1_000, 30_000)
+            .unwrap();
+        assert!(matches!(
+            ledger.authorize_device_capability_once(
+                &screenshot,
+                "dev",
+                DeviceCapability::ScreenGeometry,
+                1_001,
+            ),
+            Err(ControlError::DeviceCapabilityGrantMismatch { .. })
+        ));
+        assert!(matches!(
+            ledger.authorize_device_capability_once(
+                &screenshot,
+                "dev",
+                DeviceCapability::TypeText,
+                1_001,
+            ),
+            Err(ControlError::CapabilityDenied { .. })
+        ));
     }
 
     #[test]

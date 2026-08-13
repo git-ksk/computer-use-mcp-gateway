@@ -2,9 +2,9 @@
 """Manual macOS desktop E2E through the real gateway and Cua Driver.
 
 This intentionally performs real GUI actions. It is guarded by
-CUMG_DESKTOP_E2E_ACK=1 and is intended only for a dedicated, logged-in,
-TCC-granted self-hosted macOS runner. The workflow that invokes it is
-workflow_dispatch-only and checks out trusted main.
+CUMG_DESKTOP_E2E_ACK=1 and is intended only for a reviewed checkout on a
+trusted, logged-in, TCC-granted macOS desktop. It is not a normal CI fixture and
+must not be run from untrusted pull-request code.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ def initialize() -> None:
         {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
-            "clientInfo": {"name": "cua-desktop-e2e", "version": "0.1.0"},
+            "clientInfo": {"name": "cua-local-desktop-e2e", "version": "0.1.0"},
         },
     )
     if result.get("protocolVersion") != PROTOCOL_VERSION:

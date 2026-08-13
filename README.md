@@ -87,7 +87,7 @@ The exact authority split, 0/1-unit settlement rules, failure semantics, and non
 - optional Cua policy layer for argument-level defense in depth
 - real-Cua CI smoke coverage on Linux, macOS, and Windows
 - deterministic 100-call `tools/call` soak and hosted-Linux idle CPU/RSS regression gate
-- manual trusted self-hosted macOS desktop E2E lane for screenshot → click → type → independent readback
+- operator-controlled local macOS desktop acceptance for screenshot → click → type → independent readback
 
 The dual-protocol smoke and selected official conformance scenarios are **not** a full MCP conformance certification. The upstream complete requirement sets include capabilities and fixture-specific behavior that this tools-only gateway intentionally does not advertise. See [`docs/TESTING.md`](docs/TESTING.md).
 

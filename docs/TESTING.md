@@ -186,18 +186,11 @@ When changing the CI pin:
 
 Do not replace pinned release URLs with a mutable `latest` or convenience installer URL in normal CI.
 
-## Desktop E2E
+## Local physical Desktop E2E
 
-`.github/workflows/desktop-e2e.yml` is intentionally:
+Physical macOS acceptance is not a GitHub Actions lane. Normal Linux, macOS, and Windows CI remains on GitHub-hosted runners; a trusted operator runs the physical checks locally on a logged-in, TCC-granted Mac.
 
-- `workflow_dispatch` only;
-- restricted to `main`;
-- targeted at `[self-hosted, macOS, cua-desktop-e2e]`;
-- read-only with respect to repository contents.
-
-The dedicated runner must be a test machine, logged into a real macOS GUI session, preconfigured with CuaDriver Accessibility and Screen Recording permissions, and isolated from untrusted pull-request execution.
-
-The workflow performs two physical acceptance fixtures from trusted `main`:
+The local wrapper performs two fixtures from the reviewed checkout:
 
 ```text
 V1 desktop fixture:
@@ -220,9 +213,18 @@ real Cua state-changing operation
     → safe reuse with a new operation ID
 ```
 
-The final P1 physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`. The dedicated runner may be registered ephemerally, but the workflow must remain manual, `main`-only, and isolated from untrusted pull-request execution. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the original desktop procedure and [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) for the V2 invariant.
+Run it only after reviewing the checkout and explicitly acknowledging both real-desktop actions:
 
-The trusted lane also establishes an ordinary visible macOS Desktop immediately before the V1 TextEdit fixture. Cua `launch_app` starts the application in the background; if the runner is sitting on a different Space, the launched TextEdit window can be off-Space and `get_window_state` can return an empty Accessibility element set even though launch/window/screenshot calls themselves succeed. This is a physical-lane precondition only and does not alter the V2 execution-safety state machine.
+```bash
+CUMG_DESKTOP_E2E_ACK=1 \
+CUMG_V2_CUA_CANCEL_E2E_ACK=1 \
+CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" \
+./scripts/v2_desktop_acceptance.sh
+```
+
+Historical P1 physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`; that self-hosted-runner mechanism is retained only as historical evidence and is no longer the repository execution model. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](V2_LOCAL_DESKTOP_ACCEPTANCE.md), [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), and [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
+
+The local fixture requires an ordinary visible macOS Desktop. Cua `launch_app` starts the application in the background; if the Mac is sitting on a different Space, the launched TextEdit window can be off-Space and `get_window_state` can return an empty Accessibility element set even though launch/window/screenshot calls themselves succeed. This is a physical-acceptance precondition only and does not alter the V2 execution-safety state machine.
 
 ## V2-M1 final acceptance
 
