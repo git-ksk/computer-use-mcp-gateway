@@ -2,7 +2,7 @@
 
 A lightweight Rust gateway that exposes a local computer-use MCP backend through a policy-controlled MCP Streamable HTTP endpoint.
 
-> Status: **V1 closed / V2-M1 accepted (2026-08-12)**. V1 is the hardened MCP↔Cua gateway. V2 is now deliberately narrowed to an uncertainty-aware execution-safety layer for delegated control of stateful interactive desktops; see [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md).
+> Status: **V1 closed / V2 complete (2026-08-13)**. V1 is the hardened MCP↔Cua gateway. V2 adds an uncertainty-aware execution-safety layer for delegated control of stateful interactive desktops; see [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md).
 
 ## Start here
 
@@ -219,7 +219,7 @@ Do not expand V1 indefinitely merely because adjacent backend features are techn
 
 ## V2 direction
 
-V2-M0 and V2-M1 are complete. The final competitor review narrowed the project further before V2-M2.
+V2-M0 through the final V2 execution-safety, multi-device invariant, backend-portability, replacement-seam, observability, resource-regression, and trusted real-desktop acceptance work are complete as of 2026-08-13.
 
 CUMG is **not** trying to win the broad category of vendor-neutral physical-device control planes. That space already overlaps materially with projects such as SINT Protocol and Arm Device Connect, in addition to OpenClaw, OAHL, QuickDesk, Obot, and delegated-authorization systems.
 
@@ -247,18 +247,11 @@ ambiguous outcome?
 
 An ambiguous state-changing operation is never automatically replayed because a client, Hub, Agent, transport, backend, or device reconnects.
 
-### Core-first priority
+### Core-first boundary
 
-Future V2 work should prioritize, in order:
+V2 closeout established the authoritative operation state machine, durable `indeterminate` quarantine, explicit audited resolution, ownership/generation fencing, restart/reconnect no-auto-replay behavior, fixed-set multi-device invariant proof, backend portability, payload-safe observability, and trusted real-Cua desktop acceptance.
 
-1. hardening operation-state transitions and stale-result fencing;
-2. making `indeterminate` quarantine and explicit resolution first-class, durable, and crash-safe;
-3. proving ownership across reconnect/restart and competing principals;
-4. proving the same invariants across multiple independent desktops;
-5. proving backend portability with a second backend/reference executor;
-6. only then expanding fleet UX, broad discovery, routing convenience, dashboards, or orchestration.
-
-Generic authentication, delegated authorization, device fabric/registry, fleet routing, telemetry, TLS lifecycle, and service supervision should use standards or maintained OSS when that can be done without weakening these invariants.
+Future work must preserve those invariants. Generic authentication, delegated authorization, device fabric/registry, fleet routing, remote desktop, dashboards, orchestration, telemetry infrastructure, TLS lifecycle, and service supervision remain outside the V2 core and should use standards or maintained OSS when appropriate rather than growing a second generic control plane.
 
 See [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md) and [`docs/V2_STANDARDIZATION.md`](docs/V2_STANDARDIZATION.md).
 

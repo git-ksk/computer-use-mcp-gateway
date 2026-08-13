@@ -254,18 +254,18 @@ The P0 implementation was reviewed against these failure classes:
 - **privacy:** receipts contain typed evidence metadata, not command/result payloads; operator evidence must remain bounded metadata;
 - **compromised endpoint/backend:** still outside cryptographic proof. A compromised Agent/backend can lie or act outside the protocol; this core limits delegation/replay/ambiguity but does not sandbox a fully compromised desktop account.
 
-## 12. Deliberately remaining work
+## 12. Post-P0 follow-up status
 
-Do not mark the following complete as part of this P0 pass:
+The original P0 pass deliberately left the following work outside its acceptance claim; the release-closeout status is recorded inline:
 
 - **P1 fixed-set multi-device invariant proof — completed.** `v2_multi_device::FixedMultiDeviceHub` composes an immutable explicitly provisioned set of ordinary `SingleDeviceHub` instances. Every device keeps its own P0 controller, checkpoint directory, queue, session generation, and gRPC service; there is no shared fleet registry, discovery plane, or cross-device scheduler. `tests/v2_p1_invariants.rs` and `tests/v2_p1_multi_device_e2e.rs` cover A ambiguous/B executing, A partition/B normal, Hub restart with A quarantined, isolated generation advance, competing principals, stale/late settlement, and no replay.
 - **P1 second materially different backend — completed.** `v2_reference_backend::DeterministicReferenceExecutor` is a process-like in-process executor rather than a Cua-shaped mock. It can prove pre-commit non-start or clean local termination, and deliberately returns `Indeterminate` when post-commit outcome cannot be proven. `tests/v2_p1_backend_portability.rs` routes both Cua ambiguity and the reference executor through the same authoritative operation controller.
-- **P1 physical real-Cua rerun — completed 2026-08-13.** Trusted `main` commit `e4eb464` passed Desktop E2E run `31655691675`. In addition to the existing screenshot/click/type/accessibility fixture, `tests/v2_p1_real_cua_e2e.rs` forced a real Cua state-changing operation into `indeterminate`, verified the exact quarantine survived Hub restart and Agent reconnect with a newer generation and no terminal receipt/replay, rejected another principal, required explicit audited resolution, and only then allowed reuse. The self-hosted runner was registered ephemerally and automatically removed after the job.
+- **P1 physical real-Cua rerun — completed 2026-08-13.** Trusted `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` passed Desktop E2E run `31675515516`. In addition to the existing screenshot/click/type/accessibility fixture, `tests/v2_p1_real_cua_e2e.rs` forced a real Cua state-changing operation into `indeterminate`, verified the exact quarantine survived Hub restart and Agent reconnect with a newer generation and no terminal receipt/replay, rejected another principal, required explicit audited resolution, and only then allowed reuse. The self-hosted runner was registered ephemerally and automatically removed after the job.
 - **Remote recovery administration.** The semantic resolution API exists and is auditable, but a standalone remotely exposed operator UI/API with its own authentication/authorization has not been introduced; that must reuse an existing auth system rather than create a generic CUMG auth protocol.
 - **Provider-timeout reason precision.** An autonomous Cua timeout is conservatively surfaced to the Hub through connection-loss ambiguity, so the safety state is correct but the persisted reason may be `ConnectionLost` rather than a provider-specific timeout reason. Do not weaken quarantine merely to improve diagnostics.
 - **v4 checkpoint migration.** Automatic migration is intentionally absent because v4 cannot prove the new owner/quarantine fields.
 
-These residual items are not blockers to the P0 invariant implemented here; they remain explicit follow-up work in Issue #24 rather than being silently closed.
+The completed P1 items above are part of V2 closeout. The remaining operational items are explicit non-blocking concerns rather than reasons to weaken or reopen the P0 execution-safety invariant.
 
 ## 13. P1 proof boundary
 

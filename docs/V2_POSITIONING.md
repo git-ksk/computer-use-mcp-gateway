@@ -1,8 +1,8 @@
 # V2 product positioning
 
-Status: **accepted direction, narrowed after final competitor review (2026-08-12)**.
+Status: **V2 accepted / complete (2026-08-13), with the product boundary narrowed by the final competitor review.**
 
-Accepted P0 implementation/gap-analysis record: [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). The post-M1 core now has an explicit authoritative operation ledger, owner/generation fencing, durable desktop quarantine, evidence-bearing receipts, and explicit resolution; P1 multi-device and second-backend proofs remain separate work.
+Accepted P0 implementation/gap-analysis record: [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). The final V2 core has an explicit authoritative operation ledger, owner/generation fencing, durable desktop quarantine, evidence-bearing receipts, explicit resolution, fixed-set multi-device invariant proof, backend portability, and trusted real-Cua physical acceptance.
 
 This document defines the product boundary for V2 after V2-M1 acceptance and the final competitor review. The boundary is intentionally narrower than “secure remote computer use”, “vendor-neutral device control plane”, or “multi-machine MCP”.
 
@@ -357,4 +357,4 @@ The proof demonstrates that Device A may remain durably quarantined under one pr
 
 Backend portability is proved with a deterministic process-like reference executor whose cancellation/result contract materially differs from Cua. Proven not-started/clean termination may map to an existing terminal evidence class; an unprovable post-commit outcome maps to `indeterminate`. The same operation identity, owner, generation, quarantine, explicit resolution, receipt, and no-replay core is used for both backends.
 
-P1 physical acceptance completed on 2026-08-13 against trusted `main` commit `e4eb464` in Desktop E2E run `31655691675`. The real-Cua lane proved ambiguity -> durable quarantine -> Hub/Agent restart and generation advance without replay -> exact explicit resolution -> safe reuse. The workflow remained manual, `main`-only, and executed on an ephemeral TCC-granted macOS runner. This closes the P1 residual without broadening P1 into fleet or backend product work.
+P1 physical acceptance completed on 2026-08-13 against trusted `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`. The real-Cua lane proved ambiguity -> durable quarantine -> Hub/Agent restart and generation advance without replay -> exact explicit resolution -> safe reuse. The workflow remained manual, `main`-only, and executed on an ephemeral TCC-granted macOS runner. This closes the P1 residual without broadening P1 into fleet or backend product work.

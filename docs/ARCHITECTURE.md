@@ -132,11 +132,9 @@ The gateway is not an internet authentication service. Remote deployments keep t
 
 Tool exposure is deny-by-default. Cua's own policy engine can provide a second, argument-aware capability ceiling.
 
-## V2 candidate boundary
+## V2 accepted boundary
 
-V2 is **not** automatically "V1 plus multi-machine routing." The roadmap requires a competitor-gap PoC and an explicit GO/NO-GO decision before major V2 implementation.
-
-The candidate is a **secure delegated device capability control plane**:
+V2 is **not** "V1 plus multi-machine routing." The completed competitor-gap PoC and GO/NO-GO review narrowed the accepted boundary to **uncertainty-aware execution safety for delegated control of stateful interactive desktops**. The Hub/Agent topology remains an implementation vehicle for that safety boundary, not a generic fleet/device-fabric product:
 
 ```text
 MCP Client
@@ -173,6 +171,6 @@ The implementation order is intentionally shell-first: establish the secure Agen
 
 The M1 operator-facing `v2_agent` process now uses outbound gRPC bidirectional streaming over TLS as the production-candidate carrier. It keeps receiving heartbeats/cancellation while Agent-native work runs off the async receive loop, and it performs bounded reconnect after transport loss. The companion `v2_hub` process is the single-device always-on-VM runtime: it authenticates the enrolled Agent, persists generation/admission state before risky transitions, maintains heartbeat/offline state, issues exact-capability grants, and conservatively marks ambiguous disconnect outcomes `indeterminate`. The raw TLS carrier remains a regression/reference implementation rather than the deployment default.
 
-If the V2-M0 PoC cannot demonstrate a meaningful capability-control gap against existing computer-use/remote-device products, the roadmap says to stop rather than build another generic remote-device orchestrator.
+The V2-M0 PoC and later competitor review applied that stop rule: CUMG does not broaden into another generic remote-device orchestrator, fleet platform, device fabric, remote desktop, or delegated-authorization protocol.
 
 See [`ROADMAP.md`](ROADMAP.md) for milestones and explicit non-goals, and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md) for V2 trust boundaries, compromise assumptions, key rotation, replay, cancellation, and residual risks.

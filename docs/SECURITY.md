@@ -77,7 +77,7 @@ A desktop runner with macOS Accessibility and Screen Recording grants is a high-
 
 Use a dedicated test Mac rather than a daily-use workstation, and never execute untrusted pull-request code on that runner. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for the final operator-controlled acceptance procedure.
 
-P1 final physical acceptance ran on 2026-08-13 against trusted `main` commit `e4eb464` as Desktop E2E run `31655691675`. The runner was registered ephemerally with the dedicated label, executed only the trusted `main` checkout, and automatically unregistered after the job. The V2 P1 step required exact quarantine to survive Hub/Agent restart and generation advance with no replay before explicit resolution and reuse.
+P1 final physical acceptance ran on 2026-08-13 against trusted `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` as Desktop E2E run `31675515516`. The runner was registered ephemerally with the dedicated label, executed only the trusted `main` checkout, and automatically unregistered after the job. The V2 P1 step required exact quarantine to survive Hub/Agent restart and generation advance with no replay before explicit resolution and reuse.
 
 ## CI supply chain
 
