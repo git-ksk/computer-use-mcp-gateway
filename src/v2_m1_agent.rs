@@ -1,0 +1,1069 @@
+//! Operator-facing V2-M1 outbound Agent runtime over gRPC bidirectional streaming.
+//!
+//! The runtime keeps the V2 application protocol independently signed. gRPC/TLS
+//! supplies the long-lived full-duplex carrier while the Agent owns heartbeat,
+//! reconnect, grant validation, replay barriers, direct process execution, and
+//! cancellation. An optional external Cua MCP adapter adds typed GUI capabilities.
+
+use crate::v2_m0::{
+    CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
+    CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
+    DeviceSession, GrantLedger,
+};
+use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
+use crate::v2_m0_transport::{
+    AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubToAgent, TrustedSessionClock,
+    build_agent_heartbeat, build_agent_proof, build_remote_cancellation_ack, build_remote_result,
+    verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_cancel, verify_remote_command,
+    verify_session_accepted,
+};
+use crate::v2_m0_trust::TrustedHubIdentity;
+use crate::v2_m1::ReconnectPolicy;
+use crate::v2_m1_backend::{BackendExecutionOutcome, CuaMcpAdapter, M1BackendError};
+use crate::v2_m1_filesystem::{FilesystemError, FilesystemExecutor, FilesystemPolicy};
+use crate::v2_m1_grpc::{
+    decode_hub_frame, encode_agent_frame, proto::agent_control_client::AgentControlClient,
+};
+use crate::v2_m1_keys::AgentProvisionedMaterial;
+use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, PersistenceError};
+use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
+use crate::v2_m1_shell::{ShellError, ShellExecutor};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::fmt;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Code;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+
+const GRPC_QUEUE_DEPTH: usize = 8;
+
+#[derive(Debug, Clone)]
+pub struct CuaAgentConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub backend_version: String,
+    pub platform: String,
+    pub revision: u64,
+    pub connect_timeout: Duration,
+    pub tool_timeout: Duration,
+    pub reconnect_attempts: u32,
+    pub reconnect_backoff: Duration,
+}
+
+impl CuaAgentConfig {
+    fn validate(&self) -> Result<(), AgentServiceError> {
+        if self.command.trim().is_empty()
+            || self.backend_version.trim().is_empty()
+            || self.platform.trim().is_empty()
+            || self.revision == 0
+            || self.connect_timeout.is_zero()
+            || self.tool_timeout.is_zero()
+            || self.reconnect_attempts == 0
+            || self.reconnect_backoff.is_zero()
+        {
+            return Err(AgentServiceError::InvalidConfig(
+                "invalid Cua backend settings",
+            ));
+        }
+        Ok(())
+    }
+
+    fn adapter(&self) -> CuaMcpAdapter {
+        CuaMcpAdapter::new(
+            self.command.clone(),
+            self.args.clone(),
+            self.backend_version.clone(),
+            self.platform.clone(),
+            self.revision,
+            self.connect_timeout,
+            self.tool_timeout,
+            self.reconnect_attempts,
+            self.reconnect_backoff,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentServiceConfig {
+    pub hub_endpoint: String,
+    pub hub_domain: String,
+    pub device_id: String,
+    pub allowed_cwd_roots: Vec<PathBuf>,
+    pub state_dir: PathBuf,
+    pub heartbeat_interval: Duration,
+    pub reconnect: ReconnectPolicy,
+    pub cua: Option<CuaAgentConfig>,
+}
+
+impl AgentServiceConfig {
+    pub fn validate(&self) -> Result<(), AgentServiceError> {
+        if !self.hub_endpoint.starts_with("https://") {
+            return Err(AgentServiceError::InvalidConfig(
+                "Hub endpoint must use https://",
+            ));
+        }
+        if self.hub_domain.trim().is_empty() || self.device_id.trim().is_empty() {
+            return Err(AgentServiceError::InvalidConfig(
+                "Hub domain and device id must be non-empty",
+            ));
+        }
+        if self.heartbeat_interval.is_zero() {
+            return Err(AgentServiceError::InvalidConfig(
+                "heartbeat interval must be non-zero",
+            ));
+        }
+        self.reconnect
+            .validate()
+            .map_err(|_| AgentServiceError::InvalidConfig("invalid reconnect policy"))?;
+        if self.allowed_cwd_roots.is_empty() {
+            return Err(AgentServiceError::InvalidConfig(
+                "at least one allowed cwd root is required",
+            ));
+        }
+        if let Some(cua) = &self.cua {
+            cua.validate()?;
+        }
+        Ok(())
+    }
+}
+
+pub struct AgentService {
+    config: AgentServiceConfig,
+    material: AgentProvisionedMaterial,
+    executor: ProcessExecutor,
+    shell: ShellExecutor,
+    filesystem: FilesystemExecutor,
+    cua: Option<CuaMcpAdapter>,
+    trusted_hub: TrustedHubIdentity,
+    grants: GrantLedger,
+    execution: AgentExecutionGate,
+    checkpoint: CheckpointStore,
+}
+
+fn reconcile_grant_verifiers(grants: &mut GrantLedger, material: &AgentProvisionedMaterial) {
+    let mut configured = vec![material.grant_verifier];
+    configured.extend(material.additional_grant_verifiers.iter().copied());
+    let configured_ids: std::collections::HashSet<_> = configured
+        .iter()
+        .map(crate::v2_m0::verifying_key_id)
+        .collect();
+    for verifier in configured {
+        grants.trust_verifier(verifier);
+    }
+    let existing = grants.snapshot().verifier_keys;
+    for key in existing {
+        if let Ok(verifier) = ed25519_dalek::VerifyingKey::from_bytes(&key) {
+            let key_id = crate::v2_m0::verifying_key_id(&verifier);
+            if !configured_ids.contains(&key_id) {
+                grants.retire_verifier(&key_id);
+            }
+        }
+    }
+}
+
+impl AgentService {
+    pub fn new(
+        config: AgentServiceConfig,
+        material: AgentProvisionedMaterial,
+    ) -> Result<Self, AgentServiceError> {
+        config.validate()?;
+        let executor = ProcessExecutor::new(
+            ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
+                .map_err(AgentServiceError::Process)?,
+        );
+        let shell = ShellExecutor::new(
+            ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
+                .map_err(AgentServiceError::Process)?,
+        );
+        let filesystem = FilesystemExecutor::new(
+            FilesystemPolicy::new(config.allowed_cwd_roots.clone())
+                .map_err(AgentServiceError::Filesystem)?,
+        );
+        let cua = config.cua.as_ref().map(CuaAgentConfig::adapter);
+        let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
+            .map_err(AgentServiceError::Persistence)?;
+        let (trusted_hub, grants, execution) =
+            match checkpoint.load_latest::<AgentPersistentState>() {
+                Ok(state) => {
+                    let (device_id, mut trusted_hub, mut grants, execution) =
+                        state.restore().map_err(AgentServiceError::Persistence)?;
+                    if device_id != config.device_id {
+                        return Err(AgentServiceError::CheckpointIdentityMismatch);
+                    }
+                    if trusted_hub.verifier() != material.trusted_hub {
+                        let rotation = material
+                            .hub_rotation
+                            .as_ref()
+                            .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
+                        trusted_hub
+                            .apply_rotation(rotation)
+                            .map_err(AgentServiceError::Trust)?;
+                        if trusted_hub.verifier() != material.trusted_hub {
+                            return Err(AgentServiceError::CheckpointTrustMismatch);
+                        }
+                    }
+                    reconcile_grant_verifiers(&mut grants, &material);
+                    (trusted_hub, grants, execution)
+                }
+                Err(PersistenceError::NoCheckpoint) => {
+                    let mut grants = GrantLedger::new(material.grant_verifier);
+                    reconcile_grant_verifiers(&mut grants, &material);
+                    (
+                        TrustedHubIdentity::new(material.trusted_hub),
+                        grants,
+                        AgentExecutionGate::default(),
+                    )
+                }
+                Err(error) => return Err(AgentServiceError::Persistence(error)),
+            };
+        let service = Self {
+            config,
+            material,
+            executor,
+            shell,
+            filesystem,
+            cua,
+            trusted_hub,
+            grants,
+            execution,
+            checkpoint,
+        };
+        // Establish a baseline checkpoint before accepting any command.
+        service.persist_state()?;
+        Ok(service)
+    }
+
+    fn persist_state(&self) -> Result<(), AgentServiceError> {
+        let state = AgentPersistentState::capture(
+            self.config.device_id.clone(),
+            &self.trusted_hub,
+            &self.grants,
+            &self.execution,
+        )
+        .map_err(AgentServiceError::Persistence)?;
+        self.checkpoint
+            .save(&state)
+            .map_err(AgentServiceError::Persistence)?;
+        Ok(())
+    }
+
+    pub fn capabilities(&self) -> CapabilityAdvertisement {
+        let mut supported = vec![
+            DeviceCapability::ExecuteProcess,
+            DeviceCapability::Shell,
+            DeviceCapability::ReadFile,
+            DeviceCapability::ListDirectory,
+        ];
+        let backend = if let Some(cua) = &self.cua {
+            for capability in cua.advertisement().supported {
+                if !supported.contains(&capability) {
+                    supported.push(capability);
+                }
+            }
+            "agent-native+cua"
+        } else {
+            "agent-native"
+        };
+        CapabilityAdvertisement {
+            backend: backend.into(),
+            backend_version: env!("CARGO_PKG_VERSION").into(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            capability_schema_version: CAPABILITY_SCHEMA_VERSION,
+            revision: 3,
+            supported,
+        }
+    }
+
+    /// Run until shutdown or a bounded sequence of connection/session failures is exhausted.
+    /// A successfully authenticated session resets the reconnect failure streak.
+    pub async fn run(
+        &mut self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), AgentServiceError> {
+        if let Some(cua) = &self.cua {
+            cua.connect().await.map_err(AgentServiceError::Backend)?;
+        }
+        let result = self.run_connected_lifecycle(&mut shutdown).await;
+        if let Some(cua) = &self.cua {
+            let shutdown_result = cua.shutdown().await.map_err(AgentServiceError::Backend);
+            if result.is_ok() {
+                shutdown_result?;
+            }
+        }
+        result
+    }
+
+    async fn run_connected_lifecycle(
+        &mut self,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), AgentServiceError> {
+        let mut failures = 0_u32;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+
+            let channel = match self.connect_channel().await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures >= self.config.reconnect.max_attempts {
+                        return Err(error);
+                    }
+                    let delay = self
+                        .config
+                        .reconnect
+                        .delay_for_attempt(failures.saturating_sub(1))
+                        .map_err(|_| AgentServiceError::ReconnectExhausted)?;
+                    if sleep_or_shutdown(delay, shutdown).await {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+
+            match self.run_authenticated_session(channel, shutdown).await {
+                Ok(SessionExit::Shutdown) => return Ok(()),
+                Ok(SessionExit::Reconnect) => {
+                    failures = 0;
+                    if sleep_or_shutdown(self.config.reconnect.initial_delay, shutdown).await {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.reconnectable() => {
+                    failures = failures.saturating_add(1);
+                    if failures >= self.config.reconnect.max_attempts {
+                        return Err(error);
+                    }
+                    let delay = self
+                        .config
+                        .reconnect
+                        .delay_for_attempt(failures.saturating_sub(1))
+                        .map_err(|_| AgentServiceError::ReconnectExhausted)?;
+                    if sleep_or_shutdown(delay, shutdown).await {
+                        return Ok(());
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn connect_channel(&self) -> Result<Channel, AgentServiceError> {
+        let root_pem = der_certificate_to_pem(&self.material.tls_root_der);
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(root_pem))
+            .domain_name(self.config.hub_domain.clone());
+        Endpoint::from_shared(self.config.hub_endpoint.clone())
+            .map_err(AgentServiceError::Transport)?
+            .tls_config(tls)
+            .map_err(AgentServiceError::Transport)?
+            .connect()
+            .await
+            .map_err(AgentServiceError::Transport)
+    }
+
+    async fn run_authenticated_session(
+        &mut self,
+        channel: Channel,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<SessionExit, AgentServiceError> {
+        let mut client = AgentControlClient::new(channel)
+            .max_decoding_message_size(crate::v2_m1_grpc::MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::v2_m1_grpc::MAX_GRPC_TRANSPORT_MESSAGE_BYTES);
+        let (outbound_tx, outbound_rx) = mpsc::channel(GRPC_QUEUE_DEPTH);
+        let mut inbound = client
+            .open_session(ReceiverStream::new(outbound_rx))
+            .await
+            .map_err(AgentServiceError::Status)?
+            .into_inner();
+
+        let hello = AgentHello::new(self.config.device_id.clone(), self.capabilities());
+        send_agent(&outbound_tx, AgentToHub::Hello(hello.clone())).await?;
+        let challenge = match next_hub(&mut inbound).await? {
+            HubToAgent::Challenge(challenge) => challenge,
+            other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
+        };
+        verify_hub_challenge(&hello, &challenge, &self.trusted_hub.verifier())
+            .map_err(AgentServiceError::Protocol)?;
+        let proof = build_agent_proof(&self.material.device_identity, &hello, &challenge)
+            .map_err(AgentServiceError::Protocol)?;
+        send_agent(&outbound_tx, AgentToHub::Proof(proof)).await?;
+
+        let accepted = match next_hub(&mut inbound).await? {
+            HubToAgent::Accepted(accepted) => accepted,
+            other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
+        };
+        verify_session_accepted(&hello, &challenge, &accepted, &self.trusted_hub.verifier())
+            .map_err(AgentServiceError::Protocol)?;
+        let session = DeviceSession {
+            device_id: self.config.device_id.clone(),
+            generation: accepted.device_generation,
+            capabilities: hello.capabilities.clone(),
+        };
+        self.execution
+            .prepare_generation(session.generation)
+            .map_err(AgentServiceError::Execution)?;
+        // Persist the generation rollover before accepting work so replay
+        // tombstones from prior generations can be safely discarded on disk.
+        self.persist_state()?;
+        let trusted_clock = TrustedSessionClock::new(accepted.hub_time_ms);
+
+        self.run_session_loop(
+            inbound,
+            outbound_tx,
+            hello,
+            challenge,
+            session,
+            trusted_clock,
+            shutdown,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_session_loop(
+        &mut self,
+        mut inbound: tonic::Streaming<crate::v2_m1_grpc::proto::HubFrame>,
+        outbound_tx: mpsc::Sender<crate::v2_m1_grpc::proto::AgentFrame>,
+        hello: AgentHello,
+        challenge: HubChallenge,
+        session: DeviceSession,
+        trusted_clock: TrustedSessionClock,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<SessionExit, AgentServiceError> {
+        let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The immediate first tick establishes liveness as soon as authentication finishes.
+        let mut heartbeat_sequence = 0_u64;
+        let mut pending_heartbeat: Option<(u64, Instant)> = None;
+        let heartbeat_deadline = self.config.heartbeat_interval.saturating_mul(3);
+
+        let (operation_done_tx, mut operation_done_rx) = mpsc::channel::<OperationCompletion>(1);
+        let mut active: Option<ActiveOperation> = None;
+
+        let session_result = async {
+            loop {
+                tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+                        self.persist_state()?;
+                        return Ok(SessionExit::Shutdown);
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if pending_heartbeat.as_ref().is_some_and(|(_, sent)| sent.elapsed() >= heartbeat_deadline) {
+                        terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+                        self.persist_state()?;
+                        return Ok(SessionExit::Reconnect);
+                    }
+                    if pending_heartbeat.is_none() {
+                        heartbeat_sequence = heartbeat_sequence.saturating_add(1);
+                        let message = build_agent_heartbeat(
+                            &self.material.device_identity,
+                            &hello,
+                            &challenge,
+                            session.generation,
+                            heartbeat_sequence,
+                        ).map_err(AgentServiceError::Protocol)?;
+                        send_agent(&outbound_tx, AgentToHub::Heartbeat(message)).await?;
+                        pending_heartbeat = Some((heartbeat_sequence, Instant::now()));
+                    }
+                }
+                completion = operation_done_rx.recv(), if active.is_some() => {
+                    let completion = completion.ok_or(AgentServiceError::OperationWorkerClosed)?;
+                    let expected = active.take().ok_or(AgentServiceError::OperationStateMismatch)?;
+                    if completion.operation_id != expected.operation_id
+                        || completion.device_generation != expected.device_generation
+                        || completion.device_generation != session.generation
+                    {
+                        return Err(AgentServiceError::OperationStateMismatch);
+                    }
+                    self.execution.finish(&completion.operation_id)
+                        .map_err(AgentServiceError::Execution)?;
+                    self.persist_state()?;
+                    match completion.outcome {
+                        AgentOperationOutcome::Result(result) => {
+                            let device_result = match result {
+                                Ok(result) => result,
+                                Err(error) => DeviceResult::Error {
+                                    code: operation_error_code(&error),
+                                },
+                            };
+                            let result = CommandResultEnvelope {
+                                schema_version: CONTROL_SCHEMA_VERSION,
+                                device_id: session.device_id.clone(),
+                                device_generation: session.generation,
+                                capability_revision: session.capabilities.revision,
+                                operation_id: completion.operation_id,
+                                result: device_result,
+                            };
+                            let signed = build_remote_result(
+                                &self.material.device_identity,
+                                &hello,
+                                &challenge,
+                                result,
+                            ).map_err(AgentServiceError::Protocol)?;
+                            send_agent(&outbound_tx, AgentToHub::Result(signed)).await?;
+                        }
+                        AgentOperationOutcome::Indeterminate(cause) => {
+                            match cause {
+                                AgentIndeterminateCause::CancellationPropagated => {
+                                    // The cancellation branch already queued a signed
+                                    // IndeterminateAfterPropagation acknowledgement. Keep
+                                    // this transport generation alive so that acknowledgement
+                                    // cannot be lost merely because the local worker completed
+                                    // first; the Hub quarantine blocks all further work.
+                                    tracing::warn!(
+                                        event = "v2_agent_backend_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        "backend cancellation outcome is ambiguous; keeping session alive after signed quarantine acknowledgement"
+                                    );
+                                }
+                                AgentIndeterminateCause::BackendTimedOut => {
+                                    // No cancellation acknowledgement exists for an autonomous
+                                    // provider timeout. Reconnect deliberately forces the Hub's
+                                    // connection-loss path to settle the operation as unknown.
+                                    tracing::warn!(
+                                        event = "v2_agent_backend_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        "backend timed out with ambiguous outcome; reconnecting without a success result"
+                                    );
+                                    return Ok(SessionExit::Reconnect);
+                                }
+                            }
+                        }
+                    }
+                }
+                message = inbound.message() => {
+                    let frame = match message.map_err(AgentServiceError::Status)? {
+                        Some(frame) => frame,
+                        None => {
+                            terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+                            self.persist_state()?;
+                            return Ok(SessionExit::Reconnect);
+                        }
+                    };
+                    match decode_hub_frame(frame).map_err(AgentServiceError::Carrier)? {
+                        HubToAgent::HeartbeatAck(ack) => {
+                            verify_hub_heartbeat_ack(&hello, &challenge, &ack, &self.trusted_hub.verifier())
+                                .map_err(AgentServiceError::Protocol)?;
+                            let Some((expected, _)) = pending_heartbeat else {
+                                return Err(AgentServiceError::HeartbeatAckMismatch);
+                            };
+                            if ack.device_generation != session.generation || ack.sequence != expected {
+                                return Err(AgentServiceError::HeartbeatAckMismatch);
+                            }
+                            pending_heartbeat = None;
+                        }
+                        HubToAgent::Command(remote) => {
+                            verify_remote_command(&hello, &challenge, &remote, &self.trusted_hub.verifier())
+                                .map_err(AgentServiceError::Protocol)?;
+                            crate::v2_m0::validate_command_session(&remote.command, &session)
+                                .map_err(AgentServiceError::Control)?;
+                            self.grants.authorize_device_capability_once(
+                                &remote.grant,
+                                &session.device_id,
+                                remote.command.command.capability(),
+                                trusted_clock.now_ms(),
+                            ).map_err(AgentServiceError::Control)?;
+                            self.persist_state()?;
+                            if active.is_some() {
+                                return Err(AgentServiceError::AgentBusy);
+                            }
+                            let operation = OperationRef {
+                                device_id: session.device_id.clone(),
+                                device_generation: session.generation,
+                                operation_id: remote.command.operation_id.clone(),
+                            };
+                            self.execution.begin(operation).map_err(AgentServiceError::Execution)?;
+                            // Persist the active operation before starting any local work. A crash
+                            // after this fsync restores the operation ID as terminal.
+                            self.persist_state()?;
+                            let operation_id = remote.command.operation_id.clone();
+                            let worker_operation_id = operation_id.clone();
+                            let worker_generation = session.generation;
+                            let done = operation_done_tx.clone();
+                            let cancellation = match remote.command.command {
+                                DeviceCommand::ExecuteProcess { request } => {
+                                    let cancellation = ProcessCancellation::default();
+                                    let worker_cancel = cancellation.clone();
+                                    let executor = self.executor.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            executor.execute(&request, &worker_cancel)
+                                        }).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map(|output| DeviceResult::Process { output }).map_err(AgentOperationError::Process));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
+                                            outcome: AgentOperationOutcome::Result(result),
+                                        }).await;
+                                    });
+                                    ActiveCancellation::Process(cancellation)
+                                }
+                                DeviceCommand::Shell { request } => {
+                                    let cancellation = ProcessCancellation::default();
+                                    let worker_cancel = cancellation.clone();
+                                    let shell = self.shell.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            shell.execute(&request, &worker_cancel)
+                                        }).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map(|output| DeviceResult::Shell { output }).map_err(AgentOperationError::Shell));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
+                                            outcome: AgentOperationOutcome::Result(result),
+                                        }).await;
+                                    });
+                                    ActiveCancellation::Process(cancellation)
+                                }
+                                DeviceCommand::ReadFile { path } => {
+                                    let filesystem = self.filesystem.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || filesystem.read_file(&path)).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map_err(AgentOperationError::Filesystem));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
+                                            outcome: AgentOperationOutcome::Result(result),
+                                        }).await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::ListDirectory { path } => {
+                                    let filesystem = self.filesystem.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || filesystem.list_directory(&path)).await
+                                            .map_err(|_| AgentOperationError::WorkerPanicked)
+                                            .and_then(|result| result.map_err(AgentOperationError::Filesystem));
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
+                                            outcome: AgentOperationOutcome::Result(result),
+                                        }).await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                command @ (DeviceCommand::ListApplications
+                                | DeviceCommand::ScreenGeometry
+                                | DeviceCommand::PointerClick { .. }
+                                | DeviceCommand::PointerDrag { .. }) => {
+                                    let cua = self.cua.clone().ok_or(AgentServiceError::UnsupportedCommand)?;
+                                    let (cancel_tx, cancel_rx) = watch::channel(false);
+                                    tokio::spawn(async move {
+                                        let outcome = match cua.execute(&command, cancel_rx).await {
+                                            Ok(BackendExecutionOutcome::Completed(result)) => {
+                                                AgentOperationOutcome::Result(Ok(result))
+                                            }
+                                            Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                                                AgentOperationOutcome::Indeterminate(
+                                                    AgentIndeterminateCause::CancellationPropagated,
+                                                )
+                                            }
+                                            Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
+                                                AgentOperationOutcome::Indeterminate(
+                                                    AgentIndeterminateCause::BackendTimedOut,
+                                                )
+                                            }
+                                            Err(error) => AgentOperationOutcome::Result(Err(
+                                                AgentOperationError::Backend(error),
+                                            )),
+                                        };
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
+                                            outcome,
+                                        }).await;
+                                    });
+                                    ActiveCancellation::Backend(cancel_tx)
+                                }
+                            };
+                            active = Some(ActiveOperation {
+                                operation_id,
+                                device_generation: session.generation,
+                                cancellation,
+                            });
+                        }
+                        HubToAgent::Cancel(cancel) => {
+                            verify_remote_cancel(&hello, &challenge, &cancel, &self.trusted_hub.verifier())
+                                .map_err(AgentServiceError::Protocol)?;
+                            if cancel.device_generation != session.generation {
+                                return Err(AgentServiceError::CancellationMismatch);
+                            }
+                            let disposition = match active.as_ref() {
+                                Some(operation) if operation.operation_id == cancel.operation_id => {
+                                    self.execution.request_cancel(&cancel.operation_id)
+                                        .map_err(AgentServiceError::Execution)?;
+                                    self.persist_state()?;
+                                    match &operation.cancellation {
+                                        ActiveCancellation::Process(cancellation) => {
+                                            cancellation.cancel();
+                                            CancellationDisposition::CancellationRequested
+                                        }
+                                        ActiveCancellation::Backend(cancellation) => {
+                                            let _ = cancellation.send(true);
+                                            // MCP cancellation propagation is not proof that a desktop
+                                            // side effect stopped. The Hub must quarantine this operation.
+                                            CancellationDisposition::IndeterminateAfterPropagation
+                                        }
+                                        ActiveCancellation::None => {
+                                            // Bounded filesystem observation has no mutation side effect,
+                                            // but std filesystem calls are not asynchronously interruptible.
+                                            CancellationDisposition::IndeterminateAfterPropagation
+                                        }
+                                    }
+                                }
+                                Some(_) => return Err(AgentServiceError::CancellationMismatch),
+                                None => return Err(AgentServiceError::CancellationMismatch),
+                            };
+                            let ack = build_remote_cancellation_ack(
+                                &self.material.device_identity,
+                                &hello,
+                                &challenge,
+                                &cancel,
+                                disposition,
+                            ).map_err(AgentServiceError::Protocol)?;
+                            send_agent(&outbound_tx, AgentToHub::CancellationAck(ack)).await?;
+                        }
+                        other => return Err(AgentServiceError::UnexpectedMessage(format!("{other:?}"))),
+                    }
+                }
+            }
+        }
+        }.await;
+
+        // No session exit path may orphan a process. Protocol errors, stream
+        // errors, and policy failures are just as capable of tearing down the
+        // session as an explicit reconnect. Always cancel + wait the direct
+        // child before returning an error, then persist the terminal replay
+        // barrier before the outer lifecycle can reconnect or exit.
+        if session_result.is_err() && active.is_some() {
+            terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+            self.persist_state()?;
+        }
+        session_result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionExit {
+    Reconnect,
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct ActiveOperation {
+    operation_id: String,
+    device_generation: u64,
+    cancellation: ActiveCancellation,
+}
+
+#[derive(Debug)]
+enum ActiveCancellation {
+    Process(ProcessCancellation),
+    Backend(watch::Sender<bool>),
+    None,
+}
+
+#[derive(Debug)]
+enum AgentOperationOutcome {
+    Result(Result<DeviceResult, AgentOperationError>),
+    Indeterminate(AgentIndeterminateCause),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentIndeterminateCause {
+    CancellationPropagated,
+    BackendTimedOut,
+}
+
+#[derive(Debug)]
+struct OperationCompletion {
+    operation_id: String,
+    device_generation: u64,
+    outcome: AgentOperationOutcome,
+}
+
+#[derive(Debug)]
+pub enum AgentOperationError {
+    Process(ProcessError),
+    Shell(ShellError),
+    Filesystem(FilesystemError),
+    Backend(M1BackendError),
+    WorkerPanicked,
+}
+
+async fn terminate_active(
+    active: &mut Option<ActiveOperation>,
+    operation_done_rx: &mut mpsc::Receiver<OperationCompletion>,
+    execution: &mut AgentExecutionGate,
+) -> Result<(), AgentServiceError> {
+    let Some(operation) = active.take() else {
+        return Ok(());
+    };
+    match &operation.cancellation {
+        ActiveCancellation::Process(cancellation) => cancellation.cancel(),
+        ActiveCancellation::Backend(cancellation) => {
+            let _ = cancellation.send(true);
+        }
+        ActiveCancellation::None => {}
+    }
+    let completion = tokio::time::timeout(Duration::from_secs(5), operation_done_rx.recv())
+        .await
+        .map_err(|_| AgentServiceError::OperationTerminationTimeout)?
+        .ok_or(AgentServiceError::OperationWorkerClosed)?;
+    if completion.operation_id != operation.operation_id
+        || completion.device_generation != operation.device_generation
+    {
+        return Err(AgentServiceError::OperationStateMismatch);
+    }
+    // Process descendants have been killed/waited by ProcessExecutor. Read-only
+    // filesystem operations are bounded and awaited before the replay ID is
+    // terminalized.
+    execution
+        .abandon_on_disconnect(&operation.operation_id)
+        .map_err(AgentServiceError::Execution)?;
+    Ok(())
+}
+
+fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
+    match error {
+        AgentOperationError::Filesystem(FilesystemError::PathDenied) => {
+            DeviceErrorCode::PermissionDenied
+        }
+        AgentOperationError::Filesystem(
+            FilesystemError::InvalidPath | FilesystemError::NotFile | FilesystemError::NotDirectory,
+        ) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Filesystem(FilesystemError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            DeviceErrorCode::NotFound
+        }
+        AgentOperationError::Filesystem(FilesystemError::Io(_))
+        | AgentOperationError::Process(ProcessError::Io(_))
+        | AgentOperationError::Process(ProcessError::Spawn(_))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Io(_)))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Spawn(_))) => {
+            DeviceErrorCode::IoFailure
+        }
+        AgentOperationError::Filesystem(_)
+        | AgentOperationError::Process(_)
+        | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Backend(_) | AgentOperationError::WorkerPanicked => {
+            DeviceErrorCode::InternalFailure
+        }
+    }
+}
+
+async fn send_agent(
+    sender: &mpsc::Sender<crate::v2_m1_grpc::proto::AgentFrame>,
+    message: AgentToHub,
+) -> Result<(), AgentServiceError> {
+    sender
+        .send(encode_agent_frame(&message).map_err(AgentServiceError::Carrier)?)
+        .await
+        .map_err(|_| AgentServiceError::OutboundClosed)
+}
+
+async fn next_hub(
+    inbound: &mut tonic::Streaming<crate::v2_m1_grpc::proto::HubFrame>,
+) -> Result<HubToAgent, AgentServiceError> {
+    let frame = inbound
+        .message()
+        .await
+        .map_err(AgentServiceError::Status)?
+        .ok_or(AgentServiceError::InboundClosed)?;
+    decode_hub_frame(frame).map_err(AgentServiceError::Carrier)
+}
+
+async fn sleep_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => false,
+        result = shutdown.changed() => result.is_err() || *shutdown.borrow(),
+    }
+}
+
+fn der_certificate_to_pem(der: &[u8]) -> Vec<u8> {
+    let encoded = STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem.into_bytes()
+}
+
+#[derive(Debug)]
+pub enum AgentServiceError {
+    InvalidConfig(&'static str),
+    Transport(tonic::transport::Error),
+    Status(tonic::Status),
+    Carrier(crate::v2_m1_grpc::GrpcCarrierError),
+    Protocol(crate::v2_m0_transport::TransportError),
+    Trust(crate::v2_m0_trust::TrustError),
+    Control(crate::v2_m0::ControlError),
+    Execution(crate::v2_m0_execution::ExecutionError),
+    Process(ProcessError),
+    Filesystem(FilesystemError),
+    Backend(M1BackendError),
+    Operation(AgentOperationError),
+    Persistence(PersistenceError),
+    UnexpectedMessage(String),
+    HeartbeatAckMismatch,
+    CancellationMismatch,
+    AgentBusy,
+    UnsupportedCommand,
+    InboundClosed,
+    OutboundClosed,
+    OperationWorkerClosed,
+    OperationStateMismatch,
+    OperationTerminationTimeout,
+    ReconnectExhausted,
+    CheckpointIdentityMismatch,
+    CheckpointTrustMismatch,
+    CheckpointGrantTrustMismatch,
+}
+
+impl AgentServiceError {
+    fn reconnectable(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::InboundClosed | Self::OutboundClosed => true,
+            Self::Status(status) => matches!(
+                status.code(),
+                Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown
+            ),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for AgentServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for AgentServiceError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_requires_https_and_bounded_liveness_settings() {
+        let config = AgentServiceConfig {
+            hub_endpoint: "http://localhost:7443".into(),
+            hub_domain: "localhost".into(),
+            device_id: "dev-a".into(),
+            allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
+            state_dir: std::env::temp_dir().join("cumg-v2-agent-config-test"),
+            heartbeat_interval: Duration::from_secs(5),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_secs(1),
+                max_attempts: 3,
+            },
+            cua: None,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(AgentServiceError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn startup_applies_signed_hub_rotation_and_reconciles_grant_overlap() {
+        use crate::v2_m0::{DeviceIdentity, GrantAuthority};
+        use crate::v2_m0_transport::HubIdentity;
+        use crate::v2_m0_trust::build_hub_key_rotation;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "cumg-v2-agent-rotation-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let config = AgentServiceConfig {
+            hub_endpoint: "https://localhost:7443".into(),
+            hub_domain: "localhost".into(),
+            device_id: "dev-rotation".into(),
+            allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
+            state_dir: state_dir.clone(),
+            heartbeat_interval: Duration::from_secs(5),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_secs(1),
+                max_attempts: 3,
+            },
+            cua: None,
+        };
+        let device = DeviceIdentity::generate();
+        let old_hub = HubIdentity::generate();
+        let old_grant = GrantAuthority::generate();
+        let initial = AgentProvisionedMaterial {
+            device_identity: device.clone(),
+            trusted_hub: old_hub.verifier(),
+            grant_verifier: old_grant.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: vec![1],
+        };
+        let first = AgentService::new(config.clone(), initial).unwrap();
+        assert_eq!(first.trusted_hub.epoch(), 0);
+        drop(first);
+
+        let new_hub = HubIdentity::generate();
+        let new_grant = GrantAuthority::generate();
+        let rotation = build_hub_key_rotation(&old_hub, &new_hub, 1).unwrap();
+        let rotated = AgentService::new(
+            config.clone(),
+            AgentProvisionedMaterial {
+                device_identity: device.clone(),
+                trusted_hub: new_hub.verifier(),
+                grant_verifier: new_grant.verifier(),
+                additional_grant_verifiers: vec![old_grant.verifier()],
+                hub_rotation: Some(rotation),
+                tls_root_der: vec![1],
+            },
+        )
+        .unwrap();
+        assert_eq!(rotated.trusted_hub.verifier(), new_hub.verifier());
+        assert_eq!(rotated.trusted_hub.epoch(), 1);
+        let overlap = rotated.grants.snapshot().verifier_keys;
+        assert!(overlap.contains(&new_grant.verifier().to_bytes()));
+        assert!(overlap.contains(&old_grant.verifier().to_bytes()));
+        drop(rotated);
+
+        let retired = AgentService::new(
+            config,
+            AgentProvisionedMaterial {
+                device_identity: device,
+                trusted_hub: new_hub.verifier(),
+                grant_verifier: new_grant.verifier(),
+                additional_grant_verifiers: vec![],
+                hub_rotation: None,
+                tls_root_der: vec![1],
+            },
+        )
+        .unwrap();
+        let keys = retired.grants.snapshot().verifier_keys;
+        assert_eq!(keys, vec![new_grant.verifier().to_bytes()]);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn der_to_pem_is_bounded_ascii_certificate_encoding() {
+        let pem = String::from_utf8(der_certificate_to_pem(&[1, 2, 3, 4])).unwrap();
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
+        assert!(pem.contains("AQIDBA=="));
+        assert!(pem.ends_with("-----END CERTIFICATE-----\n"));
+    }
+}

@@ -11,9 +11,10 @@ jobs:
     # Never run untrusted PR code on a TCC-granted self-hosted desktop.
     if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, macOS, cua-desktop-e2e]
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       CUMG_DESKTOP_E2E_ACK: "1"
+      CUMG_V2_CUA_CANCEL_E2E_ACK: "1"
     steps:
       - name: Checkout trusted main
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -40,3 +41,11 @@ jobs:
       - name: Real desktop screenshot click type verify
         shell: bash
         run: python3 scripts/cua_desktop_e2e.py
+
+      - name: V2 P1 real-Cua ambiguity restart recovery
+        shell: bash
+        run: |
+          CUMG_V2_CUA_COMMAND="$(command -v cua-driver)" \
+            cargo test --locked --test v2_p1_real_cua_e2e \
+              real_cua_indeterminate_survives_restart_without_replay_and_requires_resolution \
+              -- --ignored --exact --nocapture

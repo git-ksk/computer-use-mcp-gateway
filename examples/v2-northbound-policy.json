@@ -1,0 +1,13 @@
+{
+  "grants": [
+    {
+      "issuer": "https://auth.example.com",
+      "subject": "replace-with-verified-subject",
+      "device_id": "replace-with-v2-hub-device-id",
+      "capabilities": [
+        "read_file",
+        "list_directory"
+      ]
+    }
+  ]
+}

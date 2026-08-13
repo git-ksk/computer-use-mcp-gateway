@@ -20,6 +20,37 @@ pub struct BackendResourceMetrics {
     pub rss_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCallCancelled;
+
+impl std::fmt::Display for BackendCallCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cua MCP tool call cancelled by the upstream MCP client; cancellation was propagated and the call was not replayed"
+        )
+    }
+}
+
+impl std::error::Error for BackendCallCancelled {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCallTimedOut {
+    pub timeout_secs: u64,
+}
+
+impl std::fmt::Display for BackendCallTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cua MCP tool call timed out after {} seconds; cancellation was propagated and the call was not retried because its side effects may be unknown",
+            self.timeout_secs
+        )
+    }
+}
+
+impl std::error::Error for BackendCallTimedOut {}
+
 #[async_trait]
 pub trait ComputerUseBackend: Send + Sync {
     async fn connect(&self) -> Result<()>;

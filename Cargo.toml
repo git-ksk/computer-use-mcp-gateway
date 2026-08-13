@@ -11,7 +11,10 @@ categories = ["network-programming"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-trait = "0.1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 rmcp = { version = "=3.1.2", features = [
@@ -26,6 +29,24 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "si
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tonic = { version = "0.14.6", features = ["transport", "tls-ring"] }
+prost = "0.14"
+tonic-prost = "0.14.6"
+tokio-stream = { version = "0.1", features = ["net"] }
+process-wrap = { version = "9.1.0", default-features = false, features = ["std", "process-group", "job-object"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace", "metrics"] }
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1"
+proptest = "1"
+rcgen = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14.6"

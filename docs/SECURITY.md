@@ -69,7 +69,7 @@ Cloudflare Tunnel
 Cua stdio
 ```
 
-Keep the gateway on loopback. Do not commit real tunnel credentials, Access tokens, private hostnames, or `.env` files.
+Keep the gateway on loopback. Do not commit real tunnel credentials, Access tokens, private hostnames, `.env` files, generated private keys, PKCS#12 bundles, or local `secrets/` directories. The repository ignore rules are defense in depth, not a substitute for a secret manager or repository secret scanning.
 
 ## Self-hosted desktop E2E
 
@@ -88,3 +88,27 @@ The deterministic V1 quality fixture does not touch a desktop. It covers cancell
 Gateway audit logs record coarse metadata such as tool name, semantic class, policy decision, outcome, and duration. Keep raw arguments/results and credentials out of normal logs.
 
 For security-sensitive reports, do not include credentials or unrelated private desktop data in public issues. Prefer GitHub private vulnerability reporting when available.
+
+
+## V2 trust model
+
+V2 separates northbound authenticated client principals, Hub transport identity, grant-signing authority, and Agent device identity. Key rotation requires continuity proof; bounded admission and signed cancellation/reconnect semantics fail closed around ambiguous operations. The complete compromised-component analysis and non-claims are documented in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+
+V2-M1 passed its single-secure-Agent acceptance gate on 2026-08-12. The production candidate keeps TLS-protected gRPC separate from independently signed application identity, preserves principal -> stable device -> exact capability grants, and never forwards a northbound OAuth bearer token to the Agent. Ambiguous desktop cancellation remains `indeterminate` and quarantines the device rather than authorizing replay. Linux Hub application keys use systemd encrypted credentials in the packaged service; ACME owns ordinary server-certificate renewal; Hub/device/grant key rotation stays independent and continuity-proven. OpenTelemetry/OTLP default telemetry excludes sensitive operation payloads. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+
+The post-M1 P0 hardening makes that ambiguity boundary explicit in an authoritative operation ledger. Authenticated issuer/subject ownership and Agent generation both fence settlement; dispatched uncertainty persists as an exact-operation desktop quarantine across reconnect/restart; queued pre-ambiguity work is cancelled instead of resumed; and reuse requires an explicit, auditable, persistence-gated resolution. The recovery evidence string is bounded metadata and must not contain raw desktop content, commands, results, or secrets. See [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
+
+## V2 P1 fixed-set multi-device security review
+
+P1 adds only fixed composition around the P0 core. The security review covers the requested cross-device failure classes:
+
+- **cross-device ownership bleed:** each device owns a separate `SingleDeviceHub`, authoritative controller, checkpoint directory, queue, live session and generation. No API transfers an unresolved operation or quarantine between entries;
+- **device ID / generation confusion:** routing requires an exact pre-provisioned stable device ID, while the selected P0 service still verifies its provisioned device identity, signed session material, operation identity, capability revision and generation. A reconnect advances only that device's generation;
+- **stale routing:** the fixed map is immutable after construction. There is no discovery, reassignment or failover-to-another-device operation that could route an old A result into B;
+- **shared/global queue bypass:** P1 introduces no shared queue. Admission/load shedding remains inside each existing per-device Hub, so A's quarantine cannot be bypassed through B's capacity or queue;
+- **checkpoint restore consistency:** construction rejects duplicate state directories. Hub restart reconstructs each P0 checkpoint independently; failure to restore one device is not interpreted as permission to inherit another device's state;
+- **duplicate/late result or cancellation acknowledgement:** the unchanged P0 operation/owner/generation fences reject stale settlement and duplicate finalization; separate service instances additionally prevent a signed A stream from becoming B's execution stream;
+- **resolution target confusion:** recovery is invoked through the exact device's `HubHandle` and the exact ambiguous operation ID. There is no fleet-wide lookup that can resolve a same-looking operation on another device;
+- **compromised backend evidence:** unchanged trust boundary. A malicious authenticated Agent/backend may falsely claim terminal evidence or perform side effects outside CUMG. The reference executor proves adapter classification rules for conforming backends; it is not remote attestation or Byzantine proof.
+
+The proof intentionally does not add generic authorization, mutable device enrollment/discovery, a fleet scheduler, new policy language, native GUI backends, or a ROSClaw fork.

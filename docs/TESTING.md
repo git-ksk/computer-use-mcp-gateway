@@ -51,7 +51,7 @@ These thresholds are regression guards, not capacity or production-performance c
 @modelcontextprotocol/conformance@0.2.0-alpha.11
 ```
 
-CI requires Node 20+ and asks the pinned runner to load both frozen requirement revisions tracked by this project:
+CI requires Node 22+ and asks the pinned runner to load both frozen requirement revisions tracked by this project:
 
 ```text
 2025-11-25
@@ -182,6 +182,42 @@ launch fresh TextEdit
 
 Execution of this lane is intentionally left to the operator. See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
 
+## V2-M1 final acceptance
+
+The V2-M1 gate is recorded in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). Run the deterministic portion explicitly on Rust 1.88 even if another toolchain is the local default:
+
+```bash
+cargo +1.88.0 fmt --check
+cargo +1.88.0 check --locked --all-targets
+cargo +1.88.0 test --locked --all-targets
+cargo +1.88.0 clippy --locked --all-targets
+python3 scripts/check_docs.py
+```
+
+The real-Cua cancellation test is intentionally ignored in normal test discovery because it performs a real desktop action. On the dedicated, logged-in, TCC-granted macOS acceptance machine:
+
+```bash
+CUMG_V2_CUA_CANCEL_E2E_ACK=1 CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" cargo +1.88.0 test --locked   --test v2_m1_cua_cancellation_e2e -- --ignored --nocapture
+```
+
+The current post-M1/P0 version of this acceptance is stronger than the original M1 cancellation smoke. It launches the TextEdit fixture through the Agent-native shell executor, performs the real Cua desktop action under the same operation-owner boundary, observes `IndeterminateAfterPropagation`, verifies durable quarantine, rejects another principal, explicitly resolves the exact ambiguous operation, and then proves the desktop can be reused without replaying the old action. A merely delivered cancellation notification is not sufficient evidence of non-execution.
+
+### V2 P0 execution-safety regression
+
+The detailed invariant is recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). In addition to the repository-wide gate above, the focused deterministic regressions are:
+
+```bash
+cargo test v2_execution_safety --lib
+cargo test --test v2_m1_desktop_boundary_e2e
+cargo test --test v2_m1_partition_recovery
+```
+
+`v2_m1_desktop_boundary_e2e` uses a deterministic Cua-shaped stdio fixture and a real Hub-Agent TLS/gRPC session. It proves native shell and GUI-adapter commands share one owner/fence/quarantine boundary, includes a forced checkpoint-write failure during resolution, and requires rollback to quarantine before a successful retry.
+
+`v2_m1_partition_recovery` drops the Agent after dispatch while a native shell side effect can still complete locally, reconnects a new Agent generation, requires the exact old operation to remain quarantined, rejects a competing principal, and only permits new work after explicit resolution.
+
+Packaging/lifecycle acceptance also includes `plutil -lint` on the LaunchAgent template, shell syntax plus valid/mismatched certificate fixtures for the ACME deploy hook, and throwaway `v2_keyctl` generation/rotation outside the repository. The systemd unit must additionally be run through `systemd-analyze verify` on the target Linux distribution or Linux release CI because the macOS desktop acceptance host cannot execute systemd's semantic verifier.
+
 ## Running smoke locally
 
 After building the gateway and installing Cua:
@@ -196,3 +232,21 @@ python3 scripts/check_docs.py
 ```
 
 The Cua smoke script starts its own gateway process/configuration. Do not point test harnesses at a production desktop or reuse production credentials.
+
+### V2 P1 multi-device and backend-portability proof
+
+In addition to the repository-wide locked gate, run:
+
+```bash
+cargo test --locked --test v2_p1_invariants
+cargo test --locked --test v2_p1_backend_portability
+cargo test --locked --test v2_p1_multi_device_e2e
+```
+
+`v2_p1_invariants` proves independent A/B ownership/quarantine state, restart normalization, queue cancellation on the quarantined device, wrong-owner/late/duplicate settlement rejection, and property-based stale-generation isolation.
+
+`v2_p1_backend_portability` uses a deterministic process-like second executor whose cancellation semantics can prove not-started or clean termination and can also deliberately become post-commit indeterminate. It verifies that both this executor and Cua ambiguity use the same P0 operation ID/owner/generation/quarantine/resolution/no-replay model.
+
+`v2_p1_multi_device_e2e` composes two existing `SingleDeviceHub` services in one process with independent durable state. Device A uses the Cua-shaped GUI fixture and becomes unknown/quarantined; Device B simultaneously runs native shell work under a different principal; A reconnect and partition leave B usable; Hub reconstruction restores A/B independently; explicit A resolution permits a new operation while marker counts prove the old GUI action was not replayed.
+
+A fresh physical real-Cua P1 regression is **not** claimed by these deterministic lanes. The operator-controlled TCC-granted macOS workflow remains main-only by design; keep that item open until the final P1 code is exercised there.

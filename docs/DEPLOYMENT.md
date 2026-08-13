@@ -4,6 +4,73 @@ V1 is designed to run on the same machine as the computer-use backend and remain
 
 Get the local path working with [`GETTING_STARTED.md`](GETTING_STARTED.md) before following this guide.
 
+## V2-M1 deployment boundary
+
+V2-M1 has a separate production candidate from the V1 loopback gateway. The accepted single-device topology is:
+
+```text
+MCP client
+    |
+    | HTTPS + MCP Authorization / OAuth
+    v
+reviewed TLS reverse proxy / load balancer
+    |
+    | loopback HTTP
+    v
+v2_hub northbound MCP (default deployment: 127.0.0.1:8081)
+    |
+    | AuthenticatedClientPrincipal -> stable device -> exact DeviceCapability grant
+    | OAuth token stops here
+    |
+    | outbound-Agent gRPC bidi over TLS
+    v
+v2_agent
+    +-- direct process / shell / bounded filesystem
+    +-- optional Cua MCP GUI adapter
+```
+
+The Agent-facing gRPC listener is a separate Hub service port (example 7443). Agents connect outbound and authenticate again at the application layer with the enrolled Ed25519 device identity. A public deployment must restrict this port at the host/cloud firewall and apply the deployment's normal TCP/TLS connection controls. The in-process session limits begin after transport acceptance and are defense in depth, not a raw handshake-flood defense.
+
+### Linux Hub
+
+Use `packaging/systemd/cumg-v2-hub.service` plus `packaging/systemd/hub.env.example` as templates. The unit uses systemd encrypted credentials for the Hub and grant-signing application keys and a systemd credential path for the ACME-managed TLS private key. Provision long-lived application keys into the encrypted credential store outside the repository, for example:
+
+```bash
+sudo systemd-creds encrypt --name=hub-secret /secure/admin/hub.key   /etc/credstore.encrypted/hub-secret
+sudo systemd-creds encrypt --name=grant-secret /secure/admin/grant.key   /etc/credstore.encrypted/grant-secret
+```
+
+Keep the recovery/rotation copy in the operator's normal secret manager. Do not retain plaintext administrative copies in the checkout. The service receives `%d/hub-secret`, `%d/grant-secret`, and `%d/tls-key` paths; private bytes are not environment-variable values.
+
+For northbound OAuth introspection, use the optional encrypted-credential drop-in in `packaging/systemd/cumg-v2-hub-oauth-credential.conf.example` rather than putting the client secret in `hub.env`.
+
+### TLS renewal
+
+Keep certificate issuance/renewal with the deployment's ACME client. Do not point `v2_hub` directly at a symlinked ACME `live/` private key because the Hub secret loader intentionally rejects symlinks. Configure the ACME deploy hook to run:
+
+```bash
+scripts/v2-install-renewed-tls.sh   ACME_CERT_PEM ACME_KEY_PEM   /etc/cumg-v2/tls/server.pem /etc/cumg-v2/tls/server.key
+sudo systemctl try-restart cumg-v2-hub.service
+```
+
+The hook validates that the certificate and private key parse and match before same-directory atomic replacement. The deployed key is mode 0600. Application Hub/device/grant identity rotation is independent; follow `packaging/README.md` and use `v2_keyctl` for continuity documents.
+
+### Linux Agent
+
+Install `packaging/systemd/cumg-v2-agent.service` as a **user service** and customize `packaging/systemd/agent.env.example` outside the repository. The template intentionally avoids a filesystem namespace that would silently change the explicitly configured process/filesystem capability semantics. Store the device secret as a regular 0600 file and keep Hub/grant/TLS trust anchors non-group/other-writable.
+
+### macOS Agent
+
+Customize `packaging/launchd/com.github.git-ksk.cumg-v2-agent.plist`, replacing `@BINARY@` and `@HOME@`, then install it as a user LaunchAgent. Cua-backed GUI automation must run in the logged-in user session so Accessibility/Screen Recording TCC attribution remains explicit. Secret/trust files live outside the repository under the user's Application Support tree with restrictive permissions.
+
+### Overload and observability
+
+The Hub defaults to bounded Agent sessions/session starts and bounded northbound MCP request concurrency/rate. Excess Agent sessions use gRPC `RESOURCE_EXHAUSTED`; excess northbound requests use HTTP 429 or 503. Keep external firewall/reverse-proxy limits as the outer control.
+
+OTLP is opt-in through standard OpenTelemetry variables. `OTEL_EXPORTER_OTLP_ENDPOINT` enables traces and metrics; signal-specific endpoint variables enable only that signal. The packaged build uses the standard OTLP `grpc` transport. Default telemetry intentionally excludes command bodies, argv, file contents, screenshots, clipboard data, bearer tokens and credentials.
+
+See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md) for the final security gate and [`../packaging/README.md`](../packaging/README.md) for lifecycle details.
+
 ## Required topology
 
 ```text
@@ -273,7 +340,7 @@ Do not commit:
 - personal filesystem paths;
 - `.env` files.
 
-`.gitignore` excludes `.env` and `.env.*` except `.env.example`.
+`.gitignore` excludes `.env` variants plus generated `*.key`, PKCS#12, `*.secret`, and `secrets/` material. Ignore rules are only defense in depth; production credentials belong in the selected secret store.
 
 ## Current deployment limitations
 

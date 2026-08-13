@@ -6,7 +6,10 @@
 //! On macOS, `cua-driver mcp` may proxy through the supported CuaDriver.app
 //! daemon. Do not replace that lifecycle with a raw `cua-driver serve` spawn.
 
-use super::{BackendHealth, BackendResourceMetrics, ComputerUseBackend};
+use super::{
+    BackendCallCancelled, BackendCallTimedOut, BackendHealth, BackendResourceMetrics,
+    ComputerUseBackend,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use rmcp::{
@@ -337,6 +340,14 @@ impl ComputerUseBackend for CuaBackend {
         tokio::pin!(response);
 
         tokio::select! {
+            biased;
+            changed = cancellation.changed() => {
+                if changed.is_ok() && *cancellation.borrow() {
+                    Self::notify_cancelled(&peer, request_id, "upstream MCP request cancelled").await;
+                    return Err(anyhow!(BackendCallCancelled));
+                }
+                bail!("Cua MCP cancellation channel closed unexpectedly")
+            }
             result = &mut response => {
                 match result {
                     Ok(ServerResult::CallToolResult(result)) => Ok(result),
@@ -347,20 +358,12 @@ impl ComputerUseBackend for CuaBackend {
                     }
                 }
             }
-            changed = cancellation.changed() => {
-                if changed.is_ok() && *cancellation.borrow() {
-                    Self::notify_cancelled(&peer, request_id, "upstream MCP request cancelled").await;
-                    bail!("Cua MCP tool call cancelled by the upstream MCP client; the call was not replayed")
-                }
-                bail!("Cua MCP cancellation channel closed unexpectedly")
-            }
             _ = sleep(self.tool_timeout) => {
                 Self::notify_cancelled(&peer, request_id, "gateway tool timeout").await;
                 self.recover_after_failure().await;
-                bail!(
-                    "Cua MCP tool call timed out after {} seconds; cancellation was propagated and the call was not retried because its side effects may be unknown",
-                    self.tool_timeout.as_secs()
-                )
+                return Err(anyhow!(BackendCallTimedOut {
+                    timeout_secs: self.tool_timeout.as_secs(),
+                }));
             }
         }
     }

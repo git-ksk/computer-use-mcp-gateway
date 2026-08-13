@@ -149,8 +149,11 @@ Hub
    v
 outbound Agent
    |
-   +-- Cua MCP backend
-   +-- future native backend
+   +-- direct process/shell executor
+   +-- bounded filesystem read/list capabilities
+   +-- GUI/computer-use adapter
+        +-- Cua MCP backend
+        +-- future native GUI backend
 ```
 
 The differentiated control semantics are intended to center on:
@@ -162,10 +165,14 @@ The differentiated control semantics are intended to center on:
 - policy-decision evidence without raw desktop-content logging;
 - a backend-neutral capability contract.
 
-Transport is an implementation choice, not the product boundary. WebSocket may be a candidate transport, but the command/grant schema must remain transport-neutral so a later QUIC/gRPC or other transport change does not redefine semantics.
+Transport is an implementation choice, not the product boundary. The M1 production candidate is now **gRPC bidirectional streaming over TLS**, while the earlier raw TLS transport remains as a regression/reference implementation. The application command/grant schema remains transport-neutral so a later WebSocket, QUIC, or other transport adapter does not redefine semantics. During the first gRPC migration slice, Protobuf owns the RPC/carrier framing while the existing independently signed application messages remain unchanged inside the bounded carrier; this deliberately avoids coupling transport migration to a simultaneous security-protocol rewrite.
 
-Cua remains an important backend, but Cua-specific tool names or wire behavior must not become the permanent Hub-to-Agent protocol.
+Cua remains an important GUI/computer-use backend, but Cua-specific tool names or wire behavior must not become the permanent Hub-to-Agent protocol. Direct process/shell execution is owned by the Agent itself and must not be implemented by automating a terminal window through Cua. Structured argv execution avoids implicit shell parsing but is still `Dangerous`: scripts/interpreters can execute arbitrary code and cwd policy does not confine argv filesystem access. M1 therefore scopes Agent-native process grants to the exact device capability. Separate `ReadFile`/`ListDirectory` observation capabilities canonicalize paths under approved roots, bound returned content, reject symlink escape, and return coarse errors. These read-only operations are a narrower capability surface; they do not constrain `ExecuteProcess`. Free-form shell execution is a separate implemented `Dangerous` capability with an exact grant and distinct command/result type; it intentionally invokes a fixed OS shell and therefore accepts shell parsing risk without widening `ExecuteProcess`. Explicit filesystem mutation remains a separate future higher-risk surface.
+
+The implementation order is intentionally shell-first: establish the secure Agent core, add direct process/shell execution, add only the bounded filesystem operations required by those workflows, retain Cua for GUI/computer-use during the transition, then add native GUI backends later. This keeps GUI backend replacement independent from the Agent's usefulness for development and operations tasks.
+
+The M1 operator-facing `v2_agent` process now uses outbound gRPC bidirectional streaming over TLS as the production-candidate carrier. It keeps receiving heartbeats/cancellation while Agent-native work runs off the async receive loop, and it performs bounded reconnect after transport loss. The companion `v2_hub` process is the single-device always-on-VM runtime: it authenticates the enrolled Agent, persists generation/admission state before risky transitions, maintains heartbeat/offline state, issues exact-capability grants, and conservatively marks ambiguous disconnect outcomes `indeterminate`. The raw TLS carrier remains a regression/reference implementation rather than the deployment default.
 
 If the V2-M0 PoC cannot demonstrate a meaningful capability-control gap against existing computer-use/remote-device products, the roadmap says to stop rather than build another generic remote-device orchestrator.
 
-See [`ROADMAP.md`](ROADMAP.md) for the GO/NO-GO gate and explicit non-goals.
+See [`ROADMAP.md`](ROADMAP.md) for milestones and explicit non-goals, and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md) for V2 trust boundaries, compromise assumptions, key rotation, replay, cancellation, and residual risks.
