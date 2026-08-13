@@ -1,6 +1,6 @@
 # V2 P2 replacement and integration seams
 
-Status: **replacement review accepted on 2026-08-13; final P2 acceptance remains pending until the merged main code passes the trusted real-Cua regression. P2 adds narrow replacement seams but adopts no new external runtime, authorization protocol, device fabric, workload-identity system, or policy engine.**
+Status: **accepted on 2026-08-13. The replacement review, narrow authorization/Computer Use seams, deterministic regressions, and final trusted main-only real-Cua regression all passed. P2 adopts no new external runtime, authorization protocol, device fabric, workload-identity system, or policy engine.**
 
 Canonical product boundary: [`V2_POSITIONING.md`](V2_POSITIONING.md). Authoritative execution-safety model: [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). Primary tracker: Issue #24.
 
@@ -113,5 +113,7 @@ An integration is acceptable only if all of the following remain true under dete
 ## 7. P2 acceptance boundary
 
 P2 is complete when the replacement decision is documented, the two narrow seams compile and pass invariant regressions, the existing multi-device/backend portability tests remain green, and the final main code passes the trusted real-Cua regression.
+
+Final acceptance evidence: trusted `main` commit `bb6712d` passed Desktop E2E run `31658602133` on 2026-08-13. The workflow first established the ordinary visible macOS Desktop, then passed the screenshot/click/type/Accessibility fixture and the V2 real-Cua ambiguity -> durable quarantine -> Hub/Agent restart -> newer-generation reconnect without replay -> explicit audited resolution -> reuse fixture. The ephemeral TCC runner automatically unregistered after the job.
 
 P2 does **not** require adopting an external dependency. In this review, not adopting one is the safer result: none of the evaluated systems provides a clear net improvement to the current fixed-set deployment without importing a broader control plane or weakening the separation between generic infrastructure and the CUMG execution-safety core.

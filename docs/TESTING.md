@@ -273,3 +273,5 @@ P2 adds two focused unit regressions in addition to the existing P1 suites:
 - `v2_m1_agent::tests::custom_computer_use_backend_is_injected_without_changing_native_capabilities` proves an alternate Computer Use backend can be injected without replacing Agent-native capabilities or the surrounding execution gate.
 
 The existing `v2_p1_backend_portability` test remains the semantic guard: backend-specific cancellation behavior must converge on the same authoritative operation/quarantine/resolution model. Any P2 Computer Use backend change also requires the final main-only real-Cua regression because compile-time interface compatibility is not evidence of physical cancellation behavior. See [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
+
+P2 final physical acceptance passed on 2026-08-13 against trusted `main` commit `bb6712d` in Desktop E2E run `31658602133`. This run exercised the workflow-owned Desktop precondition, the V1 physical screenshot/click/type/Accessibility fixture, and the V2 real-Cua restart/no-replay fixture in one main-only job.

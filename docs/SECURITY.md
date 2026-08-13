@@ -127,3 +127,5 @@ The two new seams are intentionally one-way and narrow:
 A future SINT/Grantex/Open Agent Auth/OPA/Cedar adapter must fail closed when its authorization state is unavailable or ambiguous. A future Arm Device Connect or other fabric integration must treat discovery and liveness as routing inputs only: they are never proof of ownership, safe settlement, or safe reuse. A future OpenClaw or other Computer Use adapter must remain an executor under the CUMG operation ID and fences rather than introducing a second authoritative action lifecycle.
 
 The existing compromised-backend boundary still applies. A malicious authenticated backend can lie about a claimed result or act outside CUMG; the adapter seam does not create remote attestation. P2 is designed to avoid making that trust boundary larger.
+
+P2 final physical acceptance passed on 2026-08-13 against trusted `main` commit `bb6712d` in Desktop E2E run `31658602133`. The run preserved the manual `main`-only TCC boundary, exercised the accepted restart/no-replay invariant through real Cua, and used an ephemeral runner that automatically unregistered after completion.

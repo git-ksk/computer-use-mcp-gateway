@@ -242,6 +242,7 @@ Candidates include:
 A replacement is acceptable only after regression evidence shows that the CUMG execution-safety invariant is preserved or improved.
 
 The 2026-08-13 P2 review and concrete adoption decisions are recorded in [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md). It adds narrow authorization and Computer Use backend seams, but no external dependency or new control plane.
+P2 final physical acceptance also passed on trusted `main` commit `bb6712d` in Desktop E2E run `31658602133`; the replacement seams therefore remain subordinate to the same accepted execution-safety core under real-Cua execution.
 
 ### Reuse externally
 
