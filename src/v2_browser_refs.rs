@@ -1,0 +1,815 @@
+//! Snapshot-scoped browser capability references for V2.
+//!
+//! Desktop element references are context-scoped. Browser references need a
+//! stricter lifetime: a new semantic snapshot or navigation invalidates page
+//! refs for exactly one tab. This registry keeps provider target/tab/ref values
+//! southbound while preserving the existing principal/device/generation/
+//! capability-revision fences carried by `InteractionContextBinding`.
+
+use crate::v2_interaction_context::InteractionContextBinding;
+use rand::{RngCore, rngs::OsRng};
+use std::collections::HashMap;
+use std::fmt;
+
+pub const DEFAULT_MAX_BROWSER_REFS_PER_CONTEXT: usize = 4_096;
+pub const MAX_BROWSER_BACKEND_REF_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BrowserRefKind {
+    Target,
+    Tab,
+    Snapshot,
+    ActionElement,
+    ContentElement,
+    Continuation,
+    Dialog,
+}
+
+impl BrowserRefKind {
+    fn is_snapshot_bound(self) -> bool {
+        matches!(
+            self,
+            Self::Snapshot
+                | Self::ActionElement
+                | Self::ContentElement
+                | Self::Continuation
+                | Self::Dialog
+        )
+    }
+}
+
+#[derive(Clone)]
+struct BrowserBackendRef {
+    public_ref: String,
+    context_id: String,
+    device_id: String,
+    device_generation: u64,
+    capability_revision: u64,
+    kind: BrowserRefKind,
+    backend_ref: String,
+    target_ref: Option<String>,
+    tab_ref: Option<String>,
+    snapshot_ref: Option<String>,
+    single_use: bool,
+}
+
+impl fmt::Debug for BrowserBackendRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrowserBackendRef")
+            .field("public_ref", &"[redacted]")
+            .field("context_id", &"[redacted]")
+            .field("device_id", &self.device_id)
+            .field("device_generation", &self.device_generation)
+            .field("capability_revision", &self.capability_revision)
+            .field("kind", &self.kind)
+            .field("backend_ref", &"[redacted]")
+            .field("target_ref", &self.target_ref.as_ref().map(|_| "[redacted]"))
+            .field("tab_ref", &self.tab_ref.as_ref().map(|_| "[redacted]"))
+            .field(
+                "snapshot_ref",
+                &self.snapshot_ref.as_ref().map(|_| "[redacted]"),
+            )
+            .field("single_use", &self.single_use)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBrowserTargetTab {
+    pub backend_target: String,
+    pub backend_tab: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBrowserPageRef {
+    pub backend_ref: String,
+    pub kind: BrowserRefKind,
+}
+
+pub struct BrowserRefRegistry {
+    max_refs_per_context: usize,
+    refs: HashMap<String, BrowserBackendRef>,
+}
+
+impl BrowserRefRegistry {
+    pub fn new(max_refs_per_context: usize) -> Result<Self, BrowserRefError> {
+        if max_refs_per_context == 0 {
+            return Err(BrowserRefError::InvalidLimit);
+        }
+        Ok(Self {
+            max_refs_per_context,
+            refs: HashMap::new(),
+        })
+    }
+
+    pub fn mint_target(
+        &mut self,
+        context: &InteractionContextBinding,
+        backend_target: &str,
+    ) -> Result<String, BrowserRefError> {
+        self.mint(
+            context,
+            BrowserRefKind::Target,
+            backend_target,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    pub fn mint_tab(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        backend_tab: &str,
+    ) -> Result<String, BrowserRefError> {
+        self.require_owned_kind(target_ref, context, BrowserRefKind::Target)?;
+        self.mint(
+            context,
+            BrowserRefKind::Tab,
+            backend_tab,
+            Some(target_ref),
+            None,
+            None,
+            false,
+        )
+    }
+
+    /// Starts a fresh semantic snapshot for one exact target/tab. All prior
+    /// snapshot-bound refs for that tab are invalidated before the new snapshot
+    /// ref is minted. Target and tab capabilities survive.
+    pub fn begin_snapshot(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        backend_snapshot: &str,
+    ) -> Result<String, BrowserRefError> {
+        self.resolve_target_tab(context, target_ref, tab_ref)?;
+        self.invalidate_snapshot_bound_for_tab(context, target_ref, tab_ref);
+        self.mint(
+            context,
+            BrowserRefKind::Snapshot,
+            backend_snapshot,
+            Some(target_ref),
+            Some(tab_ref),
+            None,
+            false,
+        )
+    }
+
+    pub fn mint_action_element(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        snapshot_ref: &str,
+        backend_element: &str,
+    ) -> Result<String, BrowserRefError> {
+        self.require_snapshot_relation(context, target_ref, tab_ref, snapshot_ref)?;
+        self.mint(
+            context,
+            BrowserRefKind::ActionElement,
+            backend_element,
+            Some(target_ref),
+            Some(tab_ref),
+            Some(snapshot_ref),
+            false,
+        )
+    }
+
+    pub fn mint_content_element(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        snapshot_ref: &str,
+        backend_element: &str,
+    ) -> Result<String, BrowserRefError> {
+        self.require_snapshot_relation(context, target_ref, tab_ref, snapshot_ref)?;
+        self.mint(
+            context,
+            BrowserRefKind::ContentElement,
+            backend_element,
+            Some(target_ref),
+            Some(tab_ref),
+            Some(snapshot_ref),
+            false,
+        )
+    }
+
+    pub fn mint_continuation(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        snapshot_ref: &str,
+        backend_continuation: &str,
+    ) -> Result<String, BrowserRefError> {
+        self.require_snapshot_relation(context, target_ref, tab_ref, snapshot_ref)?;
+        self.mint(
+            context,
+            BrowserRefKind::Continuation,
+            backend_continuation,
+            Some(target_ref),
+            Some(tab_ref),
+            Some(snapshot_ref),
+            true,
+        )
+    }
+
+    pub fn mint_dialog(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        snapshot_ref: &str,
+        backend_dialog: &str,
+    ) -> Result<String, BrowserRefError> {
+        self.require_snapshot_relation(context, target_ref, tab_ref, snapshot_ref)?;
+        self.mint(
+            context,
+            BrowserRefKind::Dialog,
+            backend_dialog,
+            Some(target_ref),
+            Some(tab_ref),
+            Some(snapshot_ref),
+            false,
+        )
+    }
+
+    pub fn resolve_target_tab(
+        &self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+    ) -> Result<ResolvedBrowserTargetTab, BrowserRefError> {
+        let target = self.require_owned_kind(target_ref, context, BrowserRefKind::Target)?;
+        let tab = self.require_owned_kind(tab_ref, context, BrowserRefKind::Tab)?;
+        if tab.target_ref.as_deref() != Some(target_ref) {
+            return Err(BrowserRefError::RelationMismatch);
+        }
+        Ok(ResolvedBrowserTargetTab {
+            backend_target: target.backend_ref.clone(),
+            backend_tab: tab.backend_ref.clone(),
+        })
+    }
+
+    pub fn resolve_action_element(
+        &self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        element_ref: &str,
+    ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
+        self.resolve_page_ref(
+            context,
+            target_ref,
+            tab_ref,
+            element_ref,
+            &[BrowserRefKind::ActionElement],
+        )
+    }
+
+    pub fn resolve_scope_ref(
+        &self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        scope_ref: &str,
+    ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
+        self.resolve_page_ref(
+            context,
+            target_ref,
+            tab_ref,
+            scope_ref,
+            &[
+                BrowserRefKind::ActionElement,
+                BrowserRefKind::ContentElement,
+            ],
+        )
+    }
+
+    pub fn resolve_dialog(
+        &self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        dialog_ref: &str,
+    ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
+        self.resolve_page_ref(
+            context,
+            target_ref,
+            tab_ref,
+            dialog_ref,
+            &[BrowserRefKind::Dialog],
+        )
+    }
+
+    /// Resolve and consume one continuation. A second use fails closed even if
+    /// no newer snapshot has been taken.
+    pub fn consume_continuation(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        continuation_ref: &str,
+    ) -> Result<String, BrowserRefError> {
+        let resolved = self.resolve_page_ref(
+            context,
+            target_ref,
+            tab_ref,
+            continuation_ref,
+            &[BrowserRefKind::Continuation],
+        )?;
+        let reference = self
+            .refs
+            .get(continuation_ref)
+            .ok_or(BrowserRefError::UnknownRef)?;
+        if !reference.single_use {
+            return Err(BrowserRefError::KindMismatch);
+        }
+        self.refs.remove(continuation_ref);
+        Ok(resolved.backend_ref)
+    }
+
+    /// Navigation changes the document identity. Drop every snapshot-bound ref
+    /// for this tab before or immediately after dispatch acceptance; callers
+    /// must obtain a new snapshot before another ref-targeted operation.
+    pub fn invalidate_tab_document(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+    ) -> Result<(), BrowserRefError> {
+        self.resolve_target_tab(context, target_ref, tab_ref)?;
+        self.invalidate_snapshot_bound_for_tab(context, target_ref, tab_ref);
+        Ok(())
+    }
+
+    pub fn invalidate_context(&mut self, context_id: &str) {
+        self.refs
+            .retain(|_, reference| reference.context_id != context_id);
+    }
+
+    pub fn invalidate_device_generation(&mut self, device_id: &str, generation: u64) {
+        self.refs.retain(|_, reference| {
+            reference.device_id != device_id || reference.device_generation == generation
+        });
+    }
+
+    pub fn invalidate_capability_revision(&mut self, device_id: &str, revision: u64) {
+        self.refs.retain(|_, reference| {
+            reference.device_id != device_id || reference.capability_revision == revision
+        });
+    }
+
+    pub fn len(&self) -> usize {
+        self.refs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.refs.is_empty()
+    }
+
+    fn resolve_page_ref(
+        &self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        public_ref: &str,
+        allowed_kinds: &[BrowserRefKind],
+    ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
+        self.resolve_target_tab(context, target_ref, tab_ref)?;
+        let reference = self.require_owned(public_ref, context)?;
+        if !allowed_kinds.contains(&reference.kind) {
+            return Err(BrowserRefError::KindMismatch);
+        }
+        if reference.target_ref.as_deref() != Some(target_ref)
+            || reference.tab_ref.as_deref() != Some(tab_ref)
+        {
+            return Err(BrowserRefError::RelationMismatch);
+        }
+        let snapshot_ref = reference
+            .snapshot_ref
+            .as_deref()
+            .ok_or(BrowserRefError::RelationMismatch)?;
+        self.require_snapshot_relation(context, target_ref, tab_ref, snapshot_ref)?;
+        Ok(ResolvedBrowserPageRef {
+            backend_ref: reference.backend_ref.clone(),
+            kind: reference.kind,
+        })
+    }
+
+    fn require_snapshot_relation(
+        &self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        snapshot_ref: &str,
+    ) -> Result<(), BrowserRefError> {
+        self.resolve_target_tab(context, target_ref, tab_ref)?;
+        let snapshot = self.require_owned_kind(snapshot_ref, context, BrowserRefKind::Snapshot)?;
+        if snapshot.target_ref.as_deref() != Some(target_ref)
+            || snapshot.tab_ref.as_deref() != Some(tab_ref)
+        {
+            return Err(BrowserRefError::RelationMismatch);
+        }
+        Ok(())
+    }
+
+    fn require_owned_kind(
+        &self,
+        public_ref: &str,
+        context: &InteractionContextBinding,
+        expected: BrowserRefKind,
+    ) -> Result<&BrowserBackendRef, BrowserRefError> {
+        let reference = self.require_owned(public_ref, context)?;
+        if reference.kind != expected {
+            return Err(BrowserRefError::KindMismatch);
+        }
+        Ok(reference)
+    }
+
+    fn require_owned(
+        &self,
+        public_ref: &str,
+        context: &InteractionContextBinding,
+    ) -> Result<&BrowserBackendRef, BrowserRefError> {
+        let reference = self.refs.get(public_ref).ok_or(BrowserRefError::UnknownRef)?;
+        if reference.public_ref != public_ref
+            || reference.context_id != context.id.as_str()
+            || reference.device_id != context.device_id
+        {
+            return Err(BrowserRefError::ContextMismatch);
+        }
+        if reference.device_generation != context.device_generation {
+            return Err(BrowserRefError::GenerationMismatch);
+        }
+        if reference.capability_revision != context.capability_revision {
+            return Err(BrowserRefError::CapabilityRevisionMismatch);
+        }
+        Ok(reference)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mint(
+        &mut self,
+        context: &InteractionContextBinding,
+        kind: BrowserRefKind,
+        backend_ref: &str,
+        target_ref: Option<&str>,
+        tab_ref: Option<&str>,
+        snapshot_ref: Option<&str>,
+        single_use: bool,
+    ) -> Result<String, BrowserRefError> {
+        validate_backend_ref(backend_ref)?;
+        let context_count = self
+            .refs
+            .values()
+            .filter(|reference| reference.context_id == context.id.as_str())
+            .count();
+        if context_count >= self.max_refs_per_context {
+            return Err(BrowserRefError::RefLimitExceeded);
+        }
+        for _ in 0..4 {
+            let public_ref = random_ref();
+            if self.refs.contains_key(&public_ref) {
+                continue;
+            }
+            self.refs.insert(
+                public_ref.clone(),
+                BrowserBackendRef {
+                    public_ref: public_ref.clone(),
+                    context_id: context.id.as_str().to_owned(),
+                    device_id: context.device_id.clone(),
+                    device_generation: context.device_generation,
+                    capability_revision: context.capability_revision,
+                    kind,
+                    backend_ref: backend_ref.to_owned(),
+                    target_ref: target_ref.map(str::to_owned),
+                    tab_ref: tab_ref.map(str::to_owned),
+                    snapshot_ref: snapshot_ref.map(str::to_owned),
+                    single_use,
+                },
+            );
+            return Ok(public_ref);
+        }
+        Err(BrowserRefError::IdentifierCollision)
+    }
+
+    fn invalidate_snapshot_bound_for_tab(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+    ) {
+        self.refs.retain(|_, reference| {
+            !(reference.context_id == context.id.as_str()
+                && reference.device_id == context.device_id
+                && reference.device_generation == context.device_generation
+                && reference.capability_revision == context.capability_revision
+                && reference.target_ref.as_deref() == Some(target_ref)
+                && reference.tab_ref.as_deref() == Some(tab_ref)
+                && reference.kind.is_snapshot_bound())
+        });
+    }
+}
+
+impl Default for BrowserRefRegistry {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_BROWSER_REFS_PER_CONTEXT)
+            .expect("static browser ref limit is valid")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserRefError {
+    InvalidLimit,
+    InvalidBackendRef,
+    RefLimitExceeded,
+    IdentifierCollision,
+    UnknownRef,
+    ContextMismatch,
+    GenerationMismatch,
+    CapabilityRevisionMismatch,
+    KindMismatch,
+    RelationMismatch,
+}
+
+impl fmt::Display for BrowserRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for BrowserRefError {}
+
+fn validate_backend_ref(value: &str) -> Result<(), BrowserRefError> {
+    if value.is_empty()
+        || value.len() > MAX_BROWSER_BACKEND_REF_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(BrowserRefError::InvalidBackendRef);
+    }
+    Ok(())
+}
+
+fn random_ref() -> String {
+    let mut random = [0_u8; 16];
+    OsRng.fill_bytes(&mut random);
+    let mut output = String::with_capacity(4 + 32);
+    output.push_str("ref_");
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v2_interaction_context::{InteractionContextLimits, InteractionContextManager};
+    use crate::v2_m0_trust::AuthenticatedClientPrincipal;
+
+    fn context(subject: &str, generation: u64, revision: u64) -> InteractionContextBinding {
+        let principal = AuthenticatedClientPrincipal {
+            issuer: "https://issuer.example".into(),
+            subject: subject.into(),
+        };
+        InteractionContextManager::new(InteractionContextLimits::default())
+            .unwrap()
+            .open(&principal, "dev-a", generation, revision, 1)
+            .unwrap()
+    }
+
+    fn bound_tab(
+        refs: &mut BrowserRefRegistry,
+        context: &InteractionContextBinding,
+    ) -> (String, String) {
+        let target = refs.mint_target(context, "backend-target-secret").unwrap();
+        let tab = refs.mint_tab(context, &target, "backend-tab-secret").unwrap();
+        (target, tab)
+    }
+
+    #[test]
+    fn target_and_tab_are_context_generation_revision_and_relation_bound() {
+        let first = context("alice", 4, 9);
+        let second = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &first);
+
+        assert_eq!(
+            refs.resolve_target_tab(&second, &target, &tab),
+            Err(BrowserRefError::ContextMismatch)
+        );
+        let mut wrong_generation = first.clone();
+        wrong_generation.device_generation += 1;
+        assert_eq!(
+            refs.resolve_target_tab(&wrong_generation, &target, &tab),
+            Err(BrowserRefError::GenerationMismatch)
+        );
+        let mut wrong_revision = first.clone();
+        wrong_revision.capability_revision += 1;
+        assert_eq!(
+            refs.resolve_target_tab(&wrong_revision, &target, &tab),
+            Err(BrowserRefError::CapabilityRevisionMismatch)
+        );
+        assert_eq!(
+            refs.resolve_target_tab(&first, &target, &tab).unwrap(),
+            ResolvedBrowserTargetTab {
+                backend_target: "backend-target-secret".into(),
+                backend_tab: "backend-tab-secret".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_tab_cannot_be_paired_with_another_target() {
+        let context = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (first_target, first_tab) = bound_tab(&mut refs, &context);
+        let second_target = refs.mint_target(&context, "target-two").unwrap();
+        assert_eq!(
+            refs.resolve_target_tab(&context, &second_target, &first_tab),
+            Err(BrowserRefError::RelationMismatch)
+        );
+        assert!(refs
+            .resolve_target_tab(&context, &first_target, &first_tab)
+            .is_ok());
+    }
+
+    #[test]
+    fn newer_snapshot_invalidates_old_page_refs_but_not_target_or_tab() {
+        let context = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        let first_snapshot = refs
+            .begin_snapshot(&context, &target, &tab, "snapshot-one")
+            .unwrap();
+        let action = refs
+            .mint_action_element(&context, &target, &tab, &first_snapshot, "element-one")
+            .unwrap();
+        let content = refs
+            .mint_content_element(&context, &target, &tab, &first_snapshot, "content-one")
+            .unwrap();
+        let continuation = refs
+            .mint_continuation(&context, &target, &tab, &first_snapshot, "continue-one")
+            .unwrap();
+        let dialog = refs
+            .mint_dialog(&context, &target, &tab, &first_snapshot, "dialog-one")
+            .unwrap();
+
+        let second_snapshot = refs
+            .begin_snapshot(&context, &target, &tab, "snapshot-two")
+            .unwrap();
+
+        assert!(refs.resolve_target_tab(&context, &target, &tab).is_ok());
+        for old in [first_snapshot, action, content, continuation, dialog] {
+            assert_eq!(
+                refs.require_owned(&old, &context),
+                Err(BrowserRefError::UnknownRef)
+            );
+        }
+        assert!(refs
+            .require_owned_kind(&second_snapshot, &context, BrowserRefKind::Snapshot)
+            .is_ok());
+    }
+
+    #[test]
+    fn navigation_invalidates_only_the_selected_tabs_document_refs() {
+        let context = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let target = refs.mint_target(&context, "target").unwrap();
+        let first_tab = refs.mint_tab(&context, &target, "tab-one").unwrap();
+        let second_tab = refs.mint_tab(&context, &target, "tab-two").unwrap();
+        let first_snapshot = refs
+            .begin_snapshot(&context, &target, &first_tab, "snapshot-one")
+            .unwrap();
+        let first_element = refs
+            .mint_action_element(
+                &context,
+                &target,
+                &first_tab,
+                &first_snapshot,
+                "element-one",
+            )
+            .unwrap();
+        let second_snapshot = refs
+            .begin_snapshot(&context, &target, &second_tab, "snapshot-two")
+            .unwrap();
+        let second_element = refs
+            .mint_action_element(
+                &context,
+                &target,
+                &second_tab,
+                &second_snapshot,
+                "element-two",
+            )
+            .unwrap();
+
+        refs.invalidate_tab_document(&context, &target, &first_tab)
+            .unwrap();
+        assert_eq!(
+            refs.resolve_action_element(&context, &target, &first_tab, &first_element),
+            Err(BrowserRefError::UnknownRef)
+        );
+        assert!(refs
+            .resolve_action_element(&context, &target, &second_tab, &second_element)
+            .is_ok());
+    }
+
+    #[test]
+    fn continuation_is_single_use() {
+        let context = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        let snapshot = refs
+            .begin_snapshot(&context, &target, &tab, "snapshot")
+            .unwrap();
+        let continuation = refs
+            .mint_continuation(&context, &target, &tab, &snapshot, "backend-continuation")
+            .unwrap();
+        assert_eq!(
+            refs.consume_continuation(&context, &target, &tab, &continuation),
+            Ok("backend-continuation".into())
+        );
+        assert_eq!(
+            refs.consume_continuation(&context, &target, &tab, &continuation),
+            Err(BrowserRefError::UnknownRef)
+        );
+    }
+
+    #[test]
+    fn content_ref_cannot_be_used_as_an_action_ref() {
+        let context = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        let snapshot = refs
+            .begin_snapshot(&context, &target, &tab, "snapshot")
+            .unwrap();
+        let content = refs
+            .mint_content_element(&context, &target, &tab, &snapshot, "content")
+            .unwrap();
+        assert_eq!(
+            refs.resolve_action_element(&context, &target, &tab, &content),
+            Err(BrowserRefError::KindMismatch)
+        );
+        assert!(refs
+            .resolve_scope_ref(&context, &target, &tab, &content)
+            .is_ok());
+    }
+
+    #[test]
+    fn generation_and_revision_invalidation_drop_browser_refs_without_rebinding() {
+        let context = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let _ = bound_tab(&mut refs, &context);
+        refs.invalidate_device_generation("dev-a", 5);
+        assert!(refs.is_empty());
+
+        let context = context("alice", 5, 9);
+        let _ = bound_tab(&mut refs, &context);
+        refs.invalidate_capability_revision("dev-a", 10);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn close_cleanup_does_not_accumulate_browser_refs() {
+        for cycle in 0..1_000 {
+            let context = context("alice", 4, 9);
+            let mut refs = BrowserRefRegistry::new(16).unwrap();
+            let (target, tab) = bound_tab(&mut refs, &context);
+            let snapshot = refs
+                .begin_snapshot(&context, &target, &tab, &format!("snapshot-{cycle}"))
+                .unwrap();
+            for index in 0..8 {
+                refs.mint_action_element(
+                    &context,
+                    &target,
+                    &tab,
+                    &snapshot,
+                    &format!("element-{cycle}-{index}"),
+                )
+                .unwrap();
+            }
+            refs.invalidate_context(context.id.as_str());
+            assert!(refs.is_empty());
+        }
+    }
+
+    #[test]
+    fn debug_redacts_public_and_backend_browser_refs() {
+        let context = context("alice", 4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let target = refs
+            .mint_target(&context, "backend-target-super-secret")
+            .unwrap();
+        let debug = format!("{:?}", refs.refs.get(&target).unwrap());
+        assert!(!debug.contains(&target));
+        assert!(!debug.contains("backend-target-super-secret"));
+        assert!(!debug.contains(context.id.as_str()));
+    }
+}
