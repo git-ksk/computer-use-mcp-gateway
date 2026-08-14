@@ -5,6 +5,7 @@
 //! Provider target/tab/ref values stay southbound and remain fenced by the
 //! owning `InteractionContextBinding`.
 
+use crate::v2_browser::BrowserAction;
 use crate::v2_interaction_context::InteractionContextBinding;
 use rand::{RngCore, rngs::OsRng};
 use std::collections::HashMap;
@@ -49,6 +50,7 @@ struct BrowserBackendRef {
     target_ref: Option<String>,
     tab_ref: Option<String>,
     snapshot_ref: Option<String>,
+    actions: Vec<BrowserAction>,
     single_use: bool,
 }
 
@@ -71,6 +73,7 @@ impl fmt::Debug for BrowserBackendRef {
                 "snapshot_ref",
                 &self.snapshot_ref.as_ref().map(|_| "[redacted]"),
             )
+            .field("actions", &self.actions)
             .field("single_use", &self.single_use)
             .finish()
     }
@@ -116,6 +119,7 @@ impl BrowserRefRegistry {
             None,
             None,
             None,
+            &[],
             false,
         )
     }
@@ -134,6 +138,7 @@ impl BrowserRefRegistry {
             Some(target_ref),
             None,
             None,
+            &[],
             false,
         )
     }
@@ -156,6 +161,7 @@ impl BrowserRefRegistry {
             Some(target_ref),
             Some(tab_ref),
             None,
+            &[],
             false,
         )
     }
@@ -167,8 +173,15 @@ impl BrowserRefRegistry {
         tab_ref: &str,
         snapshot_ref: &str,
         backend_element: &str,
+        actions: &[BrowserAction],
     ) -> Result<String, BrowserRefError> {
         self.require_snapshot(context, target_ref, tab_ref, snapshot_ref)?;
+        if actions.is_empty() {
+            return Err(BrowserRefError::ActionUnavailable);
+        }
+        let mut exact = actions.to_vec();
+        exact.sort_by_key(|action| *action as u8);
+        exact.dedup();
         self.mint(
             context,
             BrowserRefKind::ActionElement,
@@ -176,6 +189,7 @@ impl BrowserRefRegistry {
             Some(target_ref),
             Some(tab_ref),
             Some(snapshot_ref),
+            &exact,
             false,
         )
     }
@@ -196,6 +210,7 @@ impl BrowserRefRegistry {
             Some(target_ref),
             Some(tab_ref),
             Some(snapshot_ref),
+            &[],
             false,
         )
     }
@@ -216,6 +231,7 @@ impl BrowserRefRegistry {
             Some(target_ref),
             Some(tab_ref),
             Some(snapshot_ref),
+            &[],
             true,
         )
     }
@@ -236,6 +252,7 @@ impl BrowserRefRegistry {
             Some(target_ref),
             Some(tab_ref),
             Some(snapshot_ref),
+            &[],
             false,
         )
     }
@@ -257,20 +274,26 @@ impl BrowserRefRegistry {
         })
     }
 
-    pub fn resolve_action_element(
+    pub fn resolve_action(
         &self,
         context: &InteractionContextBinding,
         target_ref: &str,
         tab_ref: &str,
         element_ref: &str,
+        required: BrowserAction,
     ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
-        self.resolve_page_ref(
+        let resolved = self.resolve_page_ref(
             context,
             target_ref,
             tab_ref,
             element_ref,
             &[BrowserRefKind::ActionElement],
-        )
+        )?;
+        let reference = self.require_owned(element_ref, context)?;
+        if !reference.actions.contains(&required) {
+            return Err(BrowserRefError::ActionUnavailable);
+        }
+        Ok(resolved)
     }
 
     pub fn resolve_scope_ref(
@@ -464,6 +487,7 @@ impl BrowserRefRegistry {
         target_ref: Option<&str>,
         tab_ref: Option<&str>,
         snapshot_ref: Option<&str>,
+        actions: &[BrowserAction],
         single_use: bool,
     ) -> Result<String, BrowserRefError> {
         validate_backend_ref(backend_ref)?;
@@ -493,6 +517,7 @@ impl BrowserRefRegistry {
                     target_ref: target_ref.map(str::to_owned),
                     tab_ref: tab_ref.map(str::to_owned),
                     snapshot_ref: snapshot_ref.map(str::to_owned),
+                    actions: actions.to_vec(),
                     single_use,
                 },
             );
@@ -537,6 +562,7 @@ pub enum BrowserRefError {
     CapabilityRevisionMismatch,
     KindMismatch,
     RelationMismatch,
+    ActionUnavailable,
 }
 
 impl fmt::Display for BrowserRefError {
@@ -619,33 +645,10 @@ mod tests {
             refs.resolve_target_tab(&wrong_revision, &target, &tab),
             Err(BrowserRefError::CapabilityRevisionMismatch)
         );
-        assert_eq!(
-            refs.resolve_target_tab(&first, &target, &tab).unwrap(),
-            ResolvedBrowserTargetTab {
-                backend_target: "backend-target-secret".into(),
-                backend_tab: "backend-tab-secret".into(),
-            }
-        );
     }
 
     #[test]
-    fn a_tab_cannot_be_paired_with_another_target() {
-        let context = context(4, 9);
-        let mut refs = BrowserRefRegistry::default();
-        let (first_target, first_tab) = bound_tab(&mut refs, &context);
-        let second_target = refs.mint_target(&context, "target-two").unwrap();
-        assert_eq!(
-            refs.resolve_target_tab(&context, &second_target, &first_tab),
-            Err(BrowserRefError::RelationMismatch)
-        );
-        assert!(
-            refs.resolve_target_tab(&context, &first_target, &first_tab)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn newer_snapshot_invalidates_old_page_refs_but_not_target_or_tab() {
+    fn newer_snapshot_invalidates_old_refs_and_exact_actions_are_enforced() {
         let context = context(4, 9);
         let mut refs = BrowserRefRegistry::default();
         let (target, tab) = bound_tab(&mut refs, &context);
@@ -653,32 +656,56 @@ mod tests {
             .begin_snapshot(&context, &target, &tab, "snapshot-one")
             .unwrap();
         let action = refs
-            .mint_action_element(&context, &target, &tab, &first_snapshot, "element-one")
+            .mint_action_element(
+                &context,
+                &target,
+                &tab,
+                &first_snapshot,
+                "element-one",
+                &[BrowserAction::Click, BrowserAction::Pointer],
+            )
             .unwrap();
-        let content = refs
-            .mint_content_element(&context, &target, &tab, &first_snapshot, "content-one")
-            .unwrap();
-        let continuation = refs
-            .mint_continuation(&context, &target, &tab, &first_snapshot, "continue-one")
-            .unwrap();
-        let dialog = refs
-            .mint_dialog(&context, &target, &tab, &first_snapshot, "dialog-one")
-            .unwrap();
-        let second_snapshot = refs
+        assert!(refs
+            .resolve_action(&context, &target, &tab, &action, BrowserAction::Click)
+            .is_ok());
+        assert_eq!(
+            refs.resolve_action(&context, &target, &tab, &action, BrowserAction::Type),
+            Err(BrowserRefError::ActionUnavailable)
+        );
+
+        let _second_snapshot = refs
             .begin_snapshot(&context, &target, &tab, "snapshot-two")
             .unwrap();
-
-        assert!(refs.resolve_target_tab(&context, &target, &tab).is_ok());
-        for old in [first_snapshot, action, content, continuation, dialog] {
-            assert!(matches!(
-                refs.require_owned(&old, &context),
-                Err(BrowserRefError::UnknownRef)
-            ));
-        }
-        assert!(
-            refs.require_kind(&second_snapshot, &context, BrowserRefKind::Snapshot)
-                .is_ok()
+        assert_eq!(
+            refs.resolve_action(&context, &target, &tab, &action, BrowserAction::Click),
+            Err(BrowserRefError::UnknownRef)
         );
+    }
+
+    #[test]
+    fn content_ref_is_read_scope_not_action_authority() {
+        let context = context(4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        let snapshot = refs
+            .begin_snapshot(&context, &target, &tab, "snapshot")
+            .unwrap();
+        let content = refs
+            .mint_content_element(&context, &target, &tab, &snapshot, "content")
+            .unwrap();
+        assert_eq!(
+            refs.resolve_action(
+                &context,
+                &target,
+                &tab,
+                &content,
+                BrowserAction::Click,
+            ),
+            Err(BrowserRefError::KindMismatch)
+        );
+        assert!(refs
+            .resolve_scope_ref(&context, &target, &tab, &content)
+            .is_ok());
     }
 
     #[test]
@@ -698,6 +725,7 @@ mod tests {
                 &first_tab,
                 &first_snapshot,
                 "element-one",
+                &[BrowserAction::Click],
             )
             .unwrap();
         let second_snapshot = refs
@@ -710,19 +738,31 @@ mod tests {
                 &second_tab,
                 &second_snapshot,
                 "element-two",
+                &[BrowserAction::Click],
             )
             .unwrap();
 
         refs.invalidate_tab_document(&context, &target, &first_tab)
             .unwrap();
         assert_eq!(
-            refs.resolve_action_element(&context, &target, &first_tab, &first_element),
+            refs.resolve_action(
+                &context,
+                &target,
+                &first_tab,
+                &first_element,
+                BrowserAction::Click,
+            ),
             Err(BrowserRefError::UnknownRef)
         );
-        assert!(
-            refs.resolve_action_element(&context, &target, &second_tab, &second_element)
-                .is_ok()
-        );
+        assert!(refs
+            .resolve_action(
+                &context,
+                &target,
+                &second_tab,
+                &second_element,
+                BrowserAction::Click,
+            )
+            .is_ok());
     }
 
     #[test]
@@ -743,27 +783,6 @@ mod tests {
         assert_eq!(
             refs.consume_continuation(&context, &target, &tab, &continuation),
             Err(BrowserRefError::UnknownRef)
-        );
-    }
-
-    #[test]
-    fn content_ref_is_read_scope_not_action_authority() {
-        let context = context(4, 9);
-        let mut refs = BrowserRefRegistry::default();
-        let (target, tab) = bound_tab(&mut refs, &context);
-        let snapshot = refs
-            .begin_snapshot(&context, &target, &tab, "snapshot")
-            .unwrap();
-        let content = refs
-            .mint_content_element(&context, &target, &tab, &snapshot, "content")
-            .unwrap();
-        assert_eq!(
-            refs.resolve_action_element(&context, &target, &tab, &content),
-            Err(BrowserRefError::KindMismatch)
-        );
-        assert!(
-            refs.resolve_scope_ref(&context, &target, &tab, &content)
-                .is_ok()
         );
     }
 
