@@ -2,6 +2,7 @@ pub mod backend;
 pub mod config;
 pub mod gateway;
 pub mod policy;
+pub mod v2_browser;
 pub mod v2_m0;
 pub mod v2_m0_backend;
 pub mod v2_m0_execution;
