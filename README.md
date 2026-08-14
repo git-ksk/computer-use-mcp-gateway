@@ -2,7 +2,7 @@
 
 `computer-use-mcp-gateway` (CUMG) is a Rust MCP gateway for policy-controlled computer use. The recommended V2 runtime separates a remotely reachable **Hub** from a desktop-side **Agent** and exposes bounded, backend-neutral semantic capabilities instead of making raw backend tool names or identifiers part of the northbound contract.
 
-> **Runtime status:** V2 Hub + Agent is the recommended development/runtime path. V1 remains available as `v1_gateway` for regression/reference and existing production operation. Browser transfer (upload/download) is not implemented or advertised.
+> **Runtime status:** V2 Hub + Agent is the recommended development/runtime path. V1 remains available as `v1_gateway` for regression/reference and existing production operation. Browser core and bounded browser transfer (upload/download) are implemented and accepted.
 
 ## Overview
 
@@ -87,12 +87,12 @@ The active implementation is tracked by capability rather than by internal miles
 | --- | --- |
 | Desktop semantic path | Complete / accepted |
 | Browser core | Complete / accepted |
-| Browser transfer (upload/download) | Not started; unsupported and unadvertised |
+| Browser transfer (upload/download) | Complete / accepted |
 | V1 regression/conformance | Required and preserved |
 
-Browser core currently covers the typed prepare, bind, inspect, navigate, click, type, dialog, and pointer paths while preserving opaque CUMG references and exact-or-refuse execution semantics. Transfer remains a separate security boundary and is intentionally not implied by Browser core completion.
+Browser core covers the typed prepare, bind, inspect, navigate, click, type, dialog, and pointer paths while preserving opaque CUMG references and exact-or-refuse execution semantics. Browser transfer adds bounded staged upload/download with context-scoped references, Agent-private filesystem staging, exact capability checks, and fail-closed handling of stale references, path escape, partial completion, timeout, and cancellation.
 
-See [`docs/v2/STATUS.md`](docs/v2/STATUS.md) for the current map, [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) for Browser core evidence, and [`docs/README.md`](docs/README.md) for how active specs, acceptance evidence, and archived decision records are organized.
+See [`docs/v2/STATUS.md`](docs/v2/STATUS.md) for the current map, [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) for Browser core evidence, [`docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) for Browser transfer evidence, and [`docs/README.md`](docs/README.md) for how active specs, acceptance evidence, and archived decision records are organized.
 
 ## Testing and Deployment
 
