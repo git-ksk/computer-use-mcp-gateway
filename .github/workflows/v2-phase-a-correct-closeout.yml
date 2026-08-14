@@ -1,0 +1,92 @@
+name: V2 Phase A strict closeout
+
+on:
+  push:
+    branches:
+      - feat/v2-browser-semantic-parity
+    paths:
+      - .github/workflows/v2-phase-a-correct-closeout.yml
+
+permissions:
+  contents: write
+
+jobs:
+  strict-recovery-closeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: feat/v2-browser-semantic-parity
+          fetch-depth: 0
+
+      - name: Restore strict heartbeat semantics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/v2_m1_partition_recovery.rs')
+          s = p.read_text()
+          old = '''        // Recovery semantics are the subject of this E2E, not a 150 ms ACK deadline.
+        // Keep the Agent cadence above hosted-runner/fsync scheduling jitter without
+        // changing production heartbeat semantics.
+        heartbeat_interval: Duration::from_millis(500),
+'''
+          new = '''        heartbeat_interval: Duration::from_millis(50),
+'''
+          if s.count(old) != 1:
+              raise SystemExit('expected exactly one widened heartbeat fixture block')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt
+          rustup default 1.88.0
+
+      - name: Static validation
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked --all-targets
+          git diff --check
+
+      - name: Strict targeted tests
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test --locked --test v2_m1_partition_recovery -- --nocapture
+          cargo test --locked --test v2_p1_multi_device_e2e -- --nocapture
+
+      - name: Repeat partition recovery 50x at 50ms heartbeat
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 50); do
+            echo "===== strict partition iteration $i ====="
+            cargo test --locked --test v2_m1_partition_recovery -- --nocapture
+          done
+
+      - name: Repeat multi-device recovery 50x
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 50); do
+            echo "===== strict multi-device iteration $i ====="
+            cargo test --locked --test v2_p1_multi_device_e2e -- --nocapture
+          done
+
+      - name: Commit strict synchronization and remove diagnostics
+        shell: bash
+        run: |
+          git rm -f \
+            .github/workflows/v2-phase-a-closeout.yml \
+            .github/workflows/v2-source-audit.yml \
+            .github/workflows/v2-phase-a-correct-closeout.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/v2_m1_partition_recovery.rs
+          git commit -m "fix(v2): keep recovery E2E heartbeat semantics strict"
+          git push origin HEAD:feat/v2-browser-semantic-parity
