@@ -517,7 +517,8 @@ fn validate_browser_url(value: &str) -> Result<(), BrowserContractError> {
         return Err(BrowserContractError::InvalidUrl);
     }
     let lower = value.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("about:") {
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("about:")
+    {
         Ok(())
     } else {
         Err(BrowserContractError::InvalidUrl)
@@ -536,7 +537,11 @@ mod tests {
 
     #[test]
     fn browser_navigation_allows_only_reviewed_url_schemes() {
-        for url in ["https://example.com", "http://localhost:8080/a", "about:blank"] {
+        for url in [
+            "https://example.com",
+            "http://localhost:8080/a",
+            "about:blank",
+        ] {
             BrowserNavigateRequest {
                 context_id: CONTEXT.into(),
                 target_ref: reference(1),
@@ -546,7 +551,12 @@ mod tests {
             .validate()
             .unwrap();
         }
-        for url in ["file:///tmp/a", "javascript:alert(1)", "data:text/plain,x", " https://example.com"] {
+        for url in [
+            "file:///tmp/a",
+            "javascript:alert(1)",
+            "data:text/plain,x",
+            " https://example.com",
+        ] {
             assert_eq!(
                 BrowserNavigateRequest {
                     context_id: CONTEXT.into(),
