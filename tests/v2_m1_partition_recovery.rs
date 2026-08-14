@@ -65,7 +65,10 @@ fn agent_config(
         device_id,
         allowed_cwd_roots: vec![cwd],
         state_dir,
-        heartbeat_interval: Duration::from_millis(50),
+        // Recovery semantics are the subject of this E2E, not a 150 ms ACK deadline.
+        // Keep the Agent cadence above hosted-runner/fsync scheduling jitter without
+        // changing production heartbeat semantics.
+        heartbeat_interval: Duration::from_millis(500),
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(100),
@@ -104,6 +107,7 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
     std::fs::set_permissions(&hub_state, std::fs::Permissions::from_mode(0o700))?;
     std::fs::set_permissions(&agent_state, std::fs::Permissions::from_mode(0o700))?;
     let effect_marker = root.join("ambiguous-effect");
+    let started_marker = root.join("worker-started");
 
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_pem = cert.pem();
@@ -170,7 +174,8 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
     let alice = OperationOwner::new("https://issuer.example", "alice")?;
     let bob = OperationOwner::new("https://issuer.example", "bob")?;
     let command = format!(
-        "sleep 1; printf ambiguous-effect > '{}'",
+        "printf worker-started > '{}'; sleep 1; printf ambiguous-effect > '{}'",
+        started_marker.display(),
         effect_marker.display()
     );
     let pending = handle
@@ -187,10 +192,17 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
         )
         .await?;
     let operation_id = pending.operation_id.clone();
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !started_marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("Agent local worker did not start before partition")?;
 
-    // Drop the Agent network/runtime future after the Hub has durably marked
-    // dispatch. The already-spawned local worker can still complete, modeling a
+    // Drop the Agent network/runtime future only after the exact local worker has
+    // started. Hub dispatch admission alone does not prove spawn has occurred.
+    // The already-spawned local worker can still complete, modeling a
     // partition where the side effect and result delivery race independently.
     first_task.abort();
     let _ = first_task.await;
