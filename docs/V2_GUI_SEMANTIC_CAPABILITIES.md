@@ -2,7 +2,8 @@
 
 ## Purpose
 
-V2 does not make the configured Computer Use backend's MCP tool names part of the CUMG product contract. The stable boundary is a backend-neutral semantic vocabulary:
+V2 does not make a configured Computer Use backend's MCP tool names part of the CUMG product
+contract. The stable boundary is a backend-neutral semantic vocabulary:
 
 ```text
 northbound MCP tool
@@ -12,112 +13,167 @@ northbound MCP tool
   -> backend-specific operation
 ```
 
-Cua is the first GUI backend, but `list_windows`, `launch_app`, `get_window_state`, `verify_state`, AX role names, and other Cua wire details terminate at `CuaMcpAdapter`. A future native GUI, OpenClaw-style Computer Use runtime, or another maintained backend may implement the same semantics without copying Cua's API.
+Cua is the first GUI backend, but Cua tool names, AX roles, session helpers, and provider payloads
+terminate at `CuaMcpAdapter`. Another backend may implement the same CUMG semantics without copying
+Cua's API.
 
-This is **not** a minimum-common-denominator rule. CUMG may add a semantic capability that only some backends implement. The Agent advertises the exact `DeviceCapability` set supported by its active backend, and the Hub keeps authorization exact to `principal -> stable device -> DeviceCapability`.
+This is **not** a portable minimum-common-denominator rule. CUMG may define a semantic capability
+that only some backends implement. The Agent advertises its exact live `DeviceCapability` set, and
+northbound discovery exposes only the intersection of that advertisement and the authenticated
+principal's exact device-capability policy.
 
-## Current semantic surface
+## Desktop semantic surface
 
-The original portable/runtime surface remains:
+The V2 desktop surface now includes the existing runtime capabilities plus the desktop parity
+extension:
 
-- `list_apps` -> `ListApplications`
-- `get_screen_size` -> `ScreenGeometry`
-- `screenshot` -> `Screenshot`
-- `click` -> `PointerClick`
-- `drag` -> `PointerDrag`
-- `type_text` -> `TypeText`
-- `execute_process` -> `ExecuteProcess`
-- `shell` -> `Shell`
-- `read_file` -> `ReadFile`
-- `list_directory` -> `ListDirectory`
+| Northbound tool | `DeviceCapability` | Contract |
+|---|---|---|
+| `list_apps` | `ListApplications` | bounded application observation |
+| `get_screen_size` | `ScreenGeometry` | physical/logical display geometry |
+| `screenshot` | `Screenshot` | bounded desktop PNG; contextual desktop use requires explicit scope expansion |
+| `click` | `PointerClick` | typed button/count/modifiers, explicit window or desktop coordinates |
+| `drag` | `PointerDrag` | typed endpoints, button/modifiers, bounded duration/steps |
+| `type_text` | `TypeText` | bounded text, explicit target and delivery when contextual |
+| `list_windows` | `ListWindows` | bounded backend-neutral top-level window records |
+| `launch_application` | `LaunchApplication` | launch by opaque identifier/name with bounded targets |
+| `inspect_window` | `InspectWindow` | bounded normalized UI snapshot; mints CUMG scoped refs |
+| `verify_ui_state` | `VerifyUiState` | bounded predicates; `unknown` is never success |
+| `terminate_application` | `TerminateApplication` | exact process termination; dangerous capability |
+| `activate_window` | `ActivateWindow` | activate a process or exact window with verification evidence |
+| `set_window_frame` | `SetWindowFrame` | set and verify exact top-level window geometry |
+| `invoke_menu` | `InvokeMenu` | invoke a bounded semantic menu path without raw backend selectors |
+| `keyboard_input` | `KeyboardInput` | bounded semantic key/modifiers with explicit delivery mode |
+| `scroll` | `Scroll` | bounded direction/granularity/amount against an explicit target |
+| `clipboard_read` | `ClipboardRead` | bounded types and optional privacy-sensitive text |
+| `clipboard_write` | `ClipboardWrite` | bounded plain-text replacement |
+| `get_pointer_position` | `PointerPosition` | real desktop pointer observation |
+| `move_pointer` | `MovePointer` | real pointer movement in typed desktop coordinates |
+| `set_ui_value` | `SetUiValue` | set a bounded value through a CUMG-minted element ref |
+| `capture_region` | `CaptureRegion` | bounded window-local capture without hidden zoom state |
+| `expand_interaction_scope` | `DesktopScope` | explicit monotonic window-to-desktop scope expansion |
 
-The GUI semantic extension adds:
+`open_interaction_context` and `close_interaction_context` are workflow controls rather than device
+capabilities. They create or invalidate bounded CUMG workflow state; possession of a context ID does
+not authorize any device operation.
 
-| Northbound tool | `DeviceCapability` | Class | Current Cua adapter | Contract |
-|---|---|---|---|---|
-| `list_windows` | `ListWindows` | Observe | `list_windows` | bounded top-level window records with backend-neutral IDs, process IDs, titles, bounds and visibility |
-| `launch_application` | `LaunchApplication` | System | `launch_app` | launch by opaque application identifier or display name, with bounded targets and optional new-instance request |
-| `inspect_window` | `InspectWindow` | Observe | `get_window_state` | bounded snapshot of one exact process/window as normalized UI elements, optionally with a PNG window image |
-| `verify_ui_state` | `VerifyUiState` | Observe | `verify_state` | bounded predicates over one exact window; `unknown` remains distinct from success |
-
-The northbound names intentionally do not mirror every backend name. For example, CUMG exposes `launch_application`, not Cua's `launch_app`, because the semantic operation belongs to CUMG while the backend spelling does not.
+Process, shell, and bounded filesystem tools remain separate non-GUI V2 capabilities. Browser and
+file-transfer parity are deliberately excluded from this desktop phase.
 
 ## Capability advertisement and discovery
 
-`CapabilityAdvertisement` is the portability boundary, not a promise that every backend implements every semantic capability.
-
-When an Agent is online, V2 northbound discovery is the intersection of:
+`CapabilityAdvertisement` is the backend portability boundary. `tools/list` is the exact intersection
+of:
 
 ```text
-authorized exact DeviceCapability
+principal/device policy allow
 AND
-live Agent CapabilityAdvertisement
+current live Agent CapabilityAdvertisement
 ```
 
-A connected backend that does not advertise `InspectWindow`, for example, does not expose `inspect_window` through `tools/list` even if the principal's policy contains that capability. Dispatch independently validates the Agent generation, capability revision, and exact advertised capability, so a discovery/dispatch race still fails closed.
+If the Agent is offline, there is no live advertisement and no semantic device tool is exposed. A
+reconnect may produce a new device generation or capability revision; stateful requests are fenced
+against both, so a discovery/dispatch race fails closed.
 
-When the Agent is offline, `tools/list` keeps the authorized semantic contract visible rather than collapsing to an empty list. The call itself fails as `AgentOffline` until a new live session exists. This avoids making the usable MCP schema depend permanently on one transient disconnect while the current server does not advertise a tool-list-changed notification.
+The control and capability schemas are version 3 for this desktop contract. Pre-v3 Agent/Hub mixing
+is rejected rather than interpreted as an ambiguous rolling-upgrade compatibility mode.
 
-## Backend-neutral UI model
+## Interaction context and backend lifecycle
 
-`InspectWindow` does not forward an AX/UIA/AT-SPI tree verbatim. The adapter reduces backend fields into bounded CUMG types:
+An `InteractionContext` is CUMG workflow state, independent of HTTP or MCP transport sessions. It is
+bound to authenticated principal, stable device, Agent generation, and capability revision. The
+context ID is opaque state identity, not a bearer credential or authorization token.
 
-- `UiRect` for geometry;
-- `WindowInfo` for top-level windows;
-- `UiElement` for snapshot elements;
-- `UiRole` for common roles such as `button`, `text_field`, `menu_item`, `row`, and `cell`;
-- opaque `snapshot_ref` and `element_ref` values for backend-scoped handles.
+For Cua, the adapter uses the CUMG context ID as the backend session identifier. Desktop expansion
+explicitly ensures `start_session(capture_scope=auto)` and then invokes `escalate_session`. There is
+no automatic escalation after a narrower route fails.
 
-Cua AX roles are normalized inside the Cua adapter. For example, `AXButton` becomes `button`, `AXTextField` becomes `text_field`, and `AXMenuItem` becomes `menu_item`. Unknown backend roles become `other` in observations; `other` is not accepted as an input selector because it has no portable matching semantics.
+Cua's `start_session` and `end_session` remain backend lifecycle, not raw northbound capabilities.
+Context close, expiry, generation fencing, and capability-revision fencing invalidate CUMG refs and
+request backend-session cleanup through a signed Hub-to-Agent lifecycle control. That control does
+not create a `DeviceCommand`, grant, `OperationOwner`, replay identity, or quarantine transition.
 
-The opaque element reference is observation data, not a new authorization credential. A future element-targeted action must define its own typed semantic command and stale-reference behavior rather than accepting arbitrary backend arguments.
+Scope is monotonic. A `window_scoped` context may be explicitly expanded to `desktop_scoped`, but it
+cannot return to window scope in place. After expansion, window-only commands fail at the CUMG
+boundary; the caller must close the context and open a fresh one. This matches the Cua 0.19.3 session
+contract instead of bypassing its refusal behavior.
 
-## Verification semantics
+## Scoped backend references
 
-`VerifyUiState` carries typed predicates rather than a backend query language. The initial contract supports:
+Raw backend snapshot/element handles never become northbound action authority. `inspect_window`
+normalizes observations and mints CUMG opaque refs such as `ref_...`. Each mapping is held in memory
+and is bound to:
 
-- window existence;
-- window bounds with bounded tolerance;
-- element existence by semantic role and/or bounded label substring;
-- element enabled/selected/value state.
+```text
+InteractionContext ID
+device generation
+capability revision
+ref kind
+```
 
-The normalized result is `satisfied`, `unsatisfied`, or `unknown`. `unknown` never implies success. Backend-specific diagnostic payloads such as Cua's raw `observed_json` do not cross the adapter boundary.
+`set_ui_value` accepts only a CUMG element ref from the same live context. Unknown, stale,
+cross-context, wrong-generation, wrong-revision, or wrong-kind refs fail closed. Newer backend
+snapshots may also make older backend handles stale; CUMG does not replay or guess around that
+provider refusal.
 
-Predicate count, wait duration, stability samples, labels, values, UI element counts and screenshots are bounded. Optional screenshots use the same bounded PNG trust boundary as other V2 image results.
+The context and scoped ref registries do not replace `OperationOwner`. Quarantine ownership and
+indeterminate resolution remain bound to the authenticated principal.
 
-## Lifecycle is not a device capability
+## Backend-neutral UI and coordinate model
 
-Backend session helpers such as Cua `start_session`, `end_session`, capture-scope escalation, cursor themes, and recording lifecycle are not northbound `DeviceCapability`s merely because the backend exposes them as tools.
+`InspectWindow` does not forward an AX/UIA/AT-SPI tree verbatim. The adapter reduces backend fields
+into bounded CUMG data such as `UiRect`, `WindowInfo`, `UiElement`, and semantic `UiRole` values.
+Unknown provider-specific roles normalize to `other` rather than escaping backend vocabulary.
 
-Those operations describe the executor's local lifecycle or perception machinery, not an end-user semantic permission such as “inspect this window” or “launch this application.” They stay behind `ComputerUseBackendAdapter` unless CUMG later defines a backend-neutral lifecycle primitive with an independent security reason to expose it.
+Desktop actions use typed coordinates/targets such as `DesktopPhysical`, `WindowPhysical`,
+`InputTarget`, and `ScrollTarget`. CUMG does not expose Cua's hidden `from_zoom` coordinate state.
+`CaptureRegion` is window-local; desktop observation after explicit expansion is performed through the
+contextual desktop screenshot path.
 
-This prevents CUMG authorization policy from becoming a mirror of one backend's implementation API.
+Background delivery remains the first rung where the semantic command permits it. Backend safety
+refusals remain authoritative. For example, Cua may reject a process-scoped background key when one
+PID owns multiple eligible windows and exact delivery cannot be proven; CUMG does not silently turn
+that into a foreground action.
 
-The complete Cua 0.19.3 disposition is tracked in [`V2_CUA_PARITY_MATRIX.md`](V2_CUA_PARITY_MATRIX.md). Stateful backend workflows use the CUMG-owned [`InteractionContext`](V2_INTERACTION_CONTEXT.md) boundary; transport sessions and backend session identifiers are not authorization identity.
+## Bounded carrier and privacy
 
-## Adding another GUI semantic capability
+Ordinary signed Hub/Agent application messages remain bounded to 64 KiB. Explicitly bounded large
+observation results use the reviewed large-result carrier allowance: screenshots, UI snapshots,
+clipboard observations, and region captures. Image payloads, UI element counts, dimensions, labels,
+queries, menu paths, modifiers, text, and other arguments/results retain explicit limits.
 
-A backend feature should be promoted into the CUMG contract only when all of these are true:
+Clipboard plain text is capped at 1 MiB. Clipboard contents are user data, not telemetry; operators
+should prefer type-only observation when the text itself is unnecessary.
 
-1. The operation has a backend-neutral meaning that can be named without referring to Cua, AX, UIA, AT-SPI, CDP, or another implementation API.
-2. Inputs and outputs can be represented as bounded typed CUMG data rather than an arbitrary JSON/tool passthrough.
-3. Its capability class and read-only/mutating behavior are explicit.
-4. Cancellation/timeout ambiguity maps into the existing CUMG execution-safety and quarantine model.
-5. A backend can omit the capability from its advertisement without weakening another capability.
-6. The adapter has normalization/conformance tests, and a real backend acceptance path exists for behavior that compile-time fixtures cannot prove.
+## Browser and data-transfer boundary
 
-Likely future candidates include semantic key input, scrolling, window-frame management, and element-targeted actions. They should be added one semantic primitive at a time; a generic `call_tool`, `raw_cua`, or arbitrary backend method escape hatch remains out of scope.
+Browser semantic parity is the next phase. It will define backend-neutral browser inspect/bind,
+navigate, click, type, dialog, upload, download, and pointer contracts without exposing raw Cua/CDP
+methods.
+
+Upload is a local-data exfiltration boundary and must use a CUMG-issued file ref rather than an
+arbitrary local path. Download is a local-write boundary and must independently bind destination,
+size, and overwrite behavior. These capabilities are intentionally absent from this desktop PR.
+
+Operator configuration, diagnostics, update checks, recording, and test/replay controls remain on an
+operator plane rather than the ordinary user-facing northbound MCP surface.
 
 ## Security invariants unchanged
 
-The GUI extension does not change the authoritative safety model:
+The semantic extension preserves the authoritative V2 safety model:
 
-- northbound authentication reduces to `AuthenticatedClientPrincipal` before authorization;
+- authentication reduces to `AuthenticatedClientPrincipal` before capability authorization;
 - authorization remains exact `principal -> stable device -> DeviceCapability`;
-- Hub/Agent generation and capability-revision fencing remain authoritative;
-- short-lived exact grants remain southbound;
-- a mutating operation with unproven cancellation/timeout effect remains `indeterminate` and quarantines the device;
-- backend-specific credentials, session state and raw identity/tool headers are not forwarded through the command contract;
-- a malicious authenticated backend remains outside CUMG's ability to attest and may still lie or act outside the requested operation.
+- generation and capability-revision fencing remain authoritative;
+- southbound execution still uses short-lived exact grants rather than forwarding bearer/proxy
+  credentials;
+- mutating cancellation/timeout with unproven effect remains indeterminate and quarantines the
+  device;
+- no ambiguous operation is automatically replayed;
+- desktop escalation is explicit only;
+- raw Cua passthrough remains forbidden;
+- backend-specific credentials, tool names, refs, and payload contracts terminate at the adapter.
 
-The semantic layer improves replaceability and reduces accidental backend coupling; it does not turn the backend into a trusted execution environment.
+The complete Cua 0.19.3 disposition is tracked in
+[`V2_CUA_PARITY_MATRIX.md`](V2_CUA_PARITY_MATRIX.md). Stateful workflow rules are defined in
+[`V2_INTERACTION_CONTEXT.md`](V2_INTERACTION_CONTEXT.md).

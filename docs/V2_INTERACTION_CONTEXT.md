@@ -2,15 +2,15 @@
 
 ## Why this exists
 
-Computer Use backends often keep short-lived state: Cua sessions, accessibility snapshots, element
-handles, browser target/tab refs, capture scope, and cursor/perception state. CUMG must retain the
-useful continuity without making an HTTP connection, MCP transport session, PID/window ID, or
-backend token into an authorization credential.
+Computer Use backends keep short-lived state such as Cua sessions, accessibility snapshots, element
+handles, browser refs, capture scope, and cursor/perception state. CUMG retains useful continuity
+without making an HTTP connection, MCP transport session, PID/window ID, or backend token into an
+authorization credential.
 
-An `InteractionContext` is therefore CUMG-owned workflow state. It is **not** an execution owner,
-capability grant, quarantine resolver, or durable operation ledger.
+An `InteractionContext` is CUMG-owned workflow state. It is **not** an execution owner, capability
+grant, bearer credential, quarantine resolver, or durable operation ledger.
 
-## Binding
+## Binding and authorization
 
 Every context is bound to exactly:
 
@@ -21,44 +21,74 @@ Agent device generation
 CapabilityAdvertisement revision
 ```
 
-A context identifier is random and opaque. Possession of the identifier alone grants nothing: every
-use must also match the authenticated principal and exact device binding.
+The context identifier is random and opaque. Possession of it grants nothing: every use must still
+match the authenticated principal/device and pass the ordinary exact capability policy.
 
-The context manager is not an authorizer. Creating a context or expanding its scope is allowed only after the ordinary northbound authorization/approval path has independently permitted the relevant operation. Context validation can narrow an already-authorized request; it can never create permission.
+The context manager can only narrow an already-authorized request. It cannot create permission.
+`OperationOwner` remains the authenticated principal; context state never replaces ownership of an
+operation or quarantine.
 
-The context is deliberately independent from `Mcp-Session-Id` or any HTTP connection. Transport
-reconnect/recreation must not silently merge two chats or clients into one Computer Use session.
+The context is independent from `Mcp-Session-Id`, HTTP connections, and the MCP transport lifetime.
+Transport reconnect/recreation must not silently merge separate callers into one Computer Use
+workflow.
 
-## Lifetime
+## Lifetime and backend cleanup
 
-Contexts are non-durable workflow state. They are bounded by:
+Contexts are non-durable and bounded by:
 
 - maximum contexts per principal/device;
 - idle expiry;
 - absolute lifetime;
 - explicit close;
 - Agent generation change;
-- capability revision change when stale backend refs could otherwise survive a changed surface.
+- capability-revision change.
 
-Hub/Agent restart must never resurrect an old backend session mapping. A caller may create a new
-context after reconnect, but the old context/ref set fails closed.
+Invalidation removes all CUMG scoped refs for the context. For backends with session state, CUMG also
+requests backend-session cleanup. The current Cua adapter maps that cleanup to `end_session` through a
+signed Hub-to-Agent lifecycle control rather than a northbound `DeviceCommand`.
+
+The lifecycle control is intentionally outside operation admission: it does not mint a grant, change
+`OperationOwner`, resolve quarantine, create a replayable operation ID, or carry a northbound bearer
+credential. Cleanup failure never resurrects a locally invalid context; the request remains failed
+closed and provider idle cleanup is an additional backstop.
+
+Hub/Agent restart or Agent reconnect must never resurrect an old context/backend-session mapping. A
+new context may be opened against the new generation, but the old context/ref set is invalid.
+
+## Cua lifecycle mapping
+
+For Cua, the context ID is used as the backend session identifier for contextual desktop commands.
+The adapter keeps Cua tool names and lifecycle payloads south of the CUMG semantic boundary.
+
+The desktop expansion path is explicit:
+
+```text
+CUMG WindowScoped context
+  -> ensure Cua start_session(session=context_id, capture_scope=auto)
+  -> explicit CUMG DesktopScope authorization/control
+  -> Cua escalate_session(session=context_id)
+  -> CUMG DesktopScoped context
+```
+
+There is no automatic fallback from a failed window route to desktop scope.
 
 ## Execution scope
 
-Initial context scope is `window_scoped`.
+Every context starts `window_scoped`. Window-scoped actions may use background accessibility,
+window pixels, or other provider routes while preserving that scope.
 
-A backend may internally use background accessibility/pixels/typed browser routes while preserving
-that scope. Expanding to `desktop_scoped` is a monotonic, explicit CUMG control transition. Backend
-helpers such as Cua `escalate_session` may implement the transition only after CUMG has authorized
-and recorded it. The adapter must never broaden scope automatically because a narrower route failed.
+Expansion to `desktop_scoped` is explicit and monotonic. Once expanded, window-only commands are
+rejected at the CUMG boundary because Cua 0.19.3 also treats the effective session scope as desktop.
+The caller must close that context and open a fresh one to regain window scope. CUMG never emulates a
+backend-specific downgrade or silently starts a replacement context.
 
-Closing a context or creating a fresh context is the way to return from desktop scope to window
-scope; a backend-specific in-session downgrade is not assumed.
+Desktop-scoped commands such as contextual desktop screenshot and desktop pointer operations are
+rejected until the explicit expansion has completed.
 
 ## Scoped refs
 
-Backend handles are never long-lived CUMG identity. Future element/browser actions use CUMG-minted
-opaque refs that map to backend refs inside an in-memory scoped registry.
+Backend handles are not long-lived CUMG identity. `inspect_window` normalizes backend observation
+refs and mints CUMG opaque refs backed by an in-memory `ScopedBackendRefRegistry`.
 
 Each public ref is bound to:
 
@@ -69,41 +99,53 @@ capability revision
 ref kind (snapshot, element, browser target, tab, page element, file handle, ...)
 ```
 
-Resolution checks every field and fails closed on a mismatch. Generation/context invalidation drops
-all mappings. Backend refs are not written to the durable safety checkpoint and are not logged.
+Resolution checks every field. Unknown, stale, cross-context, wrong-generation, wrong-revision, and
+wrong-kind refs fail closed. Generation/revision/context invalidation drops all associated mappings.
+Backend-ref payloads are not persisted in the durable execution checkpoint and are not logged.
 
-Current `inspect_window` observation refs are not authorization credentials and no current V2 action
-accepts them as an input. Element-targeted actions must switch to the scoped CUMG ref registry before
-they are introduced.
+`set_ui_value` is the first current action that consumes a scoped CUMG element ref. It accepts a
+`ref_...` minted by `inspect_window` in the same live context; the backend element token itself is not
+a northbound action argument. Browser actions will use the same pattern in the next phase.
+
+A newer provider snapshot may invalidate an older backend token even inside an otherwise live CUMG
+context. That provider stale-ref refusal is preserved; CUMG does not auto-refresh and replay a
+mutation.
 
 ## Coordinate model
 
-New semantic pointer/scroll/capture operations must declare a coordinate space. Backends may use
-other internal coordinates, but the CUMG contract must not rely on hidden `from_zoom` state.
+Desktop semantic pointer, scroll, text-input, and capture commands use typed coordinate/target forms.
+Current desktop forms include:
 
-Initial planned spaces are:
+- `DesktopPhysical`: physical desktop screenshot pixels;
+- `WindowPhysical`: physical pixels relative to the exact window image;
+- `InputTarget`: desktop, exact window, or exact window point;
+- `ScrollTarget`: exact window, exact window point, or desktop point.
 
-- `desktop_physical`: physical display pixels; multi-display origins may be negative;
-- `window_physical`: physical pixels relative to the exact bound window image;
-- `browser_viewport`: CSS pixels in the exact bound browser tab viewport.
+Backends may use other internal coordinate systems, but CUMG does not depend on hidden provider state
+such as Cua `from_zoom`. Ambiguous conversion fails closed.
 
-Conversion requires explicit geometry/scale evidence. Ambiguous conversion fails closed.
+A future browser phase will add an exact browser viewport coordinate contract bound to browser target
+and tab identity.
 
 ## Browser file transfer
 
 File upload/download is not ordinary clicking. Upload can exfiltrate local data; download writes
-local data. They therefore use separate exact capabilities.
+local data. They therefore remain separate exact capabilities in the browser phase.
 
 Uploads must accept a CUMG-issued bounded file handle rather than an arbitrary backend/local path.
-Downloads must have bounded byte count, controlled destination roots, explicit overwrite behavior,
-and no symlink escape. Backend browser authorization remains an additional refusal layer.
+Downloads must bind byte limits, controlled destination roots, overwrite behavior, and symlink
+handling. Backend browser authorization remains an additional refusal layer rather than something an
+adapter may bypass.
 
 ## Invariants
 
-- `OperationOwner` remains authenticated principal identity; context never changes ownership.
+- Context ID is workflow state, never authorization identity or a bearer credential.
+- `OperationOwner` and quarantine ownership remain authenticated principal identity.
 - Context loss does not clear quarantine or settle an operation.
-- A context or ref from another principal/device/generation/revision is rejected.
+- A context/ref from another principal/device/generation/revision is rejected.
 - Scope expansion is explicit and monotonic for one context.
-- Backend session/config/credential material never crosses the Hub-to-Agent semantic contract.
-- A context/ref is not logged as a metric label and backend-ref payload is not logged at all.
-- No context mechanism can authorize replay of an ambiguous operation.
+- Window-only commands do not run after that context becomes desktop-scoped.
+- Context close/expiry/generation/revision invalidates refs and requests backend-session cleanup.
+- Backend session/config/credential material never becomes the northbound semantic contract.
+- Context/ref values are not metric labels and backend-ref payloads are not logged.
+- No context mechanism can authorize or auto-replay an ambiguous operation.

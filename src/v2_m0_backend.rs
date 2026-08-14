@@ -156,7 +156,7 @@ impl BackendAdapter for CuaCliAdapter {
                     scale_factor_milli: (scale * 1000.0).round() as u32,
                 }
             }
-            DeviceCommand::Screenshot => {
+            DeviceCommand::Screenshot | DeviceCommand::ScreenshotContextual { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::Screenshot,
                 ));
@@ -196,6 +196,21 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::ListDirectory,
                 ));
             }
+            DeviceCommand::SetUiValue { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::SetUiValue,
+                ));
+            }
+            DeviceCommand::CaptureRegion { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::CaptureRegion,
+                ));
+            }
+            DeviceCommand::ExpandInteractionScope { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::DesktopScope,
+                ));
+            }
             DeviceCommand::ListWindows { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::ListWindows,
@@ -206,14 +221,31 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::LaunchApplication,
                 ));
             }
-            DeviceCommand::InspectWindow { .. } => {
+            DeviceCommand::InspectWindow { .. } | DeviceCommand::InspectWindowContextual { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::InspectWindow,
                 ));
             }
-            DeviceCommand::VerifyUiState { .. } => {
+            DeviceCommand::VerifyUiState { .. } | DeviceCommand::VerifyUiStateContextual { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::VerifyUiState,
+                ));
+            }
+            DeviceCommand::PointerClickAdvanced { .. }
+            | DeviceCommand::PointerDragAdvanced { .. }
+            | DeviceCommand::TypeTextAdvanced { .. }
+            | DeviceCommand::TerminateApplication { .. }
+            | DeviceCommand::ActivateWindow { .. }
+            | DeviceCommand::SetWindowFrame { .. }
+            | DeviceCommand::InvokeMenu { .. }
+            | DeviceCommand::KeyboardInput { .. }
+            | DeviceCommand::Scroll { .. }
+            | DeviceCommand::ClipboardRead { .. }
+            | DeviceCommand::ClipboardWrite { .. }
+            | DeviceCommand::PointerPosition { .. }
+            | DeviceCommand::MovePointer { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    command.capability(),
                 ));
             }
         };

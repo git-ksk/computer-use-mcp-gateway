@@ -130,6 +130,26 @@ impl HubIdentity {
         Ok(remote)
     }
 
+    pub fn backend_session_end(
+        &self,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        device_id: String,
+        device_generation: u64,
+        context_id: String,
+    ) -> Result<RemoteBackendSessionEnd, TransportError> {
+        let mut remote = RemoteBackendSessionEnd {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            device_id,
+            device_generation,
+            context_id,
+            signature: Vec::new(),
+        };
+        let transcript = remote_backend_session_end_bytes(hello, challenge, &remote)?;
+        remote.signature = self.signing_key.sign(&transcript).to_bytes().to_vec();
+        Ok(remote)
+    }
+
     pub fn heartbeat_ack(
         &self,
         hello: &AgentHello,
@@ -244,6 +264,25 @@ pub struct RemoteCancel {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteBackendSessionEnd {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub context_id: String,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteBackendSessionEnded {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub context_id: String,
+    pub ended: bool,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancellationDisposition {
@@ -289,6 +328,7 @@ pub enum AgentToHub {
     Proof(AgentProof),
     Result(RemoteResult),
     CancellationAck(RemoteCancellationAck),
+    BackendSessionEnded(RemoteBackendSessionEnded),
     Heartbeat(AgentHeartbeat),
 }
 
@@ -299,6 +339,7 @@ pub enum HubToAgent {
     Accepted(SessionAccepted),
     Command(RemoteCommand),
     Cancel(RemoteCancel),
+    BackendSessionEnd(RemoteBackendSessionEnd),
     HeartbeatAck(HubHeartbeatAck),
 }
 
@@ -309,6 +350,7 @@ impl AgentToHub {
             Self::Proof(_) => "proof",
             Self::Result(_) => "result",
             Self::CancellationAck(_) => "cancellation_ack",
+            Self::BackendSessionEnded(_) => "backend_session_ended",
             Self::Heartbeat(_) => "heartbeat",
         }
     }
@@ -321,6 +363,7 @@ impl HubToAgent {
             Self::Accepted(_) => "accepted",
             Self::Command(_) => "command",
             Self::Cancel(_) => "cancel",
+            Self::BackendSessionEnd(_) => "backend_session_end",
             Self::HeartbeatAck(_) => "heartbeat_ack",
         }
     }
@@ -435,6 +478,60 @@ pub fn verify_remote_cancel(
     trusted_hub
         .verify(&transcript, &signature)
         .map_err(|_| TransportError::InvalidHubSignature)
+}
+
+pub fn verify_remote_backend_session_end(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteBackendSessionEnd,
+    trusted_hub: &VerifyingKey,
+) -> Result<(), TransportError> {
+    validate_schema(remote.schema_version)?;
+    if remote.device_id != hello.device_id {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let signature =
+        signature_from_slice(&remote.signature).map_err(|_| TransportError::InvalidHubSignature)?;
+    let transcript = remote_backend_session_end_bytes(hello, challenge, remote)?;
+    trusted_hub
+        .verify(&transcript, &signature)
+        .map_err(|_| TransportError::InvalidHubSignature)
+}
+
+pub fn build_remote_backend_session_ended(
+    identity: &DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    request: &RemoteBackendSessionEnd,
+    ended: bool,
+) -> Result<RemoteBackendSessionEnded, TransportError> {
+    let mut ack = RemoteBackendSessionEnded {
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: request.device_id.clone(),
+        device_generation: request.device_generation,
+        context_id: request.context_id.clone(),
+        ended,
+        signature: Vec::new(),
+    };
+    let transcript = remote_backend_session_ended_bytes(hello, challenge, &ack)?;
+    ack.signature = identity.sign_message(&transcript);
+    Ok(ack)
+}
+
+pub fn verify_remote_backend_session_ended(
+    registry: &DeviceRegistry,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &RemoteBackendSessionEnded,
+) -> Result<(), TransportError> {
+    validate_schema(ack.schema_version)?;
+    if ack.device_id != hello.device_id {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let transcript = remote_backend_session_ended_bytes(hello, challenge, ack)?;
+    registry
+        .verify_device_signature(&hello.device_id, &transcript, &ack.signature)
+        .map_err(TransportError::Control)
 }
 
 pub fn build_remote_cancellation_ack(
@@ -752,6 +849,62 @@ fn hub_heartbeat_ack_bytes(
         device_generation: ack.device_generation,
         sequence: ack.sequence,
         hub_time_ms: ack.hub_time_ms,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn remote_backend_session_end_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteBackendSessionEnd,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        context_id: &'a str,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m1-backend-session-end",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &remote.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: remote.device_generation,
+        context_id: &remote.context_id,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn remote_backend_session_ended_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &RemoteBackendSessionEnded,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        context_id: &'a str,
+        ended: bool,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m1-backend-session-ended",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &ack.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: ack.device_generation,
+        context_id: &ack.context_id,
+        ended: ack.ended,
     })
     .map_err(TransportError::Serialization)
 }
@@ -1087,6 +1240,43 @@ mod tests {
         tampered_ack.disposition = CancellationDisposition::AlreadyTerminal;
         assert!(matches!(
             verify_remote_cancellation_ack(&registry, &hello, &challenge, &tampered_ack),
+            Err(TransportError::Control(
+                ControlError::InvalidDeviceSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn backend_session_lifecycle_control_is_signed_and_connection_bound() {
+        let (registry, identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id.clone(), caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let request = hub
+            .backend_session_end(
+                &hello,
+                &challenge,
+                device_id,
+                3,
+                "ctx_0123456789abcdef0123456789abcdef".into(),
+            )
+            .unwrap();
+        verify_remote_backend_session_end(&hello, &challenge, &request, &hub.verifier()).unwrap();
+        let ack = build_remote_backend_session_ended(&identity, &hello, &challenge, &request, true)
+            .unwrap();
+        verify_remote_backend_session_ended(&registry, &hello, &challenge, &ack).unwrap();
+
+        let mut tampered = request.clone();
+        tampered.context_id = "ctx_ffffffffffffffffffffffffffffffff".into();
+        assert!(matches!(
+            verify_remote_backend_session_end(&hello, &challenge, &tampered, &hub.verifier()),
+            Err(TransportError::InvalidHubSignature)
+        ));
+
+        let mut tampered_ack = ack.clone();
+        tampered_ack.ended = false;
+        assert!(matches!(
+            verify_remote_backend_session_ended(&registry, &hello, &challenge, &tampered_ack),
             Err(TransportError::Control(
                 ControlError::InvalidDeviceSignature
             ))

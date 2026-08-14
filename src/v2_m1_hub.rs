@@ -21,7 +21,8 @@ use crate::v2_m0_execution::{
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubIdentity, HubToAgent,
     RemoteCancellationAck, RemoteResult, TrustedSessionClock, verify_agent_heartbeat,
-    verify_agent_proof, verify_remote_cancellation_ack, verify_remote_result,
+    verify_agent_proof, verify_remote_backend_session_ended, verify_remote_cancellation_ack,
+    verify_remote_result,
 };
 use crate::v2_m0_trust::{DeviceKeyRotation, apply_device_key_rotation};
 use crate::v2_m1_grpc::{
@@ -211,6 +212,10 @@ enum HubRequest {
         operation_id: String,
         owner: OperationOwner,
         reply: oneshot::Sender<Result<CancellationDisposition, HubCommandError>>,
+    },
+    EndBackendSession {
+        context_id: String,
+        reply: oneshot::Sender<Result<bool, HubCommandError>>,
     },
 }
 
@@ -454,6 +459,10 @@ impl SingleDeviceHub {
             String,
             oneshot::Sender<Result<CancellationDisposition, HubCommandError>>,
         > = HashMap::new();
+        let mut backend_session_end_waiters: HashMap<
+            String,
+            oneshot::Sender<Result<bool, HubCommandError>>,
+        > = HashMap::new();
         let heartbeat_deadline = tokio::time::sleep(self.inner.config.heartbeat_timeout);
         tokio::pin!(heartbeat_deadline);
 
@@ -644,6 +653,21 @@ impl SingleDeviceHub {
                                 }
                             }
                         }
+                        HubRequest::EndBackendSession { context_id, reply } => {
+                            if backend_session_end_waiters.contains_key(&context_id) {
+                                let _ = reply.send(Err(HubCommandError::Rejected));
+                                continue;
+                            }
+                            let remote = self.inner.material.hub_identity.backend_session_end(
+                                &hello,
+                                &challenge,
+                                self.inner.device_id.clone(),
+                                generation,
+                                context_id.clone(),
+                            )?;
+                            backend_session_end_waiters.insert(context_id, reply);
+                            send_hub(&outbound, HubToAgent::BackendSessionEnd(remote)).await?;
+                        }
                     }
                 }
                 message = inbound.message() => {
@@ -684,6 +708,27 @@ impl SingleDeviceHub {
                                 &mut pending,
                                 &mut queue_order,
                             ).await?;
+                        }
+                        AgentToHub::BackendSessionEnded(ack) => {
+                            {
+                                let persistent = self.inner.persistent.lock().await;
+                                verify_remote_backend_session_ended(
+                                    &persistent.registry,
+                                    &hello,
+                                    &challenge,
+                                    &ack,
+                                )?;
+                            }
+                            if ack.device_generation != generation {
+                                return Err(HubServiceError::StaleSession);
+                            }
+                            let Some(reply) = backend_session_end_waiters.remove(&ack.context_id) else {
+                                return Err(HubServiceError::UnexpectedMessage {
+                                    expected: "backend_session_end_ack",
+                                    got: "unmatched_backend_session_end_ack",
+                                });
+                            };
+                            let _ = reply.send(Ok(ack.ended));
                         }
                         AgentToHub::CancellationAck(ack) => {
                             self.handle_cancellation_ack(
@@ -1250,6 +1295,18 @@ impl HubHandle {
             .map(|session| session.capabilities)
     }
 
+    /// Atomically observe the current Agent generation and capability advertisement.
+    /// Stateful northbound workflow bindings must use this rather than reading the
+    /// generation and capability revision in separate lock acquisitions.
+    pub async fn current_session_binding(&self) -> Option<(u64, CapabilityAdvertisement)> {
+        let persistent = self.inner.persistent.lock().await;
+        persistent
+            .registry
+            .current_session(&self.inner.device_id)
+            .ok()
+            .map(|session| (session.generation, session.capabilities))
+    }
+
     pub async fn start_command(
         &self,
         command: DeviceCommand,
@@ -1375,6 +1432,29 @@ impl HubHandle {
             DeviceResult::DirectoryEntries { entries, truncated } => Ok((entries, truncated)),
             _ => Err(HubCommandError::UnexpectedResult),
         }
+    }
+
+    /// End backend-owned interaction state without creating a semantic device
+    /// operation, grant, replay identity, or quarantine transition. Callers must
+    /// validate CUMG context ownership before invoking this lifecycle control.
+    pub(crate) async fn end_backend_interaction_session(
+        &self,
+        context_id: String,
+    ) -> Result<bool, HubCommandError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let tx = {
+            let live = self.inner.live.lock().await;
+            live.as_ref()
+                .map(|session| session.command_tx.clone())
+                .ok_or(HubCommandError::AgentOffline)?
+        };
+        tx.send(HubRequest::EndBackendSession {
+            context_id,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| HubCommandError::AgentOffline)?;
+        reply_rx.await.map_err(|_| HubCommandError::SessionClosed)?
     }
 
     pub async fn cancel(

@@ -12,10 +12,11 @@ use crate::v2_m0::{
 };
 use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
 use crate::v2_m0_transport::{
-    AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubToAgent, TrustedSessionClock,
-    build_agent_heartbeat, build_agent_proof, build_remote_cancellation_ack, build_remote_result,
-    verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_cancel, verify_remote_command,
-    verify_session_accepted,
+    AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubToAgent,
+    RemoteBackendSessionEnd, TrustedSessionClock, build_agent_heartbeat, build_agent_proof,
+    build_remote_backend_session_ended, build_remote_cancellation_ack, build_remote_result,
+    verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_backend_session_end,
+    verify_remote_cancel, verify_remote_command, verify_session_accepted,
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
@@ -32,6 +33,7 @@ use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, P
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -553,6 +555,7 @@ impl AgentService {
 
         let (operation_done_tx, mut operation_done_rx) = mpsc::channel::<OperationCompletion>(1);
         let mut active: Option<ActiveOperation> = None;
+        let mut pending_backend_session_ends = VecDeque::<RemoteBackendSessionEnd>::new();
 
         let session_result = async {
             loop {
@@ -679,6 +682,14 @@ impl AgentService {
                             }
                         }
                     }
+                    drain_backend_session_ends(
+                        &mut pending_backend_session_ends,
+                        self.computer_use.as_ref(),
+                        &self.material.device_identity,
+                        &hello,
+                        &challenge,
+                        &outbound_tx,
+                    ).await?;
                 }
                 message = inbound.message() => {
                     let frame = match message.map_err(AgentServiceError::Status)? {
@@ -700,6 +711,35 @@ impl AgentService {
                                 return Err(AgentServiceError::HeartbeatAckMismatch);
                             }
                             pending_heartbeat = None;
+                        }
+                        HubToAgent::BackendSessionEnd(remote) => {
+                            verify_remote_backend_session_end(
+                                &hello,
+                                &challenge,
+                                &remote,
+                                &self.trusted_hub.verifier(),
+                            )
+                            .map_err(AgentServiceError::Protocol)?;
+                            if remote.device_generation != session.generation {
+                                return Err(AgentServiceError::Control(
+                                    crate::v2_m0::ControlError::StaleDeviceGeneration {
+                                        expected: session.generation,
+                                        got: remote.device_generation,
+                                    },
+                                ));
+                            }
+                            pending_backend_session_ends.push_back(remote);
+                            if active.is_none() {
+                                drain_backend_session_ends(
+                                    &mut pending_backend_session_ends,
+                                    self.computer_use.as_ref(),
+                                    &self.material.device_identity,
+                                    &hello,
+                                    &challenge,
+                                    &outbound_tx,
+                                )
+                                .await?;
+                            }
                         }
                         HubToAgent::Command(remote) => {
                             verify_remote_command(&hello, &challenge, &remote, &self.trusted_hub.verifier())
@@ -797,13 +837,32 @@ impl AgentService {
                                 command @ (DeviceCommand::ListApplications
                                 | DeviceCommand::ScreenGeometry
                                 | DeviceCommand::Screenshot
+                                | DeviceCommand::ScreenshotContextual { .. }
                                 | DeviceCommand::PointerClick { .. }
+                                | DeviceCommand::PointerClickAdvanced { .. }
                                 | DeviceCommand::PointerDrag { .. }
+                                | DeviceCommand::PointerDragAdvanced { .. }
                                 | DeviceCommand::TypeText { .. }
+                                | DeviceCommand::TypeTextAdvanced { .. }
                                 | DeviceCommand::ListWindows { .. }
                                 | DeviceCommand::LaunchApplication { .. }
                                 | DeviceCommand::InspectWindow { .. }
-                                | DeviceCommand::VerifyUiState { .. }) => {
+                                | DeviceCommand::InspectWindowContextual { .. }
+                                | DeviceCommand::VerifyUiState { .. }
+                                | DeviceCommand::VerifyUiStateContextual { .. }
+                                | DeviceCommand::TerminateApplication { .. }
+                                | DeviceCommand::ActivateWindow { .. }
+                                | DeviceCommand::SetWindowFrame { .. }
+                                | DeviceCommand::InvokeMenu { .. }
+                                | DeviceCommand::KeyboardInput { .. }
+                                | DeviceCommand::Scroll { .. }
+                                | DeviceCommand::ClipboardRead { .. }
+                                | DeviceCommand::ClipboardWrite { .. }
+                                | DeviceCommand::PointerPosition { .. }
+                                | DeviceCommand::MovePointer { .. }
+                                | DeviceCommand::SetUiValue { .. }
+                                | DeviceCommand::CaptureRegion { .. }
+                                | DeviceCommand::ExpandInteractionScope { .. }) => {
                                     let computer_use = self
                                         .computer_use
                                         .clone()
@@ -1022,6 +1081,37 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
             DeviceErrorCode::InternalFailure
         }
     }
+}
+
+async fn drain_backend_session_ends(
+    pending: &mut VecDeque<RemoteBackendSessionEnd>,
+    computer_use: Option<&Arc<dyn ComputerUseBackendAdapter>>,
+    identity: &crate::v2_m0::DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    outbound: &mpsc::Sender<crate::v2_m1_grpc::proto::AgentFrame>,
+) -> Result<(), AgentServiceError> {
+    while let Some(request) = pending.pop_front() {
+        let ended = match computer_use {
+            Some(adapter) => match adapter.end_interaction_session(&request.context_id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "v2_backend_session_cleanup_failed",
+                        outcome = "failed",
+                        error_code = error.safe_error_code(),
+                        "backend interaction-session cleanup failed without logging context identity"
+                    );
+                    false
+                }
+            },
+            None => true,
+        };
+        let ack = build_remote_backend_session_ended(identity, hello, challenge, &request, ended)
+            .map_err(AgentServiceError::Protocol)?;
+        send_agent(outbound, AgentToHub::BackendSessionEnded(ack)).await?;
+    }
+    Ok(())
 }
 
 fn unexpected_hub_message(expected: &'static str, message: &HubToAgent) -> AgentServiceError {

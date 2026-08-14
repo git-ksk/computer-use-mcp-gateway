@@ -21,6 +21,23 @@ pub const MAX_BACKEND_REF_BYTES: usize = 4 * 1024;
 pub struct InteractionContextId(String);
 
 impl InteractionContextId {
+    pub fn parse(value: &str) -> Result<Self, InteractionContextError> {
+        const PREFIX: &str = "ctx_";
+        const RANDOM_HEX_LEN: usize = 32;
+        let Some(hex) = value.strip_prefix(PREFIX) else {
+            return Err(InteractionContextError::InvalidIdentifier);
+        };
+        if hex.len() != RANDOM_HEX_LEN
+            || !hex
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(InteractionContextError::InvalidIdentifier);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -246,22 +263,56 @@ impl InteractionContextManager {
         Ok(())
     }
 
-    pub fn invalidate_device_generation(&mut self, device_id: &str, current_generation: u64) {
+    pub fn invalidate_device_generation(
+        &mut self,
+        device_id: &str,
+        current_generation: u64,
+    ) -> Vec<InteractionContextId> {
+        let removed: Vec<_> = self
+            .contexts
+            .iter()
+            .filter(|(_, context)| {
+                context.device_id == device_id && context.device_generation != current_generation
+            })
+            .map(|(id, _)| InteractionContextId(id.clone()))
+            .collect();
         self.contexts.retain(|_, context| {
             context.device_id != device_id || context.device_generation == current_generation
         });
+        removed
     }
 
-    pub fn invalidate_capability_revision(&mut self, device_id: &str, current_revision: u64) {
+    pub fn invalidate_capability_revision(
+        &mut self,
+        device_id: &str,
+        current_revision: u64,
+    ) -> Vec<InteractionContextId> {
+        let removed: Vec<_> = self
+            .contexts
+            .iter()
+            .filter(|(_, context)| {
+                context.device_id == device_id && context.capability_revision != current_revision
+            })
+            .map(|(id, _)| InteractionContextId(id.clone()))
+            .collect();
         self.contexts.retain(|_, context| {
             context.device_id != device_id || context.capability_revision == current_revision
         });
+        removed
     }
 
-    pub fn prune(&mut self, now_ms: u64) {
+    pub fn prune(&mut self, now_ms: u64) -> Vec<InteractionContextId> {
         let limits = self.limits;
-        self.contexts
-            .retain(|_, context| !is_expired(context, limits, now_ms));
+        let expired: Vec<_> = self
+            .contexts
+            .iter()
+            .filter(|(_, context)| is_expired(context, limits, now_ms))
+            .map(|(id, _)| InteractionContextId(id.clone()))
+            .collect();
+        for id in &expired {
+            self.contexts.remove(id.as_str());
+        }
+        expired
     }
 
     pub fn len(&self) -> usize {
@@ -442,6 +493,7 @@ fn random_id(prefix: &str) -> String {
 pub enum InteractionContextError {
     InvalidLimits,
     InvalidBinding,
+    InvalidIdentifier,
     ContextLimitExceeded,
     IdentifierCollision,
     UnknownContext,
@@ -499,6 +551,25 @@ mod tests {
             max_lifetime_ms: 1_000,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn opaque_context_identifier_parser_is_strict() {
+        let valid = "ctx_0123456789abcdef0123456789abcdef";
+        assert_eq!(InteractionContextId::parse(valid).unwrap().as_str(), valid);
+        for invalid in [
+            "",
+            "ctx_",
+            "CTX_0123456789abcdef0123456789abcdef",
+            "ctx_0123456789ABCDEF0123456789abcdef",
+            "ctx_0123456789abcdef0123456789abcdeg",
+            "ctx_0123456789abcdef0123456789abcdef00",
+        ] {
+            assert_eq!(
+                InteractionContextId::parse(invalid),
+                Err(InteractionContextError::InvalidIdentifier)
+            );
+        }
     }
 
     #[test]
@@ -639,6 +710,16 @@ mod tests {
     }
 
     #[test]
+    fn prune_reports_expired_context_ids_for_scoped_ref_cleanup() {
+        let alice = principal("alice");
+        let mut contexts = manager();
+        let context = contexts.open(&alice, "dev-a", 4, 9, 0).unwrap();
+        let expired = contexts.prune(101);
+        assert_eq!(expired, vec![context.id]);
+        assert!(contexts.is_empty());
+    }
+
+    #[test]
     fn generation_invalidation_drops_contexts_and_refs_without_replay_or_rebinding() {
         let alice = principal("alice");
         let mut contexts = manager();
@@ -651,6 +732,31 @@ mod tests {
         refs.invalidate_device_generation("dev-a", 5);
         assert!(contexts.is_empty());
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn repeated_context_close_and_ref_cleanup_do_not_accumulate_registry_state() {
+        let alice = principal("alice");
+        let mut contexts = manager();
+        let mut refs = ScopedBackendRefRegistry::new(8).unwrap();
+
+        for index in 0..1_000_u64 {
+            let now_ms = index.saturating_mul(2);
+            let context = contexts.open(&alice, "dev-a", 4, 9, now_ms).unwrap();
+            for ref_index in 0..8 {
+                refs.mint(
+                    &context,
+                    ScopedRefKind::Element,
+                    &format!("backend-element-{index}-{ref_index}"),
+                )
+                .unwrap();
+            }
+            assert_eq!(refs.len(), 8);
+            contexts.close(&context.id, &alice, "dev-a").unwrap();
+            refs.invalidate_context(&context.id);
+            assert!(contexts.is_empty());
+            assert!(refs.is_empty());
+        }
     }
 
     #[test]
