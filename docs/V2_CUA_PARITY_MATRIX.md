@@ -116,7 +116,7 @@ Cua safety refusals remain authoritative. A background key/scroll may be refused
 cannot prove which sibling window of one PID would receive process-scoped input; CUMG never turns
 that refusal into an automatic foreground or desktop escalation.
 
-`CONTROL_SCHEMA_VERSION` and `CAPABILITY_SCHEMA_VERSION` are both version 3. Pre-v3 mixing fails
+`CONTROL_SCHEMA_VERSION` and `CAPABILITY_SCHEMA_VERSION` are both version 4. Pre-v4 mixing fails
 closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded
 image/UI/clipboard/region observations use the reviewed large-result allowance. Clipboard plain text
 is capped at 1 MiB.
