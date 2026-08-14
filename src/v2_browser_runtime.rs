@@ -190,7 +190,7 @@ impl fmt::Debug for BrowserStagedUploadFile {
     }
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserBackendResult {
     Prepared {
@@ -335,7 +335,7 @@ impl fmt::Debug for BrowserBackendSemanticRef {
     }
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserBackendScreenshot {
     pub data_base64: String,
     pub mime_type: String,
@@ -343,8 +343,8 @@ pub struct BrowserBackendScreenshot {
     pub height_pixels: u32,
     pub viewport_css_width: u32,
     pub viewport_css_height: u32,
-    pub pixel_to_css_scale_x: f64,
-    pub pixel_to_css_scale_y: f64,
+    pub pixel_to_css_scale_x_millionths: u32,
+    pub pixel_to_css_scale_y_millionths: u32,
 }
 
 impl fmt::Debug for BrowserBackendScreenshot {
@@ -356,8 +356,14 @@ impl fmt::Debug for BrowserBackendScreenshot {
             .field("height_pixels", &self.height_pixels)
             .field("viewport_css_width", &self.viewport_css_width)
             .field("viewport_css_height", &self.viewport_css_height)
-            .field("pixel_to_css_scale_x", &self.pixel_to_css_scale_x)
-            .field("pixel_to_css_scale_y", &self.pixel_to_css_scale_y)
+            .field(
+                "pixel_to_css_scale_x_millionths",
+                &self.pixel_to_css_scale_x_millionths,
+            )
+            .field(
+                "pixel_to_css_scale_y_millionths",
+                &self.pixel_to_css_scale_y_millionths,
+            )
             .finish()
     }
 }
@@ -438,8 +444,8 @@ mod tests {
             height_pixels: 80,
             viewport_css_width: 100,
             viewport_css_height: 80,
-            pixel_to_css_scale_x: 1.0,
-            pixel_to_css_scale_y: 1.0,
+            pixel_to_css_scale_x_millionths: 1_000_000,
+            pixel_to_css_scale_y_millionths: 1_000_000,
         };
         assert!(!format!("{screenshot:?}").contains("super-secret-image"));
     }
