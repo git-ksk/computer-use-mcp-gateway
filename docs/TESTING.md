@@ -222,13 +222,13 @@ CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" \
 ./scripts/v2_desktop_acceptance.sh
 ```
 
-Historical P1 physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`; that self-hosted-runner mechanism is retained only as historical evidence and is no longer the repository execution model. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](V2_LOCAL_DESKTOP_ACCEPTANCE.md), [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), and [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
+Historical P1 physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`; that self-hosted-runner mechanism is retained only as historical evidence and is no longer the repository execution model. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](v2/acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md), [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), and [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXECUTION_SAFETY.md).
 
 The local fixture requires an ordinary visible macOS Desktop. Cua `launch_app` starts the application in the background; if the Mac is sitting on a different Space, the launched TextEdit window can be off-Space and `get_window_state` can return an empty Accessibility element set even though launch/window/screenshot calls themselves succeed. This is a physical-acceptance precondition only and does not alter the V2 execution-safety state machine.
 
 ## V2-M1 final acceptance
 
-The V2-M1 gate is recorded in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md). Run the deterministic portion explicitly on Rust 1.88 even if another toolchain is the local default:
+The V2-M1 gate is recorded in [`V2_M1_ACCEPTANCE.md`](v2/acceptance/V2_M1_ACCEPTANCE.md). Run the deterministic portion explicitly on Rust 1.88 even if another toolchain is the local default:
 
 ```bash
 cargo +1.88.0 fmt --check
@@ -248,7 +248,7 @@ The current post-M1/P0 version of this acceptance is stronger than the original 
 
 ### V2 P0 execution-safety regression
 
-The detailed invariant is recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). In addition to the repository-wide gate above, the focused deterministic regressions are:
+The detailed invariant is recorded in [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXECUTION_SAFETY.md). In addition to the repository-wide gate above, the focused deterministic regressions are:
 
 ```bash
 cargo test v2_execution_safety --lib
@@ -304,4 +304,4 @@ P2 adds two focused unit regressions in addition to the existing P1 suites:
 
 The Cua adapter fixture also exercises the GUI semantic normalization boundary: backend `list_windows`, `launch_app`, `get_window_state`, and `verify_state` results are reduced to backend-neutral window/UI/verification types, semantic selectors map back into the backend adapter, and no generic raw-tool escape hatch is exposed northbound. A focused northbound regression verifies that a live `CapabilityAdvertisement` narrows semantic discovery while offline discovery retains the authorized contract and dispatch still fails closed.
 
-The existing `v2_p1_backend_portability` test remains the semantic guard: backend-specific cancellation behavior must converge on the same authoritative operation/quarantine/resolution model. Any P2 Computer Use backend change also requires the final main-only real-Cua regression because compile-time interface compatibility is not evidence of physical cancellation behavior. See [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md) and [`V2_GUI_SEMANTIC_CAPABILITIES.md`](V2_GUI_SEMANTIC_CAPABILITIES.md).
+The existing `v2_p1_backend_portability` test remains the semantic guard: backend-specific cancellation behavior must converge on the same authoritative operation/quarantine/resolution model. Any P2 Computer Use backend change also requires the final main-only real-Cua regression because compile-time interface compatibility is not evidence of physical cancellation behavior. See [`V2_P2_REPLACEMENT_SEAMS.md`](v2/V2_P2_REPLACEMENT_SEAMS.md) and [`V2_GUI_SEMANTIC_CAPABILITIES.md`](v2/V2_GUI_SEMANTIC_CAPABILITIES.md).

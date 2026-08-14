@@ -18,7 +18,11 @@ use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 // This E2E validates deployable Hub/Agent execution, filesystem boundaries and
-// cancellation semantics. Heartbeat timeout precision is covered separately.
+// cancellation semantics rather than heartbeat timeout precision. The Agent
+// treats 3 missed heartbeat intervals as an acknowledgement timeout, so a
+// 50 ms fixture interval turns hosted-runner contention into a 150 ms reconnect
+// deadline. Keep the fixture comfortably outside that sub-second timing regime.
+const E2E_AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -96,7 +100,7 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
             device_id,
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
-            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(5),
                 max_delay: Duration::from_millis(50),

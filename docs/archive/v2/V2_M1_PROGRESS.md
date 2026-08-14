@@ -1,6 +1,10 @@
 # V2-M1 progress — single secure remote Agent
 
-Status: **accepted (2026-08-12)**. V2-M0 was GO; the V2-M1 single secure remote Agent acceptance gate is complete. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
+Status: **accepted (2026-08-12); archived after milestone closeout.** V2-M0 was GO; the V2-M1 single secure remote Agent acceptance gate is complete. See [`V2_M1_ACCEPTANCE.md`](../../v2/acceptance/V2_M1_ACCEPTANCE.md).
+
+> **Archived progress record.** This journal is retained for implementation provenance. Current contracts
+> and status live under [`../../v2/`](../../v2/); bounded acceptance evidence lives under
+> [`../../v2/acceptance/`](../../v2/acceptance/).
 
 ## Transport migration: gRPC bidi production candidate
 
@@ -69,7 +73,7 @@ The persisted replay/trust checkpoint intentionally contains **no private signin
 
 The repository tests prove the TLS wrapper negotiates TLS 1.3 with the dedicated ALPN and rejects an untrusted server certificate. Runtime tests also cover heartbeat replay/generation/timeout handling, capped reconnect backoff, one-device routing, consumed/revoked grant persistence, revoked device/generation persistence, queued/in-flight crash recovery, and operation replay barriers. A second encrypted integration test runs two outbound TLS sessions from the same Agent identity, proves the Hub advances device generation from 1 to 2, and confirms a command bound to generation 1 is rejected after generation 2 becomes current. The deterministic MCP backend fixture also proves that V2 cancellation propagation references the exact in-flight downstream MCP request ID; the resulting state is deliberately classified `indeterminate` and quarantines that device.
 
-The existing M0 live-Cua PoC continues to prove the semantic path from an authorized client principal through a short-lived grant and bounded Hub/Agent execution to the Cua adapter. M1 now also has an end-to-end integration test that composes the TLS channel with the application protocol in one outbound connection: TLS 1.3 + dedicated ALPN, Ed25519 Hub/Agent authentication, signed session acceptance, signed heartbeat/ack, one-device routing, bounded admission and lease ownership, short-lived grant validation on the Agent, and a signed typed result.
+The archived M0 live-Cua evidence proved the semantic path from an authorized client principal through a short-lived grant and bounded Hub/Agent execution to the Cua adapter. M1 now also has an end-to-end integration test that composes the TLS channel with the application protocol in one outbound connection: TLS 1.3 + dedicated ALPN, Ed25519 Hub/Agent authentication, signed session acceptance, signed heartbeat/ack, one-device routing, bounded admission and lease ownership, short-lived grant validation on the Agent, and a signed typed result.
 
 Northbound tests now cover RFC 9728 path-inserted metadata, HTTPS-only resource/issuer/introspection configuration, malformed or duplicate bearer rejection, query-token rejection, invalid-token 401 and insufficient-scope 403 challenges, audience binding, exact wrong-device/capability denial, and an actual MCP `2026-07-28` `tools/list` request that exposes only the principal's authorized exact capability. The auth middleware strips the `Authorization` header after verification before rmcp captures HTTP request parts, so the bearer token cannot enter the Hub command path.
 
@@ -77,7 +81,7 @@ A separate operator-controlled M1 backend run on 2026-08-11 connected the asynch
 
 ## V2-M1 acceptance result
 
-The remaining M1 blockers were closed on 2026-08-12. The final gate and command-level evidence are recorded in [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
+The remaining M1 blockers were closed on 2026-08-12. The final gate and command-level evidence are recorded in [`V2_M1_ACCEPTANCE.md`](../../v2/acceptance/V2_M1_ACCEPTANCE.md).
 
 The production boundary now follows the standard-first decision:
 

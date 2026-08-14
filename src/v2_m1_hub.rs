@@ -1032,6 +1032,9 @@ impl SingleDeviceHub {
         Ok(())
     }
 
+    // Cancellation verification needs both authenticated-session context and the two
+    // operation waiter maps; keep that state explicit instead of hiding it in a broad context bag.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_cancellation_ack(
         &self,
         ack: RemoteCancellationAck,

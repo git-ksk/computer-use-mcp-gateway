@@ -86,7 +86,7 @@ A `markLiable()` ACK can be lost after the sidecar committed the transition. CUM
 
 ## Local sidecar
 
-The private bridge lives at [`../integrations/mcp-usage-control-sidecar/`](../integrations/mcp-usage-control-sidecar/). It is not a general or public language-neutral MCPUsage protocol.
+The private bridge lives at [`../integrations/mcp-usage-control-sidecar/`](../../integrations/mcp-usage-control-sidecar). It is not a general or public language-neutral MCPUsage protocol.
 
 The sidecar binds only to literal `127.0.0.1` or `::1`. The Rust client likewise rejects non-loopback hosts, HTTPS redirects, credentials in the URL, query strings, and non-root base paths. The systemd unit additionally restricts IP traffic to localhost.
 

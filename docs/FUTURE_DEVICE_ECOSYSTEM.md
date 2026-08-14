@@ -2,7 +2,7 @@
 
 Status: **optional post-V2 direction; not a V2 acceptance requirement**.
 
-This note records a possible long-term extension without changing the current V2 product boundary in [`V2_POSITIONING.md`](V2_POSITIONING.md).
+This note records a possible long-term extension without changing the current V2 product boundary in [`V2_POSITIONING.md`](v2/V2_POSITIONING.md).
 
 ## Idea
 

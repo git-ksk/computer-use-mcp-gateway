@@ -22,20 +22,23 @@ jobs:
 
       - name: Install Rust 1.88
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --component rustfmt
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
           rustup default 1.88.0
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Check
         run: cargo check --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --locked
 
       - name: Python harness syntax
-        run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_conformance.py
+        run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_cua_mcp_backend.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_conformance.py
 
       - name: Build V1 gateway for legacy quality gate
         run: cargo build --locked --bin v1_gateway

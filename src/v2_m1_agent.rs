@@ -5,6 +5,11 @@
 //! reconnect, grant validation, replay barriers, direct process execution, and
 //! cancellation. An optional external Cua MCP adapter adds typed GUI capabilities.
 
+use crate::v2_browser_execute::BrowserRefusalReason;
+use crate::v2_browser_staging::{
+    BrowserDownloadStagingBroker, BrowserDownloadStagingError, BrowserUploadStagingBroker,
+    BrowserUploadStagingError,
+};
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
     CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
@@ -141,6 +146,8 @@ pub struct AgentService {
     executor: ProcessExecutor,
     shell: ShellExecutor,
     filesystem: FilesystemExecutor,
+    browser_upload_staging: BrowserUploadStagingBroker,
+    browser_download_staging: BrowserDownloadStagingBroker,
     computer_use: Option<Arc<dyn ComputerUseBackendAdapter>>,
     trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
@@ -213,6 +220,8 @@ impl AgentService {
             FilesystemPolicy::new(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Filesystem)?,
         );
+        // Loading the checkpoint first establishes/hardens the private state root.
+        // Browser transfer staging is created only after that reviewed root exists.
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
             .map_err(AgentServiceError::Persistence)?;
         let (trusted_hub, grants, execution) =
@@ -249,12 +258,18 @@ impl AgentService {
                 }
                 Err(error) => return Err(AgentServiceError::Persistence(error)),
             };
+        let browser_upload_staging = BrowserUploadStagingBroker::new(&config.state_dir)
+            .map_err(AgentServiceError::BrowserUploadStaging)?;
+        let browser_download_staging = BrowserDownloadStagingBroker::new(&config.state_dir)
+            .map_err(AgentServiceError::BrowserDownloadStaging)?;
         let service = Self {
             config,
             material,
             executor,
             shell,
             filesystem,
+            browser_upload_staging,
+            browser_download_staging,
             computer_use,
             trusted_hub,
             grants,
@@ -308,7 +323,7 @@ impl AgentService {
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-            revision: 4,
+            revision: 5,
             supported,
         }
     }
@@ -521,6 +536,13 @@ impl AgentService {
         // Persist the generation rollover before accepting work so replay
         // tombstones from prior generations can be safely discarded on disk.
         self.persist_state()?;
+        // Staged upload handles never survive an Agent transport generation.
+        self.browser_upload_staging
+            .cleanup_all()
+            .map_err(AgentServiceError::BrowserUploadStaging)?;
+        self.browser_download_staging
+            .cleanup_all()
+            .map_err(AgentServiceError::BrowserDownloadStaging)?;
         let trusted_clock = TrustedSessionClock::new(accepted.hub_time_ms);
 
         self.run_session_loop(
@@ -685,6 +707,8 @@ impl AgentService {
                     drain_backend_session_ends(
                         &mut pending_backend_session_ends,
                         self.computer_use.as_ref(),
+                        &self.browser_upload_staging,
+                        &self.browser_download_staging,
                         &self.material.device_identity,
                         &hello,
                         &challenge,
@@ -733,6 +757,8 @@ impl AgentService {
                                 drain_backend_session_ends(
                                     &mut pending_backend_session_ends,
                                     self.computer_use.as_ref(),
+                                    &self.browser_upload_staging,
+                                    &self.browser_download_staging,
                                     &self.material.device_identity,
                                     &hello,
                                     &challenge,
@@ -806,6 +832,45 @@ impl AgentService {
                                     });
                                     ActiveCancellation::Process(cancellation)
                                 }
+                                DeviceCommand::StageBrowserUploadFile {
+                                    context_id,
+                                    file_name,
+                                    data_base64,
+                                    expected_bytes,
+                                } => {
+                                    let staging = self.browser_upload_staging.clone();
+                                    let revision = session.capabilities.revision;
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            staging.stage(
+                                                &context_id,
+                                                worker_generation,
+                                                revision,
+                                                &file_name,
+                                                data_base64.as_str(),
+                                                expected_bytes,
+                                            )
+                                        })
+                                        .await
+                                        .map_err(|_| AgentOperationError::WorkerPanicked)
+                                        .and_then(|result| {
+                                            result
+                                                .map(|staged| DeviceResult::BrowserUploadStaged {
+                                                    backend_file_handle: staged.handle,
+                                                    bytes: staged.bytes,
+                                                })
+                                                .map_err(AgentOperationError::BrowserUploadStaging)
+                                        });
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: AgentOperationOutcome::Result(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
                                 DeviceCommand::ReadFile { path } => {
                                     let filesystem = self.filesystem.clone();
                                     tokio::spawn(async move {
@@ -862,31 +927,27 @@ impl AgentService {
                                 | DeviceCommand::MovePointer { .. }
                                 | DeviceCommand::SetUiValue { .. }
                                 | DeviceCommand::CaptureRegion { .. }
-                                | DeviceCommand::ExpandInteractionScope { .. }) => {
+                                | DeviceCommand::ExpandInteractionScope { .. }
+                                | DeviceCommand::Browser { .. }) => {
                                     let computer_use = self
                                         .computer_use
                                         .clone()
                                         .ok_or(AgentServiceError::UnsupportedCommand)?;
+                                    let upload_staging = self.browser_upload_staging.clone();
+                                    let download_staging = self.browser_download_staging.clone();
+                                    let capability_revision = session.capabilities.revision;
                                     let (cancel_tx, cancel_rx) = watch::channel(false);
                                     tokio::spawn(async move {
-                                        let outcome = match computer_use.execute(&command, cancel_rx).await {
-                                            Ok(BackendExecutionOutcome::Completed(result)) => {
-                                                AgentOperationOutcome::Result(Ok(result))
-                                            }
-                                            Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
-                                                AgentOperationOutcome::Indeterminate(
-                                                    AgentIndeterminateCause::CancellationPropagated,
-                                                )
-                                            }
-                                            Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
-                                                AgentOperationOutcome::Indeterminate(
-                                                    AgentIndeterminateCause::BackendTimedOut,
-                                                )
-                                            }
-                                            Err(error) => AgentOperationOutcome::Result(Err(
-                                                AgentOperationError::Backend(error),
-                                            )),
-                                        };
+                                        let outcome = execute_computer_use_operation(
+                                            computer_use,
+                                            command,
+                                            upload_staging,
+                                            download_staging,
+                                            worker_generation,
+                                            capability_revision,
+                                            cancel_rx,
+                                        )
+                                        .await;
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
                                             device_generation: worker_generation,
@@ -1007,6 +1068,8 @@ pub enum AgentOperationError {
     Process(ProcessError),
     Shell(ShellError),
     Filesystem(FilesystemError),
+    BrowserUploadStaging(BrowserUploadStagingError),
+    BrowserDownloadStaging(BrowserDownloadStagingError),
     Backend(M1BackendError),
     WorkerPanicked,
 }
@@ -1049,6 +1112,8 @@ fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
         AgentOperationError::Process(error) => error.safe_error_code(),
         AgentOperationError::Shell(error) => error.safe_error_code(),
         AgentOperationError::Filesystem(error) => error.safe_error_code(),
+        AgentOperationError::BrowserUploadStaging(error) => error.safe_error_code(),
+        AgentOperationError::BrowserDownloadStaging(error) => error.safe_error_code(),
         AgentOperationError::Backend(error) => error.safe_error_code(),
         AgentOperationError::WorkerPanicked => "operation_worker_panicked",
     }
@@ -1077,22 +1142,288 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         AgentOperationError::Filesystem(_)
         | AgentOperationError::Process(_)
         | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::BrowserUploadStaging(
+            BrowserUploadStagingError::UnknownHandle
+            | BrowserUploadStagingError::ContextMismatch
+            | BrowserUploadStagingError::GenerationMismatch
+            | BrowserUploadStagingError::CapabilityRevisionMismatch,
+        ) => DeviceErrorCode::BrowserRefStale,
+        AgentOperationError::BrowserUploadStaging(
+            BrowserUploadStagingError::Io | BrowserUploadStagingError::InvalidRoot,
+        ) => DeviceErrorCode::IoFailure,
+        AgentOperationError::BrowserUploadStaging(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::BrowserDownloadStaging(
+            BrowserDownloadStagingError::UnknownOperation
+            | BrowserDownloadStagingError::ContextMismatch
+            | BrowserDownloadStagingError::GenerationMismatch
+            | BrowserDownloadStagingError::CapabilityRevisionMismatch,
+        ) => DeviceErrorCode::BrowserRefStale,
+        AgentOperationError::BrowserDownloadStaging(
+            BrowserDownloadStagingError::Io | BrowserDownloadStagingError::InvalidRoot,
+        ) => DeviceErrorCode::IoFailure,
+        AgentOperationError::BrowserDownloadStaging(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Backend(M1BackendError::BrowserRefused(reason)) => {
+            browser_refusal_error_code(*reason)
+        }
         AgentOperationError::Backend(_) | AgentOperationError::WorkerPanicked => {
             DeviceErrorCode::InternalFailure
         }
     }
 }
 
+fn browser_refusal_error_code(reason: BrowserRefusalReason) -> DeviceErrorCode {
+    match reason {
+        BrowserRefusalReason::RouteUnavailable => DeviceErrorCode::BrowserRouteUnavailable,
+        BrowserRefusalReason::RequiresSetup => DeviceErrorCode::BrowserRequiresSetup,
+        BrowserRefusalReason::BindingAmbiguous => DeviceErrorCode::BrowserBindingAmbiguous,
+        BrowserRefusalReason::BindingStale => DeviceErrorCode::BrowserBindingStale,
+        BrowserRefusalReason::WrongTarget => DeviceErrorCode::BrowserWrongTargetRefused,
+        BrowserRefusalReason::TabRequired => DeviceErrorCode::BrowserTabRequired,
+        BrowserRefusalReason::TabNotFound => DeviceErrorCode::BrowserTabNotFound,
+        BrowserRefusalReason::RefStale => DeviceErrorCode::BrowserRefStale,
+        BrowserRefusalReason::InputTrustUnavailable => {
+            DeviceErrorCode::BrowserInputTrustUnavailable
+        }
+        BrowserRefusalReason::EndpointOwnerMismatch => {
+            DeviceErrorCode::BrowserEndpointOwnerMismatch
+        }
+        BrowserRefusalReason::ConsentRequired => DeviceErrorCode::BrowserConsentRequired,
+        BrowserRefusalReason::ConsentRevoked => DeviceErrorCode::BrowserConsentRevoked,
+        BrowserRefusalReason::ReconnectExhausted => DeviceErrorCode::BrowserReconnectExhausted,
+        BrowserRefusalReason::InputIncomplete => DeviceErrorCode::BrowserInputIncomplete,
+        BrowserRefusalReason::ActionUnavailable => DeviceErrorCode::BrowserActionUnavailable,
+        BrowserRefusalReason::OriginOutsideScope => DeviceErrorCode::BrowserOriginOutsideScope,
+        BrowserRefusalReason::Other => DeviceErrorCode::BrowserRefused,
+    }
+}
+
+async fn execute_computer_use_operation(
+    computer_use: Arc<dyn ComputerUseBackendAdapter>,
+    command: DeviceCommand,
+    upload_staging: BrowserUploadStagingBroker,
+    download_staging: BrowserDownloadStagingBroker,
+    device_generation: u64,
+    capability_revision: u64,
+    cancellation: watch::Receiver<bool>,
+) -> AgentOperationOutcome {
+    use crate::v2_browser_runtime::{BrowserBackendCommand, BrowserBackendResult};
+
+    match &command {
+        DeviceCommand::Browser {
+            command:
+                browser_command @ BrowserBackendCommand::Upload {
+                    context_id,
+                    staged_files,
+                    ..
+                },
+        } => {
+            let handles = staged_files
+                .iter()
+                .map(|file| file.backend_file_handle.clone())
+                .collect::<Vec<_>>();
+            let mut resolved = Vec::with_capacity(staged_files.len());
+            for file in staged_files {
+                match upload_staging.resolve(
+                    &file.backend_file_handle,
+                    context_id,
+                    device_generation,
+                    capability_revision,
+                ) {
+                    Ok(file) => resolved.push(file),
+                    Err(error) => {
+                        let _ = upload_staging.consume_handles(
+                            &handles,
+                            context_id,
+                            device_generation,
+                            capability_revision,
+                        );
+                        return AgentOperationOutcome::Result(Err(
+                            AgentOperationError::BrowserUploadStaging(error),
+                        ));
+                    }
+                }
+            }
+            let result = computer_use
+                .execute_browser_upload(browser_command, &resolved, cancellation)
+                .await;
+            match result {
+                Ok(BackendExecutionOutcome::Completed(result)) => {
+                    if let Err(error) = upload_staging.consume_handles(
+                        &handles,
+                        context_id,
+                        device_generation,
+                        capability_revision,
+                    ) {
+                        return AgentOperationOutcome::Result(Err(
+                            AgentOperationError::BrowserUploadStaging(error),
+                        ));
+                    }
+                    AgentOperationOutcome::Result(Ok(result))
+                }
+                Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                    AgentOperationOutcome::Indeterminate(
+                        AgentIndeterminateCause::CancellationPropagated,
+                    )
+                }
+                Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
+                    AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
+                }
+                Err(error) => {
+                    let _ = upload_staging.consume_handles(
+                        &handles,
+                        context_id,
+                        device_generation,
+                        capability_revision,
+                    );
+                    AgentOperationOutcome::Result(Err(AgentOperationError::Backend(error)))
+                }
+            }
+        }
+        DeviceCommand::Browser {
+            command:
+                browser_command @ BrowserBackendCommand::Download {
+                    context_id,
+                    destination_name,
+                    max_bytes,
+                    overwrite,
+                    ..
+                },
+        } => {
+            let prepared = match download_staging.prepare(
+                context_id,
+                device_generation,
+                capability_revision,
+                destination_name,
+                *max_bytes,
+                *overwrite,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return AgentOperationOutcome::Result(Err(
+                        AgentOperationError::BrowserDownloadStaging(error),
+                    ));
+                }
+            };
+            let result = computer_use
+                .execute_browser_download(browser_command, &prepared, cancellation)
+                .await;
+            match result {
+                Ok(BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                    result:
+                        BrowserBackendResult::DownloadStaged {
+                            backend_download_id,
+                            bytes_written,
+                        },
+                })) => match download_staging.finalize(
+                    prepared.operation_handle(),
+                    context_id,
+                    device_generation,
+                    capability_revision,
+                    &backend_download_id,
+                    bytes_written,
+                ) {
+                    Ok(finalized) => AgentOperationOutcome::Result(Ok(DeviceResult::Browser {
+                        result: BrowserBackendResult::DownloadCompleted {
+                            backend_download_handle: finalized.backend_download_handle,
+                            destination_name: finalized.destination_name,
+                            bytes_written: finalized.bytes,
+                            data_base64: finalized.data_base64,
+                        },
+                    })),
+                    Err(error) => AgentOperationOutcome::Result(Err(
+                        AgentOperationError::BrowserDownloadStaging(error),
+                    )),
+                },
+                Ok(BackendExecutionOutcome::Completed(_)) => {
+                    let _ = download_staging.abort(
+                        prepared.operation_handle(),
+                        context_id,
+                        device_generation,
+                        capability_revision,
+                    );
+                    AgentOperationOutcome::Result(Err(AgentOperationError::Backend(
+                        M1BackendError::MalformedResponse(
+                            "browser download adapter returned an unexpected result",
+                        ),
+                    )))
+                }
+                Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                    // The backend may still be writing. Leave this private operation staged;
+                    // execution safety quarantines the interaction until explicit resolution,
+                    // and context teardown removes the private directory.
+                    AgentOperationOutcome::Indeterminate(
+                        AgentIndeterminateCause::CancellationPropagated,
+                    )
+                }
+                Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
+                    AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
+                }
+                Err(error) => {
+                    let _ = download_staging.abort(
+                        prepared.operation_handle(),
+                        context_id,
+                        device_generation,
+                        capability_revision,
+                    );
+                    AgentOperationOutcome::Result(Err(AgentOperationError::Backend(error)))
+                }
+            }
+        }
+        _ => match computer_use.execute(&command, cancellation).await {
+            Ok(BackendExecutionOutcome::Completed(result)) => {
+                AgentOperationOutcome::Result(Ok(result))
+            }
+            Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                AgentOperationOutcome::Indeterminate(
+                    AgentIndeterminateCause::CancellationPropagated,
+                )
+            }
+            Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
+                AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
+            }
+            Err(error) => AgentOperationOutcome::Result(Err(AgentOperationError::Backend(error))),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drain_backend_session_ends(
     pending: &mut VecDeque<RemoteBackendSessionEnd>,
     computer_use: Option<&Arc<dyn ComputerUseBackendAdapter>>,
+    browser_upload_staging: &BrowserUploadStagingBroker,
+    browser_download_staging: &BrowserDownloadStagingBroker,
     identity: &crate::v2_m0::DeviceIdentity,
     hello: &AgentHello,
     challenge: &HubChallenge,
     outbound: &mpsc::Sender<crate::v2_m1_grpc::proto::AgentFrame>,
 ) -> Result<(), AgentServiceError> {
     while let Some(request) = pending.pop_front() {
-        let ended = match computer_use {
+        let staging_ended = match browser_upload_staging.cleanup_context(&request.context_id) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    event = "v2_browser_upload_staging_cleanup_failed",
+                    outcome = "failed",
+                    error_code = error.safe_error_code(),
+                    "browser upload staging cleanup failed without logging context identity"
+                );
+                false
+            }
+        };
+        let download_staging_ended =
+            match browser_download_staging.cleanup_context(&request.context_id) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "v2_browser_download_staging_cleanup_failed",
+                        outcome = "failed",
+                        error_code = error.safe_error_code(),
+                        "browser download staging cleanup failed without logging context identity"
+                    );
+                    false
+                }
+            };
+        let backend_ended = match computer_use {
             Some(adapter) => match adapter.end_interaction_session(&request.context_id).await {
                 Ok(()) => true,
                 Err(error) => {
@@ -1107,6 +1438,7 @@ async fn drain_backend_session_ends(
             },
             None => true,
         };
+        let ended = staging_ended && download_staging_ended && backend_ended;
         let ack = build_remote_backend_session_ended(identity, hello, challenge, &request, ended)
             .map_err(AgentServiceError::Protocol)?;
         send_agent(outbound, AgentToHub::BackendSessionEnded(ack)).await?;
@@ -1191,6 +1523,8 @@ pub enum AgentServiceError {
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
     Filesystem(FilesystemError),
+    BrowserUploadStaging(BrowserUploadStagingError),
+    BrowserDownloadStaging(BrowserDownloadStagingError),
     Backend(M1BackendError),
     Operation(AgentOperationError),
     Persistence(PersistenceError),
@@ -1239,6 +1573,8 @@ impl SafeErrorCode for AgentServiceError {
             Self::Execution(_) => "execution_error",
             Self::Process(_) => "process_error",
             Self::Filesystem(_) => "filesystem_error",
+            Self::BrowserUploadStaging(error) => error.safe_error_code(),
+            Self::BrowserDownloadStaging(error) => error.safe_error_code(),
             Self::Backend(error) => error.safe_error_code(),
             Self::Operation(_) => "operation_error",
             Self::Persistence(error) => error.safe_error_code(),

@@ -188,6 +188,14 @@ Rules:
 
 Agent-native process cancellation is stronger than GUI-backend cancellation: Unix process groups and Windows Job Objects terminate the supervised process tree, and background descendants are also cleaned up when the top-level process completes. The Cua MCP adapter instead propagates cancellation to the exact in-flight downstream request ID, but propagation is not treated as proof that a desktop side effect stopped. A propagated cancellation or timeout therefore maps to an `indeterminate` disposition and device quarantine. Lack of a backend-level proof of non-execution must never be interpreted as successful cancellation.
 
+## Browser transfer data boundary
+
+Browser transfer is intentionally narrower than filesystem access. Upload northbound traffic carries bounded bytes and a path-safe logical name; it mints a context/generation/revision-bound one-shot ref whose backend value is an Agent-private staging handle. The Agent creates the actual file beneath its hardened state directory, rejects symlink/directory/replacement/size violations, and re-proves a canonical regular file immediately before the southbound Cua call. Raw host paths are never accepted from or returned to the northbound caller.
+
+Download accepts no destination path or root capability from the caller. The Agent creates a private per-operation canonical root, maps exact `BrowserDownload` authorization plus a fresh click-capable page ref to Cua's reviewed MCP-host approval mechanism, and rejects any Cua completion whose opaque id is not a single component or whose object is not a direct regular file in that exact root. Reported length, actual length, caller maximum, and the global 16 MiB ceiling must all agree before a bounded read. Logical-name collisions require explicit overwrite and replacement occurs only after the new object is safely finalized.
+
+Transfer refs and staging die with context/generation/revision lifecycle. Definite failures are cleaned immediately; cancellation/timeout after provider dispatch leaves only Agent-private staging until teardown and enters the ordinary indeterminate quarantine. This avoids racing an in-flight backend read/write and preserves no-auto-replay. The threat model therefore does not claim to sandbox a compromised Agent/Cua process; it claims that an uncompromised V2 boundary does not expose generic host filesystem authority northbound.
+
 ## Key rotation
 
 ### Agent credential rotation
@@ -218,7 +226,7 @@ They should not contain raw screenshots, raw backend output, raw command argumen
 
 ## V2-M1 acceptance and residual deployment responsibilities
 
-The V2-M1 implementation gate passed on 2026-08-12. The M1 code now includes verified northbound principal construction, production key/certificate lifecycle procedures, bounded service connection/rate shedding, bounded replay pruning, real-Cua cancellation quarantine, OpenTelemetry/OTLP integration, and OS service packaging. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
+The V2-M1 implementation gate passed on 2026-08-12. The M1 code now includes verified northbound principal construction, production key/certificate lifecycle procedures, bounded service connection/rate shedding, bounded replay pruning, real-Cua cancellation quarantine, OpenTelemetry/OTLP integration, and OS service packaging. See [`V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md).
 
 The threat model still requires the deployment to preserve these external responsibilities:
 

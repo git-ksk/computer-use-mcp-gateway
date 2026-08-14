@@ -341,6 +341,7 @@ pub enum ScopedRefKind {
     BrowserTab,
     BrowserElement,
     UploadFile,
+    DownloadFile,
 }
 
 #[derive(Clone)]
@@ -421,6 +422,22 @@ impl ScopedBackendRefRegistry {
             return Ok(public_ref);
         }
         Err(ScopedRefError::IdentifierCollision)
+    }
+
+    pub fn consume_many(
+        &mut self,
+        public_refs: &[String],
+        context: &InteractionContextBinding,
+        expected_kind: ScopedRefKind,
+    ) -> Result<Vec<String>, ScopedRefError> {
+        let mut backend_refs = Vec::with_capacity(public_refs.len());
+        for public_ref in public_refs {
+            backend_refs.push(self.resolve(public_ref, context, expected_kind)?.to_owned());
+        }
+        for public_ref in public_refs {
+            self.refs.remove(public_ref);
+        }
+        Ok(backend_refs)
     }
 
     pub fn resolve(
@@ -707,6 +724,54 @@ mod tests {
             refs.resolve(&public_ref, &first, ScopedRefKind::Element),
             Ok("backend-element-secret")
         );
+    }
+
+    #[test]
+    fn scoped_ref_consume_many_is_atomic_and_single_use() {
+        let alice = principal("alice");
+        let mut contexts = manager();
+        let context = contexts.open(&alice, "dev-a", 4, 9, 0).unwrap();
+        let mut refs = ScopedBackendRefRegistry::new(4).unwrap();
+        let first = refs
+            .mint(&context, ScopedRefKind::UploadFile, "backend-upload-one")
+            .unwrap();
+        let second = refs
+            .mint(&context, ScopedRefKind::UploadFile, "backend-upload-two")
+            .unwrap();
+
+        assert!(
+            refs.consume_many(
+                &[first.clone(), "ref_missing".into()],
+                &context,
+                ScopedRefKind::UploadFile
+            )
+            .is_err()
+        );
+        assert_eq!(
+            refs.resolve(&first, &context, ScopedRefKind::UploadFile),
+            Ok("backend-upload-one")
+        );
+
+        assert_eq!(
+            refs.consume_many(
+                &[first.clone(), second.clone()],
+                &context,
+                ScopedRefKind::UploadFile
+            )
+            .unwrap(),
+            vec![
+                "backend-upload-one".to_owned(),
+                "backend-upload-two".to_owned()
+            ]
+        );
+        assert!(matches!(
+            refs.resolve(&first, &context, ScopedRefKind::UploadFile),
+            Err(ScopedRefError::UnknownRef)
+        ));
+        assert!(matches!(
+            refs.resolve(&second, &context, ScopedRefKind::UploadFile),
+            Err(ScopedRefError::UnknownRef)
+        ));
     }
 
     #[test]

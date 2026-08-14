@@ -9,19 +9,37 @@
 
 use crate::v2_observability::SafeErrorCode;
 use crate::{
+    v2_browser::{
+        BrowserAction, BrowserBindRequest, BrowserBindingResult, BrowserClickRequest,
+        BrowserClickTarget, BrowserContractError, BrowserDialogAction, BrowserDialogRequest,
+        BrowserDialogResult, BrowserDownloadRequest, BrowserDownloadResult, BrowserInspectRequest,
+        BrowserNavigateRequest, BrowserPointerAction, BrowserPointerRequest, BrowserPrepareRequest,
+        BrowserSemanticRef, BrowserSnapshotResult, BrowserStageUploadRequest,
+        BrowserStagedUploadResult, BrowserTabSummary, BrowserTypeRequest, BrowserUploadRequest,
+        MAX_BROWSER_DOWNLOAD_BASE64_BYTES, MAX_BROWSER_DOWNLOAD_BYTES,
+        MAX_BROWSER_DOWNLOAD_NAME_BYTES, MAX_BROWSER_PROFILE_NAME_BYTES,
+        MAX_BROWSER_PROMPT_TEXT_BYTES, MAX_BROWSER_QUERY_BYTES, MAX_BROWSER_SCROLL_DELTA_CSS_PX,
+        MAX_BROWSER_TEXT_BYTES, MAX_BROWSER_UPLOAD_BASE64_BYTES, MAX_BROWSER_UPLOAD_FILES,
+        MAX_BROWSER_UPLOAD_NAME_BYTES, MAX_BROWSER_URL_BYTES,
+    },
+    v2_browser_refs::{BrowserRefError, BrowserRefRegistry, DEFAULT_MAX_BROWSER_REFS_PER_CONTEXT},
+    v2_browser_runtime::{
+        BrowserBackendClickTarget, BrowserBackendCommand, BrowserBackendResult,
+        BrowserBackendSemanticRef, BrowserStagedUploadFile,
+    },
     v2_execution_safety::OperationOwner,
     v2_interaction_context::{
         DEFAULT_MAX_REFS_PER_CONTEXT, InteractionContextBinding, InteractionContextId,
         InteractionContextLimits, InteractionContextManager, InteractionScope,
-        ScopedBackendRefRegistry, ScopedRefKind,
+        ScopedBackendRefRegistry, ScopedRefError, ScopedRefKind,
     },
     v2_m0::{
-        CapabilityAdvertisement, DeviceCapability, DeviceCommand, DeviceResult, InputDeliveryMode,
-        InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES, MAX_KEYBOARD_MODIFIERS,
-        MAX_MENU_PATH_SEGMENTS, MAX_MENU_SEGMENT_BYTES, MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS,
-        MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton, PointerTarget, ProcessEnvVar,
-        ProcessRequest, ScrollDirection, ScrollGranularity, ScrollTarget, ShellRequest,
-        UiPredicate, UiRect, UiRole,
+        BrowserUploadPayload, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
+        DeviceResult, InputDeliveryMode, InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES,
+        MAX_KEYBOARD_MODIFIERS, MAX_MENU_PATH_SEGMENTS, MAX_MENU_SEGMENT_BYTES,
+        MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
+        PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
+        ScrollTarget, ShellRequest, UiPredicate, UiRect, UiRole,
     },
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
@@ -30,6 +48,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::{
     Json, Router,
+    extract::DefaultBodyLimit,
     extract::{Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -40,6 +59,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, redirect::Policy as RedirectPolicy};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -96,6 +116,17 @@ const TOOL_CLOSE_INTERACTION_CONTEXT: &str = "close_interaction_context";
 const TOOL_EXPAND_INTERACTION_SCOPE: &str = "expand_interaction_scope";
 const TOOL_SET_UI_VALUE: &str = "set_ui_value";
 const TOOL_CAPTURE_REGION: &str = "capture_region";
+const TOOL_BROWSER_PREPARE: &str = "browser_prepare";
+const TOOL_BROWSER_BIND: &str = "browser_bind";
+const TOOL_BROWSER_INSPECT: &str = "browser_inspect";
+const TOOL_BROWSER_NAVIGATE: &str = "browser_navigate";
+const TOOL_BROWSER_CLICK: &str = "browser_click";
+const TOOL_BROWSER_TYPE: &str = "browser_type";
+const TOOL_BROWSER_DIALOG: &str = "browser_dialog";
+const TOOL_BROWSER_POINTER: &str = "browser_pointer";
+const TOOL_BROWSER_STAGE_UPLOAD_FILE: &str = "browser_stage_upload_file";
+const TOOL_BROWSER_UPLOAD_FILE: &str = "browser_upload_file";
+const TOOL_BROWSER_DOWNLOAD: &str = "browser_download_file";
 
 const CONTEXT_ELIGIBLE_CAPABILITIES: &[DeviceCapability] = &[
     DeviceCapability::Screenshot,
@@ -118,6 +149,15 @@ const CONTEXT_ELIGIBLE_CAPABILITIES: &[DeviceCapability] = &[
     DeviceCapability::SetUiValue,
     DeviceCapability::CaptureRegion,
     DeviceCapability::DesktopScope,
+    DeviceCapability::BrowserInspect,
+    DeviceCapability::BrowserPrepare,
+    DeviceCapability::BrowserNavigate,
+    DeviceCapability::BrowserClick,
+    DeviceCapability::BrowserType,
+    DeviceCapability::BrowserDialog,
+    DeviceCapability::BrowserPointer,
+    DeviceCapability::BrowserUploadFile,
+    DeviceCapability::BrowserDownload,
 ];
 
 #[derive(Debug, Clone)]
@@ -644,6 +684,7 @@ pub fn build_trusted_proxy_router(handler: V2NorthboundMcp, config: TrustedProxy
     };
     Router::new()
         .nest_service(config.mcp_path(), service)
+        .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state, trusted_proxy_guard))
 }
 
@@ -703,6 +744,7 @@ pub fn build_northbound_router(
     };
     let protected = Router::new()
         .nest_service(config.mcp_path(), service)
+        .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             auth_state,
             oauth_resource_guard,
@@ -890,6 +932,7 @@ fn oauth_error_response(
 struct NorthboundInteractionState {
     contexts: InteractionContextManager,
     refs: ScopedBackendRefRegistry,
+    browser_refs: BrowserRefRegistry,
 }
 
 impl NorthboundInteractionState {
@@ -899,6 +942,8 @@ impl NorthboundInteractionState {
                 .expect("static interaction-context limits are valid"),
             refs: ScopedBackendRefRegistry::new(DEFAULT_MAX_REFS_PER_CONTEXT)
                 .expect("static scoped-ref limit is valid"),
+            browser_refs: BrowserRefRegistry::new(DEFAULT_MAX_BROWSER_REFS_PER_CONTEXT)
+                .expect("static browser-ref limit is valid"),
         }
     }
 
@@ -906,6 +951,7 @@ impl NorthboundInteractionState {
         let expired = self.contexts.prune(now_ms);
         for context_id in &expired {
             self.refs.invalidate_context(context_id);
+            self.browser_refs.invalidate_context(context_id.as_str());
         }
         expired
     }
@@ -921,14 +967,26 @@ impl NorthboundInteractionState {
             .invalidate_device_generation(device_id, generation);
         self.refs
             .invalidate_device_generation(device_id, generation);
+        self.browser_refs
+            .invalidate_device_generation(device_id, generation);
         invalidated.extend(
             self.contexts
                 .invalidate_capability_revision(device_id, revision),
         );
         self.refs
             .invalidate_capability_revision(device_id, revision);
+        self.browser_refs
+            .invalidate_capability_revision(device_id, revision);
         invalidated
     }
+}
+
+struct PreparedBrowserCall {
+    binding: InteractionContextBinding,
+    command: BrowserBackendCommand,
+    public_target_ref: Option<String>,
+    public_tab_ref: Option<String>,
+    public_dialog_ref: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1135,6 +1193,7 @@ impl V2NorthboundMcp {
                     )
                 })?;
             state.refs.invalidate_context(&id);
+            state.browser_refs.invalidate_context(id.as_str());
         }
         let backend_session_ended = match self
             .hub
@@ -1198,6 +1257,17 @@ impl V2NorthboundMcp {
         result.map_err(|_| {
             McpError::invalid_request("Interaction context is invalid, stale, or expired", None)
         })
+    }
+
+    async fn validate_browser_interaction_context(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        context_id: &str,
+    ) -> Result<InteractionContextBinding, McpError> {
+        let binding = self
+            .validate_interaction_context(principal, context_id)
+            .await?;
+        require_browser_window_scope(binding)
     }
 
     async fn prepare_contextual_command(
@@ -1306,6 +1376,964 @@ impl V2NorthboundMcp {
             elements_complete,
             screenshot,
         })
+    }
+
+    async fn prepare_browser_call(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        tool_name: &str,
+        arguments: Option<JsonObject>,
+    ) -> Result<PreparedBrowserCall, McpError> {
+        match tool_name {
+            TOOL_BROWSER_PREPARE => {
+                let request: BrowserPrepareRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Prepare {
+                        context_id: request.context_id,
+                        process_id: request.process_id,
+                        window_id: request.window_id,
+                        allow_launch: request.allow_launch,
+                        profile_mode: request.profile_mode,
+                        profile_name: request.profile_name,
+                    },
+                    public_target_ref: None,
+                    public_tab_ref: None,
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_BIND => {
+                let request: BrowserBindRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Bind {
+                        context_id: request.context_id,
+                        process_id: request.process_id,
+                        window_id: request.window_id,
+                    },
+                    public_target_ref: None,
+                    public_tab_ref: None,
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_INSPECT => {
+                let request: BrowserInspectRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, backend_scope_ref, backend_continuation) = {
+                    let mut state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let backend_scope_ref = request
+                        .scope_ref
+                        .as_deref()
+                        .map(|scope_ref| {
+                            state
+                                .browser_refs
+                                .resolve_scope_ref(
+                                    &binding,
+                                    &request.target_ref,
+                                    &request.tab_ref,
+                                    scope_ref,
+                                )
+                                .map(|resolved| resolved.backend_ref)
+                                .map_err(browser_ref_error_to_mcp)
+                        })
+                        .transpose()?;
+                    let backend_continuation = request
+                        .continuation_ref
+                        .as_deref()
+                        .map(|continuation_ref| {
+                            state
+                                .browser_refs
+                                .consume_continuation(
+                                    &binding,
+                                    &request.target_ref,
+                                    &request.tab_ref,
+                                    continuation_ref,
+                                )
+                                .map_err(browser_ref_error_to_mcp)
+                        })
+                        .transpose()?;
+                    (resolved, backend_scope_ref, backend_continuation)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Inspect {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_scope_ref,
+                        query: request.query,
+                        backend_continuation,
+                        include_screenshot: request.include_screenshot,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_NAVIGATE => {
+                let request: BrowserNavigateRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let resolved = self
+                    .interactions
+                    .lock()
+                    .await
+                    .browser_refs
+                    .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                    .map_err(browser_ref_error_to_mcp)?;
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Navigate {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        url: request.url,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_CLICK => {
+                let request: BrowserClickRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, target) = {
+                    let state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let target = match &request.target {
+                        BrowserClickTarget::Element { element_ref } => {
+                            let element = state
+                                .browser_refs
+                                .resolve_action(
+                                    &binding,
+                                    &request.target_ref,
+                                    &request.tab_ref,
+                                    element_ref,
+                                    BrowserAction::Click,
+                                )
+                                .map_err(browser_ref_error_to_mcp)?;
+                            BrowserBackendClickTarget::Element {
+                                backend_element_ref: element.backend_ref,
+                            }
+                        }
+                        BrowserClickTarget::ViewportCss { x, y } => {
+                            BrowserBackendClickTarget::ViewportCss { x: *x, y: *y }
+                        }
+                    };
+                    (resolved, target)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Click {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        target,
+                        input_route: request.input_route,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_TYPE => {
+                let request: BrowserTypeRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, element) = {
+                    let state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let element = state
+                        .browser_refs
+                        .resolve_action(
+                            &binding,
+                            &request.target_ref,
+                            &request.tab_ref,
+                            &request.element_ref,
+                            BrowserAction::Type,
+                        )
+                        .map_err(browser_ref_error_to_mcp)?;
+                    (resolved, element)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Type {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_element_ref: element.backend_ref,
+                        text: request.text,
+                        mode: request.mode,
+                        replace: request.replace,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_DIALOG => {
+                let request: BrowserDialogRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, backend_dialog_id) = {
+                    let state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let backend_dialog_id = request
+                        .dialog_ref
+                        .as_deref()
+                        .map(|dialog_ref| {
+                            state
+                                .browser_refs
+                                .resolve_dialog(
+                                    &binding,
+                                    &request.target_ref,
+                                    &request.tab_ref,
+                                    dialog_ref,
+                                )
+                                .map(|resolved| resolved.backend_ref)
+                                .map_err(browser_ref_error_to_mcp)
+                        })
+                        .transpose()?;
+                    (resolved, backend_dialog_id)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Dialog {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_dialog_id,
+                        action: request.action,
+                        prompt_text: request.prompt_text,
+                        delivery: request.delivery,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: request.dialog_ref,
+                })
+            }
+            TOOL_BROWSER_POINTER => {
+                let request: BrowserPointerRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, element, destination) = {
+                    let state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let allowed: &[BrowserAction] =
+                        if request.action == BrowserPointerAction::Scroll {
+                            &[BrowserAction::Scroll, BrowserAction::Pointer]
+                        } else {
+                            &[BrowserAction::Pointer]
+                        };
+                    let element = state
+                        .browser_refs
+                        .resolve_any_action(
+                            &binding,
+                            &request.target_ref,
+                            &request.tab_ref,
+                            &request.element_ref,
+                            allowed,
+                        )
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let destination = request
+                        .destination_ref
+                        .as_deref()
+                        .map(|destination_ref| {
+                            state
+                                .browser_refs
+                                .resolve_action(
+                                    &binding,
+                                    &request.target_ref,
+                                    &request.tab_ref,
+                                    destination_ref,
+                                    BrowserAction::Pointer,
+                                )
+                                .map(|resolved| resolved.backend_ref)
+                                .map_err(browser_ref_error_to_mcp)
+                        })
+                        .transpose()?;
+                    (resolved, element, destination)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Pointer {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_element_ref: element.backend_ref,
+                        action: request.action,
+                        backend_destination_ref: destination,
+                        delta_x: request.delta_x,
+                        delta_y: request.delta_y,
+                        input_route: request.input_route,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_UPLOAD_FILE => {
+                let request: BrowserUploadRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, element, staged_files) = {
+                    let mut state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let element = state
+                        .browser_refs
+                        .resolve_action(
+                            &binding,
+                            &request.target_ref,
+                            &request.tab_ref,
+                            &request.element_ref,
+                            BrowserAction::Upload,
+                        )
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let handles = state
+                        .refs
+                        .consume_many(&request.file_refs, &binding, ScopedRefKind::UploadFile)
+                        .map_err(scoped_ref_error_to_mcp)?;
+                    let files = handles
+                        .into_iter()
+                        .map(|backend_file_handle| BrowserStagedUploadFile {
+                            backend_file_handle,
+                        })
+                        .collect();
+                    (resolved, element, files)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Upload {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_element_ref: element.backend_ref,
+                        staged_files,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_DOWNLOAD => {
+                let request: BrowserDownloadRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, element) = {
+                    let state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    // Cua's current download primitive activates an exact clickable ref and
+                    // independently proves that a download begins/completes. It does not mint
+                    // a separate semantic "download" action in snapshots.
+                    let element = state
+                        .browser_refs
+                        .resolve_action(
+                            &binding,
+                            &request.target_ref,
+                            &request.tab_ref,
+                            &request.element_ref,
+                            BrowserAction::Click,
+                        )
+                        .map_err(browser_ref_error_to_mcp)?;
+                    (resolved, element)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Download {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_element_ref: element.backend_ref,
+                        destination_name: request.destination_name,
+                        max_bytes: request.max_bytes,
+                        overwrite: request.overwrite,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            _ => Err(McpError::invalid_params("Unknown V2 browser tool", None)),
+        }
+    }
+
+    async fn call_browser_stage_upload(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        arguments: Option<JsonObject>,
+        operation_id: String,
+        usage: UsageLease,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let request: BrowserStageUploadRequest = match parse_arguments(arguments) {
+            Ok(request) => request,
+            Err(error) => {
+                settle_usage_best_effort(
+                    &usage,
+                    UsageSettlement::Zero,
+                    "invalid_browser_upload_stage",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let expected_bytes = match request.validate() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                settle_usage_best_effort(
+                    &usage,
+                    UsageSettlement::Zero,
+                    "invalid_browser_upload_stage",
+                )
+                .await;
+                return Err(browser_contract_error_to_mcp(error));
+            }
+        };
+        let binding = match self
+            .validate_browser_interaction_context(principal, &request.context_id)
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                settle_usage_best_effort(
+                    &usage,
+                    UsageSettlement::Zero,
+                    "invalid_browser_upload_context",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let result = self
+            .execute_command(
+                principal,
+                operation_id,
+                DeviceCommand::StageBrowserUploadFile {
+                    context_id: request.context_id,
+                    file_name: request.file_name,
+                    data_base64: BrowserUploadPayload::after_contract_validation(
+                        request.data_base64,
+                    ),
+                    expected_bytes: expected_bytes as u64,
+                },
+                usage,
+                context,
+            )
+            .await?;
+        let DeviceResult::BrowserUploadStaged {
+            backend_file_handle,
+            bytes,
+        } = result
+        else {
+            return Err(McpError::internal_error(
+                "Browser upload staging result mismatch",
+                None,
+            ));
+        };
+        if bytes != expected_bytes as u64 {
+            return Err(McpError::internal_error(
+                "Browser upload staging byte count mismatch",
+                None,
+            ));
+        }
+        let file_ref = self
+            .interactions
+            .lock()
+            .await
+            .refs
+            .mint(&binding, ScopedRefKind::UploadFile, &backend_file_handle)
+            .map_err(scoped_ref_mint_error_to_mcp)?;
+        browser_json_response(
+            serde_json::to_value(BrowserStagedUploadResult { file_ref, bytes }).map_err(|_| {
+                McpError::internal_error("Browser upload staging response failed", None)
+            })?,
+        )
+    }
+
+    async fn call_browser_tool(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        tool_name: &str,
+        arguments: Option<JsonObject>,
+        operation_id: String,
+        usage: UsageLease,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let prepared = match self
+            .prepare_browser_call(principal, tool_name, arguments)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                settle_usage_best_effort(&usage, UsageSettlement::Zero, "invalid_browser_request")
+                    .await;
+                return Err(error);
+            }
+        };
+        let command = DeviceCommand::Browser {
+            command: prepared.command.clone(),
+        };
+        let result = self
+            .execute_command(principal, operation_id, command, usage, context)
+            .await?;
+        self.publicize_browser_result(prepared, result).await
+    }
+
+    async fn publicize_browser_result(
+        &self,
+        prepared: PreparedBrowserCall,
+        result: DeviceResult,
+    ) -> Result<CallToolResponse, McpError> {
+        let DeviceResult::Browser { result } = result else {
+            return Err(McpError::internal_error(
+                "Browser result did not match the requested semantic",
+                None,
+            ));
+        };
+        if !result.matches_command(&prepared.command) {
+            return Err(McpError::internal_error(
+                "Browser result did not match the requested semantic",
+                None,
+            ));
+        }
+        match (result, &prepared.command) {
+            (
+                BrowserBackendResult::Prepared {
+                    prepared,
+                    prepared_process_id,
+                    side_effect_count,
+                },
+                BrowserBackendCommand::Prepare { .. },
+            ) => browser_json_response(json!({
+                "type": "browser_prepared",
+                "prepared": prepared,
+                "prepared_process_id": prepared_process_id,
+                "side_effect_count": side_effect_count,
+            })),
+            (
+                BrowserBackendResult::Bound {
+                    backend_target_id,
+                    process_id,
+                    window_id,
+                    tabs,
+                },
+                BrowserBackendCommand::Bind { .. },
+            ) => {
+                let mut state = self.interactions.lock().await;
+                let mut minted = Vec::with_capacity(tabs.len() + 1);
+                let target_ref = match state
+                    .browser_refs
+                    .mint_target(&prepared.binding, &backend_target_id)
+                {
+                    Ok(reference) => {
+                        minted.push(reference.clone());
+                        reference
+                    }
+                    Err(error) => return Err(browser_ref_mint_error_to_mcp(error)),
+                };
+                let mut public_tabs = Vec::with_capacity(tabs.len());
+                for tab in tabs {
+                    match state.browser_refs.mint_tab(
+                        &prepared.binding,
+                        &target_ref,
+                        &tab.backend_tab_id,
+                    ) {
+                        Ok(tab_ref) => {
+                            minted.push(tab_ref.clone());
+                            public_tabs.push(BrowserTabSummary {
+                                tab_ref,
+                                title: tab.title,
+                                url: tab.url,
+                                active: tab.active,
+                            });
+                        }
+                        Err(error) => {
+                            state.browser_refs.discard_refs(&minted);
+                            return Err(browser_ref_mint_error_to_mcp(error));
+                        }
+                    }
+                }
+                browser_json_response(
+                    serde_json::to_value(BrowserBindingResult {
+                        target_ref,
+                        process_id,
+                        window_id,
+                        exact: true,
+                        mutation_allowed: true,
+                        tabs: public_tabs,
+                    })
+                    .map_err(|_| {
+                        McpError::internal_error("Browser binding serialization failed", None)
+                    })?,
+                )
+            }
+            (
+                BrowserBackendResult::Snapshot {
+                    backend_snapshot_id,
+                    outline,
+                    action_refs,
+                    content_refs,
+                    complete,
+                    omitted,
+                    backend_continuation,
+                    screenshot,
+                },
+                BrowserBackendCommand::Inspect { .. },
+            ) => {
+                let target_ref = prepared
+                    .public_target_ref
+                    .as_deref()
+                    .ok_or_else(browser_public_ref_internal_error)?;
+                let tab_ref = prepared
+                    .public_tab_ref
+                    .as_deref()
+                    .ok_or_else(browser_public_ref_internal_error)?;
+                let mut state = self.interactions.lock().await;
+                let mut minted = Vec::with_capacity(action_refs.len() + content_refs.len() + 2);
+                let snapshot_ref = state
+                    .browser_refs
+                    .begin_snapshot(&prepared.binding, target_ref, tab_ref, &backend_snapshot_id)
+                    .map_err(browser_ref_mint_error_to_mcp)?;
+                minted.push(snapshot_ref.clone());
+                let mut public_actions = Vec::with_capacity(action_refs.len());
+                for reference in action_refs {
+                    let public_ref = match state.browser_refs.mint_action_element(
+                        &prepared.binding,
+                        target_ref,
+                        tab_ref,
+                        &snapshot_ref,
+                        &reference.backend_ref,
+                        &reference.actions,
+                    ) {
+                        Ok(reference) => reference,
+                        Err(error) => {
+                            state.browser_refs.discard_refs(&minted);
+                            return Err(browser_ref_mint_error_to_mcp(error));
+                        }
+                    };
+                    minted.push(public_ref.clone());
+                    public_actions.push(publicize_browser_semantic_ref(reference, public_ref));
+                }
+                let mut public_content = Vec::with_capacity(content_refs.len());
+                for reference in content_refs {
+                    let public_ref = match state.browser_refs.mint_content_element(
+                        &prepared.binding,
+                        target_ref,
+                        tab_ref,
+                        &snapshot_ref,
+                        &reference.backend_ref,
+                    ) {
+                        Ok(reference) => reference,
+                        Err(error) => {
+                            state.browser_refs.discard_refs(&minted);
+                            return Err(browser_ref_mint_error_to_mcp(error));
+                        }
+                    };
+                    minted.push(public_ref.clone());
+                    public_content.push(publicize_browser_semantic_ref(reference, public_ref));
+                }
+                let continuation_ref = if let Some(backend_continuation) = backend_continuation {
+                    match state.browser_refs.mint_continuation(
+                        &prepared.binding,
+                        target_ref,
+                        tab_ref,
+                        &snapshot_ref,
+                        &backend_continuation,
+                    ) {
+                        Ok(reference) => {
+                            minted.push(reference.clone());
+                            Some(reference)
+                        }
+                        Err(error) => {
+                            state.browser_refs.discard_refs(&minted);
+                            return Err(browser_ref_mint_error_to_mcp(error));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let snapshot = BrowserSnapshotResult {
+                    snapshot_ref,
+                    outline,
+                    action_refs: public_actions,
+                    content_refs: public_content,
+                    complete,
+                    omitted,
+                    continuation_ref,
+                    screenshot_base64: screenshot.as_ref().map(|image| image.data_base64.clone()),
+                    screenshot_width: screenshot.as_ref().map(|image| image.width_pixels),
+                    screenshot_height: screenshot.as_ref().map(|image| image.height_pixels),
+                    viewport_css_width: screenshot.as_ref().map(|image| image.viewport_css_width),
+                    viewport_css_height: screenshot.as_ref().map(|image| image.viewport_css_height),
+                };
+                drop(state);
+                let value = serde_json::to_value(snapshot).map_err(|_| {
+                    McpError::internal_error("Browser snapshot serialization failed", None)
+                })?;
+                if let Some(image) = screenshot {
+                    let mut metadata = value;
+                    if let Some(object) = metadata.as_object_mut() {
+                        object.insert("screenshot_base64".into(), Value::Null);
+                        object.insert("screenshot_mime_type".into(), json!(image.mime_type));
+                        object.insert(
+                            "pixel_to_css_scale_x_millionths".into(),
+                            json!(image.pixel_to_css_scale_x_millionths),
+                        );
+                        object.insert(
+                            "pixel_to_css_scale_y_millionths".into(),
+                            json!(image.pixel_to_css_scale_y_millionths),
+                        );
+                    }
+                    Ok(CallToolResult::success(vec![
+                        ContentBlock::image(image.data_base64, "image/png"),
+                        ContentBlock::text(metadata.to_string()),
+                    ])
+                    .into())
+                } else {
+                    browser_json_response(value)
+                }
+            }
+            (BrowserBackendResult::NavigationCompleted, BrowserBackendCommand::Navigate { .. }) => {
+                self.invalidate_browser_document(&prepared).await?;
+                browser_json_response(json!({
+                    "type": "browser_navigation_completed",
+                    "completed": true,
+                    "fresh_snapshot_required": true,
+                }))
+            }
+            (
+                BrowserBackendResult::ClickCompleted { effect },
+                BrowserBackendCommand::Click { .. },
+            ) => browser_json_response(json!({
+                "type": "browser_click_completed",
+                "completed": true,
+                "effect": effect,
+                "verification_required": true,
+            })),
+            (BrowserBackendResult::TypeCompleted, BrowserBackendCommand::Type { .. }) => {
+                browser_json_response(json!({
+                    "type": "browser_type_completed",
+                    "completed": true,
+                    "verification_required": true,
+                }))
+            }
+            (
+                BrowserBackendResult::DialogObserved {
+                    present,
+                    backend_dialog_id,
+                    kind,
+                },
+                BrowserBackendCommand::Dialog {
+                    action: BrowserDialogAction::Inspect,
+                    ..
+                },
+            ) => {
+                let target_ref = prepared
+                    .public_target_ref
+                    .as_deref()
+                    .ok_or_else(browser_public_ref_internal_error)?;
+                let tab_ref = prepared
+                    .public_tab_ref
+                    .as_deref()
+                    .ok_or_else(browser_public_ref_internal_error)?;
+                let dialog_ref = if present {
+                    let backend_dialog_id = backend_dialog_id.as_deref().ok_or_else(|| {
+                        McpError::internal_error("Browser dialog identity was missing", None)
+                    })?;
+                    Some(
+                        self.interactions
+                            .lock()
+                            .await
+                            .browser_refs
+                            .mint_dialog(&prepared.binding, target_ref, tab_ref, backend_dialog_id)
+                            .map_err(browser_ref_mint_error_to_mcp)?,
+                    )
+                } else {
+                    None
+                };
+                browser_json_response(
+                    serde_json::to_value(BrowserDialogResult {
+                        present,
+                        dialog_ref,
+                        kind,
+                    })
+                    .map_err(|_| {
+                        McpError::internal_error("Browser dialog serialization failed", None)
+                    })?,
+                )
+            }
+            (
+                BrowserBackendResult::DialogCompleted,
+                BrowserBackendCommand::Dialog {
+                    action: BrowserDialogAction::Accept | BrowserDialogAction::Dismiss,
+                    ..
+                },
+            ) => {
+                let target_ref = prepared
+                    .public_target_ref
+                    .as_deref()
+                    .ok_or_else(browser_public_ref_internal_error)?;
+                let tab_ref = prepared
+                    .public_tab_ref
+                    .as_deref()
+                    .ok_or_else(browser_public_ref_internal_error)?;
+                let dialog_ref = prepared
+                    .public_dialog_ref
+                    .as_deref()
+                    .ok_or_else(browser_public_ref_internal_error)?;
+                self.interactions
+                    .lock()
+                    .await
+                    .browser_refs
+                    .complete_dialog(&prepared.binding, target_ref, tab_ref, dialog_ref)
+                    .map_err(browser_ref_error_to_mcp)?;
+                browser_json_response(json!({
+                    "type": "browser_dialog_completed",
+                    "completed": true,
+                }))
+            }
+            (BrowserBackendResult::PointerCompleted, BrowserBackendCommand::Pointer { .. }) => {
+                browser_json_response(json!({
+                    "type": "browser_pointer_completed",
+                    "completed": true,
+                    "verification_required": true,
+                }))
+            }
+            (
+                BrowserBackendResult::UploadAssigned { file_count },
+                BrowserBackendCommand::Upload { .. },
+            ) => browser_json_response(json!({
+                "type": "browser_upload_completed",
+                "completed": true,
+                "file_count": file_count,
+                "verification_required": true,
+            })),
+            (
+                BrowserBackendResult::DownloadCompleted {
+                    backend_download_handle,
+                    destination_name,
+                    bytes_written,
+                    data_base64,
+                },
+                BrowserBackendCommand::Download {
+                    destination_name: requested_name,
+                    max_bytes,
+                    ..
+                },
+            ) => {
+                let decoded_bytes = STANDARD.decode(data_base64.as_bytes()).map_err(|_| {
+                    McpError::internal_error(
+                        "Browser download result violated the bounded contract",
+                        None,
+                    )
+                })?;
+                if destination_name != *requested_name
+                    || bytes_written > *max_bytes
+                    || bytes_written > MAX_BROWSER_DOWNLOAD_BYTES
+                    || data_base64.len() > MAX_BROWSER_DOWNLOAD_BASE64_BYTES
+                    || u64::try_from(decoded_bytes.len()).ok() != Some(bytes_written)
+                {
+                    return Err(McpError::internal_error(
+                        "Browser download result violated the bounded contract",
+                        None,
+                    ));
+                }
+                let download_ref = self
+                    .interactions
+                    .lock()
+                    .await
+                    .refs
+                    .mint(
+                        &prepared.binding,
+                        ScopedRefKind::DownloadFile,
+                        &backend_download_handle,
+                    )
+                    .map_err(scoped_ref_mint_error_to_mcp)?;
+                browser_json_response(
+                    serde_json::to_value(BrowserDownloadResult {
+                        download_ref,
+                        destination_name,
+                        bytes_written,
+                        data_base64,
+                    })
+                    .map_err(|_| {
+                        McpError::internal_error("Browser download serialization failed", None)
+                    })?,
+                )
+            }
+            _ => Err(McpError::internal_error(
+                "Browser result did not match the requested semantic",
+                None,
+            )),
+        }
+    }
+
+    async fn invalidate_browser_document(
+        &self,
+        prepared: &PreparedBrowserCall,
+    ) -> Result<(), McpError> {
+        let target_ref = prepared
+            .public_target_ref
+            .as_deref()
+            .ok_or_else(browser_public_ref_internal_error)?;
+        let tab_ref = prepared
+            .public_tab_ref
+            .as_deref()
+            .ok_or_else(browser_public_ref_internal_error)?;
+        self.interactions
+            .lock()
+            .await
+            .browser_refs
+            .invalidate_tab_document(&prepared.binding, target_ref, tab_ref)
+            .map_err(browser_ref_error_to_mcp)
     }
 
     async fn tools_for(&self, principal: &AuthenticatedClientPrincipal) -> Vec<Tool> {
@@ -1465,6 +2493,31 @@ impl ServerHandler for V2NorthboundMcp {
         if let Err(error) = self.authorize(&auth.principal, capability) {
             settle_usage_best_effort(&usage, UsageSettlement::Zero, "authorization_denied").await;
             return Err(error);
+        }
+
+        if request.name.as_ref() == TOOL_BROWSER_STAGE_UPLOAD_FILE {
+            return self
+                .call_browser_stage_upload(
+                    &auth.principal,
+                    request.arguments,
+                    operation_id,
+                    usage,
+                    &context,
+                )
+                .await;
+        }
+
+        if is_browser_tool(request.name.as_ref()) {
+            return self
+                .call_browser_tool(
+                    &auth.principal,
+                    request.name.as_ref(),
+                    request.arguments,
+                    operation_id,
+                    usage,
+                    &context,
+                )
+                .await;
         }
 
         let command_result: Result<DeviceCommand, McpError> = (|| match request.name.as_ref() {
@@ -2156,6 +3209,84 @@ fn command_requires_window_scope(command: &DeviceCommand) -> bool {
     }
 }
 
+fn require_browser_window_scope(
+    binding: InteractionContextBinding,
+) -> Result<InteractionContextBinding, McpError> {
+    if binding.scope != InteractionScope::WindowScoped {
+        return Err(McpError::invalid_request(
+            "Browser interaction is unavailable after desktop scope expansion; close the context and open a fresh one",
+            None,
+        ));
+    }
+    Ok(binding)
+}
+
+fn is_browser_tool(name: &str) -> bool {
+    matches!(
+        name,
+        TOOL_BROWSER_PREPARE
+            | TOOL_BROWSER_BIND
+            | TOOL_BROWSER_INSPECT
+            | TOOL_BROWSER_NAVIGATE
+            | TOOL_BROWSER_CLICK
+            | TOOL_BROWSER_TYPE
+            | TOOL_BROWSER_DIALOG
+            | TOOL_BROWSER_POINTER
+            | TOOL_BROWSER_UPLOAD_FILE
+            | TOOL_BROWSER_DOWNLOAD
+    )
+}
+
+fn browser_contract_error_to_mcp(_: BrowserContractError) -> McpError {
+    McpError::invalid_params("Invalid browser arguments", None)
+}
+
+fn browser_ref_error_to_mcp(_: BrowserRefError) -> McpError {
+    McpError::invalid_request(
+        "Browser ref is stale, invalid, or unavailable for this action",
+        None,
+    )
+}
+
+fn scoped_ref_error_to_mcp(_: ScopedRefError) -> McpError {
+    McpError::invalid_request(
+        "Scoped ref is stale, invalid, or unavailable for this action",
+        None,
+    )
+}
+
+fn scoped_ref_mint_error_to_mcp(_: ScopedRefError) -> McpError {
+    McpError::internal_error("Scoped ref registry unavailable", None)
+}
+
+fn browser_ref_mint_error_to_mcp(_: BrowserRefError) -> McpError {
+    McpError::internal_error("Browser ref registry unavailable", None)
+}
+
+fn browser_public_ref_internal_error() -> McpError {
+    McpError::internal_error("Browser public ref binding unavailable", None)
+}
+
+fn browser_json_response(value: Value) -> Result<CallToolResponse, McpError> {
+    Ok(CallToolResult::success(vec![ContentBlock::text(value.to_string())]).into())
+}
+
+fn publicize_browser_semantic_ref(
+    backend: BrowserBackendSemanticRef,
+    element_ref: String,
+) -> BrowserSemanticRef {
+    BrowserSemanticRef {
+        element_ref,
+        role: backend.role,
+        name: backend.name,
+        value: backend.value,
+        states: backend.states,
+        actions: backend.actions,
+        frame: backend.frame,
+        visibility: backend.visibility,
+    }
+}
+
 fn command_is_read_only(command: &DeviceCommand) -> bool {
     matches!(
         command,
@@ -2173,6 +3304,14 @@ fn command_is_read_only(command: &DeviceCommand) -> bool {
             | DeviceCommand::ClipboardRead { .. }
             | DeviceCommand::PointerPosition { .. }
             | DeviceCommand::CaptureRegion { .. }
+            | DeviceCommand::Browser {
+                command: BrowserBackendCommand::Bind { .. }
+                    | BrowserBackendCommand::Inspect { .. }
+                    | BrowserBackendCommand::Dialog {
+                        action: BrowserDialogAction::Inspect,
+                        ..
+                    },
+            }
     )
 }
 
@@ -2234,6 +3373,12 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         }
         HubCommandError::CancelledBeforeDispatch => "Operation was cancelled before dispatch",
         HubCommandError::UsageUnavailable => "Usage accounting is temporarily unavailable",
+        HubCommandError::Remote(code) if code.is_browser_refusal() => {
+            return McpError::invalid_request(
+                "Browser operation was refused",
+                Some(json!({"code": code.safe_code()})),
+            );
+        }
         _ => "Device operation was rejected or could not be completed",
     };
     McpError::invalid_request(message, None)
@@ -2268,6 +3413,17 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_SET_UI_VALUE => Some(DeviceCapability::SetUiValue),
         TOOL_CAPTURE_REGION => Some(DeviceCapability::CaptureRegion),
         TOOL_EXPAND_INTERACTION_SCOPE => Some(DeviceCapability::DesktopScope),
+        TOOL_BROWSER_PREPARE => Some(DeviceCapability::BrowserPrepare),
+        TOOL_BROWSER_BIND | TOOL_BROWSER_INSPECT => Some(DeviceCapability::BrowserInspect),
+        TOOL_BROWSER_NAVIGATE => Some(DeviceCapability::BrowserNavigate),
+        TOOL_BROWSER_CLICK => Some(DeviceCapability::BrowserClick),
+        TOOL_BROWSER_TYPE => Some(DeviceCapability::BrowserType),
+        TOOL_BROWSER_DIALOG => Some(DeviceCapability::BrowserDialog),
+        TOOL_BROWSER_POINTER => Some(DeviceCapability::BrowserPointer),
+        TOOL_BROWSER_STAGE_UPLOAD_FILE | TOOL_BROWSER_UPLOAD_FILE => {
+            Some(DeviceCapability::BrowserUploadFile)
+        }
+        TOOL_BROWSER_DOWNLOAD => Some(DeviceCapability::BrowserDownload),
         _ => None,
     }
 }
@@ -2286,6 +3442,179 @@ fn all_tools() -> Vec<Tool> {
             object_schema(vec![("context_id", interaction_context_id_schema())], &["context_id"]),
         )
         .with_annotations(ToolAnnotations::new().destructive(false).idempotent(true)),
+        Tool::new(
+            TOOL_BROWSER_PREPARE,
+            "Explicitly prepare a browser route inside the current InteractionContext. Existing-profile setup remains backend/operator-authorized; CUMG accepts no approval artifact.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("allow_launch", boolean_schema()),
+                    ("profile_mode", browser_profile_mode_schema()),
+                    ("profile_name", browser_profile_name_schema()),
+                ],
+                &["context_id", "process_id", "allow_launch", "profile_mode"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_BIND,
+            "Bind one exact native browser window and mint CUMG target/tab refs. Heuristic bindings are refused and raw backend ids are never returned.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                ],
+                &["context_id", "process_id", "window_id"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_BROWSER_INSPECT,
+            "Read a fresh semantic snapshot for one exact CUMG browser tab. Fresh snapshots invalidate older page refs; continuation refs are single-use.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("scope_ref", scoped_ref_schema()),
+                    ("query", browser_query_schema()),
+                    ("continuation_ref", scoped_ref_schema()),
+                    ("include_screenshot", boolean_schema()),
+                ],
+                &["context_id", "target_ref", "tab_ref", "include_screenshot"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_BROWSER_NAVIGATE,
+            "Navigate one exact CUMG browser tab to an http(s) URL. Successful navigation invalidates page/dialog refs and requires a fresh snapshot.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("url", browser_url_schema()),
+                ],
+                &["context_id", "target_ref", "tab_ref", "url"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_CLICK,
+            "Click through an exact browser tab using either a current typed element ref or explicit trusted viewport coordinates. No automatic input-route or foreground fallback is performed.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("target", browser_click_target_schema()),
+                    ("input_route", browser_input_route_schema()),
+                ],
+                &["context_id", "target_ref", "tab_ref", "target", "input_route"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_TYPE,
+            "Type bounded text through a current typed browser element ref. Trusted-input refusal is returned as a semantic refusal and never causes an automatic route switch.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("text", browser_text_or_empty_schema()),
+                    ("mode", browser_type_mode_schema()),
+                    ("replace", boolean_schema()),
+                ],
+                &["context_id", "target_ref", "tab_ref", "element_ref", "text", "mode", "replace"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_DIALOG,
+            "Inspect or explicitly resolve a page-owned JavaScript dialog on one exact browser tab. Inspect mints an opaque CUMG dialog ref; background refusal never triggers automatic foreground retry.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("dialog_ref", scoped_ref_schema()),
+                    ("action", browser_dialog_action_schema()),
+                    ("prompt_text", browser_prompt_text_schema()),
+                    ("delivery", browser_dialog_delivery_schema()),
+                ],
+                &["context_id", "target_ref", "tab_ref", "action", "delivery"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_POINTER,
+            "Perform a typed pointer action through a current semantic browser ref. Scroll accepts only refs with scroll/pointer authority; no desktop escalation or route fallback is performed.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("action", browser_pointer_action_schema()),
+                    ("destination_ref", scoped_ref_schema()),
+                    ("delta_x", browser_scroll_delta_schema()),
+                    ("delta_y", browser_scroll_delta_schema()),
+                    ("input_route", browser_input_route_schema()),
+                ],
+                &["context_id", "target_ref", "tab_ref", "element_ref", "action", "delta_x", "delta_y", "input_route"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_STAGE_UPLOAD_FILE,
+            "Stage one bounded browser-upload payload on the Agent and return an opaque CUMG file ref. No local filesystem path is accepted or returned.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("file_name", json!({"type":"string","minLength":1,"maxLength":MAX_BROWSER_UPLOAD_NAME_BYTES})),
+                    ("data_base64", json!({"type":"string","minLength":1,"maxLength":MAX_BROWSER_UPLOAD_BASE64_BYTES})),
+                ],
+                &["context_id", "file_name", "data_base64"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_UPLOAD_FILE,
+            "Assign previously staged opaque CUMG file refs to an exact current file-input semantic ref. No backend ids or local paths are accepted.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("file_refs", bounded_array_schema(scoped_ref_schema(), 1, MAX_BROWSER_UPLOAD_FILES as u64)),
+                ],
+                &["context_id", "target_ref", "tab_ref", "element_ref", "file_refs"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_DOWNLOAD,
+            "Trigger one exact browser download into Agent-private staging and return a bounded opaque CUMG result ref plus bytes. No host destination path is accepted or returned.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("destination_name", json!({"type":"string","minLength":1,"maxLength":MAX_BROWSER_DOWNLOAD_NAME_BYTES})),
+                    ("max_bytes", json!({"type":"integer","minimum":1,"maximum":MAX_BROWSER_DOWNLOAD_BYTES})),
+                    ("overwrite", json!({"type":"boolean"})),
+                ],
+                &["context_id", "target_ref", "tab_ref", "element_ref", "destination_name", "max_bytes", "overwrite"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_LIST_APPS,
             "List applications through the enrolled computer-use backend.",
@@ -2683,6 +4012,84 @@ fn scoped_ref_schema() -> Value {
     json!({
         "type": "string",
         "pattern": "^ref_[0-9a-f]{32}$"
+    })
+}
+
+fn browser_profile_mode_schema() -> Value {
+    enum_string_schema(&["isolated_new", "isolated_named", "existing_profile"])
+}
+
+fn browser_profile_name_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": MAX_BROWSER_PROFILE_NAME_BYTES })
+}
+
+fn browser_query_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": MAX_BROWSER_QUERY_BYTES })
+}
+
+fn browser_url_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": MAX_BROWSER_URL_BYTES })
+}
+
+fn browser_text_or_empty_schema() -> Value {
+    json!({ "type": "string", "maxLength": MAX_BROWSER_TEXT_BYTES })
+}
+
+fn browser_prompt_text_schema() -> Value {
+    json!({ "type": "string", "maxLength": MAX_BROWSER_PROMPT_TEXT_BYTES })
+}
+
+fn browser_input_route_schema() -> Value {
+    enum_string_schema(&["trusted", "dom_event"])
+}
+
+fn browser_type_mode_schema() -> Value {
+    enum_string_schema(&["insert_text", "keystrokes"])
+}
+
+fn browser_dialog_action_schema() -> Value {
+    enum_string_schema(&["inspect", "accept", "dismiss"])
+}
+
+fn browser_dialog_delivery_schema() -> Value {
+    enum_string_schema(&["background", "foreground"])
+}
+
+fn browser_pointer_action_schema() -> Value {
+    enum_string_schema(&["hover", "right_click", "double_click", "scroll", "drag"])
+}
+
+fn browser_scroll_delta_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": -(MAX_BROWSER_SCROLL_DELTA_CSS_PX as i64),
+        "maximum": MAX_BROWSER_SCROLL_DELTA_CSS_PX
+    })
+}
+
+fn browser_click_target_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "element"},
+                    "element_ref": scoped_ref_schema()
+                },
+                "required": ["kind", "element_ref"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "viewport_css"},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"}
+                },
+                "required": ["kind", "x", "y"],
+                "additionalProperties": false
+            }
+        ]
     })
 }
 
@@ -4062,6 +5469,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_publicizer_never_leaks_backend_target_tab_or_page_refs() {
+        use crate::{
+            v2_m0::{DeviceIdentity, GrantAuthority},
+            v2_m0_transport::HubIdentity,
+            v2_m1_hub::{HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
+        };
+
+        let device_identity = DeviceIdentity::generate();
+        let state_dir = temp_state_dir("browser-publicizer");
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(1),
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_authority: GrantAuthority::generate(),
+                device_verifier: device_identity.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let device_id = hub.device_id().to_owned();
+        let principal =
+            AuthenticatedClientPrincipal::new("https://auth.example", "browser-user").unwrap();
+        let service = V2NorthboundMcp::new(handle, ClientAuthorizationPolicy::default());
+        let binding = InteractionContextManager::new(InteractionContextLimits::default())
+            .unwrap()
+            .open(&principal, &device_id, 7, 11, 1)
+            .unwrap();
+
+        let bind_command = BrowserBackendCommand::Bind {
+            context_id: binding.id.as_str().to_owned(),
+            process_id: 42,
+            window_id: 9,
+        };
+        let bind_response = service
+            .publicize_browser_result(
+                PreparedBrowserCall {
+                    binding: binding.clone(),
+                    command: bind_command,
+                    public_target_ref: None,
+                    public_tab_ref: None,
+                    public_dialog_ref: None,
+                },
+                DeviceResult::Browser {
+                    result: BrowserBackendResult::Bound {
+                        backend_target_id: "RAW_TARGET_BIND_SECRET".into(),
+                        process_id: 42,
+                        window_id: 9,
+                        tabs: vec![crate::v2_browser_runtime::BrowserBackendTab {
+                            backend_tab_id: "RAW_TAB_BIND_SECRET".into(),
+                            title: Some("Example".into()),
+                            url: Some("https://example.com".into()),
+                            active: Some(true),
+                        }],
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let bind_wire = match bind_response {
+            CallToolResponse::Complete(result) => serde_json::to_string(&result).unwrap(),
+            other => panic!("unexpected browser response: {other:?}"),
+        };
+        assert!(!bind_wire.contains("RAW_TARGET_BIND_SECRET"));
+        assert!(!bind_wire.contains("RAW_TAB_BIND_SECRET"));
+        assert!(bind_wire.contains("ref_"));
+
+        let (target_ref, tab_ref) = {
+            let mut state = service.interactions.lock().await;
+            let target_ref = state
+                .browser_refs
+                .mint_target(&binding, "RAW_TARGET_SNAPSHOT_SECRET")
+                .unwrap();
+            let tab_ref = state
+                .browser_refs
+                .mint_tab(&binding, &target_ref, "RAW_TAB_SNAPSHOT_SECRET")
+                .unwrap();
+            (target_ref, tab_ref)
+        };
+        let inspect_command = BrowserBackendCommand::Inspect {
+            context_id: binding.id.as_str().to_owned(),
+            backend_target_id: "RAW_TARGET_SNAPSHOT_SECRET".into(),
+            backend_tab_id: "RAW_TAB_SNAPSHOT_SECRET".into(),
+            backend_scope_ref: None,
+            query: None,
+            backend_continuation: None,
+            include_screenshot: false,
+        };
+        let snapshot_response = service
+            .publicize_browser_result(
+                PreparedBrowserCall {
+                    binding: binding.clone(),
+                    command: inspect_command,
+                    public_target_ref: Some(target_ref),
+                    public_tab_ref: Some(tab_ref),
+                    public_dialog_ref: None,
+                },
+                DeviceResult::Browser {
+                    result: BrowserBackendResult::Snapshot {
+                        backend_snapshot_id: "RAW_SNAPSHOT_SECRET".into(),
+                        outline: "button Example".into(),
+                        action_refs: vec![BrowserBackendSemanticRef {
+                            backend_ref: "RAW_ACTION_REF_SECRET".into(),
+                            role: "button".into(),
+                            name: Some("Example".into()),
+                            value: None,
+                            states: vec![],
+                            actions: vec![BrowserAction::Click],
+                            frame: "main".into(),
+                            visibility: "visible".into(),
+                        }],
+                        content_refs: vec![BrowserBackendSemanticRef {
+                            backend_ref: "RAW_CONTENT_REF_SECRET".into(),
+                            role: "text".into(),
+                            name: Some("Content".into()),
+                            value: None,
+                            states: vec![],
+                            actions: vec![],
+                            frame: "main".into(),
+                            visibility: "visible".into(),
+                        }],
+                        complete: false,
+                        omitted: 1,
+                        backend_continuation: Some("RAW_CONTINUATION_SECRET".into()),
+                        screenshot: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot_wire = match snapshot_response {
+            CallToolResponse::Complete(result) => serde_json::to_string(&result).unwrap(),
+            other => panic!("unexpected browser response: {other:?}"),
+        };
+        for secret in [
+            "RAW_TARGET_SNAPSHOT_SECRET",
+            "RAW_TAB_SNAPSHOT_SECRET",
+            "RAW_SNAPSHOT_SECRET",
+            "RAW_ACTION_REF_SECRET",
+            "RAW_CONTENT_REF_SECRET",
+            "RAW_CONTINUATION_SECRET",
+        ] {
+            assert!(!snapshot_wire.contains(secret), "leaked {secret}");
+        }
+        assert!(snapshot_wire.contains("ref_"));
+
+        drop(service);
+        drop(hub);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
     async fn authenticated_2026_mcp_request_exposes_no_device_tools_without_live_agent() {
         use crate::{
             v2_m0::{DeviceIdentity, GrantAuthority},
@@ -4323,6 +5887,23 @@ mod tests {
                 TOOL_EXPAND_INTERACTION_SCOPE,
                 DeviceCapability::DesktopScope,
             ),
+            (TOOL_BROWSER_PREPARE, DeviceCapability::BrowserPrepare),
+            (TOOL_BROWSER_BIND, DeviceCapability::BrowserInspect),
+            (TOOL_BROWSER_INSPECT, DeviceCapability::BrowserInspect),
+            (TOOL_BROWSER_NAVIGATE, DeviceCapability::BrowserNavigate),
+            (TOOL_BROWSER_CLICK, DeviceCapability::BrowserClick),
+            (TOOL_BROWSER_TYPE, DeviceCapability::BrowserType),
+            (TOOL_BROWSER_DIALOG, DeviceCapability::BrowserDialog),
+            (TOOL_BROWSER_POINTER, DeviceCapability::BrowserPointer),
+            (
+                TOOL_BROWSER_STAGE_UPLOAD_FILE,
+                DeviceCapability::BrowserUploadFile,
+            ),
+            (
+                TOOL_BROWSER_UPLOAD_FILE,
+                DeviceCapability::BrowserUploadFile,
+            ),
+            (TOOL_BROWSER_DOWNLOAD, DeviceCapability::BrowserDownload),
         ];
         for (tool, capability) in mappings {
             assert_eq!(tool_capability(tool), Some(capability));
@@ -4341,6 +5922,116 @@ mod tests {
                 .iter()
                 .any(|name| name == "raw_cua" || name == "call_tool")
         );
+        assert!(!names.iter().any(|name| name == "browser_upload"));
+        assert!(!names.iter().any(|name| name == "browser_download"));
+        assert_eq!(tool_capability("browser_upload"), None);
+        assert_eq!(tool_capability("browser_download"), None);
+    }
+
+    #[test]
+    fn browser_core_rejects_desktop_scoped_contexts_without_implicit_downgrade() {
+        let principal =
+            AuthenticatedClientPrincipal::new("https://auth.example", "browser-user").unwrap();
+        let mut binding = InteractionContextManager::new(InteractionContextLimits::default())
+            .unwrap()
+            .open(&principal, "dev-browser", 3, 4, 1)
+            .unwrap();
+        assert_eq!(binding.scope, InteractionScope::WindowScoped);
+        assert!(require_browser_window_scope(binding.clone()).is_ok());
+        binding.scope = InteractionScope::DesktopScoped;
+        assert!(require_browser_window_scope(binding).is_err());
+    }
+
+    #[test]
+    fn browser_tool_schemas_expose_only_cumg_semantics_and_safe_transfer_surface() {
+        let tools = all_tools();
+        let browser_names = [
+            TOOL_BROWSER_PREPARE,
+            TOOL_BROWSER_BIND,
+            TOOL_BROWSER_INSPECT,
+            TOOL_BROWSER_NAVIGATE,
+            TOOL_BROWSER_CLICK,
+            TOOL_BROWSER_TYPE,
+            TOOL_BROWSER_DIALOG,
+            TOOL_BROWSER_POINTER,
+            TOOL_BROWSER_STAGE_UPLOAD_FILE,
+            TOOL_BROWSER_UPLOAD_FILE,
+            TOOL_BROWSER_DOWNLOAD,
+        ];
+        for name in browser_names {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(!schema.contains("target_id"));
+            assert!(!schema.contains("tab_id"));
+            assert!(!schema.contains("cdp"));
+            assert!(!schema.contains("approval"));
+            assert!(!schema.contains("bearer"));
+            assert!(!schema.contains("proxy"));
+        }
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == TOOL_BROWSER_STAGE_UPLOAD_FILE)
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == TOOL_BROWSER_UPLOAD_FILE)
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == TOOL_BROWSER_DOWNLOAD)
+        );
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == "browser_download")
+        );
+    }
+
+    #[test]
+    fn browser_dialog_inspect_cannot_smuggle_resolution_authority() {
+        let base = json!({
+            "context_id": "ctx_0123456789abcdef0123456789abcdef",
+            "target_ref": "ref_0123456789abcdef0123456789abcdef",
+            "tab_ref": "ref_1123456789abcdef0123456789abcdef",
+            "action": "inspect",
+            "delivery": "background"
+        });
+        let request: BrowserDialogRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(request.validate().is_ok());
+
+        let mut with_ref = base.clone();
+        with_ref["dialog_ref"] = json!("ref_2123456789abcdef0123456789abcdef");
+        let request: BrowserDialogRequest = serde_json::from_value(with_ref).unwrap();
+        assert_eq!(
+            request.validate(),
+            Err(BrowserContractError::InvalidDialogAction)
+        );
+
+        let mut foreground = base;
+        foreground["delivery"] = json!("foreground");
+        let request: BrowserDialogRequest = serde_json::from_value(foreground).unwrap();
+        assert_eq!(
+            request.validate(),
+            Err(BrowserContractError::InvalidDialogAction)
+        );
+    }
+
+    #[test]
+    fn browser_refusal_mcp_error_carries_only_closed_safe_code() {
+        let error = hub_error_to_mcp(HubCommandError::Remote(
+            crate::v2_m0::DeviceErrorCode::BrowserInputTrustUnavailable,
+        ));
+        let serialized = serde_json::to_string(&error).unwrap();
+        assert!(serialized.contains("browser_input_trust_unavailable"));
+        assert!(!serialized.contains("provider"));
+        assert!(!serialized.contains("CDP"));
+        assert!(!serialized.contains("Chromium"));
     }
 
     #[test]

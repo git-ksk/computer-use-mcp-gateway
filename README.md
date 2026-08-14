@@ -1,26 +1,44 @@
 # computer-use-mcp-gateway
 
-A lightweight Rust gateway that exposes a local computer-use MCP backend through a policy-controlled MCP Streamable HTTP endpoint.
+`computer-use-mcp-gateway` (CUMG) is a Rust MCP gateway for policy-controlled computer use. The recommended V2 runtime separates a remotely reachable **Hub** from a desktop-side **Agent** and exposes bounded, backend-neutral semantic capabilities instead of making raw backend tool names or identifiers part of the northbound contract.
 
-> Status: **V2 recommended runtime / V1 legacy-reference (2026-08-13)**. The default `computer-use-mcp-gateway` binary now runs the V2 Hub; desktops run the separate `v2_agent`. V1 remains available as `v1_gateway` for regression/reference. See [`docs/V2_USAGE_ACCOUNTING.md`](docs/V2_USAGE_ACCOUNTING.md) for the optional MCPUsage integration.
+> **Runtime status:** V2 Hub + Agent is the recommended development/runtime path. V1 remains available as `v1_gateway` for regression/reference and existing production operation. Browser core and bounded browser transfer (upload/download) are implemented and accepted.
 
-## Start here
+## Overview
 
-New to the project? Follow **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** from top to bottom. It covers:
+CUMG keeps execution authority in the gateway while allowing maintained infrastructure to own generic concerns such as network-edge TLS and authentication. Its core safety rule is that an ambiguous state-changing operation is never automatically replayed after a client, Hub, Agent, transport, backend, or device reconnects.
 
-1. installing Git/Rust and the CI-tested Cua Driver version on macOS, Windows, or Linux;
-2. configuring platform permissions;
-3. verifying Cua independently;
-4. building and starting the gateway;
-5. checking `/healthz`;
-6. connecting a local MCP client;
-7. adding remote access only after the local path works.
+The first reviewed computer-use backend is [Cua Driver](https://github.com/trycua/cua), pinned in CI at **0.19.3**. Cua-specific MCP names, raw browser/CDP identifiers, accessibility handles, screenshots, and provider response shapes terminate at the adapter boundary rather than becoming stable CUMG API surface.
 
-If setup fails, use **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** instead of opening the security boundary until it works.
+## Architecture
 
-### Recommended runtime
+```text
+MCP client
+    |
+    | authenticated MCP
+    v
+V2 Hub
+    |  exact principal -> device -> capability authorization
+    |  operation ownership / generation fencing / quarantine
+    |
+    | gRPC bidirectional stream over TLS
+    v
+V2 Agent
+    |  direct process / shell / bounded filesystem capabilities
+    |  backend-neutral Desktop + Browser semantic adapter
+    v
+Computer-use backend (Cua Driver today)
+```
 
-Build all binaries first:
+The Hub owns admission, authorization, operation state, replay barriers, and durable `indeterminate` quarantine. The Agent owns the authenticated device session and local execution boundary. Optional usage accounting is separate accounting authority and cannot authorize execution, clear quarantine, or permit replay.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the canonical V2 boundary in [`docs/v2/V2_POSITIONING.md`](docs/v2/V2_POSITIONING.md).
+
+## Getting Started
+
+For a clean installation, follow [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md). It covers prerequisites, OS permissions, backend verification, Hub/Agent configuration, local MCP connectivity, and the safe path to remote access.
+
+Build all current targets with:
 
 ```bash
 git clone https://github.com/git-ksk/computer-use-mcp-gateway.git
@@ -28,216 +46,88 @@ cd computer-use-mcp-gateway
 cargo build --locked
 ```
 
-The recommended deployment is **V2 Hub + V2 Agent**. Key/trust/TLS provisioning is intentionally explicit, so use [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) rather than replacing those boundaries with an insecure one-line example. `cargo run --locked -- --help` now shows the V2 Hub options; `cargo run --locked --bin v2_agent -- --help` shows the desktop Agent options.
+The default binary is the V2 Hub:
 
-The V2 northbound MCP exposes backend-neutral typed capabilities rather than a generic/raw Cua passthrough. The GUI semantic extension includes `list_windows`, `launch_application`, `inspect_window`, and `verify_ui_state`; Cua-specific tool names and response shapes terminate inside the adapter. See [`docs/V2_GUI_SEMANTIC_CAPABILITIES.md`](docs/V2_GUI_SEMANTIC_CAPABILITIES.md).
+```bash
+cargo run --locked -- --help
+```
 
-For V1-only regression or legacy operation:
+The desktop-side Agent is separate:
+
+```bash
+cargo run --locked --bin v2_agent -- --help
+```
+
+V1 remains available for legacy/regression operation:
 
 ```bash
 cargo run --locked --bin v1_gateway -- --allow-tools list_apps,list_windows,get_accessibility_tree,get_screen_size
 ```
 
-V1 remains source-compatible for regression but is no longer the recommended runtime.
+Do not expose a backend transport directly or replace the documented trust/TLS boundaries with an unauthenticated public listener. Packaged service examples live under `packaging/`; client examples and troubleshooting are in [`docs/CLIENTS.md`](docs/CLIENTS.md) and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 
-## Architecture
+## Security
 
-```text
-MCP client
-    |
-    | OAuth-protected MCP
-    v
-V2 Hub northbound
-    |  optional MCPUsage reserve
-    |  CUMG authorization / ownership / generation / quarantine
-    |  optional MCPUsage markLiable
-    |
-    | gRPC bidirectional stream over TLS
-    v
-V2 Agent
-    |
-    | MCP stdio
-    v
-Cua Driver
-```
+CUMG is fail-closed around the capabilities that can change a desktop. In particular:
 
-CUMG is the execution/replay/quarantine authority. Optional MCPUsage is accounting authority only and cannot clear `indeterminate`, authorize replay, or replace explicit resolution. With usage disabled, V2 uses `NoopUsageController` and requires no Node sidecar.
+- northbound authorization is reduced to an exact authenticated principal, stable device, and exact capability;
+- stale device generations, stale capability revisions, wrong-context references, consumed references, and unauthorized operations are rejected;
+- ambiguous state-changing work becomes `indeterminate` and quarantines the device until explicit resolution instead of being replayed;
+- raw backend IDs and generic backend escape hatches are not part of the V2 northbound semantic surface;
+- backend request arguments/results, screenshots, clipboard data, bearer tokens, and private credentials are excluded from default telemetry/logging;
+- remote deployments keep the Hub listener behind a reviewed TLS/authentication edge and preserve the outbound Agent connection model.
 
-The exact authority split, 0/1-unit settlement rules, failure semantics, and non-durable `MemoryUsageStore` boundary are documented in [`docs/V2_USAGE_ACCOUNTING.md`](docs/V2_USAGE_ACCOUNTING.md).
+These controls do not replace OS permissions, endpoint hardening, secret custody, network controls, or deployment-specific monitoring. Read [`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/v2/V2_THREAT_MODEL.md`](docs/v2/V2_THREAT_MODEL.md) before exposing a sensitive desktop remotely.
 
-## V1 capabilities
+## V2 status
 
-- MCP Streamable HTTP endpoint at `/mcp`
-- compatibility smoke coverage for `2025-11-25` and stateless `2026-07-28` MCP lifecycles
-- pinned official MCP conformance runner for V1-applicable server-boundary scenarios
-- localhost-only binding by default (`127.0.0.1:8100`)
-- Host validation and browser Origin validation on the MCP endpoint
-- `cua-driver mcp` child process over MCP stdio
-- dynamic backend tool rediscovery without a gateway restart
-- **deny-by-default** exact-name tool policy; `*` is an explicit opt-in to every discovered tool
-- conservative semantic classification: `observe`, `interact`, `system`, `dangerous`; unknown tools classify as `dangerous`
-- denylist overrides allowlist
-- backend connect/tool timeouts and bounded exponential reconnect
-- upstream MCP cancellation propagated to the actual downstream request ID
-- failed, timed-out, and cancelled tool calls are never replayed automatically because their side effects may be unknown
-- serialized backend operations so independent clients cannot interleave actions on one physical desktop
-- tool name, semantic class, policy decision, outcome, and duration audit fields without raw tool arguments/results
-- `/healthz` readiness plus gateway-owned backend child PID/cumulative CPU/RSS telemetry where available
-- graceful HTTP/backend shutdown
-- optional Cua policy layer for argument-level defense in depth
-- real-Cua CI smoke coverage on Linux, macOS, and Windows
-- deterministic 100-call `tools/call` soak and hosted-Linux idle CPU/RSS regression gate
-- operator-controlled local macOS desktop acceptance for screenshot → click → type → independent readback
+The active implementation is tracked by capability rather than by internal milestone names:
 
-The dual-protocol smoke and selected official conformance scenarios are **not** a full MCP conformance certification. The upstream complete requirement sets include capabilities and fixture-specific behavior that this tools-only gateway intentionally does not advertise. See [`docs/TESTING.md`](docs/TESTING.md).
+| Area | Status |
+| --- | --- |
+| Desktop semantic path | Complete / accepted |
+| Browser core | Complete / accepted |
+| Browser transfer (upload/download) | Complete / accepted |
+| V1 regression/conformance | Required and preserved |
 
-V1 intentionally does **not** provide built-in public authentication/TLS, multi-machine routing, per-user desktop isolation, a custom computer-use engine, or a cloud control plane.
+Browser core covers the typed prepare, bind, inspect, navigate, click, type, dialog, and pointer paths while preserving opaque CUMG references and exact-or-refuse execution semantics. Browser transfer adds bounded staged upload/download with context-scoped references, Agent-private filesystem staging, exact capability checks, and fail-closed handling of stale references, path escape, partial completion, timeout, and cancellation.
 
-## Backend
+See [`docs/v2/STATUS.md`](docs/v2/STATUS.md) for the current map, [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) for Browser core evidence, [`docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) for Browser transfer evidence, and [`docs/README.md`](docs/README.md) for how active specs, acceptance evidence, and archived decision records are organized.
 
-The initial backend is [Cua Driver](https://github.com/trycua/cua):
+## Testing and Deployment
+
+Repository changes should pass the same warning-free baseline locally before relying on CI:
 
 ```bash
-cua-driver mcp
-```
-
-The repository CI currently pins Cua Driver **0.19.3** as its reviewed compatibility input. Newer Cua releases may work, but should not be treated as tested until the CI pin is deliberately updated.
-
-On macOS, keep Cua's supported application/TCC lifecycle intact. The gateway does not replace Cua's OS automation implementation. The resource fields in `/healthz` describe the direct backend child owned by the gateway, not necessarily aggregate resource use across every Cua process.
-
-For an additional backend-side capability ceiling, review [`examples/cua-policy.yaml`](examples/cua-policy.yaml) and configure `CUA_DRIVER_POLICY_FILE`.
-
-## Configuration
-
-The default binary is the V2 Hub. Run `cargo run --locked -- --help` for its Hub/northbound options and `cargo run --locked --bin v2_agent -- --help` for Agent options. Packaged examples live under `packaging/`.
-
-Optional usage accounting is enabled only when `CUMG_V2_USAGE_ENDPOINT` is set to a literal loopback endpoint such as `http://127.0.0.1:8787/`; otherwise the Noop controller preserves normal V2 behavior. The sidecar uses a required positive `CUMG_USAGE_LIMIT_PER_PRINCIPAL` and a non-durable `MemoryUsageStore`.
-
-### Legacy V1 settings
-
-The following variables belong to `v1_gateway` and remain for regression/reference:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `CUMG_BIND` | `127.0.0.1:8100` | HTTP bind address |
-| `CUMG_MCP_PATH` | `/mcp` | MCP endpoint path |
-| `CUMG_BACKEND_COMMAND` | `cua-driver` | Backend executable |
-| `CUMG_BACKEND_ARGS` | `mcp` | Backend command arguments |
-| `CUMG_ALLOW_TOOLS` | empty | Comma-separated allowlist; empty denies all, `*` explicitly allows all discovered tools |
-| `CUMG_DENY_TOOLS` | empty | Comma-separated hard denylist |
-| `CUMG_ALLOWED_HOSTS` | loopback hosts | Accepted inbound `Host` authorities for `/mcp` |
-| `CUMG_ALLOWED_ORIGINS` | loopback origins on bind port | Accepted browser origins for `/mcp` |
-| `CUMG_CONNECT_TIMEOUT_SECS` | `15` | Backend connection timeout |
-| `CUMG_TOOL_TIMEOUT_SECS` | `60` | Backend MCP operation timeout |
-| `CUMG_RECONNECT_ATTEMPTS` | `3` | Connection attempts before failure |
-| `CUMG_RECONNECT_BACKOFF_MS` | `250` | Initial exponential reconnect delay |
-| `RUST_LOG` | `info` | Logging filter |
-
-The binary itself fails closed when `CUMG_ALLOW_TOOLS` is empty. Use `CUMG_ALLOW_TOOLS=*` only when full backend exposure is intentional and reviewed.
-
-V1 splits `CUMG_BACKEND_ARGS` on ASCII whitespace and does not implement shell-style quoting for embedded spaces. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-
-## Remote access
-
-For V2, keep the northbound MCP listener loopback-only and terminate the public HTTPS resource at a reviewed proxy/load balancer. Northbound authentication is external infrastructure: the Hub consumes a verified identity and reduces it to `AuthenticatedClientPrincipal { issuer, subject }`; CUMG then authorizes only the exact `principal -> stable device -> DeviceCapability` tuple. The Agent connects outbound to the Hub over the existing gRPC/TLS carrier.
-
-The packaged northbound boundary supports OAuth bearer validation through RFC 7662 introspection and an explicitly single-principal trusted authenticated-proxy mode. Both converge on the same verified `AuthenticatedClientPrincipal` boundary before exact CUMG authorization. The trusted-proxy mode takes its fixed principal only from Hub configuration and never trusts caller-supplied identity headers; multi-principal deployments should use a signed-token/OIDC-style adapter. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-
-## Development
-
-```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo check --locked --all-targets
 cargo test --locked
-python3 -m py_compile \
-  scripts/cua_gateway_smoke.py \
-  scripts/cua_desktop_e2e.py \
-  scripts/mock_mcp_backend.py \
-  scripts/v1_quality_gate.py \
-  scripts/v1_conformance.py
-cargo build --locked
-python3 scripts/v1_quality_gate.py
-python3 scripts/v1_conformance.py
+cargo clippy --locked --all-targets -- -D warnings
 python3 scripts/check_docs.py
+git diff --check
 ```
 
-Normal CI independently verifies the pinned Cua installer SHA-256, platform release payload SHA-256, and installed `cua-driver` identity before running real gateway/Cua smoke tests on Linux, macOS, and Windows against both exercised MCP lifecycles. It also runs cancellation, 100-call soak, resource, and selected official conformance gates. The separate read-only Docs workflow checks repository-local Markdown links.
+V1 compatibility remains an explicit regression boundary:
 
-See [`docs/TESTING.md`](docs/TESTING.md) for the exact guarantees and limits.
+```bash
+python3 scripts/v1_quality_gate.py
+python3 scripts/v1_conformance.py
+```
+
+Normal CI also exercises the pinned Cua release on Linux, macOS, and Windows, selected MCP conformance scenarios, cancellation behavior, resource/soak checks, and the backend passthrough contract. Trusted physical Desktop acceptance is operator-controlled rather than granting an untrusted hosted runner GUI access.
+
+See [`docs/TESTING.md`](docs/TESTING.md) for exact guarantees and limits. Deployment, service supervision, TLS/authentication edge requirements, credential handling, and V1 legacy configuration are documented in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Documentation
 
-- **[`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md)** — clean-machine install-to-first-working-local-connection guide
-- **[`docs/CLIENTS.md`](docs/CLIENTS.md)** — MCP client configuration, including local and authenticated remote examples
-- **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** — symptom-based setup/debugging guide
-- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — localhost-first remote deployment and reverse-proxy requirements
-- [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md) — V1 closure evidence
-- [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md) — canonical V2 product boundary and core-first priority
-- [`docs/V2_STANDARDIZATION.md`](docs/V2_STANDARDIZATION.md) — standard/OSS replacement boundary versus custom uncertainty-aware execution semantics
-- [`docs/V2_M1_ACCEPTANCE.md`](docs/V2_M1_ACCEPTANCE.md) — accepted single secure remote Agent evidence
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — V1 boundaries, state, cancellation, metrics, and V2 boundary
-- [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, policy, CI supply chain, and desktop-runner safety
-- [`docs/TESTING.md`](docs/TESTING.md) — CI matrix, closeout quality gates, conformance scope, and desktop E2E
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — implementation snapshot; V2 positioning is further narrowed by `V2_POSITIONING.md`
+Start at [`docs/README.md`](docs/README.md). It separates:
 
-## Security model
+- operator/contributor guides;
+- active V2 specifications;
+- acceptance evidence;
+- historical PoC and decision records.
 
-1. Bind to loopback by default.
-2. Put TLS and remote authentication at a trusted reverse proxy before remote exposure.
-3. Validate inbound Host and Origin values at the MCP boundary.
-4. Fail closed on exact-name tool capability policy.
-5. Treat semantic classification as audit/review metadata, not authorization.
-6. Never expose the Cua backend transport directly.
-7. Propagate cancellation downstream and never automatically replay ambiguous calls.
-8. Serialize operations against the single physical desktop in V1.
-9. Do not log MCP tool arguments, results, screenshots, or credentials by default.
-10. Use Cua's own policy engine as a second, narrower enforcement layer where practical.
-
-See [`docs/SECURITY.md`](docs/SECURITY.md) before using the gateway on a sensitive or remotely reachable desktop.
-
-## V1 closure
-
-V1 was closed on 2026-08-11 after automated/code-local checks plus trusted real-desktop and Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood. See [`docs/V1_ACCEPTANCE.md`](docs/V1_ACCEPTANCE.md).
-
-Do not expand V1 indefinitely merely because adjacent backend features are technically possible.
-
-## V2 direction
-
-V2-M0 through the final V2 execution-safety, multi-device invariant, backend-portability, replacement-seam, observability, resource-regression, and trusted real-desktop acceptance work are complete as of 2026-08-13.
-
-CUMG is **not** trying to win the broad category of vendor-neutral physical-device control planes. That space already overlaps materially with projects such as SINT Protocol and Arm Device Connect, in addition to OpenClaw, OAHL, QuickDesk, Obot, and delegated-authorization systems.
-
-The V2 core is:
-
-```text
-external authorization
-        |
-        v
-specific desktop + exact capability
-        |
-        v
-operation ID + exclusive ownership + fencing
-        |
-        v
-state-changing action
-        |
-        v
-ambiguous outcome?
-        |
-        +--> no  -> terminal
-        |
-        +--> yes -> indeterminate -> quarantine -> explicit resolution
-```
-
-An ambiguous state-changing operation is never automatically replayed because a client, Hub, Agent, transport, backend, or device reconnects.
-
-### Core-first boundary
-
-V2 closeout established the authoritative operation state machine, durable `indeterminate` quarantine, explicit audited resolution, ownership/generation fencing, restart/reconnect no-auto-replay behavior, fixed-set multi-device invariant proof, backend portability, payload-safe observability, and trusted real-Cua desktop acceptance.
-
-Future work must preserve those invariants. Generic authentication, delegated authorization, device fabric/registry, fleet routing, remote desktop, dashboards, orchestration, telemetry infrastructure, TLS lifecycle, and service supervision remain outside the V2 core and should use standards or maintained OSS when appropriate rather than growing a second generic control plane.
-
-See [`docs/V2_POSITIONING.md`](docs/V2_POSITIONING.md) and [`docs/V2_STANDARDIZATION.md`](docs/V2_STANDARDIZATION.md).
+The repository-local documentation link checker recursively validates these directories so archived or nested documents cannot silently accumulate broken local links.
 
 ## License
 
