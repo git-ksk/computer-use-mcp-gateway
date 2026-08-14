@@ -65,10 +65,7 @@ fn agent_config(
         device_id,
         allowed_cwd_roots: vec![cwd],
         state_dir,
-        // Recovery semantics are the subject of this E2E, not a 150 ms ACK deadline.
-        // Keep the Agent cadence above hosted-runner/fsync scheduling jitter without
-        // changing production heartbeat semantics.
-        heartbeat_interval: Duration::from_millis(500),
+        heartbeat_interval: Duration::from_millis(50),
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(100),
