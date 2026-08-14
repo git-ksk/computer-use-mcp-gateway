@@ -19,6 +19,10 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
+// Partition is created by explicitly aborting the transport. Do not make this
+// recovery/quarantine test depend on hosted-runner sub-second scheduling.
+const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn temp_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "cumg-{name}-{}-{}",
@@ -112,7 +116,7 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
     let (hub, handle) = SingleDeviceHub::new(
         HubServiceConfig {
             state_dir: hub_state.clone(),
-            heartbeat_timeout: Duration::from_millis(700),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
             max_queued_per_device: 4,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 60,
@@ -234,7 +238,7 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
     let (restarted_hub, handle) = SingleDeviceHub::new(
         HubServiceConfig {
             state_dir: hub_state.clone(),
-            heartbeat_timeout: Duration::from_millis(700),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
             max_queued_per_device: 4,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 60,

@@ -17,6 +17,10 @@ use std::{env, time::Duration};
 use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
+// This E2E validates deployable Hub/Agent execution, filesystem boundaries and
+// cancellation semantics. Heartbeat timeout precision is covered separately.
+const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
         "cumg-{name}-{}-{}",
@@ -54,7 +58,7 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     let (hub, handle) = SingleDeviceHub::new(
         HubServiceConfig {
             state_dir: hub_state.clone(),
-            heartbeat_timeout: Duration::from_millis(500),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
             max_queued_per_device: 2,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 30,
