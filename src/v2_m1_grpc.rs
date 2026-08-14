@@ -75,6 +75,8 @@ fn agent_message_limit(message: &AgentToHub) -> usize {
                     | DeviceResult::ApplicationLaunched { .. }
                     | DeviceResult::WindowSnapshot { .. }
                     | DeviceResult::UiStateVerification { .. }
+                    | DeviceResult::ClipboardState { .. }
+                    | DeviceResult::RegionCaptured { .. }
             ) =>
         {
             MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES
@@ -193,6 +195,64 @@ mod tests {
         let bounded_snapshot_budget =
             max_base64 + (crate::v2_m0::MAX_UI_ELEMENTS * per_element_budget) + 128 * 1024;
         assert!(bounded_snapshot_budget < MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn bounded_clipboard_text_uses_the_large_result_allowance() {
+        use crate::v2_m0::{CONTROL_SCHEMA_VERSION, CommandResultEnvelope, DeviceResult};
+        use crate::v2_m0_transport::{AgentToHub, HUB_AGENT_SCHEMA_VERSION, RemoteResult};
+
+        let result = AgentToHub::Result(RemoteResult {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            result: CommandResultEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: "dev-test".into(),
+                device_generation: 1,
+                capability_revision: 1,
+                operation_id: "op-clipboard".into(),
+                result: DeviceResult::ClipboardState {
+                    types: vec!["public.utf8-plain-text".into()],
+                    text: Some("x".repeat(crate::v2_m0::MAX_CLIPBOARD_TEXT_BYTES)),
+                },
+            },
+            signature: vec![0; 64],
+        });
+        let frame = encode_agent_frame(&result)
+            .expect("bounded clipboard text fits large result allowance");
+        assert!(frame.signed_message_json.len() > MAX_GRPC_APPLICATION_MESSAGE_BYTES);
+        assert!(frame.signed_message_json.len() <= MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES);
+        assert_eq!(decode_agent_frame(frame).unwrap(), result);
+    }
+
+    #[test]
+    fn bounded_region_capture_uses_the_large_result_allowance() {
+        use crate::v2_m0::{CONTROL_SCHEMA_VERSION, CommandResultEnvelope, DeviceResult, UiImage};
+        use crate::v2_m0_transport::{AgentToHub, HUB_AGENT_SCHEMA_VERSION, RemoteResult};
+
+        let image_bytes = vec![7_u8; 96 * 1024];
+        let result = AgentToHub::Result(RemoteResult {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            result: CommandResultEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: "dev-test".into(),
+                device_generation: 1,
+                capability_revision: 1,
+                operation_id: "op-region".into(),
+                result: DeviceResult::RegionCaptured {
+                    image: UiImage {
+                        data_base64: base64::engine::general_purpose::STANDARD.encode(image_bytes),
+                        mime_type: "image/jpeg".into(),
+                        width_pixels: 500,
+                        height_pixels: 500,
+                    },
+                },
+            },
+            signature: vec![0; 64],
+        });
+        let frame =
+            encode_agent_frame(&result).expect("bounded region capture fits large allowance");
+        assert!(frame.signed_message_json.len() > MAX_GRPC_APPLICATION_MESSAGE_BYTES);
+        assert_eq!(decode_agent_frame(frame).unwrap(), result);
     }
 
     #[test]

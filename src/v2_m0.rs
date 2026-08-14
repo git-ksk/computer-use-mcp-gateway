@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 2;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 2;
+pub const CONTROL_SCHEMA_VERSION: u16 = 3;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 3;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
 pub const MAX_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -20,6 +20,12 @@ pub const MAX_UI_QUERY_BYTES: usize = 1_024;
 pub const MAX_UI_TEXT_BYTES: usize = 2 * 1024;
 pub const MAX_UI_REF_BYTES: usize = 512;
 pub const MAX_UI_PREDICATES: usize = 8;
+pub const MAX_KEYBOARD_MODIFIERS: usize = 5;
+pub const MAX_MENU_PATH_SEGMENTS: usize = 16;
+pub const MAX_MENU_SEGMENT_BYTES: usize = 200;
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+pub const MAX_CLIPBOARD_TYPES: usize = 64;
+pub const MAX_CLIPBOARD_TYPE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +53,19 @@ pub enum DeviceCapability {
     LaunchApplication,
     InspectWindow,
     VerifyUiState,
+    TerminateApplication,
+    ActivateWindow,
+    SetWindowFrame,
+    InvokeMenu,
+    KeyboardInput,
+    Scroll,
+    ClipboardRead,
+    ClipboardWrite,
+    PointerPosition,
+    MovePointer,
+    SetUiValue,
+    CaptureRegion,
+    DesktopScope,
 }
 
 impl DeviceCapability {
@@ -59,12 +78,28 @@ impl DeviceCapability {
             | Self::ListDirectory
             | Self::ListWindows
             | Self::InspectWindow
-            | Self::VerifyUiState => CapabilityClass::Observe,
-            Self::PointerClick | Self::PointerDrag | Self::TypeText => CapabilityClass::Interact,
-            Self::LaunchApplication => CapabilityClass::System,
-            // Direct process and free-form shell execution can mutate arbitrary
-            // local state and are therefore never implied by observe/interact access.
-            Self::ExecuteProcess | Self::Shell => CapabilityClass::Dangerous,
+            | Self::VerifyUiState
+            | Self::ClipboardRead
+            | Self::PointerPosition
+            | Self::CaptureRegion => CapabilityClass::Observe,
+            Self::PointerClick
+            | Self::PointerDrag
+            | Self::TypeText
+            | Self::InvokeMenu
+            | Self::KeyboardInput
+            | Self::Scroll
+            | Self::ClipboardWrite
+            | Self::MovePointer
+            | Self::SetUiValue => CapabilityClass::Interact,
+            Self::LaunchApplication
+            | Self::ActivateWindow
+            | Self::SetWindowFrame
+            | Self::DesktopScope => CapabilityClass::System,
+            // Direct process/free-form shell and forced process termination can
+            // mutate or destroy arbitrary local state.
+            Self::ExecuteProcess | Self::Shell | Self::TerminateApplication => {
+                CapabilityClass::Dangerous
+            }
         }
     }
 }
@@ -75,6 +110,89 @@ pub enum PointerButton {
     Left,
     Right,
     Middle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputDeliveryMode {
+    Background,
+    Foreground,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyboardModifier {
+    Meta,
+    Shift,
+    Alt,
+    Control,
+    Function,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "space", rename_all = "snake_case")]
+pub enum PointerTarget {
+    DesktopPhysical {
+        x: i32,
+        y: i32,
+    },
+    WindowPhysical {
+        process_id: u32,
+        window_id: u64,
+        x: i32,
+        y: i32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputTarget {
+    Desktop,
+    Window {
+        process_id: u32,
+        window_id: Option<u64>,
+    },
+    WindowPoint {
+        process_id: u32,
+        window_id: u64,
+        x: i32,
+        y: i32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollGranularity {
+    Line,
+    Page,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScrollTarget {
+    Window {
+        process_id: u32,
+        window_id: Option<u64>,
+    },
+    WindowPoint {
+        process_id: u32,
+        window_id: u64,
+        x: i32,
+        y: i32,
+    },
+    DesktopPoint {
+        x: i32,
+        y: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,10 +357,21 @@ pub enum DeviceCommand {
     ListApplications,
     ScreenGeometry,
     Screenshot,
+    ScreenshotContextual {
+        context_id: String,
+    },
     PointerClick {
         x: i32,
         y: i32,
         button: PointerButton,
+    },
+    PointerClickAdvanced {
+        context_id: Option<String>,
+        target: PointerTarget,
+        button: PointerButton,
+        click_count: u8,
+        modifiers: Vec<KeyboardModifier>,
+        delivery: InputDeliveryMode,
     },
     PointerDrag {
         from_x: i32,
@@ -251,8 +380,25 @@ pub enum DeviceCommand {
         to_y: i32,
         duration_ms: u64,
     },
+    PointerDragAdvanced {
+        context_id: Option<String>,
+        from: PointerTarget,
+        to: PointerTarget,
+        button: PointerButton,
+        modifiers: Vec<KeyboardModifier>,
+        delivery: InputDeliveryMode,
+        duration_ms: u64,
+        steps: u16,
+    },
     TypeText {
         text: String,
+    },
+    TypeTextAdvanced {
+        context_id: Option<String>,
+        text: String,
+        target: InputTarget,
+        delivery: InputDeliveryMode,
+        delay_ms: u16,
     },
     ExecuteProcess {
         request: ProcessRequest,
@@ -284,6 +430,15 @@ pub enum DeviceCommand {
         max_depth: u32,
         include_screenshot: bool,
     },
+    InspectWindowContextual {
+        context_id: String,
+        process_id: u32,
+        window_id: u64,
+        query: Option<String>,
+        max_elements: u32,
+        max_depth: u32,
+        include_screenshot: bool,
+    },
     VerifyUiState {
         process_id: u32,
         window_id: u64,
@@ -292,6 +447,82 @@ pub enum DeviceCommand {
         stable_samples: u8,
         include_screenshot: bool,
     },
+    VerifyUiStateContextual {
+        context_id: String,
+        process_id: u32,
+        window_id: u64,
+        predicates: Vec<UiPredicate>,
+        timeout_ms: u64,
+        stable_samples: u8,
+        include_screenshot: bool,
+    },
+    TerminateApplication {
+        process_id: u32,
+    },
+    ActivateWindow {
+        process_id: u32,
+        window_id: Option<u64>,
+    },
+    SetWindowFrame {
+        context_id: Option<String>,
+        process_id: u32,
+        window_id: u64,
+        bounds: UiRect,
+    },
+    InvokeMenu {
+        context_id: Option<String>,
+        process_id: u32,
+        window_id: u64,
+        path: Vec<String>,
+    },
+    KeyboardInput {
+        context_id: Option<String>,
+        key: String,
+        modifiers: Vec<KeyboardModifier>,
+        target: InputTarget,
+        delivery: InputDeliveryMode,
+    },
+    Scroll {
+        context_id: Option<String>,
+        direction: ScrollDirection,
+        granularity: ScrollGranularity,
+        amount: u8,
+        target: ScrollTarget,
+        delivery: InputDeliveryMode,
+    },
+    ClipboardRead {
+        context_id: Option<String>,
+        include_text: bool,
+    },
+    ClipboardWrite {
+        context_id: Option<String>,
+        text: String,
+    },
+    PointerPosition {
+        context_id: Option<String>,
+    },
+    MovePointer {
+        context_id: String,
+        x: i32,
+        y: i32,
+    },
+    SetUiValue {
+        context_id: String,
+        process_id: u32,
+        window_id: u64,
+        element_ref: String,
+        value: String,
+    },
+    CaptureRegion {
+        context_id: Option<String>,
+        process_id: u32,
+        window_id: u64,
+        bounds: UiRect,
+    },
+    ExpandInteractionScope {
+        context_id: String,
+        reason: String,
+    },
 }
 
 impl DeviceCommand {
@@ -299,18 +530,39 @@ impl DeviceCommand {
         match self {
             Self::ListApplications => DeviceCapability::ListApplications,
             Self::ScreenGeometry => DeviceCapability::ScreenGeometry,
-            Self::Screenshot => DeviceCapability::Screenshot,
-            Self::PointerClick { .. } => DeviceCapability::PointerClick,
-            Self::PointerDrag { .. } => DeviceCapability::PointerDrag,
-            Self::TypeText { .. } => DeviceCapability::TypeText,
+            Self::Screenshot | Self::ScreenshotContextual { .. } => DeviceCapability::Screenshot,
+            Self::PointerClick { .. } | Self::PointerClickAdvanced { .. } => {
+                DeviceCapability::PointerClick
+            }
+            Self::PointerDrag { .. } | Self::PointerDragAdvanced { .. } => {
+                DeviceCapability::PointerDrag
+            }
+            Self::TypeText { .. } | Self::TypeTextAdvanced { .. } => DeviceCapability::TypeText,
             Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
             Self::Shell { .. } => DeviceCapability::Shell,
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
             Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
             Self::ListWindows { .. } => DeviceCapability::ListWindows,
             Self::LaunchApplication { .. } => DeviceCapability::LaunchApplication,
-            Self::InspectWindow { .. } => DeviceCapability::InspectWindow,
-            Self::VerifyUiState { .. } => DeviceCapability::VerifyUiState,
+            Self::InspectWindow { .. } | Self::InspectWindowContextual { .. } => {
+                DeviceCapability::InspectWindow
+            }
+            Self::VerifyUiState { .. } | Self::VerifyUiStateContextual { .. } => {
+                DeviceCapability::VerifyUiState
+            }
+            Self::TerminateApplication { .. } => DeviceCapability::TerminateApplication,
+            Self::ActivateWindow { .. } => DeviceCapability::ActivateWindow,
+            Self::SetWindowFrame { .. } => DeviceCapability::SetWindowFrame,
+            Self::InvokeMenu { .. } => DeviceCapability::InvokeMenu,
+            Self::KeyboardInput { .. } => DeviceCapability::KeyboardInput,
+            Self::Scroll { .. } => DeviceCapability::Scroll,
+            Self::ClipboardRead { .. } => DeviceCapability::ClipboardRead,
+            Self::ClipboardWrite { .. } => DeviceCapability::ClipboardWrite,
+            Self::PointerPosition { .. } => DeviceCapability::PointerPosition,
+            Self::MovePointer { .. } => DeviceCapability::MovePointer,
+            Self::SetUiValue { .. } => DeviceCapability::SetUiValue,
+            Self::CaptureRegion { .. } => DeviceCapability::CaptureRegion,
+            Self::ExpandInteractionScope { .. } => DeviceCapability::DesktopScope,
         }
     }
 
@@ -1052,6 +1304,40 @@ pub enum DeviceResult {
     PointerClickCompleted,
     PointerDragCompleted,
     TypeTextCompleted,
+    ApplicationTerminated {
+        process_id: u32,
+    },
+    WindowActivated {
+        process_id: u32,
+        window_id: Option<u64>,
+        process_activated: bool,
+        exact_window_verified: Option<bool>,
+    },
+    WindowFrameSet {
+        process_id: u32,
+        window_id: u64,
+        bounds: UiRect,
+    },
+    MenuInvoked,
+    KeyboardInputCompleted,
+    ScrollCompleted,
+    ClipboardState {
+        types: Vec<String>,
+        text: Option<String>,
+    },
+    ClipboardWritten {
+        types: Vec<String>,
+    },
+    PointerPosition {
+        x_points: i32,
+        y_points: i32,
+    },
+    PointerMoveCompleted,
+    UiValueSet,
+    RegionCaptured {
+        image: UiImage,
+    },
+    InteractionScopeExpanded,
     Process {
         output: ProcessOutput,
     },
@@ -1107,14 +1393,21 @@ impl DeviceResult {
                 | (Self::ScreenGeometry { .. }, DeviceCommand::ScreenGeometry)
                 | (Self::Screenshot { .. }, DeviceCommand::Screenshot)
                 | (
+                    Self::Screenshot { .. },
+                    DeviceCommand::ScreenshotContextual { .. }
+                )
+                | (
                     Self::PointerClickCompleted,
-                    DeviceCommand::PointerClick { .. }
+                    DeviceCommand::PointerClick { .. } | DeviceCommand::PointerClickAdvanced { .. }
                 )
                 | (
                     Self::PointerDragCompleted,
-                    DeviceCommand::PointerDrag { .. }
+                    DeviceCommand::PointerDrag { .. } | DeviceCommand::PointerDragAdvanced { .. }
                 )
-                | (Self::TypeTextCompleted, DeviceCommand::TypeText { .. })
+                | (
+                    Self::TypeTextCompleted,
+                    DeviceCommand::TypeText { .. } | DeviceCommand::TypeTextAdvanced { .. }
+                )
                 | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
                 | (Self::Shell { .. }, DeviceCommand::Shell { .. })
                 | (Self::FileContents { .. }, DeviceCommand::ReadFile { .. })
@@ -1132,8 +1425,59 @@ impl DeviceResult {
                     DeviceCommand::InspectWindow { .. }
                 )
                 | (
+                    Self::WindowSnapshot { .. },
+                    DeviceCommand::InspectWindowContextual { .. }
+                )
+                | (
                     Self::UiStateVerification { .. },
                     DeviceCommand::VerifyUiState { .. }
+                )
+                | (
+                    Self::UiStateVerification { .. },
+                    DeviceCommand::VerifyUiStateContextual { .. }
+                )
+                | (
+                    Self::ApplicationTerminated { .. },
+                    DeviceCommand::TerminateApplication { .. }
+                )
+                | (
+                    Self::WindowActivated { .. },
+                    DeviceCommand::ActivateWindow { .. }
+                )
+                | (
+                    Self::WindowFrameSet { .. },
+                    DeviceCommand::SetWindowFrame { .. }
+                )
+                | (Self::MenuInvoked, DeviceCommand::InvokeMenu { .. })
+                | (
+                    Self::KeyboardInputCompleted,
+                    DeviceCommand::KeyboardInput { .. }
+                )
+                | (Self::ScrollCompleted, DeviceCommand::Scroll { .. })
+                | (
+                    Self::ClipboardState { .. },
+                    DeviceCommand::ClipboardRead { .. }
+                )
+                | (
+                    Self::ClipboardWritten { .. },
+                    DeviceCommand::ClipboardWrite { .. }
+                )
+                | (
+                    Self::PointerPosition { .. },
+                    DeviceCommand::PointerPosition { .. }
+                )
+                | (
+                    Self::PointerMoveCompleted,
+                    DeviceCommand::MovePointer { .. }
+                )
+                | (Self::UiValueSet, DeviceCommand::SetUiValue { .. })
+                | (
+                    Self::RegionCaptured { .. },
+                    DeviceCommand::CaptureRegion { .. }
+                )
+                | (
+                    Self::InteractionScopeExpanded,
+                    DeviceCommand::ExpandInteractionScope { .. }
                 )
                 | (Self::Error { .. }, _)
         )
@@ -1663,6 +2007,31 @@ mod tests {
     }
 
     #[test]
+    fn pre_v3_control_and_capability_schemas_fail_closed_during_rolling_upgrade() {
+        let (mut registry, _identity, device_id) = enrolled();
+        let mut old_capabilities = capabilities(8);
+        old_capabilities.capability_schema_version = 2;
+        assert_eq!(
+            registry.connect(&device_id, old_capabilities),
+            Err(ControlError::UnsupportedCapabilitySchema { got: 2 })
+        );
+
+        let session = registry.connect(&device_id, capabilities(9)).unwrap();
+        let old_command = CommandEnvelope {
+            schema_version: 2,
+            device_id,
+            device_generation: session.generation,
+            capability_revision: session.capabilities.revision,
+            operation_id: "op-old-schema".into(),
+            command: DeviceCommand::ListApplications,
+        };
+        assert_eq!(
+            validate_command_session(&old_command, &session),
+            Err(ControlError::UnsupportedControlSchema { got: 2 })
+        );
+    }
+
+    #[test]
     fn stale_generation_and_capability_revision_are_rejected() {
         let (mut registry, _identity, device_id) = enrolled();
         let first = registry.connect(&device_id, capabilities(9)).unwrap();
@@ -1690,6 +2059,109 @@ mod tests {
         assert!(matches!(
             validate_command_session(&stale_revision, &second),
             Err(ControlError::StaleCapabilityRevision { .. })
+        ));
+    }
+
+    #[test]
+    fn contextual_observation_results_match_their_contextual_commands() {
+        let context_id = "ctx_0123456789abcdef0123456789abcdef".to_owned();
+        assert!(
+            DeviceResult::Screenshot {
+                data_base64: "AA==".into(),
+                mime_type: "image/png".into(),
+                width_pixels: 1,
+                height_pixels: 1,
+            }
+            .matches_command(&DeviceCommand::ScreenshotContextual {
+                context_id: context_id.clone(),
+            })
+        );
+        assert!(
+            DeviceResult::WindowSnapshot {
+                snapshot_ref: "s".into(),
+                process_id: 1,
+                window_id: 2,
+                elements: vec![],
+                elements_complete: true,
+                screenshot: None,
+            }
+            .matches_command(&DeviceCommand::InspectWindowContextual {
+                context_id: context_id.clone(),
+                process_id: 1,
+                window_id: 2,
+                query: None,
+                max_elements: 1,
+                max_depth: 1,
+                include_screenshot: false,
+            })
+        );
+        assert!(
+            DeviceResult::UiStateVerification {
+                status: VerificationStatus::Satisfied,
+                stable: true,
+                samples: 1,
+                predicates: vec![],
+                screenshot: None,
+            }
+            .matches_command(&DeviceCommand::VerifyUiStateContextual {
+                context_id,
+                process_id: 1,
+                window_id: 2,
+                predicates: vec![],
+                timeout_ms: 0,
+                stable_samples: 1,
+                include_screenshot: false,
+            })
+        );
+    }
+
+    #[test]
+    fn desktop_parity_results_match_only_their_exact_new_commands() {
+        let context_id = "ctx_0123456789abcdef0123456789abcdef".to_owned();
+        assert!(
+            DeviceResult::UiValueSet.matches_command(&DeviceCommand::SetUiValue {
+                context_id: context_id.clone(),
+                process_id: 1,
+                window_id: 2,
+                element_ref: "ref_0123456789abcdef0123456789abcdef".into(),
+                value: "x".into(),
+            })
+        );
+        assert!(
+            DeviceResult::RegionCaptured {
+                image: UiImage {
+                    data_base64: "/9j/2Q==".into(),
+                    mime_type: "image/jpeg".into(),
+                    width_pixels: 1,
+                    height_pixels: 1,
+                },
+            }
+            .matches_command(&DeviceCommand::CaptureRegion {
+                context_id: Some(context_id.clone()),
+                process_id: 1,
+                window_id: 2,
+                bounds: UiRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            })
+        );
+        assert!(DeviceResult::InteractionScopeExpanded.matches_command(
+            &DeviceCommand::ExpandInteractionScope {
+                context_id,
+                reason: "test".into(),
+            }
+        ));
+        assert!(!DeviceResult::InteractionScopeExpanded.matches_command(
+            &DeviceCommand::SetUiValue {
+                context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+                process_id: 1,
+                window_id: 2,
+                element_ref: "ref_0123456789abcdef0123456789abcdef".into(),
+                value: "x".into(),
+            }
         ));
     }
 

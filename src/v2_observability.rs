@@ -243,6 +243,19 @@ pub const fn capability_name(capability: DeviceCapability) -> &'static str {
         DeviceCapability::LaunchApplication => "launch_application",
         DeviceCapability::InspectWindow => "inspect_window",
         DeviceCapability::VerifyUiState => "verify_ui_state",
+        DeviceCapability::TerminateApplication => "terminate_application",
+        DeviceCapability::ActivateWindow => "activate_window",
+        DeviceCapability::SetWindowFrame => "set_window_frame",
+        DeviceCapability::InvokeMenu => "invoke_menu",
+        DeviceCapability::KeyboardInput => "keyboard_input",
+        DeviceCapability::Scroll => "scroll",
+        DeviceCapability::ClipboardRead => "clipboard_read",
+        DeviceCapability::ClipboardWrite => "clipboard_write",
+        DeviceCapability::PointerPosition => "pointer_position",
+        DeviceCapability::MovePointer => "move_pointer",
+        DeviceCapability::SetUiValue => "set_ui_value",
+        DeviceCapability::CaptureRegion => "capture_region",
+        DeviceCapability::DesktopScope => "desktop_scope",
     }
 }
 

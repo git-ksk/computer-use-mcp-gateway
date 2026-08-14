@@ -9,10 +9,12 @@ use crate::backend::{
 };
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
-    DeviceResult, MAX_SCREENSHOT_BYTES, MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES,
-    MAX_UI_QUERY_BYTES, MAX_UI_REF_BYTES, MAX_UI_TEXT_BYTES, MAX_WINDOW_RESULTS, UiElement,
-    UiElementSelector, UiImage, UiPredicate, UiPredicateResult, UiRect, UiRole, VerificationStatus,
-    WindowInfo,
+    DeviceResult, InputDeliveryMode, InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES,
+    MAX_CLIPBOARD_TYPE_BYTES, MAX_CLIPBOARD_TYPES, MAX_KEYBOARD_MODIFIERS, MAX_MENU_PATH_SEGMENTS,
+    MAX_MENU_SEGMENT_BYTES, MAX_SCREENSHOT_BYTES, MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS,
+    MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, MAX_UI_REF_BYTES, MAX_UI_TEXT_BYTES, MAX_WINDOW_RESULTS,
+    PointerTarget, ScrollDirection, ScrollGranularity, ScrollTarget, UiElement, UiElementSelector,
+    UiImage, UiPredicate, UiPredicateResult, UiRect, UiRole, VerificationStatus, WindowInfo,
 };
 use crate::v2_m0_transport::CancellationDisposition;
 use crate::v2_observability::SafeErrorCode;
@@ -64,6 +66,13 @@ pub trait ComputerUseBackendAdapter: Send + Sync {
     async fn connect(&self) -> Result<(), M1BackendError>;
 
     async fn shutdown(&self) -> Result<(), M1BackendError>;
+
+    /// Tear down backend-owned state for a CUMG interaction context. This is
+    /// executor lifecycle, not a northbound semantic capability. Stateless
+    /// backends may keep the default no-op implementation.
+    async fn end_interaction_session(&self, _context_id: &str) -> Result<(), M1BackendError> {
+        Ok(())
+    }
 
     async fn execute(
         &self,
@@ -136,6 +145,19 @@ impl CuaMcpAdapter {
                 DeviceCapability::LaunchApplication,
                 DeviceCapability::InspectWindow,
                 DeviceCapability::VerifyUiState,
+                DeviceCapability::TerminateApplication,
+                DeviceCapability::ActivateWindow,
+                DeviceCapability::SetWindowFrame,
+                DeviceCapability::InvokeMenu,
+                DeviceCapability::KeyboardInput,
+                DeviceCapability::Scroll,
+                DeviceCapability::ClipboardRead,
+                DeviceCapability::ClipboardWrite,
+                DeviceCapability::PointerPosition,
+                DeviceCapability::MovePointer,
+                DeviceCapability::SetUiValue,
+                DeviceCapability::CaptureRegion,
+                DeviceCapability::DesktopScope,
             ],
         }
     }
@@ -156,11 +178,81 @@ impl CuaMcpAdapter {
             .map_err(M1BackendError::Backend)
     }
 
+    pub async fn end_interaction_session(&self, context_id: &str) -> Result<(), M1BackendError> {
+        let valid = context_id.len() == 36
+            && context_id.starts_with("ctx_")
+            && context_id[4..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !valid {
+            return Err(M1BackendError::InvalidRequest(
+                "invalid interaction context id",
+            ));
+        }
+        let (_cancel_tx, cancellation) = watch::channel(false);
+        let arguments = serde_json::json!({"session": context_id})
+            .as_object()
+            .cloned();
+        let result = self
+            .backend
+            .call_tool("end_session", arguments, cancellation)
+            .await
+            .map_err(|error| {
+                crate::v2_observability::backend_failure(
+                    crate::v2_observability::BackendFailureReason::Tool,
+                );
+                M1BackendError::Backend(error)
+            })?;
+        if result.is_error == Some(true) {
+            crate::v2_observability::backend_failure(
+                crate::v2_observability::BackendFailureReason::Tool,
+            );
+            return Err(M1BackendError::BackendToolError);
+        }
+        Ok(())
+    }
+
     pub async fn execute(
         &self,
         command: &DeviceCommand,
         cancellation: watch::Receiver<bool>,
     ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        if let DeviceCommand::ExpandInteractionScope { context_id, .. } = command {
+            let start_args = serde_json::json!({
+                "session": context_id,
+                "capture_scope": "auto",
+            })
+            .as_object()
+            .cloned();
+            let started = match self
+                .backend
+                .call_tool("start_session", start_args, cancellation.clone())
+                .await
+            {
+                Ok(result) => result,
+                Err(error) if error.downcast_ref::<BackendCallCancelled>().is_some() => {
+                    return Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate);
+                }
+                Err(error) if error.downcast_ref::<BackendCallTimedOut>().is_some() => {
+                    crate::v2_observability::backend_failure(
+                        crate::v2_observability::BackendFailureReason::Timeout,
+                    );
+                    return Ok(BackendExecutionOutcome::TimedOutIndeterminate);
+                }
+                Err(error) => {
+                    crate::v2_observability::backend_failure(
+                        crate::v2_observability::BackendFailureReason::Tool,
+                    );
+                    return Err(M1BackendError::Backend(error));
+                }
+            };
+            if started.is_error == Some(true) {
+                crate::v2_observability::backend_failure(
+                    crate::v2_observability::BackendFailureReason::Tool,
+                );
+                return Err(M1BackendError::BackendToolError);
+            }
+        }
         let (tool, arguments) = map_command(command)?;
         let raw = match self.backend.call_tool(tool, arguments, cancellation).await {
             Ok(result) => result,
@@ -187,12 +279,54 @@ impl CuaMcpAdapter {
             return Err(M1BackendError::BackendToolError);
         }
         let result = match command {
-            DeviceCommand::PointerClick { .. } => DeviceResult::PointerClickCompleted,
-            DeviceCommand::PointerDrag { .. } => DeviceResult::PointerDragCompleted,
-            DeviceCommand::TypeText { .. } => DeviceResult::TypeTextCompleted,
-            DeviceCommand::Screenshot => normalize_screenshot_result(&raw)?,
-            DeviceCommand::InspectWindow { .. } => normalize_window_snapshot_result(command, &raw)?,
-            DeviceCommand::VerifyUiState { .. } => normalize_ui_verification_result(command, &raw)?,
+            DeviceCommand::PointerClick { .. } | DeviceCommand::PointerClickAdvanced { .. } => {
+                DeviceResult::PointerClickCompleted
+            }
+            DeviceCommand::PointerDrag { .. } | DeviceCommand::PointerDragAdvanced { .. } => {
+                DeviceResult::PointerDragCompleted
+            }
+            DeviceCommand::TypeText { .. } | DeviceCommand::TypeTextAdvanced { .. } => {
+                DeviceResult::TypeTextCompleted
+            }
+            DeviceCommand::TerminateApplication { process_id } => {
+                DeviceResult::ApplicationTerminated {
+                    process_id: *process_id,
+                }
+            }
+            DeviceCommand::ActivateWindow { .. } => {
+                normalize_window_activation_result(command, &raw)?
+            }
+            DeviceCommand::SetWindowFrame {
+                process_id,
+                window_id,
+                bounds,
+                ..
+            } => DeviceResult::WindowFrameSet {
+                process_id: *process_id,
+                window_id: *window_id,
+                bounds: bounds.clone(),
+            },
+            DeviceCommand::InvokeMenu { .. } => DeviceResult::MenuInvoked,
+            DeviceCommand::KeyboardInput { .. } => DeviceResult::KeyboardInputCompleted,
+            DeviceCommand::Scroll { .. } => DeviceResult::ScrollCompleted,
+            DeviceCommand::ClipboardRead { .. } => normalize_clipboard_read_result(&raw)?,
+            DeviceCommand::ClipboardWrite { .. } => normalize_clipboard_write_result(&raw)?,
+            DeviceCommand::PointerPosition { .. } => normalize_pointer_position_result(&raw)?,
+            DeviceCommand::MovePointer { .. } => DeviceResult::PointerMoveCompleted,
+            DeviceCommand::SetUiValue { .. } => DeviceResult::UiValueSet,
+            DeviceCommand::CaptureRegion { .. } => DeviceResult::RegionCaptured {
+                image: normalize_region_capture_result(&raw)?,
+            },
+            DeviceCommand::ExpandInteractionScope { .. } => DeviceResult::InteractionScopeExpanded,
+            DeviceCommand::Screenshot | DeviceCommand::ScreenshotContextual { .. } => {
+                normalize_screenshot_result(&raw)?
+            }
+            DeviceCommand::InspectWindow { .. } | DeviceCommand::InspectWindowContextual { .. } => {
+                normalize_window_snapshot_result(command, &raw)?
+            }
+            DeviceCommand::VerifyUiState { .. } | DeviceCommand::VerifyUiStateContextual { .. } => {
+                normalize_ui_verification_result(command, &raw)?
+            }
             _ => {
                 let value = structured_value(&raw)?;
                 normalize_result(command, &value)?
@@ -216,6 +350,10 @@ impl ComputerUseBackendAdapter for CuaMcpAdapter {
         CuaMcpAdapter::shutdown(self).await
     }
 
+    async fn end_interaction_session(&self, context_id: &str) -> Result<(), M1BackendError> {
+        CuaMcpAdapter::end_interaction_session(self, context_id).await
+    }
+
     async fn execute(
         &self,
         command: &DeviceCommand,
@@ -232,6 +370,12 @@ fn map_command(
         DeviceCommand::ListApplications => Ok(("list_apps", None)),
         DeviceCommand::ScreenGeometry => Ok(("get_screen_size", None)),
         DeviceCommand::Screenshot => Ok(("get_desktop_state", None)),
+        DeviceCommand::ScreenshotContextual { context_id } => Ok((
+            "get_desktop_state",
+            serde_json::json!({"session": context_id})
+                .as_object()
+                .cloned(),
+        )),
         DeviceCommand::PointerClick { x, y, button } => Ok((
             "click",
             serde_json::json!({
@@ -243,6 +387,39 @@ fn map_command(
             .as_object()
             .cloned(),
         )),
+        DeviceCommand::PointerClickAdvanced {
+            context_id,
+            target,
+            button,
+            click_count,
+            modifiers,
+            delivery,
+        } => {
+            if !(1..=3).contains(click_count) {
+                return Err(M1BackendError::InvalidRequest(
+                    "click count must be within 1..=3",
+                ));
+            }
+            let modifiers = map_keyboard_modifiers(modifiers)?;
+            if !modifiers.is_empty() && *delivery != InputDeliveryMode::Foreground {
+                return Err(M1BackendError::InvalidRequest(
+                    "modified click requires explicit foreground delivery",
+                ));
+            }
+            let mut args = pointer_target_arguments(target, *delivery)?;
+            args.insert(
+                "button".into(),
+                serde_json::json!(pointer_button_name(*button)),
+            );
+            args.insert("count".into(), serde_json::json!(click_count));
+            args.insert("modifier".into(), serde_json::json!(modifiers));
+            args.insert(
+                "delivery_mode".into(),
+                serde_json::json!(delivery_mode_name(*delivery)),
+            );
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("click", Some(args)))
+        }
         DeviceCommand::PointerDrag {
             from_x,
             from_y,
@@ -269,6 +446,37 @@ fn map_command(
                 .cloned(),
             ))
         }
+        DeviceCommand::PointerDragAdvanced {
+            context_id,
+            from,
+            to,
+            button,
+            modifiers,
+            delivery,
+            duration_ms,
+            steps,
+        } => {
+            if *duration_ms > 10_000 || !(1..=200).contains(steps) {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid advanced pointer drag bounds",
+                ));
+            }
+            let modifiers = map_keyboard_modifiers(modifiers)?;
+            let mut args = drag_target_arguments(from, to, *delivery)?;
+            args.insert(
+                "button".into(),
+                serde_json::json!(pointer_button_name(*button)),
+            );
+            args.insert("modifier".into(), serde_json::json!(modifiers));
+            args.insert(
+                "delivery_mode".into(),
+                serde_json::json!(delivery_mode_name(*delivery)),
+            );
+            args.insert("duration_ms".into(), serde_json::json!(duration_ms));
+            args.insert("steps".into(), serde_json::json!(steps));
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("drag", Some(args)))
+        }
         DeviceCommand::TypeText { text } => {
             if text.is_empty() || text.len() > MAX_TYPE_TEXT_BYTES {
                 return Err(M1BackendError::InvalidRequest(
@@ -284,6 +492,28 @@ fn map_command(
                 .as_object()
                 .cloned(),
             ))
+        }
+        DeviceCommand::TypeTextAdvanced {
+            context_id,
+            text,
+            target,
+            delivery,
+            delay_ms,
+        } => {
+            if text.is_empty() || text.len() > MAX_TYPE_TEXT_BYTES || *delay_ms > 200 {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid targeted text input bounds",
+                ));
+            }
+            let mut args = input_target_arguments(target, *delivery)?;
+            args.insert("text".into(), serde_json::json!(text));
+            args.insert("delay_ms".into(), serde_json::json!(delay_ms));
+            args.insert(
+                "delivery_mode".into(),
+                serde_json::json!(delivery_mode_name(*delivery)),
+            );
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("type_text", Some(args)))
         }
         DeviceCommand::ListWindows {
             process_id,
@@ -323,34 +553,32 @@ fn map_command(
             max_elements,
             max_depth,
             include_screenshot,
-        } => {
-            validate_window_target(*process_id, *window_id)?;
-            if query
-                .as_ref()
-                .is_some_and(|value| value.len() > MAX_UI_QUERY_BYTES)
-                || *max_elements == 0
-                || (*max_elements as usize) > MAX_UI_ELEMENTS
-                || *max_depth == 0
-                || *max_depth > 64
-            {
-                return Err(M1BackendError::InvalidRequest(
-                    "invalid window inspection bounds",
-                ));
-            }
-            Ok((
-                "get_window_state",
-                serde_json::json!({
-                    "pid": process_id,
-                    "window_id": window_id,
-                    "query": query,
-                    "max_elements": max_elements,
-                    "max_depth": max_depth,
-                    "include_screenshot": include_screenshot,
-                })
-                .as_object()
-                .cloned(),
-            ))
-        }
+        } => map_inspect_window(
+            None,
+            *process_id,
+            *window_id,
+            query,
+            *max_elements,
+            *max_depth,
+            *include_screenshot,
+        ),
+        DeviceCommand::InspectWindowContextual {
+            context_id,
+            process_id,
+            window_id,
+            query,
+            max_elements,
+            max_depth,
+            include_screenshot,
+        } => map_inspect_window(
+            Some(context_id.as_str()),
+            *process_id,
+            *window_id,
+            query,
+            *max_elements,
+            *max_depth,
+            *include_screenshot,
+        ),
         DeviceCommand::VerifyUiState {
             process_id,
             window_id,
@@ -358,30 +586,267 @@ fn map_command(
             timeout_ms,
             stable_samples,
             include_screenshot,
-        } => {
-            validate_window_target(*process_id, *window_id)?;
-            if predicates.is_empty()
-                || predicates.len() > MAX_UI_PREDICATES
-                || *timeout_ms > 10_000
-                || !(1..=5).contains(stable_samples)
-            {
+        } => map_verify_ui_state(
+            None,
+            *process_id,
+            *window_id,
+            predicates,
+            *timeout_ms,
+            *stable_samples,
+            *include_screenshot,
+        ),
+        DeviceCommand::VerifyUiStateContextual {
+            context_id,
+            process_id,
+            window_id,
+            predicates,
+            timeout_ms,
+            stable_samples,
+            include_screenshot,
+        } => map_verify_ui_state(
+            Some(context_id.as_str()),
+            *process_id,
+            *window_id,
+            predicates,
+            *timeout_ms,
+            *stable_samples,
+            *include_screenshot,
+        ),
+        DeviceCommand::TerminateApplication { process_id } => {
+            if *process_id == 0 {
                 return Err(M1BackendError::InvalidRequest(
-                    "invalid UI verification bounds",
+                    "process_id must be positive",
                 ));
             }
-            let expect = predicates
-                .iter()
-                .map(map_ui_predicate)
-                .collect::<Result<Vec<_>, _>>()?;
             Ok((
-                "verify_state",
+                "kill_app",
+                serde_json::json!({"pid": process_id}).as_object().cloned(),
+            ))
+        }
+        DeviceCommand::ActivateWindow {
+            process_id,
+            window_id,
+        } => {
+            if *process_id == 0 || window_id == &Some(0) {
+                return Err(M1BackendError::InvalidRequest("invalid activation target"));
+            }
+            let mut args = JsonObject::new();
+            args.insert("pid".into(), serde_json::json!(process_id));
+            if let Some(window_id) = window_id {
+                args.insert("window_id".into(), serde_json::json!(window_id));
+            }
+            Ok(("bring_to_front", Some(args)))
+        }
+        DeviceCommand::SetWindowFrame {
+            context_id,
+            process_id,
+            window_id,
+            bounds,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if bounds.width == 0 || bounds.height == 0 {
+                return Err(M1BackendError::InvalidRequest(
+                    "window frame must be positive",
+                ));
+            }
+            let mut args = serde_json::json!({
+                "pid": process_id,
+                "window_id": window_id,
+                "x": bounds.x,
+                "y": bounds.y,
+                "width": bounds.width,
+                "height": bounds.height,
+            })
+            .as_object()
+            .cloned()
+            .expect("object literal");
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("set_window_frame", Some(args)))
+        }
+        DeviceCommand::InvokeMenu {
+            context_id,
+            process_id,
+            window_id,
+            path,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if path.is_empty()
+                || path.len() > MAX_MENU_PATH_SEGMENTS
+                || path.iter().any(|segment| {
+                    segment.trim().is_empty() || segment.len() > MAX_MENU_SEGMENT_BYTES
+                })
+            {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid application menu path",
+                ));
+            }
+            let mut args = serde_json::json!({
+                "pid": process_id,
+                "window_id": window_id,
+                "path": path,
+            })
+            .as_object()
+            .cloned()
+            .expect("object literal");
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("invoke_menu", Some(args)))
+        }
+        DeviceCommand::KeyboardInput {
+            context_id,
+            key,
+            modifiers,
+            target,
+            delivery,
+        } => {
+            validate_keyboard_key(key)?;
+            let modifiers = map_keyboard_modifiers(modifiers)?;
+            let mut args = input_target_arguments(target, *delivery)?;
+            args.insert("key".into(), serde_json::json!(key));
+            args.insert("modifiers".into(), serde_json::json!(modifiers));
+            args.insert(
+                "delivery_mode".into(),
+                serde_json::json!(delivery_mode_name(*delivery)),
+            );
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("press_key", Some(args)))
+        }
+        DeviceCommand::Scroll {
+            context_id,
+            direction,
+            granularity,
+            amount,
+            target,
+            delivery,
+        } => {
+            if !(1..=50).contains(amount) {
+                return Err(M1BackendError::InvalidRequest(
+                    "scroll amount must be within 1..=50",
+                ));
+            }
+            let mut args = scroll_target_arguments(target, *delivery)?;
+            args.insert(
+                "direction".into(),
+                serde_json::json!(scroll_direction_name(*direction)),
+            );
+            args.insert(
+                "by".into(),
+                serde_json::json!(scroll_granularity_name(*granularity)),
+            );
+            args.insert("amount".into(), serde_json::json!(amount));
+            args.insert(
+                "delivery_mode".into(),
+                serde_json::json!(delivery_mode_name(*delivery)),
+            );
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("scroll", Some(args)))
+        }
+        DeviceCommand::ClipboardRead {
+            context_id,
+            include_text,
+        } => {
+            let mut args = serde_json::json!({"include_text": include_text})
+                .as_object()
+                .cloned()
+                .expect("object literal");
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("clipboard_read", Some(args)))
+        }
+        DeviceCommand::ClipboardWrite { context_id, text } => {
+            if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+                return Err(M1BackendError::InvalidRequest(
+                    "clipboard text is too large",
+                ));
+            }
+            let mut args = serde_json::json!({"text": text})
+                .as_object()
+                .cloned()
+                .expect("object literal");
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("clipboard_write", Some(args)))
+        }
+        DeviceCommand::PointerPosition { context_id } => {
+            let mut args = JsonObject::new();
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("get_cursor_position", (!args.is_empty()).then_some(args)))
+        }
+        DeviceCommand::MovePointer { context_id, x, y } => Ok((
+            "move_cursor",
+            serde_json::json!({"session": context_id, "x": x, "y": y, "scope": "desktop"})
+                .as_object()
+                .cloned(),
+        )),
+        DeviceCommand::SetUiValue {
+            context_id,
+            process_id,
+            window_id,
+            element_ref,
+            value,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if element_ref.is_empty()
+                || element_ref.len() > MAX_UI_REF_BYTES
+                || value.len() > MAX_TYPE_TEXT_BYTES
+            {
+                return Err(M1BackendError::InvalidRequest("invalid UI value request"));
+            }
+            Ok((
+                "set_value",
                 serde_json::json!({
+                    "session": context_id,
                     "pid": process_id,
                     "window_id": window_id,
-                    "expect": expect,
-                    "timeout_ms": timeout_ms,
-                    "stable_samples": stable_samples,
-                    "include_screenshot": include_screenshot,
+                    "element_token": element_ref,
+                    "value": value,
+                })
+                .as_object()
+                .cloned(),
+            ))
+        }
+        DeviceCommand::CaptureRegion {
+            context_id,
+            process_id,
+            window_id,
+            bounds,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if bounds.width == 0 || bounds.height == 0 {
+                return Err(M1BackendError::InvalidRequest(
+                    "capture region must be positive",
+                ));
+            }
+            let x2 = i64::from(bounds.x) + i64::from(bounds.width);
+            let y2 = i64::from(bounds.y) + i64::from(bounds.height);
+            if x2 > i64::from(i32::MAX) || y2 > i64::from(i32::MAX) {
+                return Err(M1BackendError::InvalidRequest(
+                    "capture region overflows coordinates",
+                ));
+            }
+            let mut args = serde_json::json!({
+                "pid": process_id,
+                "window_id": window_id,
+                "x1": bounds.x,
+                "y1": bounds.y,
+                "x2": x2 as i32,
+                "y2": y2 as i32,
+            })
+            .as_object()
+            .cloned()
+            .expect("object literal");
+            insert_context_session(&mut args, context_id.as_deref())?;
+            Ok(("zoom", Some(args)))
+        }
+        DeviceCommand::ExpandInteractionScope { context_id, reason } => {
+            if reason.is_empty() || reason.len() > 200 {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid scope escalation reason",
+                ));
+            }
+            Ok((
+                "escalate_session",
+                serde_json::json!({
+                    "session": context_id,
+                    "reason": "other",
+                    "detail": reason,
                 })
                 .as_object()
                 .cloned(),
@@ -448,21 +913,43 @@ fn normalize_result(
             })
         }
         DeviceCommand::PointerClick { .. }
+        | DeviceCommand::PointerClickAdvanced { .. }
         | DeviceCommand::PointerDrag { .. }
-        | DeviceCommand::TypeText { .. } => Err(M1BackendError::MalformedResponse(
-            "interaction result should not require response normalization",
+        | DeviceCommand::PointerDragAdvanced { .. }
+        | DeviceCommand::TypeText { .. }
+        | DeviceCommand::TypeTextAdvanced { .. }
+        | DeviceCommand::TerminateApplication { .. }
+        | DeviceCommand::ActivateWindow { .. }
+        | DeviceCommand::SetWindowFrame { .. }
+        | DeviceCommand::InvokeMenu { .. }
+        | DeviceCommand::KeyboardInput { .. }
+        | DeviceCommand::Scroll { .. }
+        | DeviceCommand::ClipboardRead { .. }
+        | DeviceCommand::ClipboardWrite { .. }
+        | DeviceCommand::PointerPosition { .. }
+        | DeviceCommand::MovePointer { .. }
+        | DeviceCommand::SetUiValue { .. }
+        | DeviceCommand::CaptureRegion { .. }
+        | DeviceCommand::ExpandInteractionScope { .. } => Err(M1BackendError::MalformedResponse(
+            "specialized Computer Use result should not use generic normalization",
         )),
-        DeviceCommand::Screenshot => Err(M1BackendError::MalformedResponse(
-            "screenshot result requires image-content normalization",
-        )),
+        DeviceCommand::Screenshot | DeviceCommand::ScreenshotContextual { .. } => {
+            Err(M1BackendError::MalformedResponse(
+                "screenshot result requires image-content normalization",
+            ))
+        }
         DeviceCommand::ListWindows { .. } => normalize_windows_result(value),
         DeviceCommand::LaunchApplication { .. } => normalize_application_launch_result(value),
-        DeviceCommand::InspectWindow { .. } => Err(M1BackendError::MalformedResponse(
-            "window snapshot requires full tool-result normalization",
-        )),
-        DeviceCommand::VerifyUiState { .. } => Err(M1BackendError::MalformedResponse(
-            "UI verification requires full tool-result normalization",
-        )),
+        DeviceCommand::InspectWindow { .. } | DeviceCommand::InspectWindowContextual { .. } => {
+            Err(M1BackendError::MalformedResponse(
+                "window snapshot requires full tool-result normalization",
+            ))
+        }
+        DeviceCommand::VerifyUiState { .. } | DeviceCommand::VerifyUiStateContextual { .. } => {
+            Err(M1BackendError::MalformedResponse(
+                "UI verification requires full tool-result normalization",
+            ))
+        }
         DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ExecuteProcess,
         )),
@@ -476,6 +963,81 @@ fn normalize_result(
             DeviceCapability::ListDirectory,
         )),
     }
+}
+
+fn map_inspect_window(
+    context_id: Option<&str>,
+    process_id: u32,
+    window_id: u64,
+    query: &Option<String>,
+    max_elements: u32,
+    max_depth: u32,
+    include_screenshot: bool,
+) -> Result<(&'static str, Option<JsonObject>), M1BackendError> {
+    validate_window_target(process_id, window_id)?;
+    if query
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_UI_QUERY_BYTES)
+        || max_elements == 0
+        || (max_elements as usize) > MAX_UI_ELEMENTS
+        || max_depth == 0
+        || max_depth > 64
+    {
+        return Err(M1BackendError::InvalidRequest(
+            "invalid window inspection bounds",
+        ));
+    }
+    let mut args = serde_json::json!({
+        "pid": process_id,
+        "window_id": window_id,
+        "query": query,
+        "max_elements": max_elements,
+        "max_depth": max_depth,
+        "include_screenshot": include_screenshot,
+    })
+    .as_object()
+    .cloned()
+    .expect("object literal");
+    insert_context_session(&mut args, context_id)?;
+    Ok(("get_window_state", Some(args)))
+}
+
+fn map_verify_ui_state(
+    context_id: Option<&str>,
+    process_id: u32,
+    window_id: u64,
+    predicates: &[UiPredicate],
+    timeout_ms: u64,
+    stable_samples: u8,
+    include_screenshot: bool,
+) -> Result<(&'static str, Option<JsonObject>), M1BackendError> {
+    validate_window_target(process_id, window_id)?;
+    if predicates.is_empty()
+        || predicates.len() > MAX_UI_PREDICATES
+        || timeout_ms > 10_000
+        || !(1..=5).contains(&stable_samples)
+    {
+        return Err(M1BackendError::InvalidRequest(
+            "invalid UI verification bounds",
+        ));
+    }
+    let expect = predicates
+        .iter()
+        .map(map_ui_predicate)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut args = serde_json::json!({
+        "pid": process_id,
+        "window_id": window_id,
+        "expect": expect,
+        "timeout_ms": timeout_ms,
+        "stable_samples": stable_samples,
+        "include_screenshot": include_screenshot,
+    })
+    .as_object()
+    .cloned()
+    .expect("object literal");
+    insert_context_session(&mut args, context_id)?;
+    Ok(("verify_state", Some(args)))
 }
 
 fn validate_application_selector(
@@ -780,14 +1342,20 @@ fn normalize_window_snapshot_result(
     command: &DeviceCommand,
     result: &CallToolResult,
 ) -> Result<DeviceResult, M1BackendError> {
-    let DeviceCommand::InspectWindow {
-        process_id,
-        window_id,
-        include_screenshot,
-        ..
-    } = command
-    else {
-        return Err(M1BackendError::MalformedResponse("wrong snapshot command"));
+    let (process_id, window_id, include_screenshot) = match command {
+        DeviceCommand::InspectWindow {
+            process_id,
+            window_id,
+            include_screenshot,
+            ..
+        }
+        | DeviceCommand::InspectWindowContextual {
+            process_id,
+            window_id,
+            include_screenshot,
+            ..
+        } => (process_id, window_id, include_screenshot),
+        _ => return Err(M1BackendError::MalformedResponse("wrong snapshot command")),
     };
     let value = structured_value(result)?;
     let snapshot_ref = value.get("snapshot_id").and_then(Value::as_str).ok_or(
@@ -950,15 +1518,22 @@ fn normalize_ui_verification_result(
     command: &DeviceCommand,
     result: &CallToolResult,
 ) -> Result<DeviceResult, M1BackendError> {
-    let DeviceCommand::VerifyUiState {
-        predicates: expected,
-        include_screenshot,
-        ..
-    } = command
-    else {
-        return Err(M1BackendError::MalformedResponse(
-            "wrong verification command",
-        ));
+    let (expected, include_screenshot) = match command {
+        DeviceCommand::VerifyUiState {
+            predicates,
+            include_screenshot,
+            ..
+        }
+        | DeviceCommand::VerifyUiStateContextual {
+            predicates,
+            include_screenshot,
+            ..
+        } => (predicates, include_screenshot),
+        _ => {
+            return Err(M1BackendError::MalformedResponse(
+                "wrong verification command",
+            ));
+        }
     };
     let value = structured_value(result)?;
     let status = parse_verification_status(value.get("status").and_then(Value::as_str).ok_or(
@@ -1146,6 +1721,448 @@ fn json_u32_number(value: Option<&Value>, name: &'static str) -> Result<u32, M1B
         return Err(M1BackendError::NumericOverflow);
     }
     Ok(value.round() as u32)
+}
+
+fn insert_context_session(
+    args: &mut JsonObject,
+    context_id: Option<&str>,
+) -> Result<(), M1BackendError> {
+    if let Some(context_id) = context_id {
+        if context_id.len() > MAX_UI_REF_BYTES || !context_id.starts_with("ctx_") {
+            return Err(M1BackendError::InvalidRequest(
+                "invalid interaction context id",
+            ));
+        }
+        args.insert("session".into(), serde_json::json!(context_id));
+    }
+    Ok(())
+}
+
+fn normalize_window_activation_result(
+    command: &DeviceCommand,
+    result: &CallToolResult,
+) -> Result<DeviceResult, M1BackendError> {
+    let DeviceCommand::ActivateWindow {
+        process_id,
+        window_id,
+    } = command
+    else {
+        return Err(M1BackendError::MalformedResponse(
+            "wrong activation command",
+        ));
+    };
+    let value = structured_value(result)?;
+    let process_activated = value
+        .get("process_activated")
+        .and_then(Value::as_bool)
+        .ok_or(M1BackendError::MalformedResponse(
+            "activation missing process_activated",
+        ))?;
+    let exact_window_verified = if window_id.is_some() {
+        Some(
+            value
+                .get("exact_window_effect")
+                .and_then(Value::as_object)
+                .and_then(|effect| effect.get("verified"))
+                .and_then(Value::as_bool)
+                .ok_or(M1BackendError::MalformedResponse(
+                    "activation missing exact-window evidence",
+                ))?,
+        )
+    } else {
+        None
+    };
+    Ok(DeviceResult::WindowActivated {
+        process_id: *process_id,
+        window_id: *window_id,
+        process_activated,
+        exact_window_verified,
+    })
+}
+
+fn normalize_region_capture_result(result: &CallToolResult) -> Result<UiImage, M1BackendError> {
+    let value = structured_value(result)?;
+    let mime_type = value
+        .get("mime_type")
+        .or_else(|| value.get("screenshot_mime_type"))
+        .and_then(Value::as_str)
+        .ok_or(M1BackendError::MalformedResponse(
+            "region capture missing mime type",
+        ))?;
+    if mime_type != "image/jpeg" {
+        return Err(M1BackendError::MalformedResponse(
+            "region capture is not JPEG",
+        ));
+    }
+    let width_pixels = json_u32(&value, "width")?;
+    let height_pixels = json_u32(&value, "height")?;
+    if width_pixels == 0 || height_pixels == 0 || width_pixels > 4096 || height_pixels > 4096 {
+        return Err(M1BackendError::MalformedResponse(
+            "invalid region capture dimensions",
+        ));
+    }
+    let image_data = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_image())
+        .find(|image| image.mime_type == "image/jpeg")
+        .map(|image| image.data.clone())
+        .or_else(|| {
+            value
+                .get("screenshot_png_b64")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .ok_or(M1BackendError::MalformedResponse(
+            "region capture missing JPEG content",
+        ))?;
+    let max_encoded = MAX_SCREENSHOT_BYTES.div_ceil(3) * 4;
+    if image_data.len() > max_encoded {
+        return Err(M1BackendError::ScreenshotTooLarge);
+    }
+    let decoded = STANDARD
+        .decode(image_data.as_bytes())
+        .map_err(|_| M1BackendError::MalformedResponse("region capture base64 is invalid"))?;
+    if decoded.len() > MAX_SCREENSHOT_BYTES || !decoded.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Err(M1BackendError::MalformedResponse(
+            "region capture content is not JPEG",
+        ));
+    }
+    Ok(UiImage {
+        data_base64: image_data,
+        mime_type: mime_type.to_owned(),
+        width_pixels,
+        height_pixels,
+    })
+}
+
+fn delivery_mode_name(mode: InputDeliveryMode) -> &'static str {
+    match mode {
+        InputDeliveryMode::Background => "background",
+        InputDeliveryMode::Foreground => "foreground",
+    }
+}
+
+fn keyboard_modifier_name(modifier: KeyboardModifier) -> &'static str {
+    match modifier {
+        KeyboardModifier::Meta => "cmd",
+        KeyboardModifier::Shift => "shift",
+        KeyboardModifier::Alt => "alt",
+        KeyboardModifier::Control => "ctrl",
+        KeyboardModifier::Function => "fn",
+    }
+}
+
+fn map_keyboard_modifiers(
+    modifiers: &[KeyboardModifier],
+) -> Result<Vec<&'static str>, M1BackendError> {
+    if modifiers.len() > MAX_KEYBOARD_MODIFIERS {
+        return Err(M1BackendError::InvalidRequest(
+            "too many keyboard modifiers",
+        ));
+    }
+    let mut seen = Vec::with_capacity(modifiers.len());
+    for modifier in modifiers {
+        if seen.contains(modifier) {
+            return Err(M1BackendError::InvalidRequest(
+                "duplicate keyboard modifier",
+            ));
+        }
+        seen.push(*modifier);
+    }
+    Ok(seen.into_iter().map(keyboard_modifier_name).collect())
+}
+
+fn validate_keyboard_key(key: &str) -> Result<(), M1BackendError> {
+    let named = [
+        "return", "tab", "escape", "up", "down", "left", "right", "space", "delete", "home", "end",
+        "pageup", "pagedown", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11",
+        "f12",
+    ];
+    let single_ascii = key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric();
+    if single_ascii || named.contains(&key) {
+        Ok(())
+    } else {
+        Err(M1BackendError::InvalidRequest("unsupported keyboard key"))
+    }
+}
+
+fn pointer_target_arguments(
+    target: &PointerTarget,
+    delivery: InputDeliveryMode,
+) -> Result<JsonObject, M1BackendError> {
+    let mut args = JsonObject::new();
+    match target {
+        PointerTarget::DesktopPhysical { x, y } => {
+            if delivery == InputDeliveryMode::Foreground {
+                return Err(M1BackendError::InvalidRequest(
+                    "desktop pointer target cannot request foreground delivery",
+                ));
+            }
+            args.insert("x".into(), serde_json::json!(x));
+            args.insert("y".into(), serde_json::json!(y));
+            args.insert("scope".into(), serde_json::json!("desktop"));
+        }
+        PointerTarget::WindowPhysical {
+            process_id,
+            window_id,
+            x,
+            y,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            args.insert("pid".into(), serde_json::json!(process_id));
+            args.insert("window_id".into(), serde_json::json!(window_id));
+            args.insert("x".into(), serde_json::json!(x));
+            args.insert("y".into(), serde_json::json!(y));
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
+    }
+    Ok(args)
+}
+
+fn drag_target_arguments(
+    from: &PointerTarget,
+    to: &PointerTarget,
+    delivery: InputDeliveryMode,
+) -> Result<JsonObject, M1BackendError> {
+    let mut args = JsonObject::new();
+    match (from, to) {
+        (
+            PointerTarget::DesktopPhysical {
+                x: from_x,
+                y: from_y,
+            },
+            PointerTarget::DesktopPhysical { x: to_x, y: to_y },
+        ) => {
+            if delivery == InputDeliveryMode::Foreground {
+                return Err(M1BackendError::InvalidRequest(
+                    "desktop drag cannot request foreground delivery",
+                ));
+            }
+            args.insert("from_x".into(), serde_json::json!(from_x));
+            args.insert("from_y".into(), serde_json::json!(from_y));
+            args.insert("to_x".into(), serde_json::json!(to_x));
+            args.insert("to_y".into(), serde_json::json!(to_y));
+            args.insert("scope".into(), serde_json::json!("desktop"));
+        }
+        (
+            PointerTarget::WindowPhysical {
+                process_id: from_pid,
+                window_id: from_window,
+                x: from_x,
+                y: from_y,
+            },
+            PointerTarget::WindowPhysical {
+                process_id: to_pid,
+                window_id: to_window,
+                x: to_x,
+                y: to_y,
+            },
+        ) if from_pid == to_pid && from_window == to_window => {
+            validate_window_target(*from_pid, *from_window)?;
+            args.insert("pid".into(), serde_json::json!(from_pid));
+            args.insert("window_id".into(), serde_json::json!(from_window));
+            args.insert("from_x".into(), serde_json::json!(from_x));
+            args.insert("from_y".into(), serde_json::json!(from_y));
+            args.insert("to_x".into(), serde_json::json!(to_x));
+            args.insert("to_y".into(), serde_json::json!(to_y));
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
+        _ => {
+            return Err(M1BackendError::InvalidRequest(
+                "drag endpoints must share one coordinate space and exact window",
+            ));
+        }
+    }
+    Ok(args)
+}
+
+fn input_target_arguments(
+    target: &InputTarget,
+    delivery: InputDeliveryMode,
+) -> Result<JsonObject, M1BackendError> {
+    let mut args = JsonObject::new();
+    match target {
+        InputTarget::Desktop => {
+            if delivery == InputDeliveryMode::Foreground {
+                return Err(M1BackendError::InvalidRequest(
+                    "desktop input cannot request foreground delivery",
+                ));
+            }
+            args.insert("scope".into(), serde_json::json!("desktop"));
+        }
+        InputTarget::Window {
+            process_id,
+            window_id,
+        } => {
+            if *process_id == 0 || window_id == &Some(0) {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid window input target",
+                ));
+            }
+            if delivery == InputDeliveryMode::Foreground && window_id.is_none() {
+                return Err(M1BackendError::InvalidRequest(
+                    "foreground input requires an exact window",
+                ));
+            }
+            args.insert("pid".into(), serde_json::json!(process_id));
+            if let Some(window_id) = window_id {
+                args.insert("window_id".into(), serde_json::json!(window_id));
+            }
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
+        InputTarget::WindowPoint {
+            process_id,
+            window_id,
+            x,
+            y,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            args.insert("pid".into(), serde_json::json!(process_id));
+            args.insert("window_id".into(), serde_json::json!(window_id));
+            args.insert("x".into(), serde_json::json!(x));
+            args.insert("y".into(), serde_json::json!(y));
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
+    }
+    Ok(args)
+}
+
+fn scroll_target_arguments(
+    target: &ScrollTarget,
+    delivery: InputDeliveryMode,
+) -> Result<JsonObject, M1BackendError> {
+    let mut args = JsonObject::new();
+    match target {
+        ScrollTarget::Window {
+            process_id,
+            window_id,
+        } => {
+            if *process_id == 0 || window_id == &Some(0) {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid scroll window target",
+                ));
+            }
+            if delivery == InputDeliveryMode::Foreground && window_id.is_none() {
+                return Err(M1BackendError::InvalidRequest(
+                    "foreground scroll requires an exact window",
+                ));
+            }
+            args.insert("pid".into(), serde_json::json!(process_id));
+            if let Some(window_id) = window_id {
+                args.insert("window_id".into(), serde_json::json!(window_id));
+            }
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
+        ScrollTarget::WindowPoint {
+            process_id,
+            window_id,
+            x,
+            y,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            args.insert("pid".into(), serde_json::json!(process_id));
+            args.insert("window_id".into(), serde_json::json!(window_id));
+            args.insert("x".into(), serde_json::json!(x));
+            args.insert("y".into(), serde_json::json!(y));
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
+        ScrollTarget::DesktopPoint { x, y } => {
+            if delivery == InputDeliveryMode::Foreground {
+                return Err(M1BackendError::InvalidRequest(
+                    "desktop scroll cannot request foreground delivery",
+                ));
+            }
+            args.insert("x".into(), serde_json::json!(x));
+            args.insert("y".into(), serde_json::json!(y));
+            args.insert("scope".into(), serde_json::json!("desktop"));
+        }
+    }
+    Ok(args)
+}
+
+fn scroll_direction_name(direction: ScrollDirection) -> &'static str {
+    match direction {
+        ScrollDirection::Up => "up",
+        ScrollDirection::Down => "down",
+        ScrollDirection::Left => "left",
+        ScrollDirection::Right => "right",
+    }
+}
+
+fn scroll_granularity_name(granularity: ScrollGranularity) -> &'static str {
+    match granularity {
+        ScrollGranularity::Line => "line",
+        ScrollGranularity::Page => "page",
+    }
+}
+
+fn normalize_clipboard_read_result(
+    result: &CallToolResult,
+) -> Result<DeviceResult, M1BackendError> {
+    let value = structured_value(result)?;
+    let types = normalize_clipboard_types(&value)?;
+    let text = match value.get("text") {
+        Some(Value::String(text)) if text.len() <= MAX_CLIPBOARD_TEXT_BYTES => Some(text.clone()),
+        Some(Value::String(_)) => {
+            return Err(M1BackendError::MalformedResponse(
+                "clipboard text is too large",
+            ));
+        }
+        Some(Value::Null) | None => None,
+        _ => return Err(M1BackendError::MalformedResponse("invalid clipboard text")),
+    };
+    Ok(DeviceResult::ClipboardState { types, text })
+}
+
+fn normalize_clipboard_write_result(
+    result: &CallToolResult,
+) -> Result<DeviceResult, M1BackendError> {
+    let value = structured_value(result)?;
+    Ok(DeviceResult::ClipboardWritten {
+        types: normalize_clipboard_types(&value)?,
+    })
+}
+
+fn normalize_clipboard_types(value: &Value) -> Result<Vec<String>, M1BackendError> {
+    let types =
+        value
+            .get("types")
+            .and_then(Value::as_array)
+            .ok_or(M1BackendError::MalformedResponse(
+                "clipboard result missing types",
+            ))?;
+    if types.len() > MAX_CLIPBOARD_TYPES {
+        return Err(M1BackendError::MalformedResponse(
+            "too many clipboard types",
+        ));
+    }
+    types
+        .iter()
+        .map(|value| {
+            let value = value
+                .as_str()
+                .ok_or(M1BackendError::MalformedResponse("invalid clipboard type"))?;
+            bounded_string(
+                value,
+                MAX_CLIPBOARD_TYPE_BYTES,
+                "clipboard type is too large",
+            )
+        })
+        .collect()
+}
+
+fn normalize_pointer_position_result(
+    result: &CallToolResult,
+) -> Result<DeviceResult, M1BackendError> {
+    let value = structured_value(result)?;
+    let object = value.as_object().ok_or(M1BackendError::MalformedResponse(
+        "invalid pointer position",
+    ))?;
+    Ok(DeviceResult::PointerPosition {
+        x_points: json_i32_number(object.get("x"), "pointer x")?,
+        y_points: json_i32_number(object.get("y"), "pointer y")?,
+    })
 }
 
 fn normalize_screenshot_result(result: &CallToolResult) -> Result<DeviceResult, M1BackendError> {
@@ -1583,6 +2600,249 @@ mod tests {
             }),
             Err(M1BackendError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn desktop_semantic_mapping_preserves_scope_delivery_and_backend_neutral_modifiers() {
+        let context = Some("ctx_0123456789abcdef0123456789abcdef".into());
+        let (tool, args) = map_command(&DeviceCommand::PointerClickAdvanced {
+            context_id: context.clone(),
+            target: PointerTarget::WindowPhysical {
+                process_id: 42,
+                window_id: 7,
+                x: 10,
+                y: 20,
+            },
+            button: crate::v2_m0::PointerButton::Left,
+            click_count: 2,
+            modifiers: vec![KeyboardModifier::Meta],
+            delivery: InputDeliveryMode::Foreground,
+        })
+        .unwrap();
+        assert_eq!(tool, "click");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["session"], context.unwrap());
+        assert_eq!(args["scope"], "window");
+        assert_eq!(args["pid"], 42);
+        assert_eq!(args["window_id"], 7);
+        assert_eq!(args["modifier"], serde_json::json!(["cmd"]));
+        assert_eq!(args["delivery_mode"], "foreground");
+        assert_eq!(args["count"], 2);
+
+        assert!(matches!(
+            map_command(&DeviceCommand::PointerClickAdvanced {
+                context_id: None,
+                target: PointerTarget::WindowPhysical {
+                    process_id: 42,
+                    window_id: 7,
+                    x: 10,
+                    y: 20,
+                },
+                button: crate::v2_m0::PointerButton::Left,
+                click_count: 1,
+                modifiers: vec![KeyboardModifier::Meta],
+                delivery: InputDeliveryMode::Background,
+            }),
+            Err(M1BackendError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            map_command(&DeviceCommand::PointerDragAdvanced {
+                context_id: None,
+                from: PointerTarget::WindowPhysical {
+                    process_id: 42,
+                    window_id: 7,
+                    x: 1,
+                    y: 2,
+                },
+                to: PointerTarget::WindowPhysical {
+                    process_id: 42,
+                    window_id: 8,
+                    x: 3,
+                    y: 4,
+                },
+                button: crate::v2_m0::PointerButton::Left,
+                modifiers: vec![],
+                delivery: InputDeliveryMode::Background,
+                duration_ms: 100,
+                steps: 10,
+            }),
+            Err(M1BackendError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn scoped_value_region_and_escalation_map_without_raw_backend_escape_hatch() {
+        let context = "ctx_0123456789abcdef0123456789abcdef";
+        let (tool, args) = map_command(&DeviceCommand::SetUiValue {
+            context_id: context.into(),
+            process_id: 42,
+            window_id: 7,
+            element_ref: "backend-element-token".into(),
+            value: "new-value".into(),
+        })
+        .unwrap();
+        assert_eq!(tool, "set_value");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["session"], context);
+        assert_eq!(args["element_token"], "backend-element-token");
+
+        let (tool, args) = map_command(&DeviceCommand::CaptureRegion {
+            context_id: Some(context.into()),
+            process_id: 42,
+            window_id: 7,
+            bounds: UiRect {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 50,
+            },
+        })
+        .unwrap();
+        assert_eq!(tool, "zoom");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["x1"], 10);
+        assert_eq!(args["y1"], 20);
+        assert_eq!(args["x2"], 110);
+        assert_eq!(args["y2"], 70);
+        assert_eq!(args["session"], context);
+
+        let (tool, args) = map_command(&DeviceCommand::ExpandInteractionScope {
+            context_id: context.into(),
+            reason: "window routes exhausted".into(),
+        })
+        .unwrap();
+        assert_eq!(tool, "escalate_session");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["session"], context);
+        assert_eq!(args["reason"], "other");
+        assert_eq!(args["detail"], "window routes exhausted");
+    }
+
+    #[tokio::test]
+    async fn end_interaction_session_stays_backend_lifecycle_and_uses_exact_context() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "cumg-m1-end-session-{}-{nonce}",
+            std::process::id()
+        ));
+        let adapter = fixture(vec![
+            "scripts/mock_mcp_backend.py".into(),
+            "--args-marker".into(),
+            marker.to_string_lossy().into_owned(),
+        ]);
+        adapter.connect().await.unwrap();
+        let context_id = "ctx_0123456789abcdef0123456789abcdef";
+        adapter.end_interaction_session(context_id).await.unwrap();
+        wait_for_file(&marker).await;
+        let recorded: Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(recorded["tool"], "end_session");
+        assert_eq!(recorded["arguments"]["session"], context_id);
+        assert!(
+            adapter
+                .end_interaction_session("bad-context")
+                .await
+                .is_err()
+        );
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_file(marker);
+    }
+
+    #[tokio::test]
+    async fn desktop_fixture_normalizes_activation_clipboard_pointer_region_and_scope() {
+        let adapter = fixture(vec!["scripts/mock_mcp_backend.py".into()]);
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::ActivateWindow {
+                        process_id: 101,
+                        window_id: Some(77),
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::WindowActivated {
+                process_id: 101,
+                window_id: Some(77),
+                process_activated: true,
+                exact_window_verified: Some(true),
+            })
+        );
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::ClipboardRead {
+                        context_id: None,
+                        include_text: true,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::ClipboardState {
+                types: vec!["public.utf8-plain-text".into()],
+                text: Some("fixture clipboard".into()),
+            })
+        );
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::PointerPosition { context_id: None },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::PointerPosition {
+                x_points: 123,
+                y_points: 456
+            })
+        );
+        let region = adapter
+            .execute(
+                &DeviceCommand::CaptureRegion {
+                    context_id: None,
+                    process_id: 101,
+                    window_id: 77,
+                    bounds: UiRect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 80,
+                    },
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            region,
+            BackendExecutionOutcome::Completed(DeviceResult::RegionCaptured {
+                image: UiImage {
+                    width_pixels: 144,
+                    height_pixels: 96,
+                    ..
+                }
+            })
+        ));
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::ExpandInteractionScope {
+                        context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+                        reason: "test".into(),
+                    },
+                    cancel_rx,
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::InteractionScopeExpanded)
+        );
+        adapter.shutdown().await.unwrap();
     }
 
     #[test]

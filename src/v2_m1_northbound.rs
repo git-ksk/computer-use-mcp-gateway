@@ -10,10 +10,18 @@
 use crate::v2_observability::SafeErrorCode;
 use crate::{
     v2_execution_safety::OperationOwner,
+    v2_interaction_context::{
+        DEFAULT_MAX_REFS_PER_CONTEXT, InteractionContextBinding, InteractionContextId,
+        InteractionContextLimits, InteractionContextManager, InteractionScope,
+        ScopedBackendRefRegistry, ScopedRefKind,
+    },
     v2_m0::{
-        CapabilityAdvertisement, DeviceCapability, DeviceCommand, DeviceResult,
-        MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
-        ProcessEnvVar, ProcessRequest, ShellRequest, UiPredicate, UiRole,
+        CapabilityAdvertisement, DeviceCapability, DeviceCommand, DeviceResult, InputDeliveryMode,
+        InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES, MAX_KEYBOARD_MODIFIERS,
+        MAX_MENU_PATH_SEGMENTS, MAX_MENU_SEGMENT_BYTES, MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS,
+        MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton, PointerTarget, ProcessEnvVar,
+        ProcessRequest, ScrollDirection, ScrollGranularity, ScrollTarget, ShellRequest,
+        UiPredicate, UiRect, UiRole,
     },
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
@@ -54,6 +62,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
 const DEFAULT_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,6 +81,44 @@ const TOOL_LIST_WINDOWS: &str = "list_windows";
 const TOOL_LAUNCH_APPLICATION: &str = "launch_application";
 const TOOL_INSPECT_WINDOW: &str = "inspect_window";
 const TOOL_VERIFY_UI_STATE: &str = "verify_ui_state";
+const TOOL_TERMINATE_APPLICATION: &str = "terminate_application";
+const TOOL_ACTIVATE_WINDOW: &str = "activate_window";
+const TOOL_SET_WINDOW_FRAME: &str = "set_window_frame";
+const TOOL_INVOKE_MENU: &str = "invoke_menu";
+const TOOL_KEYBOARD_INPUT: &str = "keyboard_input";
+const TOOL_SCROLL: &str = "scroll";
+const TOOL_CLIPBOARD_READ: &str = "clipboard_read";
+const TOOL_CLIPBOARD_WRITE: &str = "clipboard_write";
+const TOOL_GET_POINTER_POSITION: &str = "get_pointer_position";
+const TOOL_MOVE_POINTER: &str = "move_pointer";
+const TOOL_OPEN_INTERACTION_CONTEXT: &str = "open_interaction_context";
+const TOOL_CLOSE_INTERACTION_CONTEXT: &str = "close_interaction_context";
+const TOOL_EXPAND_INTERACTION_SCOPE: &str = "expand_interaction_scope";
+const TOOL_SET_UI_VALUE: &str = "set_ui_value";
+const TOOL_CAPTURE_REGION: &str = "capture_region";
+
+const CONTEXT_ELIGIBLE_CAPABILITIES: &[DeviceCapability] = &[
+    DeviceCapability::Screenshot,
+    DeviceCapability::PointerClick,
+    DeviceCapability::PointerDrag,
+    DeviceCapability::TypeText,
+    DeviceCapability::ListWindows,
+    DeviceCapability::LaunchApplication,
+    DeviceCapability::InspectWindow,
+    DeviceCapability::VerifyUiState,
+    DeviceCapability::ActivateWindow,
+    DeviceCapability::SetWindowFrame,
+    DeviceCapability::InvokeMenu,
+    DeviceCapability::KeyboardInput,
+    DeviceCapability::Scroll,
+    DeviceCapability::ClipboardRead,
+    DeviceCapability::ClipboardWrite,
+    DeviceCapability::PointerPosition,
+    DeviceCapability::MovePointer,
+    DeviceCapability::SetUiValue,
+    DeviceCapability::CaptureRegion,
+    DeviceCapability::DesktopScope,
+];
 
 #[derive(Debug, Clone)]
 pub struct NorthboundMcpConfig {
@@ -431,6 +478,13 @@ fn canonical_resource_eq(candidate: &str, expected: &str) -> bool {
 
 fn unix_time_secs() -> Result<u64, std::time::SystemTimeError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
+fn unix_time_ms() -> Result<u64, std::time::SystemTimeError> {
+    Ok(
+        u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+            .unwrap_or(u64::MAX),
+    )
 }
 
 #[derive(Clone)]
@@ -833,11 +887,56 @@ fn oauth_error_response(
     response
 }
 
+struct NorthboundInteractionState {
+    contexts: InteractionContextManager,
+    refs: ScopedBackendRefRegistry,
+}
+
+impl NorthboundInteractionState {
+    fn new() -> Self {
+        Self {
+            contexts: InteractionContextManager::new(InteractionContextLimits::default())
+                .expect("static interaction-context limits are valid"),
+            refs: ScopedBackendRefRegistry::new(DEFAULT_MAX_REFS_PER_CONTEXT)
+                .expect("static scoped-ref limit is valid"),
+        }
+    }
+
+    fn prune_expired(&mut self, now_ms: u64) -> Vec<InteractionContextId> {
+        let expired = self.contexts.prune(now_ms);
+        for context_id in &expired {
+            self.refs.invalidate_context(context_id);
+        }
+        expired
+    }
+
+    fn fence_live_binding(
+        &mut self,
+        device_id: &str,
+        generation: u64,
+        revision: u64,
+    ) -> Vec<InteractionContextId> {
+        let mut invalidated = self
+            .contexts
+            .invalidate_device_generation(device_id, generation);
+        self.refs
+            .invalidate_device_generation(device_id, generation);
+        invalidated.extend(
+            self.contexts
+                .invalidate_capability_revision(device_id, revision),
+        );
+        self.refs
+            .invalidate_capability_revision(device_id, revision);
+        invalidated
+    }
+}
+
 #[derive(Clone)]
 pub struct V2NorthboundMcp {
     hub: HubHandle,
     authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
     usage: UsageManager,
+    interactions: Arc<TokioMutex<NorthboundInteractionState>>,
 }
 
 /// Replacement seam for delegated authorization and generic policy engines.
@@ -896,6 +995,7 @@ impl V2NorthboundMcp {
             hub,
             authorizer,
             usage,
+            interactions: Arc::new(TokioMutex::new(NorthboundInteractionState::new())),
         }
     }
 
@@ -933,17 +1033,294 @@ impl V2NorthboundMcp {
             })
     }
 
+    fn context_access_allowed(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        capabilities: Option<&CapabilityAdvertisement>,
+    ) -> bool {
+        CONTEXT_ELIGIBLE_CAPABILITIES
+            .iter()
+            .copied()
+            .any(|capability| {
+                capability_is_live(capabilities, capability)
+                    && self
+                        .authorizer
+                        .authorize_device_capability(principal, self.hub.device_id(), capability)
+                        .is_ok()
+            })
+    }
+
+    async fn cleanup_backend_sessions(&self, contexts: Vec<InteractionContextId>) {
+        for context_id in contexts {
+            if let Err(error) = self
+                .hub
+                .end_backend_interaction_session(context_id.as_str().to_owned())
+                .await
+            {
+                tracing::warn!(
+                    event = "v2_backend_session_cleanup_unavailable",
+                    outcome = "failed",
+                    error_code = error.safe_error_code(),
+                    "backend interaction-session cleanup was unavailable without logging context identity"
+                );
+            }
+        }
+    }
+
+    async fn open_interaction_context(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+    ) -> Result<CallToolResponse, McpError> {
+        let (generation, capabilities) = self
+            .hub
+            .current_session_binding()
+            .await
+            .ok_or_else(|| McpError::invalid_request("Agent is offline", None))?;
+        if !self.context_access_allowed(principal, Some(&capabilities)) {
+            return Err(McpError::invalid_request(
+                "No authorized live Computer Use capability is available",
+                None,
+            ));
+        }
+        let now_ms = unix_time_ms()
+            .map_err(|_| McpError::internal_error("System clock unavailable", None))?;
+        let (binding, invalidated) = {
+            let mut state = self.interactions.lock().await;
+            let mut invalidated = state.prune_expired(now_ms);
+            invalidated.extend(state.fence_live_binding(
+                self.hub.device_id(),
+                generation,
+                capabilities.revision,
+            ));
+            let binding = state
+                .contexts
+                .open(
+                    principal,
+                    self.hub.device_id(),
+                    generation,
+                    capabilities.revision,
+                    now_ms,
+                )
+                .map_err(|_| {
+                    McpError::invalid_request("Interaction context could not be opened", None)
+                })?;
+            (binding, invalidated)
+        };
+        self.cleanup_backend_sessions(invalidated).await;
+        let payload = json!({
+            "context_id": binding.id.as_str(),
+            "scope": "window_scoped",
+            "device_generation": binding.device_generation,
+            "capability_revision": binding.capability_revision,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]).into())
+    }
+
+    async fn close_interaction_context(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        context_id: &str,
+    ) -> Result<CallToolResponse, McpError> {
+        let id = InteractionContextId::parse(context_id)
+            .map_err(|_| McpError::invalid_params("Invalid interaction context id", None))?;
+        {
+            let mut state = self.interactions.lock().await;
+            state
+                .contexts
+                .close(&id, principal, self.hub.device_id())
+                .map_err(|_| {
+                    McpError::invalid_request(
+                        "Interaction context is not owned by this principal/device",
+                        None,
+                    )
+                })?;
+            state.refs.invalidate_context(&id);
+        }
+        let backend_session_ended = match self
+            .hub
+            .end_backend_interaction_session(id.as_str().to_owned())
+            .await
+        {
+            Ok(ended) => ended,
+            Err(error) => {
+                tracing::warn!(
+                    event = "v2_backend_session_cleanup_unavailable",
+                    outcome = "failed",
+                    error_code = error.safe_error_code(),
+                    "backend interaction-session cleanup was unavailable without logging context identity"
+                );
+                false
+            }
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            json!({
+                "closed": true,
+                "backend_session_ended": backend_session_ended,
+            })
+            .to_string(),
+        )])
+        .into())
+    }
+
+    async fn validate_interaction_context(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        context_id: &str,
+    ) -> Result<InteractionContextBinding, McpError> {
+        let id = InteractionContextId::parse(context_id)
+            .map_err(|_| McpError::invalid_params("Invalid interaction context id", None))?;
+        let (generation, capabilities) = self
+            .hub
+            .current_session_binding()
+            .await
+            .ok_or_else(|| McpError::invalid_request("Agent is offline", None))?;
+        let now_ms = unix_time_ms()
+            .map_err(|_| McpError::internal_error("System clock unavailable", None))?;
+        let (result, invalidated) = {
+            let mut state = self.interactions.lock().await;
+            let mut invalidated = state.prune_expired(now_ms);
+            invalidated.extend(state.fence_live_binding(
+                self.hub.device_id(),
+                generation,
+                capabilities.revision,
+            ));
+            let result = state.contexts.validate_and_touch(
+                &id,
+                principal,
+                self.hub.device_id(),
+                generation,
+                capabilities.revision,
+                now_ms,
+            );
+            (result, invalidated)
+        };
+        self.cleanup_backend_sessions(invalidated).await;
+        result.map_err(|_| {
+            McpError::invalid_request("Interaction context is invalid, stale, or expired", None)
+        })
+    }
+
+    async fn prepare_contextual_command(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        mut command: DeviceCommand,
+    ) -> Result<(DeviceCommand, Option<InteractionContextBinding>), McpError> {
+        if matches!(
+            command,
+            DeviceCommand::Screenshot
+                | DeviceCommand::PointerClick { .. }
+                | DeviceCommand::PointerDrag { .. }
+                | DeviceCommand::TypeText { .. }
+        ) {
+            return Err(McpError::invalid_params(
+                "Desktop-scoped northbound input requires an interaction context",
+                None,
+            ));
+        }
+        let context_id = command_interaction_context_id(&command).map(ToOwned::to_owned);
+        let Some(context_id) = context_id else {
+            return Ok((command, None));
+        };
+        let binding = self
+            .validate_interaction_context(principal, &context_id)
+            .await?;
+        if command_requires_desktop_scope(&command)
+            && binding.scope != InteractionScope::DesktopScoped
+        {
+            return Err(McpError::invalid_request(
+                "Interaction context has not been explicitly expanded to desktop scope",
+                None,
+            ));
+        }
+        if command_requires_window_scope(&command)
+            && binding.scope != InteractionScope::WindowScoped
+        {
+            return Err(McpError::invalid_request(
+                "Window-scoped interaction is unavailable after desktop scope expansion; close the context and open a fresh one",
+                None,
+            ));
+        }
+        if let DeviceCommand::SetUiValue { element_ref, .. } = &mut command {
+            let backend_ref = {
+                let state = self.interactions.lock().await;
+                state
+                    .refs
+                    .resolve(element_ref, &binding, ScopedRefKind::Element)
+                    .map(str::to_owned)
+                    .map_err(|_| {
+                        McpError::invalid_request(
+                            "UI element ref is stale or belongs to another context",
+                            None,
+                        )
+                    })?
+            };
+            *element_ref = backend_ref;
+        }
+        Ok((command, Some(binding)))
+    }
+
+    async fn publicize_window_snapshot(
+        &self,
+        binding: &InteractionContextBinding,
+        result: DeviceResult,
+    ) -> Result<DeviceResult, McpError> {
+        let DeviceResult::WindowSnapshot {
+            snapshot_ref,
+            process_id,
+            window_id,
+            mut elements,
+            elements_complete,
+            screenshot,
+        } = result
+        else {
+            return Ok(result);
+        };
+        let mut state = self.interactions.lock().await;
+        let public_snapshot = state
+            .refs
+            .mint(binding, ScopedRefKind::Snapshot, &snapshot_ref)
+            .map_err(|_| McpError::internal_error("Scoped snapshot ref limit exceeded", None))?;
+        let mut remap = BTreeMap::new();
+        for element in &elements {
+            let public = state
+                .refs
+                .mint(binding, ScopedRefKind::Element, &element.element_ref)
+                .map_err(|_| McpError::internal_error("Scoped element ref limit exceeded", None))?;
+            remap.insert(element.element_ref.clone(), public);
+        }
+        for element in &mut elements {
+            let raw = element.element_ref.clone();
+            element.element_ref = remap.get(&raw).cloned().ok_or_else(|| {
+                McpError::internal_error("Scoped element ref rewrite failed", None)
+            })?;
+            element.parent_ref = element
+                .parent_ref
+                .as_ref()
+                .and_then(|raw_parent| remap.get(raw_parent).cloned());
+        }
+        Ok(DeviceResult::WindowSnapshot {
+            snapshot_ref: public_snapshot,
+            process_id,
+            window_id,
+            elements,
+            elements_complete,
+            screenshot,
+        })
+    }
+
     async fn tools_for(&self, principal: &AuthenticatedClientPrincipal) -> Vec<Tool> {
         let capabilities = self.hub.current_capabilities().await;
+        let context_access = self.context_access_allowed(principal, capabilities.as_ref());
         all_tools()
             .into_iter()
-            .filter(|tool| {
-                tool_capability(tool.name.as_ref()).is_some_and(|capability| {
+            .filter(|tool| match tool.name.as_ref() {
+                TOOL_OPEN_INTERACTION_CONTEXT | TOOL_CLOSE_INTERACTION_CONTEXT => context_access,
+                name => tool_capability(name).is_some_and(|capability| {
                     self.authorizer
                         .authorize_device_capability(principal, self.hub.device_id(), capability)
                         .is_ok()
-                        && capability_is_live_or_unknown(capabilities.as_ref(), capability)
-                })
+                        && capability_is_live(capabilities.as_ref(), capability)
+                }),
             })
             .collect()
     }
@@ -1058,6 +1435,16 @@ impl ServerHandler for V2NorthboundMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let auth = Self::auth_context(&context)?;
+        if request.name.as_ref() == TOOL_OPEN_INTERACTION_CONTEXT {
+            let _: EmptyArgs = parse_arguments(request.arguments)?;
+            return self.open_interaction_context(&auth.principal).await;
+        }
+        if request.name.as_ref() == TOOL_CLOSE_INTERACTION_CONTEXT {
+            let args: ContextIdArgs = parse_arguments(request.arguments)?;
+            return self
+                .close_interaction_context(&auth.principal, &args.context_id)
+                .await;
+        }
         let capability = tool_capability(request.name.as_ref())
             .ok_or_else(|| McpError::invalid_params("Unknown V2 Hub tool", None))?;
         let operation_id = self.hub.new_operation_id();
@@ -1083,29 +1470,98 @@ impl ServerHandler for V2NorthboundMcp {
         let command_result: Result<DeviceCommand, McpError> = (|| match request.name.as_ref() {
             TOOL_LIST_APPS => Ok(DeviceCommand::ListApplications),
             TOOL_GET_SCREEN_SIZE => Ok(DeviceCommand::ScreenGeometry),
-            TOOL_SCREENSHOT => Ok(DeviceCommand::Screenshot),
+            TOOL_SCREENSHOT => {
+                let args: ScreenshotArgs = parse_arguments(request.arguments)?;
+                Ok(DeviceCommand::ScreenshotContextual {
+                    context_id: args.context_id,
+                })
+            }
             TOOL_CLICK => {
                 let args: ClickArgs = parse_arguments(request.arguments)?;
-                Ok(DeviceCommand::PointerClick {
-                    x: args.x,
-                    y: args.y,
-                    button: parse_pointer_button(args.button.as_deref())?,
+                let button = parse_pointer_button(args.button.as_deref())?;
+                let advanced = args.context_id.is_some()
+                    || args.coordinate_space.is_some()
+                    || args.process_id.is_some()
+                    || args.window_id.is_some()
+                    || args.click_count.unwrap_or(1) != 1
+                    || !args.modifiers.is_empty()
+                    || args.delivery.is_some();
+                if !advanced {
+                    return Ok(DeviceCommand::PointerClick {
+                        x: args.x,
+                        y: args.y,
+                        button,
+                    });
+                }
+                Ok(DeviceCommand::PointerClickAdvanced {
+                    context_id: args.context_id,
+                    target: parse_pointer_target(
+                        args.coordinate_space.as_deref(),
+                        args.process_id,
+                        args.window_id,
+                        args.x,
+                        args.y,
+                    )?,
+                    button,
+                    click_count: args.click_count.unwrap_or(1),
+                    modifiers: parse_keyboard_modifiers(&args.modifiers)?,
+                    delivery: parse_delivery_mode(args.delivery.as_deref())?,
                 })
             }
             TOOL_DRAG => {
                 let args: DragArgs = parse_arguments(request.arguments)?;
-                if args.duration_ms == 0 || args.duration_ms > 10_000 {
+                if args.duration_ms > 10_000 {
                     return Err(McpError::invalid_params(
-                        "duration_ms must be within 1..=10000",
+                        "duration_ms must be within 0..=10000",
                         None,
                     ));
                 }
-                Ok(DeviceCommand::PointerDrag {
-                    from_x: args.from_x,
-                    from_y: args.from_y,
-                    to_x: args.to_x,
-                    to_y: args.to_y,
+                let advanced = args.context_id.is_some()
+                    || args.coordinate_space.is_some()
+                    || args.process_id.is_some()
+                    || args.window_id.is_some()
+                    || args.button.is_some()
+                    || !args.modifiers.is_empty()
+                    || args.delivery.is_some()
+                    || args.steps.is_some();
+                if !advanced {
+                    if args.duration_ms == 0 {
+                        return Err(McpError::invalid_params(
+                            "legacy duration_ms must be within 1..=10000",
+                            None,
+                        ));
+                    }
+                    return Ok(DeviceCommand::PointerDrag {
+                        from_x: args.from_x,
+                        from_y: args.from_y,
+                        to_x: args.to_x,
+                        to_y: args.to_y,
+                        duration_ms: args.duration_ms,
+                    });
+                }
+                let from = parse_pointer_target(
+                    args.coordinate_space.as_deref(),
+                    args.process_id,
+                    args.window_id,
+                    args.from_x,
+                    args.from_y,
+                )?;
+                let to = parse_pointer_target(
+                    args.coordinate_space.as_deref(),
+                    args.process_id,
+                    args.window_id,
+                    args.to_x,
+                    args.to_y,
+                )?;
+                Ok(DeviceCommand::PointerDragAdvanced {
+                    context_id: args.context_id,
+                    from,
+                    to,
+                    button: parse_pointer_button(args.button.as_deref())?,
+                    modifiers: parse_keyboard_modifiers(&args.modifiers)?,
+                    delivery: parse_delivery_mode(args.delivery.as_deref())?,
                     duration_ms: args.duration_ms,
+                    steps: args.steps.unwrap_or(20),
                 })
             }
             TOOL_TYPE_TEXT => {
@@ -1116,7 +1572,30 @@ impl ServerHandler for V2NorthboundMcp {
                         None,
                     ));
                 }
-                Ok(DeviceCommand::TypeText { text: args.text })
+                let advanced = args.context_id.is_some()
+                    || args.target_kind.is_some()
+                    || args.process_id.is_some()
+                    || args.window_id.is_some()
+                    || args.x.is_some()
+                    || args.y.is_some()
+                    || args.delivery.is_some()
+                    || args.delay_ms.is_some();
+                if !advanced {
+                    return Ok(DeviceCommand::TypeText { text: args.text });
+                }
+                Ok(DeviceCommand::TypeTextAdvanced {
+                    context_id: args.context_id,
+                    text: args.text,
+                    target: parse_input_target(
+                        args.target_kind.as_deref(),
+                        args.process_id,
+                        args.window_id,
+                        args.x,
+                        args.y,
+                    )?,
+                    delivery: parse_delivery_mode(args.delivery.as_deref())?,
+                    delay_ms: args.delay_ms.unwrap_or(30),
+                })
             }
             TOOL_EXECUTE_PROCESS => {
                 let args: ExecuteProcessArgs = parse_arguments(request.arguments)?;
@@ -1183,14 +1662,26 @@ impl ServerHandler for V2NorthboundMcp {
                         None,
                     ));
                 }
-                Ok(DeviceCommand::InspectWindow {
-                    process_id: args.process_id,
-                    window_id: args.window_id,
-                    query: args.query,
-                    max_elements: args.max_elements,
-                    max_depth: args.max_depth,
-                    include_screenshot: args.include_screenshot,
-                })
+                if let Some(context_id) = args.context_id {
+                    Ok(DeviceCommand::InspectWindowContextual {
+                        context_id,
+                        process_id: args.process_id,
+                        window_id: args.window_id,
+                        query: args.query,
+                        max_elements: args.max_elements,
+                        max_depth: args.max_depth,
+                        include_screenshot: args.include_screenshot,
+                    })
+                } else {
+                    Ok(DeviceCommand::InspectWindow {
+                        process_id: args.process_id,
+                        window_id: args.window_id,
+                        query: args.query,
+                        max_elements: args.max_elements,
+                        max_depth: args.max_depth,
+                        include_screenshot: args.include_screenshot,
+                    })
+                }
             }
             TOOL_VERIFY_UI_STATE => {
                 let args: VerifyUiStateArgs = parse_arguments(request.arguments)?;
@@ -1202,13 +1693,197 @@ impl ServerHandler for V2NorthboundMcp {
                         None,
                     ));
                 }
-                Ok(DeviceCommand::VerifyUiState {
+                if let Some(context_id) = args.context_id {
+                    Ok(DeviceCommand::VerifyUiStateContextual {
+                        context_id,
+                        process_id: args.process_id,
+                        window_id: args.window_id,
+                        predicates: args.expect,
+                        timeout_ms: args.timeout_ms,
+                        stable_samples: args.stable_samples,
+                        include_screenshot: args.include_screenshot,
+                    })
+                } else {
+                    Ok(DeviceCommand::VerifyUiState {
+                        process_id: args.process_id,
+                        window_id: args.window_id,
+                        predicates: args.expect,
+                        timeout_ms: args.timeout_ms,
+                        stable_samples: args.stable_samples,
+                        include_screenshot: args.include_screenshot,
+                    })
+                }
+            }
+            TOOL_TERMINATE_APPLICATION => {
+                let args: ProcessIdArgs = parse_arguments(request.arguments)?;
+                require_positive_process_id(args.process_id)?;
+                Ok(DeviceCommand::TerminateApplication {
+                    process_id: args.process_id,
+                })
+            }
+            TOOL_ACTIVATE_WINDOW => {
+                let args: ActivateWindowArgs = parse_arguments(request.arguments)?;
+                require_positive_process_id(args.process_id)?;
+                if args.window_id == Some(0) {
+                    return Err(McpError::invalid_params("window_id must be positive", None));
+                }
+                Ok(DeviceCommand::ActivateWindow {
                     process_id: args.process_id,
                     window_id: args.window_id,
-                    predicates: args.expect,
-                    timeout_ms: args.timeout_ms,
-                    stable_samples: args.stable_samples,
-                    include_screenshot: args.include_screenshot,
+                })
+            }
+            TOOL_SET_WINDOW_FRAME => {
+                let args: SetWindowFrameArgs = parse_arguments(request.arguments)?;
+                validate_window_args(args.process_id, args.window_id)?;
+                if args.width == 0 || args.height == 0 {
+                    return Err(McpError::invalid_params(
+                        "window frame width and height must be positive",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::SetWindowFrame {
+                    context_id: args.context_id,
+                    process_id: args.process_id,
+                    window_id: args.window_id,
+                    bounds: UiRect {
+                        x: args.x,
+                        y: args.y,
+                        width: args.width,
+                        height: args.height,
+                    },
+                })
+            }
+            TOOL_INVOKE_MENU => {
+                let args: InvokeMenuArgs = parse_arguments(request.arguments)?;
+                validate_window_args(args.process_id, args.window_id)?;
+                validate_menu_path(&args.path)?;
+                Ok(DeviceCommand::InvokeMenu {
+                    context_id: args.context_id,
+                    process_id: args.process_id,
+                    window_id: args.window_id,
+                    path: args.path,
+                })
+            }
+            TOOL_KEYBOARD_INPUT => {
+                let args: KeyboardInputArgs = parse_arguments(request.arguments)?;
+                validate_keyboard_key_input(&args.key)?;
+                Ok(DeviceCommand::KeyboardInput {
+                    context_id: args.context_id,
+                    key: args.key,
+                    modifiers: parse_keyboard_modifiers(&args.modifiers)?,
+                    target: parse_input_target(
+                        args.target_kind.as_deref(),
+                        args.process_id,
+                        args.window_id,
+                        args.x,
+                        args.y,
+                    )?,
+                    delivery: parse_delivery_mode(args.delivery.as_deref())?,
+                })
+            }
+            TOOL_SCROLL => {
+                let args: ScrollArgs = parse_arguments(request.arguments)?;
+                if !(1..=50).contains(&args.amount) {
+                    return Err(McpError::invalid_params(
+                        "amount must be within 1..=50",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::Scroll {
+                    context_id: args.context_id,
+                    direction: parse_scroll_direction(&args.direction)?,
+                    granularity: parse_scroll_granularity(args.granularity.as_deref())?,
+                    amount: args.amount,
+                    target: parse_scroll_target(
+                        args.target_kind.as_deref(),
+                        args.process_id,
+                        args.window_id,
+                        args.x,
+                        args.y,
+                    )?,
+                    delivery: parse_delivery_mode(args.delivery.as_deref())?,
+                })
+            }
+            TOOL_CLIPBOARD_READ => {
+                let args: ClipboardReadArgs = parse_arguments(request.arguments)?;
+                Ok(DeviceCommand::ClipboardRead {
+                    context_id: args.context_id,
+                    include_text: args.include_text,
+                })
+            }
+            TOOL_CLIPBOARD_WRITE => {
+                let args: ClipboardWriteArgs = parse_arguments(request.arguments)?;
+                if args.text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+                    return Err(McpError::invalid_params(
+                        "clipboard text exceeds the 1 MiB bound",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::ClipboardWrite {
+                    context_id: args.context_id,
+                    text: args.text,
+                })
+            }
+            TOOL_GET_POINTER_POSITION => {
+                let args: PointerPositionArgs = parse_arguments(request.arguments)?;
+                Ok(DeviceCommand::PointerPosition {
+                    context_id: Some(args.context_id),
+                })
+            }
+            TOOL_MOVE_POINTER => {
+                let args: MovePointerArgs = parse_arguments(request.arguments)?;
+                Ok(DeviceCommand::MovePointer {
+                    context_id: args.context_id,
+                    x: args.x,
+                    y: args.y,
+                })
+            }
+            TOOL_SET_UI_VALUE => {
+                let args: SetUiValueArgs = parse_arguments(request.arguments)?;
+                validate_window_args(args.process_id, args.window_id)?;
+                if args.element_ref.len() > 128 || args.value.len() > MAX_TYPE_TEXT_BYTES {
+                    return Err(McpError::invalid_params("Invalid UI value arguments", None));
+                }
+                Ok(DeviceCommand::SetUiValue {
+                    context_id: args.context_id,
+                    process_id: args.process_id,
+                    window_id: args.window_id,
+                    element_ref: args.element_ref,
+                    value: args.value,
+                })
+            }
+            TOOL_CAPTURE_REGION => {
+                let args: CaptureRegionArgs = parse_arguments(request.arguments)?;
+                validate_window_args(args.process_id, args.window_id)?;
+                if args.width == 0 || args.height == 0 {
+                    return Err(McpError::invalid_params(
+                        "Capture region must be positive",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::CaptureRegion {
+                    context_id: args.context_id,
+                    process_id: args.process_id,
+                    window_id: args.window_id,
+                    bounds: UiRect {
+                        x: args.x,
+                        y: args.y,
+                        width: args.width,
+                        height: args.height,
+                    },
+                })
+            }
+            TOOL_EXPAND_INTERACTION_SCOPE => {
+                let args: ExpandInteractionScopeArgs = parse_arguments(request.arguments)?;
+                if args.reason.trim().is_empty() || args.reason.len() > 200 {
+                    return Err(McpError::invalid_params(
+                        "reason must contain 1..=200 UTF-8 bytes",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::ExpandInteractionScope {
+                    context_id: args.context_id,
+                    reason: args.reason,
                 })
             }
             _ => Err(McpError::invalid_params("Unknown V2 Hub tool", None)),
@@ -1220,10 +1895,64 @@ impl ServerHandler for V2NorthboundMcp {
                 return Err(error);
             }
         };
+        let (command, interaction_binding) = match self
+            .prepare_contextual_command(&auth.principal, command)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                settle_usage_best_effort(
+                    &usage,
+                    UsageSettlement::Zero,
+                    "invalid_interaction_context",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let publicize_snapshot = matches!(command, DeviceCommand::InspectWindowContextual { .. });
+        let expand_context_id = match &command {
+            DeviceCommand::ExpandInteractionScope { context_id, .. } => Some(context_id.clone()),
+            _ => None,
+        };
 
-        let result = self
+        let mut result = self
             .execute_command(&auth.principal, operation_id, command, usage, &context)
             .await?;
+        if publicize_snapshot {
+            let binding = interaction_binding.as_ref().ok_or_else(|| {
+                McpError::internal_error("Contextual snapshot lost its interaction binding", None)
+            })?;
+            result = self.publicize_window_snapshot(binding, result).await?;
+        }
+        if let Some(context_id) = expand_context_id {
+            let binding = interaction_binding.as_ref().ok_or_else(|| {
+                McpError::internal_error("Scope expansion lost its interaction binding", None)
+            })?;
+            let id = InteractionContextId::parse(&context_id).map_err(|_| {
+                McpError::invalid_request("Interaction context became invalid", None)
+            })?;
+            let now_ms = unix_time_ms()
+                .map_err(|_| McpError::internal_error("System clock unavailable", None))?;
+            self.interactions
+                .lock()
+                .await
+                .contexts
+                .expand_to_desktop_after_authorization(
+                    &id,
+                    &auth.principal,
+                    self.hub.device_id(),
+                    binding.device_generation,
+                    binding.capability_revision,
+                    now_ms,
+                )
+                .map_err(|_| {
+                    McpError::invalid_request(
+                        "Interaction context expired or changed during scope expansion",
+                        None,
+                    )
+                })?;
+        }
         match result {
             DeviceResult::Screenshot {
                 data_base64,
@@ -1238,6 +1967,18 @@ impl ServerHandler for V2NorthboundMcp {
                 });
                 Ok(CallToolResult::success(vec![
                     ContentBlock::image(data_base64, "image/png"),
+                    ContentBlock::text(metadata.to_string()),
+                ])
+                .into())
+            }
+            DeviceResult::RegionCaptured { image } => {
+                let metadata = json!({
+                    "mime_type": image.mime_type,
+                    "width_pixels": image.width_pixels,
+                    "height_pixels": image.height_pixels,
+                });
+                Ok(CallToolResult::success(vec![
+                    ContentBlock::image(image.data_base64, "image/jpeg"),
                     ContentBlock::text(metadata.to_string()),
                 ])
                 .into())
@@ -1312,11 +2053,107 @@ impl ServerHandler for V2NorthboundMcp {
     }
 }
 
-fn capability_is_live_or_unknown(
+fn capability_is_live(
     advertisement: Option<&CapabilityAdvertisement>,
     capability: DeviceCapability,
 ) -> bool {
-    advertisement.is_none_or(|advertisement| advertisement.supports(capability))
+    advertisement.is_some_and(|advertisement| advertisement.supports(capability))
+}
+
+fn command_interaction_context_id(command: &DeviceCommand) -> Option<&str> {
+    match command {
+        DeviceCommand::ScreenshotContextual { context_id }
+        | DeviceCommand::InspectWindowContextual { context_id, .. }
+        | DeviceCommand::VerifyUiStateContextual { context_id, .. }
+        | DeviceCommand::MovePointer { context_id, .. }
+        | DeviceCommand::SetUiValue { context_id, .. }
+        | DeviceCommand::ExpandInteractionScope { context_id, .. } => Some(context_id.as_str()),
+        DeviceCommand::PointerClickAdvanced { context_id, .. }
+        | DeviceCommand::PointerDragAdvanced { context_id, .. }
+        | DeviceCommand::TypeTextAdvanced { context_id, .. }
+        | DeviceCommand::SetWindowFrame { context_id, .. }
+        | DeviceCommand::InvokeMenu { context_id, .. }
+        | DeviceCommand::KeyboardInput { context_id, .. }
+        | DeviceCommand::Scroll { context_id, .. }
+        | DeviceCommand::ClipboardRead { context_id, .. }
+        | DeviceCommand::ClipboardWrite { context_id, .. }
+        | DeviceCommand::PointerPosition { context_id }
+        | DeviceCommand::CaptureRegion { context_id, .. } => context_id.as_deref(),
+        _ => None,
+    }
+}
+
+fn command_requires_desktop_scope(command: &DeviceCommand) -> bool {
+    match command {
+        DeviceCommand::ScreenshotContextual { .. }
+        | DeviceCommand::MovePointer { .. }
+        | DeviceCommand::PointerPosition {
+            context_id: Some(_),
+        } => true,
+        DeviceCommand::PointerClickAdvanced { target, .. } => {
+            matches!(target, PointerTarget::DesktopPhysical { .. })
+        }
+        DeviceCommand::PointerDragAdvanced { from, to, .. } => {
+            matches!(from, PointerTarget::DesktopPhysical { .. })
+                || matches!(to, PointerTarget::DesktopPhysical { .. })
+        }
+        DeviceCommand::TypeTextAdvanced { target, .. }
+        | DeviceCommand::KeyboardInput { target, .. } => matches!(target, InputTarget::Desktop),
+        DeviceCommand::Scroll { target, .. } => {
+            matches!(target, ScrollTarget::DesktopPoint { .. })
+        }
+        _ => false,
+    }
+}
+
+fn command_requires_window_scope(command: &DeviceCommand) -> bool {
+    match command {
+        DeviceCommand::InspectWindowContextual { .. }
+        | DeviceCommand::VerifyUiStateContextual { .. }
+        | DeviceCommand::SetUiValue { .. }
+        | DeviceCommand::CaptureRegion {
+            context_id: Some(_),
+            ..
+        } => true,
+        DeviceCommand::PointerClickAdvanced {
+            context_id: Some(_),
+            target: PointerTarget::WindowPhysical { .. },
+            ..
+        } => true,
+        DeviceCommand::PointerDragAdvanced {
+            context_id: Some(_),
+            from,
+            to,
+            ..
+        } => {
+            matches!(from, PointerTarget::WindowPhysical { .. })
+                && matches!(to, PointerTarget::WindowPhysical { .. })
+        }
+        DeviceCommand::TypeTextAdvanced {
+            context_id: Some(_),
+            target,
+            ..
+        }
+        | DeviceCommand::KeyboardInput {
+            context_id: Some(_),
+            target,
+            ..
+        } => !matches!(target, InputTarget::Desktop),
+        DeviceCommand::SetWindowFrame {
+            context_id: Some(_),
+            ..
+        }
+        | DeviceCommand::InvokeMenu {
+            context_id: Some(_),
+            ..
+        } => true,
+        DeviceCommand::Scroll {
+            context_id: Some(_),
+            target,
+            ..
+        } => !matches!(target, ScrollTarget::DesktopPoint { .. }),
+        _ => false,
+    }
 }
 
 fn command_is_read_only(command: &DeviceCommand) -> bool {
@@ -1325,11 +2162,17 @@ fn command_is_read_only(command: &DeviceCommand) -> bool {
         DeviceCommand::ListApplications
             | DeviceCommand::ScreenGeometry
             | DeviceCommand::Screenshot
+            | DeviceCommand::ScreenshotContextual { .. }
             | DeviceCommand::ReadFile { .. }
             | DeviceCommand::ListDirectory { .. }
             | DeviceCommand::ListWindows { .. }
             | DeviceCommand::InspectWindow { .. }
+            | DeviceCommand::InspectWindowContextual { .. }
             | DeviceCommand::VerifyUiState { .. }
+            | DeviceCommand::VerifyUiStateContextual { .. }
+            | DeviceCommand::ClipboardRead { .. }
+            | DeviceCommand::PointerPosition { .. }
+            | DeviceCommand::CaptureRegion { .. }
     )
 }
 
@@ -1412,12 +2255,37 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_LAUNCH_APPLICATION => Some(DeviceCapability::LaunchApplication),
         TOOL_INSPECT_WINDOW => Some(DeviceCapability::InspectWindow),
         TOOL_VERIFY_UI_STATE => Some(DeviceCapability::VerifyUiState),
+        TOOL_TERMINATE_APPLICATION => Some(DeviceCapability::TerminateApplication),
+        TOOL_ACTIVATE_WINDOW => Some(DeviceCapability::ActivateWindow),
+        TOOL_SET_WINDOW_FRAME => Some(DeviceCapability::SetWindowFrame),
+        TOOL_INVOKE_MENU => Some(DeviceCapability::InvokeMenu),
+        TOOL_KEYBOARD_INPUT => Some(DeviceCapability::KeyboardInput),
+        TOOL_SCROLL => Some(DeviceCapability::Scroll),
+        TOOL_CLIPBOARD_READ => Some(DeviceCapability::ClipboardRead),
+        TOOL_CLIPBOARD_WRITE => Some(DeviceCapability::ClipboardWrite),
+        TOOL_GET_POINTER_POSITION => Some(DeviceCapability::PointerPosition),
+        TOOL_MOVE_POINTER => Some(DeviceCapability::MovePointer),
+        TOOL_SET_UI_VALUE => Some(DeviceCapability::SetUiValue),
+        TOOL_CAPTURE_REGION => Some(DeviceCapability::CaptureRegion),
+        TOOL_EXPAND_INTERACTION_SCOPE => Some(DeviceCapability::DesktopScope),
         _ => None,
     }
 }
 
 fn all_tools() -> Vec<Tool> {
     vec![
+        Tool::new(
+            TOOL_OPEN_INTERACTION_CONTEXT,
+            "Open bounded CUMG workflow state for stateful Computer Use. The opaque context id is not authorization.",
+            object_schema(vec![], &[]),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(false).idempotent(false)),
+        Tool::new(
+            TOOL_CLOSE_INTERACTION_CONTEXT,
+            "Invalidate one interaction context and all CUMG-scoped refs owned by the authenticated principal/device.",
+            object_schema(vec![("context_id", interaction_context_id_schema())], &["context_id"]),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(false).idempotent(true)),
         Tool::new(
             TOOL_LIST_APPS,
             "List applications through the enrolled computer-use backend.",
@@ -1432,8 +2300,11 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().read_only(true)),
         Tool::new(
             TOOL_SCREENSHOT,
-            "Capture the enrolled device primary display as a bounded PNG image.",
-            object_schema(vec![], &[]),
+            "Capture the enrolled device desktop as a bounded PNG image. Requires an explicitly desktop-scoped interaction context.",
+            object_schema(
+                vec![("context_id", interaction_context_id_schema())],
+                &["context_id"],
+            ),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
         Tool::new(
@@ -1441,9 +2312,16 @@ fn all_tools() -> Vec<Tool> {
             "Click desktop coordinates through the enrolled computer-use backend.",
             object_schema(
                 vec![
+                    ("context_id", interaction_context_id_schema()),
                     ("x", signed_integer_schema()),
                     ("y", signed_integer_schema()),
-                    ("button", string_schema()),
+                    ("button", pointer_button_schema()),
+                    ("coordinate_space", pointer_coordinate_space_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("click_count", bounded_positive_integer_schema(3)),
+                    ("modifiers", keyboard_modifiers_schema()),
+                    ("delivery", delivery_mode_schema()),
                 ],
                 &["x", "y"],
             ),
@@ -1454,11 +2332,19 @@ fn all_tools() -> Vec<Tool> {
             "Drag the desktop pointer through the enrolled computer-use backend.",
             object_schema(
                 vec![
+                    ("context_id", interaction_context_id_schema()),
                     ("from_x", signed_integer_schema()),
                     ("from_y", signed_integer_schema()),
                     ("to_x", signed_integer_schema()),
                     ("to_y", signed_integer_schema()),
-                    ("duration_ms", positive_integer_schema()),
+                    ("duration_ms", bounded_nonnegative_integer_schema(10_000)),
+                    ("coordinate_space", pointer_coordinate_space_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("button", pointer_button_schema()),
+                    ("modifiers", keyboard_modifiers_schema()),
+                    ("delivery", delivery_mode_schema()),
+                    ("steps", bounded_positive_integer_schema(200)),
                 ],
                 &["from_x", "from_y", "to_x", "to_y", "duration_ms"],
             ),
@@ -1467,7 +2353,20 @@ fn all_tools() -> Vec<Tool> {
         Tool::new(
             TOOL_TYPE_TEXT,
             "Type text into the current foreground desktop application.",
-            object_schema(vec![("text", bounded_text_schema())], &["text"]),
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("text", bounded_text_schema()),
+                    ("target_kind", input_target_kind_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("x", signed_integer_schema()),
+                    ("y", signed_integer_schema()),
+                    ("delivery", delivery_mode_schema()),
+                    ("delay_ms", bounded_nonnegative_integer_schema(200)),
+                ],
+                &["text"],
+            ),
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
@@ -1542,6 +2441,7 @@ fn all_tools() -> Vec<Tool> {
             "Inspect one exact top-level window as a bounded backend-neutral UI element snapshot, optionally with a window screenshot.",
             object_schema(
                 vec![
+                    ("context_id", interaction_context_id_schema()),
                     ("process_id", positive_integer_schema()),
                     ("window_id", positive_integer_schema()),
                     ("query", bounded_ui_query_schema()),
@@ -1558,6 +2458,7 @@ fn all_tools() -> Vec<Tool> {
             "Verify bounded predicates against one exact window. Unknown never implies success.",
             object_schema(
                 vec![
+                    ("context_id", interaction_context_id_schema()),
                     ("process_id", positive_integer_schema()),
                     ("window_id", positive_integer_schema()),
                     ("expect", bounded_array_schema(ui_predicate_schema(), 1, MAX_UI_PREDICATES as u64)),
@@ -1569,6 +2470,184 @@ fn all_tools() -> Vec<Tool> {
             ),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_TERMINATE_APPLICATION,
+            "Force-terminate one exact process. Unsaved application state may be lost.",
+            object_schema(vec![("process_id", positive_integer_schema())], &["process_id"]),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_ACTIVATE_WINDOW,
+            "Persistently bring an application or exact window to the foreground. This intentionally steals foreground.",
+            object_schema(
+                vec![
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                ],
+                &["process_id"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_SET_WINDOW_FRAME,
+            "Set and verify an exact top-level window frame in desktop logical coordinates.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("x", signed_integer_schema()),
+                    ("y", signed_integer_schema()),
+                    ("width", positive_integer_schema()),
+                    ("height", positive_integer_schema()),
+                ],
+                &["process_id", "window_id", "x", "y", "width", "height"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_INVOKE_MENU,
+            "Resolve and invoke an exact bounded application-menu path without pixel fallback.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("path", bounded_array_schema(bounded_menu_segment_schema(), 1, MAX_MENU_PATH_SEGMENTS as u64)),
+                ],
+                &["process_id", "window_id", "path"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_KEYBOARD_INPUT,
+            "Send one bounded semantic key with optional modifiers using explicit background or foreground delivery.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("key", keyboard_key_schema()),
+                    ("modifiers", keyboard_modifiers_schema()),
+                    ("target_kind", input_target_kind_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("x", signed_integer_schema()),
+                    ("y", signed_integer_schema()),
+                    ("delivery", delivery_mode_schema()),
+                ],
+                &["key"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_SCROLL,
+            "Scroll a focused window region, exact window point, or desktop point with explicit coordinate targeting.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("direction", scroll_direction_schema()),
+                    ("granularity", scroll_granularity_schema()),
+                    ("amount", bounded_positive_integer_schema(50)),
+                    ("target_kind", scroll_target_kind_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("x", signed_integer_schema()),
+                    ("y", signed_integer_schema()),
+                    ("delivery", delivery_mode_schema()),
+                ],
+                &["direction"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_CLIPBOARD_READ,
+            "Read bounded clipboard type metadata and optionally privacy-sensitive plain text. Clipboard content is never telemetry.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("include_text", boolean_schema()),
+                ],
+                &[],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_CLIPBOARD_WRITE,
+            "Replace the clipboard with bounded plain text. File/image clipboard writes require a future CUMG-issued file ref.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("text", clipboard_text_schema()),
+                ],
+                &["text"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_GET_POINTER_POSITION,
+            "Read the current real pointer position. Requires an explicitly desktop-scoped interaction context.",
+            object_schema(
+                vec![("context_id", interaction_context_id_schema())],
+                &["context_id"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_MOVE_POINTER,
+            "Move the real OS pointer in desktop physical screenshot pixels.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("x", signed_integer_schema()),
+                    ("y", signed_integer_schema()),
+                ],
+                &["context_id", "x", "y"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_SET_UI_VALUE,
+            "Set a bounded value on a UI element ref minted by inspect_window in the same interaction context.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("value", bounded_text_or_empty_schema()),
+                ],
+                &["context_id", "process_id", "window_id", "element_ref", "value"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_CAPTURE_REGION,
+            "Capture a bounded window-local region without hidden zoom-coordinate state.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("x", signed_integer_schema()),
+                    ("y", signed_integer_schema()),
+                    ("width", positive_integer_schema()),
+                    ("height", positive_integer_schema()),
+                ],
+                &["process_id", "window_id", "x", "y", "width", "height"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_EXPAND_INTERACTION_SCOPE,
+            "Explicitly and monotonically expand one authorized interaction context from window-scoped to desktop-scoped execution.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("reason", bounded_reason_schema()),
+                ],
+                &["context_id", "reason"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(true)),
     ]
 }
 
@@ -1593,8 +2672,82 @@ fn object_schema(properties: Vec<(&str, Value)>, required: &[&str]) -> Arc<JsonO
     Arc::new(schema)
 }
 
+fn interaction_context_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^ctx_[0-9a-f]{32}$"
+    })
+}
+
+fn scoped_ref_schema() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^ref_[0-9a-f]{32}$"
+    })
+}
+
+fn bounded_reason_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": 200 })
+}
+
+fn bounded_text_or_empty_schema() -> Value {
+    json!({ "type": "string", "maxLength": MAX_TYPE_TEXT_BYTES })
+}
+
 fn string_schema() -> Value {
     json!({ "type": "string", "minLength": 1 })
+}
+
+fn enum_string_schema(values: &[&str]) -> Value {
+    json!({ "type": "string", "enum": values })
+}
+
+fn pointer_button_schema() -> Value {
+    enum_string_schema(&["left", "right", "middle"])
+}
+
+fn pointer_coordinate_space_schema() -> Value {
+    enum_string_schema(&["desktop_physical", "window_physical"])
+}
+
+fn delivery_mode_schema() -> Value {
+    enum_string_schema(&["background", "foreground"])
+}
+
+fn input_target_kind_schema() -> Value {
+    enum_string_schema(&["desktop", "window", "window_point"])
+}
+
+fn scroll_target_kind_schema() -> Value {
+    enum_string_schema(&["window", "window_point", "desktop_point"])
+}
+
+fn keyboard_modifier_schema() -> Value {
+    enum_string_schema(&["meta", "shift", "alt", "control", "function"])
+}
+
+fn keyboard_modifiers_schema() -> Value {
+    bounded_array_schema(keyboard_modifier_schema(), 0, MAX_KEYBOARD_MODIFIERS as u64)
+}
+
+fn scroll_direction_schema() -> Value {
+    enum_string_schema(&["up", "down", "left", "right"])
+}
+
+fn scroll_granularity_schema() -> Value {
+    enum_string_schema(&["line", "page"])
+}
+
+fn keyboard_key_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": 16 })
+}
+
+fn bounded_menu_segment_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": MAX_MENU_SEGMENT_BYTES })
+}
+
+fn clipboard_text_schema() -> Value {
+    json!({ "type": "string", "maxLength": MAX_CLIPBOARD_TEXT_BYTES })
 }
 
 fn array_schema(items: Value) -> Value {
@@ -1712,6 +2865,51 @@ fn ui_predicate_schema() -> Value {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EmptyArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextIdArgs {
+    context_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScreenshotArgs {
+    context_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpandInteractionScopeArgs {
+    context_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetUiValueArgs {
+    context_id: String,
+    process_id: u32,
+    window_id: u64,
+    element_ref: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureRegionArgs {
+    context_id: Option<String>,
+    process_id: u32,
+    window_id: u64,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListWindowsArgs {
     process_id: Option<u32>,
     #[serde(default)]
@@ -1732,6 +2930,7 @@ struct LaunchApplicationArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InspectWindowArgs {
+    context_id: Option<String>,
     process_id: u32,
     window_id: u64,
     query: Option<String>,
@@ -1746,6 +2945,7 @@ struct InspectWindowArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerifyUiStateArgs {
+    context_id: Option<String>,
     process_id: u32,
     window_id: u64,
     expect: Vec<UiPredicate>,
@@ -1885,25 +3085,328 @@ fn validate_ui_selector(selector: &crate::v2_m0::UiElementSelector) -> Result<()
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TypeTextArgs {
+    context_id: Option<String>,
     text: String,
+    target_kind: Option<String>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    x: Option<i32>,
+    y: Option<i32>,
+    delivery: Option<String>,
+    delay_ms: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClickArgs {
+    context_id: Option<String>,
     x: i32,
     y: i32,
     button: Option<String>,
+    coordinate_space: Option<String>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    click_count: Option<u8>,
+    #[serde(default)]
+    modifiers: Vec<String>,
+    delivery: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DragArgs {
+    context_id: Option<String>,
     from_x: i32,
     from_y: i32,
     to_x: i32,
     to_y: i32,
     duration_ms: u64,
+    coordinate_space: Option<String>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    button: Option<String>,
+    #[serde(default)]
+    modifiers: Vec<String>,
+    delivery: Option<String>,
+    steps: Option<u16>,
+}
+
+fn require_positive_process_id(process_id: u32) -> Result<(), McpError> {
+    if process_id == 0 {
+        Err(McpError::invalid_params(
+            "process_id must be positive",
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_delivery_mode(value: Option<&str>) -> Result<InputDeliveryMode, McpError> {
+    match value.unwrap_or("background") {
+        "background" => Ok(InputDeliveryMode::Background),
+        "foreground" => Ok(InputDeliveryMode::Foreground),
+        _ => Err(McpError::invalid_params(
+            "delivery must be background or foreground",
+            None,
+        )),
+    }
+}
+
+fn parse_keyboard_modifiers(values: &[String]) -> Result<Vec<KeyboardModifier>, McpError> {
+    if values.len() > MAX_KEYBOARD_MODIFIERS {
+        return Err(McpError::invalid_params(
+            "too many keyboard modifiers",
+            None,
+        ));
+    }
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        let modifier = match value.as_str() {
+            "meta" => KeyboardModifier::Meta,
+            "shift" => KeyboardModifier::Shift,
+            "alt" => KeyboardModifier::Alt,
+            "control" => KeyboardModifier::Control,
+            "function" => KeyboardModifier::Function,
+            _ => return Err(McpError::invalid_params("invalid keyboard modifier", None)),
+        };
+        if output.contains(&modifier) {
+            return Err(McpError::invalid_params(
+                "duplicate keyboard modifier",
+                None,
+            ));
+        }
+        output.push(modifier);
+    }
+    Ok(output)
+}
+
+fn validate_keyboard_key_input(key: &str) -> Result<(), McpError> {
+    let named = [
+        "return", "tab", "escape", "up", "down", "left", "right", "space", "delete", "home", "end",
+        "pageup", "pagedown", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11",
+        "f12",
+    ];
+    let single_ascii = key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric();
+    if single_ascii || named.contains(&key) {
+        Ok(())
+    } else {
+        Err(McpError::invalid_params("unsupported keyboard key", None))
+    }
+}
+
+fn parse_pointer_target(
+    coordinate_space: Option<&str>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    x: i32,
+    y: i32,
+) -> Result<PointerTarget, McpError> {
+    match coordinate_space.unwrap_or_else(|| {
+        if process_id.is_some() || window_id.is_some() {
+            "window_physical"
+        } else {
+            "desktop_physical"
+        }
+    }) {
+        "desktop_physical" => {
+            if process_id.is_some() || window_id.is_some() {
+                return Err(McpError::invalid_params(
+                    "desktop_physical cannot include process_id or window_id",
+                    None,
+                ));
+            }
+            Ok(PointerTarget::DesktopPhysical { x, y })
+        }
+        "window_physical" => {
+            let process_id = process_id.ok_or_else(|| {
+                McpError::invalid_params("window_physical requires process_id", None)
+            })?;
+            let window_id = window_id.ok_or_else(|| {
+                McpError::invalid_params("window_physical requires window_id", None)
+            })?;
+            validate_window_args(process_id, window_id)?;
+            Ok(PointerTarget::WindowPhysical {
+                process_id,
+                window_id,
+                x,
+                y,
+            })
+        }
+        _ => Err(McpError::invalid_params(
+            "coordinate_space must be desktop_physical or window_physical",
+            None,
+        )),
+    }
+}
+
+fn parse_input_target(
+    target_kind: Option<&str>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> Result<InputTarget, McpError> {
+    let inferred = target_kind.unwrap_or_else(|| {
+        if x.is_some() || y.is_some() {
+            "window_point"
+        } else if process_id.is_some() || window_id.is_some() {
+            "window"
+        } else {
+            "desktop"
+        }
+    });
+    match inferred {
+        "desktop" => {
+            if process_id.is_some() || window_id.is_some() || x.is_some() || y.is_some() {
+                return Err(McpError::invalid_params(
+                    "desktop target cannot include process/window/point fields",
+                    None,
+                ));
+            }
+            Ok(InputTarget::Desktop)
+        }
+        "window" => {
+            let process_id = process_id.ok_or_else(|| {
+                McpError::invalid_params("window target requires process_id", None)
+            })?;
+            require_positive_process_id(process_id)?;
+            if window_id == Some(0) || x.is_some() || y.is_some() {
+                return Err(McpError::invalid_params("invalid window target", None));
+            }
+            Ok(InputTarget::Window {
+                process_id,
+                window_id,
+            })
+        }
+        "window_point" => {
+            let process_id = process_id.ok_or_else(|| {
+                McpError::invalid_params("window_point requires process_id", None)
+            })?;
+            let window_id = window_id
+                .ok_or_else(|| McpError::invalid_params("window_point requires window_id", None))?;
+            let x = x.ok_or_else(|| McpError::invalid_params("window_point requires x", None))?;
+            let y = y.ok_or_else(|| McpError::invalid_params("window_point requires y", None))?;
+            validate_window_args(process_id, window_id)?;
+            Ok(InputTarget::WindowPoint {
+                process_id,
+                window_id,
+                x,
+                y,
+            })
+        }
+        _ => Err(McpError::invalid_params(
+            "target_kind must be desktop, window, or window_point",
+            None,
+        )),
+    }
+}
+
+fn parse_scroll_target(
+    target_kind: Option<&str>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> Result<ScrollTarget, McpError> {
+    let inferred = target_kind.unwrap_or_else(|| {
+        if process_id.is_some() && (x.is_some() || y.is_some()) {
+            "window_point"
+        } else if process_id.is_some() || window_id.is_some() {
+            "window"
+        } else if x.is_some() || y.is_some() {
+            "desktop_point"
+        } else {
+            "window"
+        }
+    });
+    match inferred {
+        "window" => {
+            let process_id = process_id.ok_or_else(|| {
+                McpError::invalid_params("window scroll requires process_id", None)
+            })?;
+            require_positive_process_id(process_id)?;
+            if window_id == Some(0) || x.is_some() || y.is_some() {
+                return Err(McpError::invalid_params(
+                    "invalid window scroll target",
+                    None,
+                ));
+            }
+            Ok(ScrollTarget::Window {
+                process_id,
+                window_id,
+            })
+        }
+        "window_point" => {
+            let process_id = process_id.ok_or_else(|| {
+                McpError::invalid_params("window_point scroll requires process_id", None)
+            })?;
+            let window_id = window_id.ok_or_else(|| {
+                McpError::invalid_params("window_point scroll requires window_id", None)
+            })?;
+            let x =
+                x.ok_or_else(|| McpError::invalid_params("window_point scroll requires x", None))?;
+            let y =
+                y.ok_or_else(|| McpError::invalid_params("window_point scroll requires y", None))?;
+            validate_window_args(process_id, window_id)?;
+            Ok(ScrollTarget::WindowPoint {
+                process_id,
+                window_id,
+                x,
+                y,
+            })
+        }
+        "desktop_point" => {
+            if process_id.is_some() || window_id.is_some() {
+                return Err(McpError::invalid_params(
+                    "desktop_point cannot include process_id or window_id",
+                    None,
+                ));
+            }
+            let x =
+                x.ok_or_else(|| McpError::invalid_params("desktop_point scroll requires x", None))?;
+            let y =
+                y.ok_or_else(|| McpError::invalid_params("desktop_point scroll requires y", None))?;
+            Ok(ScrollTarget::DesktopPoint { x, y })
+        }
+        _ => Err(McpError::invalid_params(
+            "target_kind must be window, window_point, or desktop_point",
+            None,
+        )),
+    }
+}
+
+fn parse_scroll_direction(value: &str) -> Result<ScrollDirection, McpError> {
+    match value {
+        "up" => Ok(ScrollDirection::Up),
+        "down" => Ok(ScrollDirection::Down),
+        "left" => Ok(ScrollDirection::Left),
+        "right" => Ok(ScrollDirection::Right),
+        _ => Err(McpError::invalid_params("invalid scroll direction", None)),
+    }
+}
+
+fn parse_scroll_granularity(value: Option<&str>) -> Result<ScrollGranularity, McpError> {
+    match value.unwrap_or("line") {
+        "line" => Ok(ScrollGranularity::Line),
+        "page" => Ok(ScrollGranularity::Page),
+        _ => Err(McpError::invalid_params("invalid scroll granularity", None)),
+    }
+}
+
+fn validate_menu_path(path: &[String]) -> Result<(), McpError> {
+    if path.is_empty()
+        || path.len() > MAX_MENU_PATH_SEGMENTS
+        || path
+            .iter()
+            .any(|segment| segment.trim().is_empty() || segment.len() > MAX_MENU_SEGMENT_BYTES)
+    {
+        return Err(McpError::invalid_params(
+            "invalid application menu path",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn parse_pointer_button(value: Option<&str>) -> Result<PointerButton, McpError> {
@@ -1916,6 +3419,104 @@ fn parse_pointer_button(value: Option<&str>) -> Result<PointerButton, McpError> 
             None,
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessIdArgs {
+    process_id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateWindowArgs {
+    process_id: u32,
+    window_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetWindowFrameArgs {
+    context_id: Option<String>,
+    process_id: u32,
+    window_id: u64,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvokeMenuArgs {
+    context_id: Option<String>,
+    process_id: u32,
+    window_id: u64,
+    path: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyboardInputArgs {
+    context_id: Option<String>,
+    key: String,
+    #[serde(default)]
+    modifiers: Vec<String>,
+    target_kind: Option<String>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    x: Option<i32>,
+    y: Option<i32>,
+    delivery: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScrollArgs {
+    context_id: Option<String>,
+    direction: String,
+    granularity: Option<String>,
+    #[serde(default = "default_scroll_amount")]
+    amount: u8,
+    target_kind: Option<String>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    x: Option<i32>,
+    y: Option<i32>,
+    delivery: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClipboardReadArgs {
+    context_id: Option<String>,
+    #[serde(default)]
+    include_text: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClipboardWriteArgs {
+    context_id: Option<String>,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PointerPositionArgs {
+    context_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MovePointerArgs {
+    context_id: String,
+    x: i32,
+    y: i32,
+}
+
+fn default_scroll_amount() -> u8 {
+    3
 }
 
 #[derive(Debug, Deserialize)]
@@ -2461,7 +4062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_2026_mcp_request_receives_only_exactly_authorized_tools() {
+    async fn authenticated_2026_mcp_request_exposes_no_device_tools_without_live_agent() {
         use crate::{
             v2_m0::{DeviceIdentity, GrantAuthority},
             v2_m0_transport::HubIdentity,
@@ -2541,7 +4142,9 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert_eq!(names, vec![TOOL_READ_FILE]);
+        // Authentication and policy allow are necessary but not sufficient. This
+        // fixture has no live Agent advertisement, so discovery must stay empty.
+        assert!(names.is_empty());
 
         task.abort();
         drop(hub);
@@ -2549,7 +4152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_proxy_mcp_ignores_caller_identity_and_keeps_exact_policy() {
+    async fn trusted_proxy_mcp_ignores_caller_identity_but_requires_live_agent() {
         use crate::{
             v2_m0::{DeviceIdentity, GrantAuthority},
             v2_m0_transport::HubIdentity,
@@ -2625,7 +4228,9 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert_eq!(names, vec![TOOL_READ_FILE]);
+        // The fixed trusted-proxy principal is still authoritative, but policy
+        // alone does not manufacture a backend capability while the Agent is offline.
+        assert!(names.is_empty());
 
         task.abort();
         drop(hub);
@@ -2669,24 +4274,21 @@ mod tests {
             revision: 1,
             supported: vec![DeviceCapability::ListWindows],
         };
-        assert!(capability_is_live_or_unknown(
+        assert!(capability_is_live(
             Some(&advertisement),
             DeviceCapability::ListWindows,
         ));
-        assert!(!capability_is_live_or_unknown(
+        assert!(!capability_is_live(
             Some(&advertisement),
             DeviceCapability::InspectWindow,
         ));
-        // Offline discovery keeps the authorized semantic contract visible; dispatch
-        // still fails closed as AgentOffline until a new live advertisement exists.
-        assert!(capability_is_live_or_unknown(
-            None,
-            DeviceCapability::InspectWindow,
-        ));
+        // Discovery is the exact intersection of policy and a live backend
+        // advertisement. An offline Agent exposes no semantic device tools.
+        assert!(!capability_is_live(None, DeviceCapability::InspectWindow,));
     }
 
     #[test]
-    fn northbound_exposes_existing_exact_cua_capabilities_without_generic_raw_tool() {
+    fn northbound_exposes_typed_semantic_capabilities_without_generic_raw_tool() {
         let mappings = [
             (TOOL_LIST_APPS, DeviceCapability::ListApplications),
             (TOOL_GET_SCREEN_SIZE, DeviceCapability::ScreenGeometry),
@@ -2702,15 +4304,38 @@ mod tests {
             (TOOL_LAUNCH_APPLICATION, DeviceCapability::LaunchApplication),
             (TOOL_INSPECT_WINDOW, DeviceCapability::InspectWindow),
             (TOOL_VERIFY_UI_STATE, DeviceCapability::VerifyUiState),
+            (
+                TOOL_TERMINATE_APPLICATION,
+                DeviceCapability::TerminateApplication,
+            ),
+            (TOOL_ACTIVATE_WINDOW, DeviceCapability::ActivateWindow),
+            (TOOL_SET_WINDOW_FRAME, DeviceCapability::SetWindowFrame),
+            (TOOL_INVOKE_MENU, DeviceCapability::InvokeMenu),
+            (TOOL_KEYBOARD_INPUT, DeviceCapability::KeyboardInput),
+            (TOOL_SCROLL, DeviceCapability::Scroll),
+            (TOOL_CLIPBOARD_READ, DeviceCapability::ClipboardRead),
+            (TOOL_CLIPBOARD_WRITE, DeviceCapability::ClipboardWrite),
+            (TOOL_GET_POINTER_POSITION, DeviceCapability::PointerPosition),
+            (TOOL_MOVE_POINTER, DeviceCapability::MovePointer),
+            (TOOL_SET_UI_VALUE, DeviceCapability::SetUiValue),
+            (TOOL_CAPTURE_REGION, DeviceCapability::CaptureRegion),
+            (
+                TOOL_EXPAND_INTERACTION_SCOPE,
+                DeviceCapability::DesktopScope,
+            ),
         ];
         for (tool, capability) in mappings {
             assert_eq!(tool_capability(tool), Some(capability));
         }
+        assert_eq!(tool_capability(TOOL_OPEN_INTERACTION_CONTEXT), None);
+        assert_eq!(tool_capability(TOOL_CLOSE_INTERACTION_CONTEXT), None);
         let names: Vec<_> = all_tools()
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names.len(), mappings.len());
+        assert_eq!(names.len(), mappings.len() + 2);
+        assert!(names.contains(&TOOL_OPEN_INTERACTION_CONTEXT.to_owned()));
+        assert!(names.contains(&TOOL_CLOSE_INTERACTION_CONTEXT.to_owned()));
         assert!(
             !names
                 .iter()
@@ -2740,6 +4365,58 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_value::<TypeTextArgs>(serde_json::json!({"text": "ok"})).is_ok());
+    }
+
+    #[test]
+    fn interaction_scope_classification_is_explicit_and_monotonic() {
+        let context_id = Some("ctx_0123456789abcdef0123456789abcdef".into());
+        let window_click = DeviceCommand::PointerClickAdvanced {
+            context_id: context_id.clone(),
+            target: PointerTarget::WindowPhysical {
+                process_id: 1,
+                window_id: 2,
+                x: 3,
+                y: 4,
+            },
+            button: PointerButton::Left,
+            click_count: 1,
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Background,
+        };
+        assert!(command_requires_window_scope(&window_click));
+        assert!(!command_requires_desktop_scope(&window_click));
+
+        let desktop_click = DeviceCommand::PointerClickAdvanced {
+            context_id,
+            target: PointerTarget::DesktopPhysical { x: 3, y: 4 },
+            button: PointerButton::Left,
+            click_count: 1,
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Foreground,
+        };
+        assert!(command_requires_desktop_scope(&desktop_click));
+        assert!(!command_requires_window_scope(&desktop_click));
+
+        let capture = DeviceCommand::CaptureRegion {
+            context_id: Some("ctx_0123456789abcdef0123456789abcdef".into()),
+            process_id: 1,
+            window_id: 2,
+            bounds: UiRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        };
+        assert!(command_requires_window_scope(&capture));
+        assert!(!command_requires_desktop_scope(&capture));
+
+        let clipboard = DeviceCommand::ClipboardRead {
+            context_id: Some("ctx_0123456789abcdef0123456789abcdef".into()),
+            include_text: false,
+        };
+        assert!(!command_requires_window_scope(&clipboard));
+        assert!(!command_requires_desktop_scope(&clipboard));
     }
 
     #[test]

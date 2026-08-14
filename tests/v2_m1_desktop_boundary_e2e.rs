@@ -20,7 +20,12 @@ use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 // This E2E validates the shared desktop ownership/quarantine boundary rather
-// than sub-second heartbeat timeout behavior.
+// than heartbeat timeout precision. The Agent treats 3 missed heartbeat
+// intervals as an acknowledgement timeout, so a 50 ms fixture interval turns
+// an ordinary hosted-runner fsync/deschedule into a 150 ms reconnect deadline.
+// Keep both sides comfortably outside that sub-second timing regime.
+const E2E_EVENTUALLY: Duration = Duration::from_secs(10);
+const E2E_AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -36,7 +41,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 async fn wait_online(handle: &computer_use_mcp_gateway::v2_m1_hub::HubHandle) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(E2E_EVENTUALLY, async {
         while !handle.is_online().await {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -108,7 +113,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
             device_id,
             allowed_cwd_roots: vec![cwd.clone(), state_root.clone()],
             state_dir: agent_state,
-            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),
                 max_delay: Duration::from_millis(100),
@@ -166,9 +171,11 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
                 },
             },
         )
-        .await?
+        .await
+        .context("shell command admission lost the Agent session")?
         .wait()
-        .await?;
+        .await
+        .context("shell command result lost the Agent session")?;
     assert!(app_marker.is_file());
     assert_eq!(shell.receipt.owner, alice);
     assert_eq!(shell.receipt.terminal_state, HubOperationState::Completed);
@@ -188,7 +195,8 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
                 duration_ms: 10_000,
             },
         )
-        .await?;
+        .await
+        .context("Cua drag admission lost the Agent session")?;
     let ambiguous_operation = pending.operation_id.clone();
     tokio::time::timeout(Duration::from_secs(3), async {
         while !drag_marker.is_file() {
@@ -207,7 +215,8 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
     );
     let disposition = handle
         .cancel_as(alice.clone(), ambiguous_operation.clone())
-        .await?;
+        .await
+        .context("Cua cancellation acknowledgement lost the Agent session")?;
     assert_eq!(
         disposition,
         CancellationDisposition::IndeterminateAfterPropagation
@@ -287,9 +296,11 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
     assert_eq!(handle.current_generation().await, Some(initial_generation));
     let reused = handle
         .start_command_as(bob, DeviceCommand::ScreenGeometry)
-        .await?
+        .await
+        .context("post-resolution admission lost the Agent session")?
         .wait()
-        .await?;
+        .await
+        .context("post-resolution result lost the Agent session")?;
     assert!(matches!(reused.result, DeviceResult::ScreenGeometry { .. }));
 
     // Resolution reopens the desktop but never replays the old Cua action.

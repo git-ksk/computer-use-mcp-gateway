@@ -141,6 +141,91 @@ def handle_request(message: dict) -> None:
                         "inputSchema": {"type": "object", "additionalProperties": True},
                     },
                     {
+                        "name": "click",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "drag",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "kill_app",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "bring_to_front",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "set_window_frame",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "invoke_menu",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "press_key",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "scroll",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "clipboard_read",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "clipboard_write",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "get_cursor_position",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "move_cursor",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "set_value",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "zoom",
+                        "description": "Desktop semantic fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "start_session",
+                        "description": "Interaction lifecycle fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "escalate_session",
+                        "description": "Interaction lifecycle fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "end_session",
+                        "description": "Interaction lifecycle fixture",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
                         "name": "echo_contract",
                         "description": "Records exact arguments and returns backend identity data unchanged",
                         "inputSchema": {"type": "object", "additionalProperties": True},
@@ -340,6 +425,95 @@ def handle_request(message: dict) -> None:
                             {"index": i, "status": "satisfied", "unknown_reason": None}
                             for i, _ in enumerate(expect)
                         ],
+                    },
+                    "isError": False,
+                },
+            )
+            return
+        if name in {
+            "click",
+            "drag",
+            "kill_app",
+            "set_window_frame",
+            "invoke_menu",
+            "press_key",
+            "scroll",
+            "clipboard_write",
+            "move_cursor",
+            "set_value",
+            "start_session",
+            "escalate_session",
+            "end_session",
+        }:
+            arguments = params.get("arguments") or {}
+            touch(
+                ARGS_MARKER,
+                json.dumps({"tool": name, "arguments": arguments}, sort_keys=True, separators=(",", ":")),
+            )
+            structured = None
+            if name == "clipboard_write":
+                structured = {"types": ["public.utf8-plain-text"]}
+            payload = {
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": False,
+            }
+            if structured is not None:
+                payload["structuredContent"] = structured
+            result(request_id, payload)
+            return
+        if name == "bring_to_front":
+            arguments = params.get("arguments") or {}
+            result(
+                request_id,
+                {
+                    "content": [],
+                    "structuredContent": {
+                        "process_activated": True,
+                        "exact_window_effect": {
+                            "verified": arguments.get("window_id") == 77,
+                        },
+                    },
+                    "isError": False,
+                },
+            )
+            return
+        if name == "clipboard_read":
+            arguments = params.get("arguments") or {}
+            result(
+                request_id,
+                {
+                    "content": [],
+                    "structuredContent": {
+                        "types": ["public.utf8-plain-text"],
+                        "text": "fixture clipboard" if arguments.get("include_text") else None,
+                    },
+                    "isError": False,
+                },
+            )
+            return
+        if name == "get_cursor_position":
+            result(
+                request_id,
+                {
+                    "content": [],
+                    "structuredContent": {"x": 123.0, "y": 456.0},
+                    "isError": False,
+                },
+            )
+            return
+        if name == "zoom":
+            result(
+                request_id,
+                {
+                    "content": [
+                        {"type": "image", "data": "/9j/2Q==", "mimeType": "image/jpeg"}
+                    ],
+                    "structuredContent": {
+                        "format": "jpeg",
+                        "mime_type": "image/jpeg",
+                        "screenshot_mime_type": "image/jpeg",
+                        "width": 144,
+                        "height": 96,
                     },
                     "isError": False,
                 },

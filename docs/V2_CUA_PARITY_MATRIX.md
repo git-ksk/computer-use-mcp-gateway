@@ -40,25 +40,25 @@ method escape hatch.
 | 3 | `get_window_state` | semantic, current | `InspectWindow` / `inspect_window` |
 | 4 | `verify_state` | semantic, current | `VerifyUiState` / `verify_ui_state` |
 | 5 | `launch_app` | semantic, current | `LaunchApplication` / `launch_application` |
-| 6 | `kill_app` | semantic, planned | `TerminateApplication` |
-| 7 | `bring_to_front` | semantic, planned | `ActivateWindow` or `ActivateApplication` |
-| 8 | `set_window_frame` | semantic, planned | `SetWindowFrame` |
-| 9 | `invoke_menu` | semantic, planned | exact bounded `InvokeMenu` |
-| 10 | `click` | semantic, current | `PointerClick`; extend with click count and coordinate space |
+| 6 | `kill_app` | semantic, current | `TerminateApplication` |
+| 7 | `bring_to_front` | semantic, current | `ActivateWindow` with exact-window verification evidence |
+| 8 | `set_window_frame` | semantic, current | `SetWindowFrame` |
+| 9 | `invoke_menu` | semantic, current | exact bounded `InvokeMenu` |
+| 10 | `click` | semantic, current | `PointerClick`; typed count/button/modifiers and coordinate target |
 | 11 | `double_click` | integrated | `PointerClick { click_count: 2 }` |
 | 12 | `right_click` | integrated | `PointerClick { button: right }` |
-| 13 | `drag` | semantic, current | `PointerDrag`; add explicit coordinate space |
-| 14 | `type_text` | semantic, current | `TypeText`; later context-aware targeting |
-| 15 | `press_key` | semantic, planned | `KeyboardInput` |
+| 13 | `drag` | semantic, current | `PointerDrag`; typed endpoints, modifiers, duration, and steps |
+| 14 | `type_text` | semantic, current | `TypeText`; bounded contextual target/delivery semantics |
+| 15 | `press_key` | semantic, current | `KeyboardInput` |
 | 16 | `hotkey` | integrated | `KeyboardInput` chord |
-| 17 | `set_value` | semantic, planned | `SetUiValue` using scoped CUMG element refs |
-| 18 | `scroll` | semantic, planned | `Scroll` with explicit coordinate space/target |
-| 19 | `clipboard_read` | semantic, planned | `ClipboardRead` with bounded output and sensitive-data treatment |
-| 20 | `clipboard_write` | semantic, planned | `ClipboardWrite` with bounded input |
+| 17 | `set_value` | semantic, current | `SetUiValue` using scoped CUMG element refs |
+| 18 | `scroll` | semantic, current | `Scroll` with explicit coordinate space/target |
+| 19 | `clipboard_read` | semantic, current | `ClipboardRead` with bounded output and sensitive-data treatment |
+| 20 | `clipboard_write` | semantic, current | `ClipboardWrite` with bounded input |
 | 21 | `get_screen_size` | semantic, current | `ScreenGeometry` / `get_screen_size` |
-| 22 | `get_desktop_state` | semantic, planned | `InspectDesktop` with image + physical geometry |
-| 23 | `get_cursor_position` | semantic, planned | `PointerPosition` |
-| 24 | `move_cursor` | semantic, planned | `MovePointer` |
+| 22 | `get_desktop_state` | integrated, current | contextual `Screenshot` after explicit `DesktopScope` expansion |
+| 23 | `get_cursor_position` | semantic, current | `PointerPosition` |
+| 24 | `move_cursor` | semantic, current | `MovePointer` |
 | 25 | `set_agent_cursor_enabled` | backend lifecycle | interaction visualization policy |
 | 26 | `set_agent_cursor_motion` | backend lifecycle | interaction visualization policy |
 | 27 | `set_agent_cursor_theme` | backend lifecycle | interaction visualization policy |
@@ -68,7 +68,7 @@ method escape hatch.
 | 31 | `get_config` | operator-only | backend configuration inspection |
 | 32 | `set_config` | operator-only | backend configuration mutation |
 | 33 | `get_accessibility_tree` | integrated | `ListApplications` + `ListWindows`; no raw backend tree contract |
-| 34 | `zoom` | semantic, planned | bounded `CaptureRegion`; no `from_zoom` hidden coordinate state |
+| 34 | `zoom` | semantic, current | bounded window-local `CaptureRegion`; no hidden `from_zoom` state |
 | 35 | `page` | intentionally excluded/replaced | typed browser surface; arbitrary JS is not standard parity |
 | 36 | `get_browser_state` | semantic, planned | `BrowserInspect` |
 | 37 | `browser_prepare` | semantic, planned | `BrowserPrepare`; preserve Cua/backend authorization/refusal |
@@ -84,11 +84,41 @@ method escape hatch.
 | 47 | `get_recording_state` | operator/test-only | local acceptance/regression tooling |
 | 48 | `replay_trajectory` | intentionally excluded from production | test-only; never a production replay authority |
 | 49 | `install_ffmpeg` | operator-only | local dependency/setup plane |
-| 50 | `start_session` | backend lifecycle | created behind a CUMG `InteractionContext` |
-| 51 | `escalate_session` | explicit CUMG control semantic | monotonic `WindowScoped -> DesktopScoped`, separately authorized |
+| 50 | `start_session` | backend lifecycle, current | CUMG context ID is the backend session ID |
+| 51 | `escalate_session` | explicit CUMG control, current | monotonic `WindowScoped -> DesktopScoped` |
 | 52 | `get_session_state` | backend lifecycle/diagnostic | context health may be exposed only as bounded CUMG state |
-| 53 | `end_session` | backend lifecycle | context close/expiry tears down backend session |
+| 53 | `end_session` | backend lifecycle, current | close/expiry/generation/revision cleanup ends backend session |
 | 54 | `check_for_update` | operator-only | local update plane |
+
+
+## Desktop parity status
+
+The desktop semantic phase currently exposes 29 northbound tools on the Cua 0.19.3 shadow Agent.
+There is no generic Cua call/proxy tool. `tools/list` is the exact policy/live-advertisement
+intersection, and an offline Agent exposes no semantic device tools.
+
+Current desktop runtime acceptance covers:
+
+- context open bound atomically to device generation and capability revision;
+- contextual window inspection and CUMG snapshot/element ref minting;
+- `set_ui_value` through a same-context CUMG ref with read-back verification;
+- stale, unknown, cross-context, wrong-generation, and closed-context ref rejection;
+- verified exact-window activation;
+- representative background keyboard/scroll on an unambiguous target;
+- privacy-safe clipboard type-only observation;
+- bounded window-local region capture;
+- explicit `WindowScoped -> DesktopScoped` expansion followed by desktop screenshot;
+- CUMG pre-dispatch rejection of window-only commands after desktop expansion;
+- context close and generation fencing removing both CUMG refs and Cua session state.
+
+Cua safety refusals remain authoritative. A background key/scroll may be refused when the provider
+cannot prove which sibling window of one PID would receive process-scoped input; CUMG never turns
+that refusal into an automatic foreground or desktop escalation.
+
+`CONTROL_SCHEMA_VERSION` and `CAPABILITY_SCHEMA_VERSION` are both version 3. Pre-v3 mixing fails
+closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded
+image/UI/clipboard/region observations use the reviewed large-result allowance. Clipboard plain text
+is capped at 1 MiB.
 
 ## Required implementation order
 
