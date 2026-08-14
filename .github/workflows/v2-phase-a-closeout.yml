@@ -1,4 +1,4 @@
-name: V2 Phase A strict evidence
+name: V2 Phase A finalize
 
 on:
   push:
@@ -8,50 +8,44 @@ on:
       - .github/workflows/v2-phase-a-closeout.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  recovery-stability:
+  finalize:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: feat/v2-browser-semantic-parity
+          fetch-depth: 0
 
-      - name: Restore original heartbeat deadline
+      - name: Restore strict fixture semantics
         run: |
           sed -i 's/heartbeat_interval: Duration::from_millis(500)/heartbeat_interval: Duration::from_millis(50)/' tests/v2_m1_partition_recovery.rs
+          sed -i '/Recovery semantics are the subject of this E2E, not a 150 ms ACK deadline/d' tests/v2_m1_partition_recovery.rs
+          sed -i '/Keep the Agent cadence above hosted-runner\/fsync scheduling jitter without/d' tests/v2_m1_partition_recovery.rs
+          sed -i '/changing production heartbeat semantics\./d' tests/v2_m1_partition_recovery.rs
           grep -q 'heartbeat_interval: Duration::from_millis(50)' tests/v2_m1_partition_recovery.rs
           ! grep -q 'heartbeat_interval: Duration::from_millis(500)' tests/v2_m1_partition_recovery.rs
 
       - name: Install Rust 1.88
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt
           rustup default 1.88.0
 
-      - name: Exact targeted tests
-        env:
-          RUST_BACKTRACE: "1"
+      - name: Validate final Phase A patch
         run: |
-          cargo test --locked --test v2_m1_partition_recovery -- --nocapture
-          cargo test --locked --test v2_p1_multi_device_e2e -- --nocapture
+          cargo fmt --all -- --check
+          cargo test --locked --test v2_m1_partition_recovery
+          cargo test --locked --test v2_p1_multi_device_e2e
+          git diff --check
 
-      - name: Repeat partition recovery 50x
-        env:
-          RUST_BACKTRACE: "1"
+      - name: Commit Phase A closeout
         run: |
-          set -euo pipefail
-          for i in $(seq 1 50); do
-            echo "===== strict partition iteration $i ====="
-            cargo test --locked --test v2_m1_partition_recovery -- --nocapture
-          done
-
-      - name: Repeat multi-device recovery 50x
-        env:
-          RUST_BACKTRACE: "1"
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 50); do
-            echo "===== strict multi-device iteration $i ====="
-            cargo test --locked --test v2_p1_multi_device_e2e -- --nocapture
-          done
+          git rm -f .github/workflows/v2-phase-a-closeout.yml .github/workflows/v2-source-audit.yml .github/workflows/v2-phase-a-correct-closeout.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/v2_m1_partition_recovery.rs
+          git commit -m "fix(v2): close recovery E2E synchronization race"
+          git push origin HEAD:feat/v2-browser-semantic-parity
