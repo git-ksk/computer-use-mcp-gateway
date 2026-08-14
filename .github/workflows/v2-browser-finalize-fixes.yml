@@ -1,0 +1,115 @@
+name: V2 browser finalize fixes
+
+on:
+  push:
+    branches:
+      - feat/v2-browser-semantic-parity
+    paths:
+      - .github/workflows/v2-browser-finalize-fixes.yml
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: feat/v2-browser-semantic-parity
+
+      - name: Apply exact fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one marker, found {count}: {old!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          cua = "src/v2_browser_cua.rs"
+          replace_once(
+              cua,
+              '        "paths".into(),\n        Value::Array(files.iter().map(|path| json!(path.as_str())).collect()),\n',
+              '        "files".into(),\n        Value::Array(files.iter().map(|path| json!(path.as_str())).collect()),\n',
+          )
+          replace_once(
+              cua,
+              '        assert_eq!(call.arguments()["paths"], json!(["/tmp/proven-upload.txt"]));\n',
+              '        assert_eq!(call.arguments()["files"], json!(["/tmp/proven-upload.txt"]));\n        assert!(!call.arguments().contains_key("paths"));\n',
+          )
+
+          test = "tests/v2_m1_partition_recovery.rs"
+          replace_once(
+              test,
+              '    let effect_marker = root.join("ambiguous-effect");\n',
+              '    let effect_marker = root.join("ambiguous-effect");\n    let started_marker = root.join("started");\n',
+          )
+          replace_once(
+              test,
+              '    let command = format!(\n        "sleep 1; printf ambiguous-effect > \'{}\'",\n        effect_marker.display()\n    );\n',
+              '    let command = format!(\n        "printf started > \'{}\'; sleep 1; printf ambiguous-effect > \'{}\'",\n        started_marker.display(),\n        effect_marker.display()\n    );\n',
+          )
+          replace_once(
+              test,
+              '    let operation_id = pending.operation_id.clone();\n    tokio::time::sleep(Duration::from_millis(120)).await;\n\n    // Drop the Agent network/runtime future after the Hub has durably marked\n    // dispatch. The already-spawned local worker can still complete, modeling a\n',
+              '    let operation_id = pending.operation_id.clone();\n    tokio::time::timeout(Duration::from_secs(3), async {\n        while !started_marker.is_file() {\n            tokio::time::sleep(Duration::from_millis(10)).await;\n        }\n    })\n    .await\n    .context("Agent local worker did not start before partition")?;\n\n    // Drop the Agent network/runtime future after the local worker has started\n    // and the Hub has durably marked dispatch. The worker can still complete, modeling a\n',
+          )
+          PY
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt
+          rustup default 1.88.0
+
+      - name: Format and diff check
+        run: |
+          cargo fmt
+          git diff --check
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
+      - name: Targeted tests
+        run: |
+          cargo test --locked v2_browser_cua::tests::upload_never_accepts_arbitrary_paths_from_the_browser_request -- --exact
+          cargo test --locked --test v2_m1_partition_recovery
+
+      - name: Repeat partition recovery
+        run: |
+          for i in $(seq 1 20); do
+            echo "===== partition iteration $i ====="
+            cargo test --locked --test v2_m1_partition_recovery
+          done
+
+      - name: Repeat multi-device recovery
+        run: |
+          for i in $(seq 1 20); do
+            echo "===== multi-device iteration $i ====="
+            cargo test --locked --test v2_p1_multi_device_e2e
+          done
+
+      - name: Full test
+        run: cargo test --locked
+
+      - name: Commit verified fixes and remove diagnostics
+        shell: bash
+        run: |
+          git rm -f \
+            .github/workflows/v2-browser-finalize-fixes.yml \
+            .github/workflows/transfer-upload-schema-fix.yml \
+            .github/workflows/v2-session-race-diagnostic.yml \
+            .github/workflows/v2-session-race-fix.yml \
+            .github/workflows/v2-partition-sync-diagnostic.yml \
+            .github/workflows/v2-e2e-timing-diagnostic.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/v2_browser_cua.rs tests/v2_m1_partition_recovery.rs
+          git commit -m "fix(v2): align Cua upload schema and partition E2E"
+          git push origin HEAD:feat/v2-browser-semantic-parity
