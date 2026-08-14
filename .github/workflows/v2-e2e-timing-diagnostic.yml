@@ -1,0 +1,76 @@
+name: V2 E2E timing diagnostic
+
+on:
+  push:
+    branches:
+      - feat/v2-browser-semantic-parity
+    paths:
+      - .github/workflows/v2-e2e-timing-diagnostic.yml
+
+jobs:
+  repeat-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: feat/v2-browser-semantic-parity
+      - name: Patch deterministic test synchronization and realistic heartbeat cadence
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for name in ['tests/v2_m1_partition_recovery.rs', 'tests/v2_p1_multi_device_e2e.rs']:
+              p = Path(name)
+              s = p.read_text()
+              count = s.count('heartbeat_interval: Duration::from_millis(50),')
+              if count != 1:
+                  raise SystemExit(f'{name}: expected one 50ms heartbeat, got {count}')
+              p.write_text(s.replace(
+                  'heartbeat_interval: Duration::from_millis(50),',
+                  'heartbeat_interval: Duration::from_millis(500),',
+                  1,
+              ))
+
+          p = Path('tests/v2_m1_partition_recovery.rs')
+          s = p.read_text()
+          old_marker = '    let effect_marker = root.join("ambiguous-effect");\n'
+          new_marker = old_marker + '    let started_marker = root.join("started");\n'
+          if s.count(old_marker) != 1:
+              raise SystemExit('partition: expected one effect marker')
+          s = s.replace(old_marker, new_marker, 1)
+          old_command = '    let command = format!(\n        "sleep 1; printf ambiguous-effect > \'{}\'",\n        effect_marker.display()\n    );\n'
+          new_command = '    let command = format!(\n        "printf started > \'{}\'; sleep 1; printf ambiguous-effect > \'{}\'",\n        started_marker.display(),\n        effect_marker.display()\n    );\n'
+          if s.count(old_command) != 1:
+              raise SystemExit('partition: expected one ambiguous command')
+          s = s.replace(old_command, new_command, 1)
+          old_sleep = '    tokio::time::sleep(Duration::from_millis(120)).await;\n\n    // Drop the Agent network/runtime future after the Hub has durably marked\n'
+          new_wait = '    tokio::time::timeout(Duration::from_secs(3), async {\n        while !started_marker.is_file() {\n            tokio::time::sleep(Duration::from_millis(10)).await;\n        }\n    })\n    .await\n    .context("Agent local worker did not start before partition")?;\n\n    // Drop the Agent network/runtime future after the local worker has started and the Hub has durably marked\n'
+          if s.count(old_sleep) != 1:
+              raise SystemExit('partition: expected one fixed dispatch sleep')
+          p.write_text(s.replace(old_sleep, new_wait, 1))
+          PY
+          git diff --check
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Repeat partition recovery
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          for i in $(seq 1 10); do
+            echo "===== partition iteration $i ====="
+            cargo test --locked --test v2_m1_partition_recovery -- --nocapture
+          done
+
+      - name: Repeat multi-device recovery
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          for i in $(seq 1 10); do
+            echo "===== multi-device iteration $i ====="
+            cargo test --locked --test v2_p1_multi_device_e2e -- --nocapture
+          done
