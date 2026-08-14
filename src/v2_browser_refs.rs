@@ -785,20 +785,20 @@ mod tests {
 
     #[test]
     fn generation_revision_and_context_cleanup_drop_browser_refs() {
-        let context = context(4, 9);
+        let generation_context = context(4, 9);
         let mut refs = BrowserRefRegistry::default();
-        let _ = bound_tab(&mut refs, &context);
+        let _ = bound_tab(&mut refs, &generation_context);
         refs.invalidate_device_generation("dev-a", 5);
         assert!(refs.is_empty());
 
-        let context = context(5, 9);
-        let _ = bound_tab(&mut refs, &context);
+        let revision_context = context(5, 9);
+        let _ = bound_tab(&mut refs, &revision_context);
         refs.invalidate_capability_revision("dev-a", 10);
         assert!(refs.is_empty());
 
-        let context = context(5, 10);
-        let _ = bound_tab(&mut refs, &context);
-        refs.invalidate_context(context.id.as_str());
+        let cleanup_context = context(5, 10);
+        let _ = bound_tab(&mut refs, &cleanup_context);
+        refs.invalidate_context(cleanup_context.id.as_str());
         assert!(refs.is_empty());
     }
 

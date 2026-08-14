@@ -1772,8 +1772,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_browser_runtime::{BrowserBackendClickTarget, BrowserMutationEffect};
     use crate::v2_browser::BrowserInputRoute;
+    use crate::v2_browser_runtime::{BrowserBackendClickTarget, BrowserMutationEffect};
 
     fn capabilities(revision: u64) -> CapabilityAdvertisement {
         CapabilityAdvertisement {
@@ -1962,16 +1962,20 @@ mod tests {
         };
         assert_eq!(click.capability(), DeviceCapability::BrowserClick);
         assert_eq!(click.class(), CapabilityClass::Interact);
-        assert!(DeviceResult::Browser {
-            result: BrowserBackendResult::ClickCompleted {
-                effect: BrowserMutationEffect::Unverifiable,
-            },
-        }
-        .matches_command(&click));
-        assert!(!DeviceResult::Browser {
-            result: BrowserBackendResult::TypeCompleted,
-        }
-        .matches_command(&click));
+        assert!(
+            DeviceResult::Browser {
+                result: BrowserBackendResult::ClickCompleted {
+                    effect: BrowserMutationEffect::Unverifiable,
+                },
+            }
+            .matches_command(&click)
+        );
+        assert!(
+            !DeviceResult::Browser {
+                result: BrowserBackendResult::TypeCompleted,
+            }
+            .matches_command(&click)
+        );
 
         assert_eq!(
             DeviceCapability::BrowserUploadFile.class(),

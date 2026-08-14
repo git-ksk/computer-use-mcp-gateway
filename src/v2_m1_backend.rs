@@ -864,6 +864,9 @@ fn map_command(
         DeviceCommand::ListDirectory { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ListDirectory,
         )),
+        DeviceCommand::Browser { .. } => {
+            Err(M1BackendError::UnsupportedCommand(command.capability()))
+        }
     }
 }
 
@@ -962,6 +965,9 @@ fn normalize_result(
         DeviceCommand::ListDirectory { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ListDirectory,
         )),
+        DeviceCommand::Browser { .. } => {
+            Err(M1BackendError::UnsupportedCommand(command.capability()))
+        }
     }
 }
 

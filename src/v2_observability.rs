@@ -256,6 +256,15 @@ pub const fn capability_name(capability: DeviceCapability) -> &'static str {
         DeviceCapability::SetUiValue => "set_ui_value",
         DeviceCapability::CaptureRegion => "capture_region",
         DeviceCapability::DesktopScope => "desktop_scope",
+        DeviceCapability::BrowserInspect => "browser_inspect",
+        DeviceCapability::BrowserPrepare => "browser_prepare",
+        DeviceCapability::BrowserNavigate => "browser_navigate",
+        DeviceCapability::BrowserClick => "browser_click",
+        DeviceCapability::BrowserType => "browser_type",
+        DeviceCapability::BrowserDialog => "browser_dialog",
+        DeviceCapability::BrowserPointer => "browser_pointer",
+        DeviceCapability::BrowserUploadFile => "browser_upload_file",
+        DeviceCapability::BrowserDownload => "browser_download",
     }
 }
 

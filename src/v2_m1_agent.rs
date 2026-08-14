@@ -862,7 +862,8 @@ impl AgentService {
                                 | DeviceCommand::MovePointer { .. }
                                 | DeviceCommand::SetUiValue { .. }
                                 | DeviceCommand::CaptureRegion { .. }
-                                | DeviceCommand::ExpandInteractionScope { .. }) => {
+                                | DeviceCommand::ExpandInteractionScope { .. }
+                                | DeviceCommand::Browser { .. }) => {
                                     let computer_use = self
                                         .computer_use
                                         .clone()
