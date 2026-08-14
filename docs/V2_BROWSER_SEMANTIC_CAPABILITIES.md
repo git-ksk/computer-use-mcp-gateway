@@ -200,14 +200,16 @@ BrowserDownload {
   tab_ref,
   element_ref,
   destination_root_ref,
+  destination_name,
   max_bytes,
   overwrite
 }
 ```
 
 `destination_root_ref` is a CUMG-issued storage capability, not a caller-provided arbitrary path.
-`max_bytes` is mandatory and bounded by the protocol-wide absolute ceiling. Overwrite behavior is
-explicit for every request.
+`destination_name` is a caller-chosen, path-safe basename inside that root; it is never inferred
+from an untrusted server filename. `max_bytes` is mandatory and bounded by the protocol-wide
+absolute ceiling. Overwrite behavior applies to that exact destination name on every request.
 
 The normal result contains only an opaque download ref and byte count. Source URL, server filename,
 and resolved local destination path are not necessary northbound authority and should remain hidden
@@ -264,7 +266,7 @@ Browser parity is complete only when all of the following are true:
 7. backend input-trust refusal is preserved without automatic foreground or route switching;
 8. page dialogs use fresh opaque dialog refs and native dialogs remain excluded;
 9. upload has no local-path northbound field and accepts only exact CUMG file refs;
-10. download binds destination root, byte ceiling, and overwrite policy independently;
+10. download binds destination root, path-safe destination name, byte ceiling, and overwrite policy independently;
 11. ambiguous cancellation/timeout still creates the ordinary CUMG indeterminate/quarantine state;
 12. close/expiry/reconnect removes all browser refs and backend session state;
 13. resource/ref counts plateau under repeated browser context cycles;

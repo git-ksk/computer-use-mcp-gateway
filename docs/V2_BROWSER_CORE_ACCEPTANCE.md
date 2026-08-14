@@ -101,6 +101,7 @@ Download completion requires:
 
 - a CUMG-issued destination-root ref;
 - an existing canonical local root;
+- a caller-chosen path-safe destination basename, never an untrusted server filename;
 - a hard byte ceiling enforced during transfer, not only checked afterward;
 - explicit overwrite policy enforced before destination mutation;
 - exact `BrowserDownload` authorization and reviewed mapping to Cua's host-approval proof;

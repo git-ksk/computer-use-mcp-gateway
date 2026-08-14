@@ -602,6 +602,7 @@ mod tests {
             tab_ref: public_ref(2),
             element_ref: public_ref(3),
             destination_root_ref: public_ref(4),
+            destination_name: "download.bin".into(),
             max_bytes: 1024,
             overwrite: false,
         };

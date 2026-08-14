@@ -18,6 +18,7 @@ pub const MAX_BROWSER_PROMPT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_BROWSER_PROFILE_NAME_BYTES: usize = 128;
 pub const MAX_BROWSER_UPLOAD_FILES: usize = 32;
 pub const MAX_BROWSER_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_BROWSER_DOWNLOAD_NAME_BYTES: usize = 255;
 pub const MAX_BROWSER_SCROLL_DELTA_CSS_PX: i32 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +369,9 @@ pub struct BrowserDownloadRequest {
     /// CUMG-issued destination-root capability. No arbitrary local path crosses
     /// the northbound browser contract.
     pub destination_root_ref: String,
+    /// Caller-chosen path-safe basename inside the approved destination root.
+    /// This is not the server-provided filename.
+    pub destination_name: String,
     pub max_bytes: u64,
     pub overwrite: bool,
 }
@@ -379,6 +383,7 @@ impl BrowserDownloadRequest {
         validate_public_ref(&self.tab_ref)?;
         validate_public_ref(&self.element_ref)?;
         validate_public_ref(&self.destination_root_ref)?;
+        validate_download_destination_name(&self.destination_name)?;
         if self.max_bytes == 0 || self.max_bytes > MAX_BROWSER_DOWNLOAD_BYTES {
             return Err(BrowserContractError::InvalidDownloadBound);
         }
@@ -477,6 +482,7 @@ pub enum BrowserContractError {
     InvalidUploadSet,
     DuplicateFileRef,
     InvalidDownloadBound,
+    InvalidDownloadName,
 }
 
 impl fmt::Display for BrowserContractError {
@@ -529,6 +535,36 @@ fn validate_profile_name(value: &str) -> Result<(), BrowserContractError> {
             .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
     {
         return Err(BrowserContractError::InvalidProfileName);
+    }
+    Ok(())
+}
+
+fn validate_download_destination_name(value: &str) -> Result<(), BrowserContractError> {
+    if value.is_empty()
+        || value.len() > MAX_BROWSER_DOWNLOAD_NAME_BYTES
+        || value.trim() != value
+        || value == "."
+        || value == ".."
+        || value.chars().any(char::is_control)
+        || value
+            .chars()
+            .any(|ch| matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        || value.ends_with('.')
+    {
+        return Err(BrowserContractError::InvalidDownloadName);
+    }
+
+    let reserved_stem = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved = matches!(reserved_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (reserved_stem.len() == 4
+            && (reserved_stem.starts_with("COM") || reserved_stem.starts_with("LPT"))
+            && matches!(reserved_stem.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        return Err(BrowserContractError::InvalidDownloadName);
     }
     Ok(())
 }
@@ -670,6 +706,7 @@ mod tests {
             tab_ref: reference(2),
             element_ref: reference(3),
             destination_root_ref: reference(4),
+            destination_name: "download.bin".into(),
             max_bytes: 8 * 1024 * 1024,
             overwrite: false,
         }
@@ -683,12 +720,36 @@ mod tests {
                 tab_ref: reference(2),
                 element_ref: reference(3),
                 destination_root_ref: reference(4),
+                destination_name: "download.bin".into(),
                 max_bytes: 0,
                 overwrite: true,
             }
             .validate(),
             Err(BrowserContractError::InvalidDownloadBound)
         );
+
+        for invalid_name in [
+            "../escape",
+            "nested/file",
+            "nested\\file",
+            "CON.txt",
+            "name.",
+        ] {
+            assert_eq!(
+                BrowserDownloadRequest {
+                    context_id: CONTEXT.into(),
+                    target_ref: reference(1),
+                    tab_ref: reference(2),
+                    element_ref: reference(3),
+                    destination_root_ref: reference(4),
+                    destination_name: invalid_name.into(),
+                    max_bytes: 1024,
+                    overwrite: false,
+                }
+                .validate(),
+                Err(BrowserContractError::InvalidDownloadName)
+            );
+        }
     }
 
     #[test]
