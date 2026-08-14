@@ -141,7 +141,7 @@ The actual northbound runtime is now the V2 Hub. The default binary and the expl
 The usage seam is deliberately outside the authoritative execution controller:
 
 ```text
-OAuth verify -> verified issuer+subject -> reserve(1)
+northbound authentication -> verified issuer+subject -> reserve(1)
   -> exact DeviceCapability authorization
   -> CUMG admission / ownership / generation / quarantine
   -> markLiable()

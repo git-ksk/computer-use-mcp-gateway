@@ -41,17 +41,22 @@ MCP / OAuth / OIDC / IAM / delegated-auth / external policy
 
 ### Northbound authentication and delegated authorization
 
-Use MCP Authorization/OAuth, OIDC, IAM-like systems, or maintained delegated-authorization/capability systems rather than inventing another general public authorization protocol.
+Use MCP Authorization/OAuth, OIDC, IAM-like systems, or maintained delegated-authorization/capability systems rather than inventing another general public authentication or authorization protocol.
 
-The Hub reduces validated identity/authority to the local execution question:
+Keep authentication and CUMG authorization as separate replaceable boundaries:
 
 ```text
-principal -> stable desktop -> exact DeviceCapability
+external IdP / authenticated proxy
+        -> verified issuer + subject
+        -> AuthenticatedClientPrincipal
+        -> principal -> stable desktop -> exact DeviceCapability
 ```
 
-Northbound credentials are **not** Agent credentials and must never be forwarded southbound as a substitute for a device-scoped execution grant.
+The current token-validation adapter is RFC 7662 introspection. Treat it as one adapter, not the canonical identity protocol. Generic OIDC/JWT validation is the preferred signed-token adapter direction; a trusted authenticated-proxy adapter is appropriate for deployments whose origin is reachable only through that reviewed proxy/tunnel. Provider-specific logic must terminate before `AuthenticatedClientPrincipal`.
 
-Generic scope/expiry/revocation/delegation machinery is replaceable. What must survive replacement is the binding from authorized intent to the CUMG operation-ownership state machine.
+A trusted proxy that does not carry an authenticated per-user identity can only yield a configured/fixed principal and is therefore suitable only for an explicitly single-principal deployment. Multi-principal authorization must receive a tamper-resistant authenticated identity from the authentication boundary.
+
+Northbound credentials are **not** Agent credentials and must never be forwarded southbound as a substitute for a device-scoped execution grant. Generic scope/expiry/revocation/delegation machinery is replaceable. What must survive replacement is the binding from authorized intent to the CUMG operation-ownership state machine.
 
 ### Device fabric, registry, and fleet concerns
 

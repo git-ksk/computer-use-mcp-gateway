@@ -233,7 +233,7 @@ cargo run --locked -- --help
 cargo run --locked --bin v2_hub -- --help
 ```
 
-Configure the required Hub/grant/device-public/TLS/state paths plus the Agent-facing gRPC bind. To expose northbound MCP, also configure the loopback `CUMG_V2_MCP_BIND`, canonical public HTTPS resource, OAuth introspection settings, and exact principal -> device -> `DeviceCapability` policy from [`DEPLOYMENT.md`](DEPLOYMENT.md).
+Configure the required Hub/grant/device-public/TLS/state paths plus the Agent-facing gRPC bind. To expose northbound MCP with the current packaged adapter, also configure the loopback `CUMG_V2_MCP_BIND`, canonical public HTTPS resource, OAuth RFC 7662 introspection settings, and exact principal -> device -> `DeviceCapability` policy from [`DEPLOYMENT.md`](DEPLOYMENT.md). RFC 7662 is the current adapter rather than a core requirement; all supported northbound authentication adapters must reduce identity to the same `AuthenticatedClientPrincipal` before CUMG authorization.
 
 The northbound MCP is not a raw Cua proxy. The current typed V2 contract exposes the existing exact capabilities `list_apps`, `get_screen_size`, `click`, `drag`, `execute_process`, `shell`, `read_file`, and `list_directory`, filtered by the authenticated capability policy.
 
