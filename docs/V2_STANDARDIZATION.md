@@ -52,9 +52,9 @@ external IdP / authenticated proxy
         -> principal -> stable desktop -> exact DeviceCapability
 ```
 
-The current token-validation adapter is RFC 7662 introspection. Treat it as one adapter, not the canonical identity protocol. Generic OIDC/JWT validation is the preferred signed-token adapter direction; a trusted authenticated-proxy adapter is appropriate for deployments whose origin is reachable only through that reviewed proxy/tunnel. Provider-specific logic must terminate before `AuthenticatedClientPrincipal`.
+RFC 7662 introspection is one packaged token-validation adapter, not the canonical identity protocol. The packaged trusted authenticated-proxy fixed-principal adapter is appropriate for explicitly single-principal deployments whose origin is loopback-only behind that reviewed proxy/tunnel. Generic OIDC/JWT validation remains the preferred multi-principal signed-token direction. Provider-specific logic must terminate before `AuthenticatedClientPrincipal`.
 
-A trusted proxy that does not carry an authenticated per-user identity can only yield a configured/fixed principal and is therefore suitable only for an explicitly single-principal deployment. Multi-principal authorization must receive a tamper-resistant authenticated identity from the authentication boundary.
+The trusted-proxy runtime mode yields only its configured/fixed principal and is therefore suitable only for an explicitly single-principal deployment. It does not read arbitrary caller identity headers. Multi-principal authorization must receive a tamper-resistant authenticated identity from the authentication boundary.
 
 Northbound credentials are **not** Agent credentials and must never be forwarded southbound as a substitute for a device-scoped execution grant. Generic scope/expiry/revocation/delegation machinery is replaceable. What must survive replacement is the binding from authorized intent to the CUMG operation-ownership state machine.
 

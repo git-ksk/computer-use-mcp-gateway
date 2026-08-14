@@ -43,7 +43,7 @@ Authentication infrastructure proves caller identity; CUMG consumes only the nor
 verified external identity -> AuthenticatedClientPrincipal { issuer, subject }
 ```
 
-`OAuthIntrospectionVerifier` is the current concrete adapter behind `AccessTokenVerifier`; RFC 7662 is not a product-level requirement. A future generic OIDC/JWT adapter should verify signature and required claims against the configured issuer/audience and then emit the same principal. A trusted authenticated-proxy adapter may emit a proxy-proven identity, or a configured fixed principal for an explicitly single-principal deployment, but must not trust arbitrary client-supplied identity headers.
+`OAuthIntrospectionVerifier` remains the concrete token adapter behind `AccessTokenVerifier`; RFC 7662 is not a product-level requirement. The packaged trusted authenticated-proxy adapter now emits a configured fixed principal for an explicitly single-principal loopback deployment and ignores caller-supplied identity headers. A future generic OIDC/JWT adapter should verify signature and required claims against the configured issuer/audience and then emit the same principal for multi-principal deployments.
 
 This seam owns no user/account database. Token issuance, login/session state, password/MFA handling, and identity lifecycle remain with the external IdP or authentication edge.
 

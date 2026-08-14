@@ -12,7 +12,8 @@ use computer_use_mcp_gateway::{
     },
     v2_m1_northbound::{
         NorthboundMcpConfig, NorthboundPolicyDocument, OAuthIntrospectionConfig,
-        OAuthIntrospectionVerifier, V2NorthboundMcp, build_northbound_router,
+        OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp, build_northbound_router,
+        build_trusted_proxy_router,
     },
     v2_usage::{McpUsageController, UsageManager},
 };
@@ -82,6 +83,12 @@ struct Args {
     /// Integrity-protected JSON principal -> device -> exact-capability mapping.
     #[arg(long, env = "CUMG_V2_NORTHBOUND_POLICY_FILE")]
     northbound_policy_file: Option<PathBuf>,
+    /// Fixed authenticated principal for an explicitly single-principal trusted-proxy deployment.
+    /// Must be used only with a loopback listener reachable through the reviewed proxy/tunnel.
+    #[arg(long, env = "CUMG_V2_TRUSTED_PROXY_ISSUER")]
+    trusted_proxy_issuer: Option<String>,
+    #[arg(long, env = "CUMG_V2_TRUSTED_PROXY_SUBJECT")]
+    trusted_proxy_subject: Option<String>,
     #[arg(
         long,
         env = "CUMG_V2_OAUTH_INTROSPECTION_TIMEOUT_SECS",
@@ -108,7 +115,8 @@ struct NorthboundRuntime {
     bind: SocketAddr,
     router: axum::Router,
     resource: String,
-    metadata_url: String,
+    metadata_url: Option<String>,
+    auth_mode: &'static str,
 }
 
 #[tokio::main]
@@ -202,8 +210,9 @@ async fn main() -> Result<()> {
             event = "v2_northbound_mcp_start",
             bind = %northbound.bind,
             resource = %northbound.resource,
-            metadata_url = %northbound.metadata_url,
-            "starting OAuth-protected northbound MCP resource server"
+            metadata_url = northbound.metadata_url.as_deref().unwrap_or("none"),
+            auth_mode = northbound.auth_mode,
+            "starting protected northbound MCP resource server"
         );
         let http_shutdown = shutdown_rx;
         let http = axum::serve(listener, northbound.router)
@@ -223,22 +232,34 @@ fn build_northbound_runtime(
     handle: computer_use_mcp_gateway::v2_m1_hub::HubHandle,
     device_id: &str,
 ) -> Result<Option<NorthboundRuntime>> {
-    let configured = [
-        args.mcp_resource.is_some(),
+    let oauth_configured = [
         args.oauth_authorization_server.is_some(),
         args.oauth_introspection_endpoint.is_some(),
         args.oauth_introspection_client_id.is_some(),
         args.oauth_introspection_client_secret_file.is_some(),
         args.oauth_required_scopes.is_some(),
+    ]
+    .into_iter()
+    .any(|value| value);
+    let trusted_proxy_configured =
+        args.trusted_proxy_issuer.is_some() || args.trusted_proxy_subject.is_some();
+    ensure!(
+        !(oauth_configured && trusted_proxy_configured),
+        "OAuth introspection and trusted-proxy authentication modes are mutually exclusive"
+    );
+    let configured = [
+        args.mcp_resource.is_some(),
         args.northbound_policy_file.is_some(),
         args.usage_endpoint.is_some(),
+        oauth_configured,
+        trusted_proxy_configured,
     ]
     .into_iter()
     .any(|value| value);
 
     let Some(bind) = args.mcp_bind else {
         if configured {
-            bail!("CUMG_V2_MCP_BIND is required when northbound OAuth settings are configured");
+            bail!("CUMG_V2_MCP_BIND is required when northbound settings are configured");
         }
         return Ok(None);
     };
@@ -248,59 +269,12 @@ fn build_northbound_runtime(
     );
 
     let resource = required(&args.mcp_resource, "CUMG_V2_MCP_RESOURCE")?;
-    let authorization_server = required(
-        &args.oauth_authorization_server,
-        "CUMG_V2_OAUTH_AUTHORIZATION_SERVER",
-    )?;
-    let introspection_endpoint = required(
-        &args.oauth_introspection_endpoint,
-        "CUMG_V2_OAUTH_INTROSPECTION_ENDPOINT",
-    )?;
-    let introspection_client_id = required(
-        &args.oauth_introspection_client_id,
-        "CUMG_V2_OAUTH_INTROSPECTION_CLIENT_ID",
-    )?;
-    let secret_file = args
-        .oauth_introspection_client_secret_file
-        .as_ref()
-        .context("CUMG_V2_OAUTH_INTROSPECTION_CLIENT_SECRET_FILE is required")?;
-    let scopes = required(&args.oauth_required_scopes, "CUMG_V2_OAUTH_REQUIRED_SCOPES")?
-        .split_ascii_whitespace()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
     let policy_file = args
         .northbound_policy_file
         .as_ref()
         .context("CUMG_V2_NORTHBOUND_POLICY_FILE is required")?;
-
-    let mcp_config = NorthboundMcpConfig::new(resource, authorization_server, scopes)
-        .context("invalid V2 northbound MCP Authorization configuration")?;
-    let secret = load_secret_text(secret_file, MAX_OAUTH_SECRET_BYTES)
-        .context("failed to load OAuth introspection client secret")?;
     let policy_text = load_trusted_text(policy_file, MAX_NORTHBOUND_POLICY_BYTES)
         .context("failed to load northbound authorization policy")?;
-    let policy = NorthboundPolicyDocument::from_json(&policy_text)
-        .context("failed to parse northbound authorization policy")?
-        .build_policy(mcp_config.authorization_server(), device_id)
-        .context("invalid northbound principal/device/capability policy")?;
-
-    let mut verifier_config = OAuthIntrospectionConfig::new(
-        mcp_config.authorization_server(),
-        mcp_config.resource(),
-        introspection_endpoint,
-        introspection_client_id,
-        secret,
-    );
-    verifier_config.timeout = Duration::from_secs(args.oauth_introspection_timeout_secs);
-    let verifier = OAuthIntrospectionVerifier::new(verifier_config)
-        .context("invalid OAuth token introspection configuration")?;
-    let metadata_url = mcp_config.metadata_url().to_owned();
-    let resource = mcp_config.resource().to_owned();
-    let overload = computer_use_mcp_gateway::v2_limits::HttpOverloadGuard::new(
-        args.max_northbound_concurrency,
-        args.max_northbound_requests_per_minute,
-    )
-    .context("invalid V2 northbound connection/rate limits")?;
     let usage = if let Some(endpoint) = args.usage_endpoint.as_deref() {
         UsageManager::new(Arc::new(
             McpUsageController::new(endpoint, Duration::from_secs(args.usage_timeout_secs))
@@ -309,20 +283,90 @@ fn build_northbound_runtime(
     } else {
         UsageManager::noop()
     };
-    let router = build_northbound_router(
-        V2NorthboundMcp::new_with_usage(handle, policy, usage),
-        mcp_config,
-        Arc::new(verifier),
+    let overload = computer_use_mcp_gateway::v2_limits::HttpOverloadGuard::new(
+        args.max_northbound_concurrency,
+        args.max_northbound_requests_per_minute,
     )
-    .layer(axum::middleware::from_fn_with_state(
-        overload,
-        computer_use_mcp_gateway::v2_limits::enforce_http_limits,
-    ));
+    .context("invalid V2 northbound connection/rate limits")?;
+
+    let (router, resource, metadata_url, auth_mode) = if trusted_proxy_configured {
+        let issuer = required(&args.trusted_proxy_issuer, "CUMG_V2_TRUSTED_PROXY_ISSUER")?;
+        let subject = required(&args.trusted_proxy_subject, "CUMG_V2_TRUSTED_PROXY_SUBJECT")?;
+        let proxy_config = TrustedProxyConfig::new(resource, issuer, subject)
+            .context("invalid trusted-proxy fixed-principal configuration")?;
+        let policy = NorthboundPolicyDocument::from_json(&policy_text)
+            .context("failed to parse northbound authorization policy")?
+            .build_policy(proxy_config.issuer(), device_id)
+            .context("invalid northbound principal/device/capability policy")?;
+        let resource = proxy_config.resource().to_owned();
+        let router = build_trusted_proxy_router(
+            V2NorthboundMcp::new_with_usage(handle, policy, usage),
+            proxy_config,
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            overload,
+            computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+        ));
+        (router, resource, None, "trusted_proxy_fixed_principal")
+    } else {
+        let authorization_server = required(
+            &args.oauth_authorization_server,
+            "CUMG_V2_OAUTH_AUTHORIZATION_SERVER",
+        )?;
+        let introspection_endpoint = required(
+            &args.oauth_introspection_endpoint,
+            "CUMG_V2_OAUTH_INTROSPECTION_ENDPOINT",
+        )?;
+        let introspection_client_id = required(
+            &args.oauth_introspection_client_id,
+            "CUMG_V2_OAUTH_INTROSPECTION_CLIENT_ID",
+        )?;
+        let secret_file = args
+            .oauth_introspection_client_secret_file
+            .as_ref()
+            .context("CUMG_V2_OAUTH_INTROSPECTION_CLIENT_SECRET_FILE is required")?;
+        let scopes = required(&args.oauth_required_scopes, "CUMG_V2_OAUTH_REQUIRED_SCOPES")?
+            .split_ascii_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let mcp_config = NorthboundMcpConfig::new(resource, authorization_server, scopes)
+            .context("invalid V2 northbound MCP Authorization configuration")?;
+        let secret = load_secret_text(secret_file, MAX_OAUTH_SECRET_BYTES)
+            .context("failed to load OAuth introspection client secret")?;
+        let policy = NorthboundPolicyDocument::from_json(&policy_text)
+            .context("failed to parse northbound authorization policy")?
+            .build_policy(mcp_config.authorization_server(), device_id)
+            .context("invalid northbound principal/device/capability policy")?;
+        let mut verifier_config = OAuthIntrospectionConfig::new(
+            mcp_config.authorization_server(),
+            mcp_config.resource(),
+            introspection_endpoint,
+            introspection_client_id,
+            secret,
+        );
+        verifier_config.timeout = Duration::from_secs(args.oauth_introspection_timeout_secs);
+        let verifier = OAuthIntrospectionVerifier::new(verifier_config)
+            .context("invalid OAuth token introspection configuration")?;
+        let metadata_url = mcp_config.metadata_url().to_owned();
+        let resource = mcp_config.resource().to_owned();
+        let router = build_northbound_router(
+            V2NorthboundMcp::new_with_usage(handle, policy, usage),
+            mcp_config,
+            Arc::new(verifier),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            overload,
+            computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+        ));
+        (router, resource, Some(metadata_url), "oauth_introspection")
+    };
+
     Ok(Some(NorthboundRuntime {
         bind,
         router,
         resource,
         metadata_url,
+        auth_mode,
     }))
 }
 
