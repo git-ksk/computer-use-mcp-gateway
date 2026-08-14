@@ -245,17 +245,13 @@ pub(crate) fn normalize_cua_browser_snapshot(
         .get("complete")
         .and_then(Value::as_bool)
         .ok_or(BrowserNormalizeError::InvalidShape)?;
-    let backend_continuation = snapshot
-        .get("continuation")
-        .map(|value| {
-            value
-                .as_str()
-                .ok_or(BrowserNormalizeError::InvalidShape)
-                .and_then(backend_handle)
-        })
-        .transpose()?;
+    let backend_continuation = match snapshot.get("continuation") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(backend_handle(value)?),
+        Some(_) => return Err(BrowserNormalizeError::InvalidShape),
+    };
     let omitted = sum_omissions(snapshot.get("omitted"))?;
-    let outline = bounded_string(value, "outline", MAX_BROWSER_OUTLINE_BYTES)?;
+    let outline = bounded_multiline_string(value, "outline", MAX_BROWSER_OUTLINE_BYTES)?;
     let action_refs = normalize_ref_array(value.get("refs"), true)?;
     let content_refs = normalize_ref_array(value.get("content_refs"), false)?;
     if action_refs.len().saturating_add(content_refs.len()) > MAX_BROWSER_SNAPSHOT_REFS {
@@ -336,8 +332,6 @@ fn normalize_actions(value: Option<&Value>) -> Result<Vec<BrowserAction>, Browse
             "scroll" => Some(BrowserAction::Scroll),
             "upload" => Some(BrowserAction::Upload),
             "download" => Some(BrowserAction::Download),
-            // Unknown provider actions are observation only. They never become
-            // CUMG authority until the semantic vocabulary explicitly adds them.
             _ => None,
         };
         if let Some(action) = action {
@@ -359,8 +353,7 @@ fn normalize_screenshot_metadata(
         .as_object()
         .ok_or(BrowserNormalizeError::InvalidScreenshotMetadata)?;
     if screenshot.get("mime_type").and_then(Value::as_str) != Some("image/png")
-        || screenshot.get("coordinate_space").and_then(Value::as_str)
-            != Some("viewport_css_px")
+        || screenshot.get("coordinate_space").and_then(Value::as_str) != Some("viewport_css_px")
     {
         return Err(BrowserNormalizeError::InvalidScreenshotMetadata);
     }
@@ -377,9 +370,7 @@ fn sum_omissions(value: Option<&Value>) -> Result<u32, BrowserNormalizeError> {
     };
     let mut total = 0_u32;
     for value in object.values() {
-        let raw = value
-            .as_u64()
-            .ok_or(BrowserNormalizeError::InvalidShape)?;
+        let raw = value.as_u64().ok_or(BrowserNormalizeError::InvalidShape)?;
         let count = u32::try_from(raw).map_err(|_| BrowserNormalizeError::ValueTooLarge)?;
         total = total
             .checked_add(count)
@@ -414,13 +405,21 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, BrowserNormalizeEr
         .ok_or(BrowserNormalizeError::InvalidShape)
 }
 
-fn bounded_string(
+fn bounded_string(value: &Value, key: &str, limit: usize) -> Result<String, BrowserNormalizeError> {
+    let value = string(value, key)?;
+    if value.len() > limit || has_disallowed_control(value, false) {
+        return Err(BrowserNormalizeError::ValueTooLarge);
+    }
+    Ok(value.to_owned())
+}
+
+fn bounded_multiline_string(
     value: &Value,
     key: &str,
     limit: usize,
 ) -> Result<String, BrowserNormalizeError> {
     let value = string(value, key)?;
-    if value.len() > limit || value.chars().any(char::is_control) {
+    if value.len() > limit || has_disallowed_control(value, true) {
         return Err(BrowserNormalizeError::ValueTooLarge);
     }
     Ok(value.to_owned())
@@ -434,7 +433,7 @@ fn optional_bounded_string(
     match value.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => {
-            if value.len() > limit || value.chars().any(char::is_control) {
+            if value.len() > limit || has_disallowed_control(value, false) {
                 return Err(BrowserNormalizeError::ValueTooLarge);
             }
             Ok(Some(value.clone()))
@@ -464,10 +463,8 @@ fn bounded_string_array(
     }
     let mut output = Vec::with_capacity(raw.len());
     for item in raw {
-        let item = item
-            .as_str()
-            .ok_or(BrowserNormalizeError::InvalidShape)?;
-        if item.len() > max_bytes || item.chars().any(char::is_control) {
+        let item = item.as_str().ok_or(BrowserNormalizeError::InvalidShape)?;
+        if item.len() > max_bytes || has_disallowed_control(item, false) {
             return Err(BrowserNormalizeError::ValueTooLarge);
         }
         if !output.iter().any(|existing| existing == item) {
@@ -475,6 +472,13 @@ fn bounded_string_array(
         }
     }
     Ok(output)
+}
+
+fn has_disallowed_control(value: &str, allow_layout_whitespace: bool) -> bool {
+    value.chars().any(|character| {
+        character.is_control()
+            && !(allow_layout_whitespace && matches!(character, '\n' | '\r' | '\t'))
+    })
 }
 
 fn backend_handle(value: &str) -> Result<String, BrowserNormalizeError> {
@@ -569,8 +573,12 @@ mod tests {
             }
         ]));
         let normalized = normalize_cua_browser_snapshot(&raw, "target", "tab").unwrap();
-        assert_eq!(normalized.action_refs[0].actions, vec![BrowserAction::Click]);
+        assert_eq!(
+            normalized.action_refs[0].actions,
+            vec![BrowserAction::Click]
+        );
         assert_eq!(normalized.action_refs[1].actions, vec![BrowserAction::Type]);
+        assert!(normalized.outline.contains('\n'));
         let debug = format!("{normalized:?}");
         assert!(!debug.contains("p7:1"));
         assert!(!debug.contains("p7:2"));
@@ -578,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn content_refs_never_gain_action_authority_even_if_provider_lists_actions() {
+    fn content_refs_never_gain_action_authority() {
         let mut raw = snapshot(json!([]));
         raw["content_refs"] = json!([{
             "ref": "p7:9",
@@ -608,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_only_action_ref_is_refused_instead_of_becoming_generic_authority() {
+    fn unknown_only_action_ref_is_refused() {
         let raw = snapshot(json!([{
             "ref": "p7:1",
             "role": "button",
@@ -626,8 +634,9 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_metadata_is_exact_and_bounded_to_positive_dimensions() {
+    fn null_continuation_and_exact_screenshot_metadata_are_valid() {
         let mut raw = snapshot(json!([]));
+        raw["snapshot"]["continuation"] = Value::Null;
         raw["screenshot"] = json!({
             "mime_type": "image/png",
             "coordinate_space": "viewport_css_px",
@@ -637,6 +646,7 @@ mod tests {
             "viewport_css_height": 400
         });
         let normalized = normalize_cua_browser_snapshot(&raw, "target", "tab").unwrap();
+        assert_eq!(normalized.backend_continuation(), None);
         assert_eq!(normalized.screenshot_width, Some(1200));
         assert_eq!(normalized.viewport_css_width, Some(600));
 
