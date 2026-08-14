@@ -30,7 +30,7 @@ cargo build --locked
 
 The recommended deployment is **V2 Hub + V2 Agent**. Key/trust/TLS provisioning is intentionally explicit, so use [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) rather than replacing those boundaries with an insecure one-line example. `cargo run --locked -- --help` now shows the V2 Hub options; `cargo run --locked --bin v2_agent -- --help` shows the desktop Agent options.
 
-The V2 northbound MCP exposes the typed capabilities already present in the V2 contract, including the existing Cua-backed `list_apps`, `get_screen_size`, `click`, and `drag` operations. It does **not** expose a generic/raw Cua passthrough.
+The V2 northbound MCP exposes backend-neutral typed capabilities rather than a generic/raw Cua passthrough. The GUI semantic extension includes `list_windows`, `launch_application`, `inspect_window`, and `verify_ui_state`; Cua-specific tool names and response shapes terminate inside the adapter. See [`docs/V2_GUI_SEMANTIC_CAPABILITIES.md`](docs/V2_GUI_SEMANTIC_CAPABILITIES.md).
 
 For V1-only regression or legacy operation:
 

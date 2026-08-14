@@ -239,6 +239,10 @@ pub const fn capability_name(capability: DeviceCapability) -> &'static str {
         DeviceCapability::Shell => "shell",
         DeviceCapability::ReadFile => "read_file",
         DeviceCapability::ListDirectory => "list_directory",
+        DeviceCapability::ListWindows => "list_windows",
+        DeviceCapability::LaunchApplication => "launch_application",
+        DeviceCapability::InspectWindow => "inspect_window",
+        DeviceCapability::VerifyUiState => "verify_ui_state",
     }
 }
 

@@ -63,7 +63,7 @@ Authorization infrastructure failure must fail closed at the northbound boundary
 
 ### Computer Use backend seam
 
-`ComputerUseBackendAdapter` owns only backend lifecycle, capability advertisement, and execution of the typed Computer Use subset. It returns the existing `BackendExecutionOutcome` contract:
+`ComputerUseBackendAdapter` owns only backend lifecycle, capability advertisement, normalization, and execution of the typed Computer Use subset. The semantic vocabulary may be broader than one backend: an adapter advertises only the `DeviceCapability`s it implements, and backend-specific names such as Cua `get_window_state` or `verify_state` terminate before the Hub-to-Agent contract. Cua `start_session`/`end_session` remain backend lifecycle rather than northbound capabilities. See [`V2_GUI_SEMANTIC_CAPABILITIES.md`](V2_GUI_SEMANTIC_CAPABILITIES.md). It returns the existing `BackendExecutionOutcome` contract:
 
 - `Completed(DeviceResult)` only when the backend contract provides the evidence required for an ordinary result;
 - cancellation propagation with unknown side effect -> `CancellationPropagatedIndeterminate`;

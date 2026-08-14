@@ -121,6 +121,26 @@ def handle_request(message: dict) -> None:
                         "inputSchema": {"type": "object", "additionalProperties": False},
                     },
                     {
+                        "name": "list_windows",
+                        "description": "Semantic adapter fixture for window listing",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "launch_app",
+                        "description": "Semantic adapter fixture for application launch",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "get_window_state",
+                        "description": "Semantic adapter fixture for window inspection",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
+                        "name": "verify_state",
+                        "description": "Semantic adapter fixture for UI verification",
+                        "inputSchema": {"type": "object", "additionalProperties": True},
+                    },
+                    {
                         "name": "echo_contract",
                         "description": "Records exact arguments and returns backend identity data unchanged",
                         "inputSchema": {"type": "object", "additionalProperties": True},
@@ -213,6 +233,114 @@ def handle_request(message: dict) -> None:
                 request_id,
                 {
                     "content": [{"type": "text", "text": "typed"}],
+                    "isError": False,
+                },
+            )
+            return
+        if name == "list_windows":
+            result(
+                request_id,
+                {
+                    "content": [],
+                    "structuredContent": {
+                        "current_space_id": 1,
+                        "windows": [
+                            {
+                                "window_id": 77,
+                                "pid": 101,
+                                "app_name": "Fixture A",
+                                "title": "Main",
+                                "bounds": {"x": 10.0, "y": 20.0, "width": 800.0, "height": 600.0},
+                                "is_on_screen": True,
+                                "on_current_space": True,
+                            }
+                        ],
+                    },
+                    "isError": False,
+                },
+            )
+            return
+        if name == "launch_app":
+            arguments = params.get("arguments") or {}
+            result(
+                request_id,
+                {
+                    "content": [],
+                    "structuredContent": {
+                        "bundle_id": arguments.get("bundle_id") or "fixture.app",
+                        "name": arguments.get("name") or "Fixture A",
+                        "pid": 101,
+                        "launch_state": {"process_running": True, "requested": True, "window_ready": True},
+                        "windows": [
+                            {
+                                "window_id": 77,
+                                "pid": 101,
+                                "app_name": "Fixture A",
+                                "title": "Main",
+                                "bounds": {"x": 10.0, "y": 20.0, "width": 800.0, "height": 600.0},
+                                "is_on_screen": True,
+                                "on_current_space": True,
+                            }
+                        ],
+                    },
+                    "isError": False,
+                },
+            )
+            return
+        if name == "get_window_state":
+            arguments = params.get("arguments") or {}
+            content = []
+            structured = {
+                "pid": arguments.get("pid", 101),
+                "window_id": arguments.get("window_id", 77),
+                "snapshot_id": "sfixture1",
+                "elements_complete": True,
+                "elements": [
+                    {
+                        "depth": 0,
+                        "element_index": 0,
+                        "element_token": "sfixture1:0",
+                        "frame": {"x": 10.0, "y": 20.0, "w": 800.0, "h": 600.0},
+                        "label": "Main",
+                        "role": "AXWindow",
+                    },
+                    {
+                        "depth": 1,
+                        "element_index": 1,
+                        "element_token": "sfixture1:1",
+                        "parent_index": 0,
+                        "frame": {"x": 20.0, "y": 40.0, "w": 100.0, "h": 30.0},
+                        "label": "Run",
+                        "role": "AXButton",
+                        "enabled": True,
+                        "selected": False,
+                    },
+                ],
+            }
+            if arguments.get("include_screenshot", True):
+                content.append({"type": "image", "data": "iVBORw0KGgoAAAANSUhEUgAAAOYAAAGY", "mimeType": "image/png"})
+                structured.update({"screenshot_width": 230, "screenshot_height": 408, "screenshot_mime_type": "image/png"})
+            result(request_id, {"content": content, "structuredContent": structured, "isError": False})
+            return
+        if name == "verify_state":
+            arguments = params.get("arguments") or {}
+            content = []
+            if arguments.get("include_screenshot", False):
+                content.append({"type": "image", "data": "iVBORw0KGgoAAAANSUhEUgAAAOYAAAGY", "mimeType": "image/png"})
+            expect = arguments.get("expect") or []
+            result(
+                request_id,
+                {
+                    "content": content,
+                    "structuredContent": {
+                        "status": "satisfied",
+                        "stable": True,
+                        "samples": 1,
+                        "predicates": [
+                            {"index": i, "status": "satisfied", "unknown_reason": None}
+                            for i, _ in enumerate(expect)
+                        ],
+                    },
                     "isError": False,
                 },
             )

@@ -235,7 +235,7 @@ cargo run --locked --bin v2_hub -- --help
 
 Configure the required Hub/grant/device-public/TLS/state paths plus the Agent-facing gRPC bind. To expose northbound MCP, configure the loopback `CUMG_V2_MCP_BIND`, canonical public HTTPS resource, and exact principal -> device -> `DeviceCapability` policy from [`DEPLOYMENT.md`](DEPLOYMENT.md). Choose either OAuth RFC 7662 introspection or the packaged trusted-proxy fixed-principal mode for an explicitly single-principal authenticated tunnel. Both reduce identity to the same `AuthenticatedClientPrincipal` before CUMG authorization; the modes are mutually exclusive.
 
-The northbound MCP is not a raw Cua proxy. The current typed V2 contract exposes the existing exact capabilities `list_apps`, `get_screen_size`, `screenshot`, `click`, `drag`, `type_text`, `execute_process`, `shell`, `read_file`, and `list_directory`, filtered by the authenticated capability policy.
+The northbound MCP is not a raw Cua proxy. The current typed V2 contract exposes `list_apps`, `get_screen_size`, `screenshot`, `click`, `drag`, `type_text`, `execute_process`, `shell`, `read_file`, `list_directory`, plus the GUI semantic capabilities `list_windows`, `launch_application`, `inspect_window`, and `verify_ui_state`. Discovery is filtered by exact authorization and, while the Agent is online, its live `CapabilityAdvertisement`. See [`V2_GUI_SEMANTIC_CAPABILITIES.md`](V2_GUI_SEMANTIC_CAPABILITIES.md).
 
 ## 8. Start the V2 Agent on the controlled desktop
 

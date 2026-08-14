@@ -10,9 +10,9 @@ use crate::v2_execution_safety::{
     IndeterminateReason, OperationOwner, ResolutionRecord,
 };
 use crate::v2_m0::{
-    CONTROL_SCHEMA_VERSION, CommandEnvelope, DeviceCommand, DeviceErrorCode, DeviceRegistry,
-    DeviceResult, DirectoryEntry, GrantAuthority, ProcessOutput, ProcessRequest, ShellRequest,
-    validate_command_result,
+    CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CommandEnvelope, DeviceCommand,
+    DeviceErrorCode, DeviceRegistry, DeviceResult, DirectoryEntry, GrantAuthority, ProcessOutput,
+    ProcessRequest, ShellRequest, validate_command_result,
 };
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision,
@@ -1234,6 +1234,20 @@ impl HubHandle {
             .await
             .as_ref()
             .map(|session| session.generation)
+    }
+
+    /// Return the currently connected Agent's versioned capability advertisement.
+    ///
+    /// `None` means the Agent is offline or its live registry entry is unavailable.
+    /// Callers must still rely on command-session validation at dispatch time because
+    /// a reconnect can change generation/revision after this observation.
+    pub async fn current_capabilities(&self) -> Option<CapabilityAdvertisement> {
+        let persistent = self.inner.persistent.lock().await;
+        persistent
+            .registry
+            .current_session(&self.inner.device_id)
+            .ok()
+            .map(|session| session.capabilities)
     }
 
     pub async fn start_command(

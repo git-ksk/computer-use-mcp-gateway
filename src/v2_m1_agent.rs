@@ -306,7 +306,7 @@ impl AgentService {
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-            revision: 3,
+            revision: 4,
             supported,
         }
     }
@@ -799,7 +799,11 @@ impl AgentService {
                                 | DeviceCommand::Screenshot
                                 | DeviceCommand::PointerClick { .. }
                                 | DeviceCommand::PointerDrag { .. }
-                                | DeviceCommand::TypeText { .. }) => {
+                                | DeviceCommand::TypeText { .. }
+                                | DeviceCommand::ListWindows { .. }
+                                | DeviceCommand::LaunchApplication { .. }
+                                | DeviceCommand::InspectWindow { .. }
+                                | DeviceCommand::VerifyUiState { .. }) => {
                                     let computer_use = self
                                         .computer_use
                                         .clone()
