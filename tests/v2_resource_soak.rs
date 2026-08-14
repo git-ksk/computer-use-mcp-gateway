@@ -42,7 +42,6 @@ fn current_rss_bytes() -> Option<u64> {
 #[test]
 fn ten_thousand_operations_with_reconnect_churn_keep_v2_state_and_rss_bounded() {
     assert_eq!(TOTAL_OPERATIONS % OPERATIONS_PER_GENERATION, 0);
-    assert!(WARMUP_OPERATIONS < TOTAL_OPERATIONS);
 
     let limits = AdmissionLimits {
         max_global_active: 2,

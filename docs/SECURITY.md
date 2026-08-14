@@ -75,7 +75,7 @@ Keep the gateway on loopback. Do not commit real tunnel credentials, Access toke
 
 A Mac with Accessibility and Screen Recording grants is a high-trust machine. Physical desktop acceptance is therefore operator-controlled and local-only; normal GitHub Actions use GitHub-hosted runners and do not receive those desktop grants.
 
-Run `scripts/v2_desktop_acceptance.sh` only from a reviewed checkout on a trusted logged-in Mac, with both physical-action ACK variables explicitly set to `1`. Prefer a dedicated test Mac rather than a daily-use workstation. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](V2_LOCAL_DESKTOP_ACCEPTANCE.md) and [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
+Run `scripts/v2_desktop_acceptance.sh` only from a reviewed checkout on a trusted logged-in Mac, with both physical-action ACK variables explicitly set to `1`. Prefer a dedicated test Mac rather than a daily-use workstation. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](v2/acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md) and [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
 
 P1 final physical acceptance ran on 2026-08-13 against trusted `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` as Desktop E2E run `31675515516`. The runner was registered ephemerally with the dedicated label, executed only the trusted `main` checkout, and automatically unregistered after the job. The V2 P1 step required exact quarantine to survive Hub/Agent restart and generation advance with no replay before explicit resolution and reuse.
 
@@ -94,11 +94,11 @@ For security-sensitive reports, do not include credentials or unrelated private 
 
 ## V2 trust model
 
-V2 separates northbound authenticated client principals, Hub transport identity, grant-signing authority, and Agent device identity. Key rotation requires continuity proof; bounded admission and signed cancellation/reconnect semantics fail closed around ambiguous operations. The complete compromised-component analysis and non-claims are documented in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+V2 separates northbound authenticated client principals, Hub transport identity, grant-signing authority, and Agent device identity. Key rotation requires continuity proof; bounded admission and signed cancellation/reconnect semantics fail closed around ambiguous operations. The complete compromised-component analysis and non-claims are documented in [`V2_THREAT_MODEL.md`](v2/V2_THREAT_MODEL.md).
 
-V2-M1 passed its single-secure-Agent acceptance gate on 2026-08-12. The production candidate keeps TLS-protected gRPC separate from independently signed application identity, preserves principal -> stable device -> exact capability grants, and never forwards a northbound OAuth bearer token to the Agent. Ambiguous desktop cancellation remains `indeterminate` and quarantines the device rather than authorizing replay. Linux Hub application keys use systemd encrypted credentials in the packaged service; ACME owns ordinary server-certificate renewal; Hub/device/grant key rotation stays independent and continuity-proven. OpenTelemetry/OTLP default telemetry excludes sensitive operation payloads. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+V2-M1 passed its single-secure-Agent acceptance gate on 2026-08-12. The production candidate keeps TLS-protected gRPC separate from independently signed application identity, preserves principal -> stable device -> exact capability grants, and never forwards a northbound OAuth bearer token to the Agent. Ambiguous desktop cancellation remains `indeterminate` and quarantines the device rather than authorizing replay. Linux Hub application keys use systemd encrypted credentials in the packaged service; ACME owns ordinary server-certificate renewal; Hub/device/grant key rotation stays independent and continuity-proven. OpenTelemetry/OTLP default telemetry excludes sensitive operation payloads. See [`V2_M1_ACCEPTANCE.md`](v2/acceptance/V2_M1_ACCEPTANCE.md) and [`V2_THREAT_MODEL.md`](v2/V2_THREAT_MODEL.md).
 
-The post-M1 P0 hardening makes that ambiguity boundary explicit in an authoritative operation ledger. Authenticated issuer/subject ownership and Agent generation both fence settlement; dispatched uncertainty persists as an exact-operation desktop quarantine across reconnect/restart; queued pre-ambiguity work is cancelled instead of resumed; and reuse requires an explicit, auditable, persistence-gated resolution. The recovery evidence string is bounded metadata and must not contain raw desktop content, commands, results, or secrets. See [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
+The post-M1 P0 hardening makes that ambiguity boundary explicit in an authoritative operation ledger. Authenticated issuer/subject ownership and Agent generation both fence settlement; dispatched uncertainty persists as an exact-operation desktop quarantine across reconnect/restart; queued pre-ambiguity work is cancelled instead of resumed; and reuse requires an explicit, auditable, persistence-gated resolution. The recovery evidence string is bounded metadata and must not contain raw desktop content, commands, results, or secrets. See [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXECUTION_SAFETY.md).
 
 ### V2 payload-safe observability
 
@@ -112,7 +112,7 @@ Higher verbosity through `RUST_LOG` does not relax the payload-free policy. Do n
 
 Usage accounting does not become execution authority. The Hub first completes northbound authentication and derives issuer+subject, then sends only that verified identity, CUMG `operation_id`, and bounded tool/accounting metadata to the loopback sidecar. Authentication credentials, tool arguments/results, screenshots, shell text, file contents, and introspection credentials do not cross the usage bridge. The current RFC 7662 adapter additionally strips its bearer token before Hub execution. The sidecar rejects unexpected reserve fields.
 
-A usage reserve/`markLiable()` failure fails closed before Agent dispatch. A settlement failure after dispatch never clears CUMG quarantine, converts `indeterminate`, retries the operation, or authorizes a competing principal. MemoryUsageStore restart can reset quota state but cannot reset durable CUMG safety state. The packaged sidecar is additionally constrained to localhost traffic. See [`V2_USAGE_ACCOUNTING.md`](V2_USAGE_ACCOUNTING.md).
+A usage reserve/`markLiable()` failure fails closed before Agent dispatch. A settlement failure after dispatch never clears CUMG quarantine, converts `indeterminate`, retries the operation, or authorizes a competing principal. MemoryUsageStore restart can reset quota state but cannot reset durable CUMG safety state. The packaged sidecar is additionally constrained to localhost traffic. See [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md).
 
 ## V2 P1 fixed-set multi-device security review
 
@@ -131,7 +131,7 @@ The proof intentionally does not add generic authorization, mutable device enrol
 
 ## V2 P2 replacement-seam security boundary
 
-P2 does not delegate the execution-safety authority to an external authorization system, policy engine, device fabric, or Computer Use runtime. The detailed review is in [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
+P2 does not delegate the execution-safety authority to an external authorization system, policy engine, device fabric, or Computer Use runtime. The detailed review is in [`V2_P2_REPLACEMENT_SEAMS.md`](v2/V2_P2_REPLACEMENT_SEAMS.md).
 
 The two new seams are intentionally one-way and narrow:
 

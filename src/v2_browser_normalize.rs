@@ -521,30 +521,6 @@ fn normalize_states(value: Option<&Value>) -> Result<Vec<String>, BrowserNormali
     Ok(states)
 }
 
-fn bounded_string_array(
-    value: Option<&Value>,
-    max_items: usize,
-    max_bytes: usize,
-) -> Result<Vec<String>, BrowserNormalizeError> {
-    let raw = value
-        .and_then(Value::as_array)
-        .ok_or(BrowserNormalizeError::InvalidShape)?;
-    if raw.len() > max_items {
-        return Err(BrowserNormalizeError::ValueTooLarge);
-    }
-    let mut output = Vec::with_capacity(raw.len());
-    for item in raw {
-        let item = item.as_str().ok_or(BrowserNormalizeError::InvalidShape)?;
-        if item.len() > max_bytes || has_disallowed_control(item, false) {
-            return Err(BrowserNormalizeError::ValueTooLarge);
-        }
-        if !output.iter().any(|existing| existing == item) {
-            output.push(item.to_owned());
-        }
-    }
-    Ok(output)
-}
-
 fn has_disallowed_control(value: &str, allow_layout_whitespace: bool) -> bool {
     value.chars().any(|character| {
         character.is_control()

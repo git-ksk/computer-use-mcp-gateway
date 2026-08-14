@@ -53,7 +53,7 @@ For northbound OAuth introspection, use the optional encrypted-credential drop-i
 
 Usage accounting is disabled by default. To enable it, install `packaging/systemd/cumg-v2-usage-sidecar.service`, copy `usage.env.example` outside the repository, build/install `mcp-usage-control` core from source locally, and install the optional `cumg-v2-hub-usage.conf.example` drop-in. The Hub then uses `CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/`.
 
-The drop-in couples the sidecar lifecycle to Hub restart; therefore an explicit packaged Hub restart recreates the non-durable MemoryUsageStore. If you manually supervise Hub and sidecar separately, a Hub-only restart does not reset a still-running sidecar. In either case, usage reset never clears CUMG operation/quarantine checkpoints. Do not use this Memory store as a financial ledger. See [`V2_USAGE_ACCOUNTING.md`](V2_USAGE_ACCOUNTING.md).
+The drop-in couples the sidecar lifecycle to Hub restart; therefore an explicit packaged Hub restart recreates the non-durable MemoryUsageStore. If you manually supervise Hub and sidecar separately, a Hub-only restart does not reset a still-running sidecar. In either case, usage reset never clears CUMG operation/quarantine checkpoints. Do not use this Memory store as a financial ledger. See [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md).
 
 ### TLS renewal
 
@@ -100,7 +100,7 @@ Never add `operation_id`, `device_id`, principal/subject, request path, command/
 
 For an incident, correlate Hub and Agent by `device_id` + `generation`, then follow `operation_id`. A `v2_operation_indeterminate` event must be followed by durable quarantine until a `v2_quarantine_resolved` event exists for that operation. Persistence failures expose a safe `error_code` such as `persistence_checkpoint_too_large` without a path or serialized checkpoint. Reconnect exhaustion and heartbeat timeouts are visible independently from TLS/transport connection failures. OAuth introspection unavailability is distinct from authorization denial, and a quarantine admission rejection remains `device_indeterminate` rather than being retried or auto-replayed.
 
-See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md) for the final security gate and [`../packaging/README.md`](../packaging/README.md) for lifecycle details.
+See [`V2_M1_ACCEPTANCE.md`](v2/acceptance/V2_M1_ACCEPTANCE.md) for the final security gate and [`../packaging/README.md`](../packaging/README.md) for lifecycle details.
 
 ## V1 legacy/reference topology
 

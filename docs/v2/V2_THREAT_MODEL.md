@@ -218,7 +218,7 @@ They should not contain raw screenshots, raw backend output, raw command argumen
 
 ## V2-M1 acceptance and residual deployment responsibilities
 
-The V2-M1 implementation gate passed on 2026-08-12. The M1 code now includes verified northbound principal construction, production key/certificate lifecycle procedures, bounded service connection/rate shedding, bounded replay pruning, real-Cua cancellation quarantine, OpenTelemetry/OTLP integration, and OS service packaging. See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
+The V2-M1 implementation gate passed on 2026-08-12. The M1 code now includes verified northbound principal construction, production key/certificate lifecycle procedures, bounded service connection/rate shedding, bounded replay pruning, real-Cua cancellation quarantine, OpenTelemetry/OTLP integration, and OS service packaging. See [`V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md).
 
 The threat model still requires the deployment to preserve these external responsibilities:
 

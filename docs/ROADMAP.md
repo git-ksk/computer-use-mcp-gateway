@@ -2,9 +2,9 @@
 
 This file is the implementation roadmap snapshot. Historical acceptance detail lives in the milestone acceptance/progress documents.
 
-Canonical V2 product boundary: [`V2_POSITIONING.md`](V2_POSITIONING.md).  
-Standard/OSS boundary: [`V2_STANDARDIZATION.md`](V2_STANDARDIZATION.md).
-P2 replacement-seam review: [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
+Canonical V2 product boundary: [`V2_POSITIONING.md`](v2/V2_POSITIONING.md).
+Standard/OSS boundary: [`V2_STANDARDIZATION.md`](v2/V2_STANDARDIZATION.md).
+P2 replacement-seam review: [`V2_P2_REPLACEMENT_SEAMS.md`](v2/V2_P2_REPLACEMENT_SEAMS.md).
 
 ## Positioning rule
 
@@ -81,7 +81,7 @@ M0 proved the initial single-device delegated-capability control semantics:
 - backend-neutral adapter contract;
 - threat model for compromised Hub, Agent, backend, and client.
 
-See [`V2_M0_POC.md`](V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+See [`V2_M0_POC.md`](archive/v2/V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](v2/V2_THREAT_MODEL.md).
 
 ## V2-M1 — single secure remote Agent
 
@@ -102,7 +102,7 @@ M1 established the production-candidate single-device foundation:
 - real Cua Driver 0.19.3 cancellation E2E where cancellation propagation does **not** imply non-execution;
 - `indeterminate` outcome + device quarantine when the backend cannot prove a safe terminal result.
 
-See [`V2_M1_ACCEPTANCE.md`](V2_M1_ACCEPTANCE.md).
+See [`V2_M1_ACCEPTANCE.md`](v2/acceptance/V2_M1_ACCEPTANCE.md).
 
 ### Post-M1 correction
 
@@ -155,7 +155,7 @@ M2 is no longer “build a multi-machine Hub” as a feature milestone. The firs
 - [x] duplicate/late cancellation acknowledgements cannot clear quarantine incorrectly;
 - [x] network partition/reconnect races are covered around dispatch and result delivery.
 
-P0 execution-safety hardening is accepted on 2026-08-12. The detailed gap analysis, invariants, security review, and residual work are recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
+P0 execution-safety hardening is accepted on 2026-08-12. The detailed gap analysis, invariants, security review, and residual work are recorded in [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXECUTION_SAFETY.md).
 
 ## V2-M2 acceptance — multi-device invariant proof
 
@@ -197,7 +197,7 @@ Review maintained standards/OSS before expanding custom implementations:
 - [x] SPIFFE reviewed and deferred until dynamic workload/trust-domain scale justifies its operational cost;
 - [x] OPA/Cedar-class generic policy engines reviewed and deferred while authorization remains an exact principal/device/capability tuple.
 
-The P2 review is accepted when these decisions and narrow seams pass regression. A checked review item does **not** mean the external system was adopted. Replacement remains conditional on evidence that the uncertainty-aware execution invariant is preserved or improved. See [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md).
+The P2 review is accepted when these decisions and narrow seams pass regression. A checked review item does **not** mean the external system was adopted. Replacement remains conditional on evidence that the uncertainty-aware execution invariant is preserved or improved. See [`V2_P2_REPLACEMENT_SEAMS.md`](v2/V2_P2_REPLACEMENT_SEAMS.md).
 
 Final P2 integration acceptance is **accepted / closed on 2026-08-13**. Trusted merged `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` passed Desktop E2E run `31675515516`, supplementing the deterministic replacement-seam, multi-device, backend-portability, observability, and resource-regression gates.
 

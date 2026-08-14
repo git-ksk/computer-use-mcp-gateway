@@ -1,6 +1,11 @@
 # V2-M0 control-plane PoC
 
-Status: **V2-M0 GO recorded 2026-08-11 — proceed to V2-M1 only**.
+Status: **V2-M0 GO recorded 2026-08-11 — historical decision accepted.**
+
+> **Archived decision record.** The M0 decision and operator evidence are retained for provenance.
+> The executable PoC binaries were retired on 2026-08-15 after their control, transport, and Cua-adapter
+> responsibilities were covered by the long-lived V2 runtime and automated tests. Current V2 status is
+> [`../../v2/STATUS.md`](../../v2/STATUS.md).
 
 This PoC deliberately tests the control semantics before selecting or building a Hub↔Agent transport. V1 remains unchanged.
 
@@ -55,13 +60,13 @@ The network PoC deliberately binds only to loopback TCP. It proves the outbound 
 
 ## One-device live backend proof
 
-Run:
+Historical command (the binary has been retired):
 
 ```bash
 CUMG_BACKEND_COMMAND="$HOME/.local/bin/cua-driver" cargo run --bin v2_m0_poc
 ```
 
-The PoC:
+The preserved run demonstrated:
 
 1. generates a cryptographic device identity;
 2. proves possession during enrollment;
@@ -79,7 +84,7 @@ The PoC:
 
 ## Outbound authenticated Agent proof
 
-Run:
+Historical command (the binary has been retired):
 
 ```bash
 CUMG_BACKEND_COMMAND="$HOME/.local/bin/cua-driver" cargo run --locked --bin v2_m0_network_poc
@@ -99,7 +104,7 @@ The M0 GO does **not** make these PoCs production-ready. V2-M1 still must implem
 - live cancellation acceptance against interruptible and non-interruptible backend actions;
 - production deployment rate limiting, secret storage, and observability.
 
-These are now V2-M1 implementation/acceptance requirements rather than reasons to keep M0 undecided. The trust-model baseline is documented in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+These are now V2-M1 implementation/acceptance requirements rather than reasons to keep M0 undecided. The trust-model baseline is documented in [`V2_THREAT_MODEL.md`](../../v2/V2_THREAT_MODEL.md).
 
 ## Recorded local run — 2026-08-11
 
@@ -149,7 +154,7 @@ After the first network run, the PoC added and tested:
 - backend adapter conformance across independent fixture implementations;
 - live Cua execution through `CuaCliAdapter`, keeping Cua tool names/results out of the Hub↔Agent protocol.
 
-The compromised-component and residual-risk analysis is in [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md).
+The compromised-component and residual-risk analysis is in [`V2_THREAT_MODEL.md`](../../v2/V2_THREAT_MODEL.md).
 
 ## V2-M0 GO decision
 
@@ -158,3 +163,12 @@ The compromised-component and residual-risk analysis is in [`V2_THREAT_MODEL.md`
 The evidence supports a differentiated capability-control slice rather than another screenshot/input engine: authenticated client-to-device capability delegation, independently checked short-lived grants, continuity-proven key rotation, generation/lease ownership, bounded execution, replay-safe cancellation/disconnect semantics, and a backend-neutral adapter boundary.
 
 This GO is deliberately narrow. It does **not** mean the loopback TCP PoC is production-ready, and it does not authorize starting multi-machine routing yet. V2-M1 must first prove encrypted remote transport, real northbound authentication integration, persistent trust/operation state, heartbeat/reconnect, and live backend cancellation behavior.
+## Successor coverage
+
+The retired PoCs are superseded by production modules and deterministic tests rather than by a new example binary:
+
+- control semantics and lease/generation invariants: [`../../v2/V2_P0_EXECUTION_SAFETY.md`](../../v2/V2_P0_EXECUTION_SAFETY.md) and `src/v2_m0.rs`;
+- authenticated Hub/Agent protocol and replay/tamper checks: `src/v2_m0_transport.rs`, `src/v2_m1_hub.rs`, `src/v2_m1_agent.rs`, and the V2 gRPC/process integration tests;
+- asynchronous Cua semantic adapter: `src/v2_m1_backend.rs` plus backend-portability and real-Cua acceptance tests.
+
+The historical commands above are intentionally not restored as build targets.

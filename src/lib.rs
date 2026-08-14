@@ -3,7 +3,6 @@ pub mod config;
 pub mod gateway;
 pub mod policy;
 pub mod v2_browser;
-pub mod v2_browser_cua;
 pub mod v2_browser_execute;
 pub mod v2_browser_normalize;
 pub mod v2_browser_refs;

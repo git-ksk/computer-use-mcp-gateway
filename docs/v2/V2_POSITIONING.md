@@ -1,6 +1,6 @@
 # V2 product positioning
 
-Status: **V2 accepted / complete (2026-08-13), with the product boundary narrowed by the final competitor review.**
+Status: **V2 execution-safety baseline accepted / complete (2026-08-13). Desktop and Browser core are complete; Browser transfer remains a separate pending boundary.**
 
 Accepted P0 implementation/gap-analysis record: [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md). The final V2 core has an explicit authoritative operation ledger, owner/generation fencing, durable desktop quarantine, evidence-bearing receipts, explicit resolution, fixed-set multi-device invariant proof, backend portability, and trusted real-Cua physical acceptance.
 

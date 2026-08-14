@@ -332,6 +332,9 @@ pub enum AgentToHub {
     Heartbeat(AgentHeartbeat),
 }
 
+// The signed wire envelope intentionally keeps command payload ownership direct; boxing the
+// largest variant would add representation churn without changing the bounded transport contract.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
 pub enum HubToAgent {

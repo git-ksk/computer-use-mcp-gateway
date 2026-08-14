@@ -2711,9 +2711,9 @@ mod tests {
 
     #[test]
     fn desktop_semantic_mapping_preserves_scope_delivery_and_backend_neutral_modifiers() {
-        let context = Some("ctx_0123456789abcdef0123456789abcdef".into());
+        let context = "ctx_0123456789abcdef0123456789abcdef".to_owned();
         let (tool, args) = map_command(&DeviceCommand::PointerClickAdvanced {
-            context_id: context.clone(),
+            context_id: Some(context.clone()),
             target: PointerTarget::WindowPhysical {
                 process_id: 42,
                 window_id: 7,
@@ -2728,7 +2728,7 @@ mod tests {
         .unwrap();
         assert_eq!(tool, "click");
         let args = Value::Object(args.unwrap());
-        assert_eq!(args["session"], context.unwrap());
+        assert_eq!(args["session"], context);
         assert_eq!(args["scope"], "window");
         assert_eq!(args["pid"], 42);
         assert_eq!(args["window_id"], 7);
