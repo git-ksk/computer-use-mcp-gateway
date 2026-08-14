@@ -3,14 +3,17 @@
 //! This module is deliberately isolated from the V1 MCP gateway. It proves the
 //! control semantics before any Hub/Agent transport is selected.
 
+use crate::v2_browser_runtime::{
+    BrowserBackendCommand, BrowserBackendResult, BrowserRuntimeCapability,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 3;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 3;
+pub const CONTROL_SCHEMA_VERSION: u16 = 4;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
 pub const MAX_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -66,6 +69,15 @@ pub enum DeviceCapability {
     SetUiValue,
     CaptureRegion,
     DesktopScope,
+    BrowserInspect,
+    BrowserPrepare,
+    BrowserNavigate,
+    BrowserClick,
+    BrowserType,
+    BrowserDialog,
+    BrowserPointer,
+    BrowserUploadFile,
+    BrowserDownload,
 }
 
 impl DeviceCapability {
@@ -81,7 +93,8 @@ impl DeviceCapability {
             | Self::VerifyUiState
             | Self::ClipboardRead
             | Self::PointerPosition
-            | Self::CaptureRegion => CapabilityClass::Observe,
+            | Self::CaptureRegion
+            | Self::BrowserInspect => CapabilityClass::Observe,
             Self::PointerClick
             | Self::PointerDrag
             | Self::TypeText
@@ -90,16 +103,25 @@ impl DeviceCapability {
             | Self::Scroll
             | Self::ClipboardWrite
             | Self::MovePointer
-            | Self::SetUiValue => CapabilityClass::Interact,
+            | Self::SetUiValue
+            | Self::BrowserNavigate
+            | Self::BrowserClick
+            | Self::BrowserType
+            | Self::BrowserDialog
+            | Self::BrowserPointer => CapabilityClass::Interact,
             Self::LaunchApplication
             | Self::ActivateWindow
             | Self::SetWindowFrame
-            | Self::DesktopScope => CapabilityClass::System,
-            // Direct process/free-form shell and forced process termination can
-            // mutate or destroy arbitrary local state.
-            Self::ExecuteProcess | Self::Shell | Self::TerminateApplication => {
-                CapabilityClass::Dangerous
-            }
+            | Self::DesktopScope
+            | Self::BrowserPrepare => CapabilityClass::System,
+            // Direct process/free-form shell, forced process termination, local
+            // file exfiltration, and browser-originated local writes are exact
+            // dangerous capabilities rather than generic browser authority.
+            Self::ExecuteProcess
+            | Self::Shell
+            | Self::TerminateApplication
+            | Self::BrowserUploadFile
+            | Self::BrowserDownload => CapabilityClass::Dangerous,
         }
     }
 }
@@ -523,6 +545,9 @@ pub enum DeviceCommand {
         context_id: String,
         reason: String,
     },
+    Browser {
+        command: BrowserBackendCommand,
+    },
 }
 
 impl DeviceCommand {
@@ -563,11 +588,26 @@ impl DeviceCommand {
             Self::SetUiValue { .. } => DeviceCapability::SetUiValue,
             Self::CaptureRegion { .. } => DeviceCapability::CaptureRegion,
             Self::ExpandInteractionScope { .. } => DeviceCapability::DesktopScope,
+            Self::Browser { command } => browser_device_capability(command.capability()),
         }
     }
 
     pub fn class(&self) -> CapabilityClass {
         self.capability().class()
+    }
+}
+
+fn browser_device_capability(capability: BrowserRuntimeCapability) -> DeviceCapability {
+    match capability {
+        BrowserRuntimeCapability::Inspect => DeviceCapability::BrowserInspect,
+        BrowserRuntimeCapability::Prepare => DeviceCapability::BrowserPrepare,
+        BrowserRuntimeCapability::Navigate => DeviceCapability::BrowserNavigate,
+        BrowserRuntimeCapability::Click => DeviceCapability::BrowserClick,
+        BrowserRuntimeCapability::Type => DeviceCapability::BrowserType,
+        BrowserRuntimeCapability::Dialog => DeviceCapability::BrowserDialog,
+        BrowserRuntimeCapability::Pointer => DeviceCapability::BrowserPointer,
+        BrowserRuntimeCapability::UploadFile => DeviceCapability::BrowserUploadFile,
+        BrowserRuntimeCapability::Download => DeviceCapability::BrowserDownload,
     }
 }
 
@@ -1380,6 +1420,9 @@ pub enum DeviceResult {
         predicates: Vec<UiPredicateResult>,
         screenshot: Option<UiImage>,
     },
+    Browser {
+        result: BrowserBackendResult,
+    },
     Error {
         code: DeviceErrorCode,
     },
@@ -1387,6 +1430,9 @@ pub enum DeviceResult {
 
 impl DeviceResult {
     pub(crate) fn matches_command(&self, command: &DeviceCommand) -> bool {
+        if let (Self::Browser { result }, DeviceCommand::Browser { command }) = (self, command) {
+            return result.matches_command(command);
+        }
         matches!(
             (self, command),
             (Self::Applications { .. }, DeviceCommand::ListApplications)
@@ -1726,6 +1772,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2_browser_runtime::{BrowserBackendClickTarget, BrowserMutationEffect};
+    use crate::v2_browser::BrowserInputRoute;
 
     fn capabilities(revision: u64) -> CapabilityAdvertisement {
         CapabilityAdvertisement {
@@ -1889,6 +1937,53 @@ mod tests {
     }
 
     #[test]
+    fn browser_commands_map_to_exact_capabilities_and_result_types() {
+        let inspect = DeviceCommand::Browser {
+            command: BrowserBackendCommand::Bind {
+                context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+                process_id: 1,
+                window_id: 2,
+            },
+        };
+        assert_eq!(inspect.capability(), DeviceCapability::BrowserInspect);
+        assert_eq!(inspect.class(), CapabilityClass::Observe);
+
+        let click_command = BrowserBackendCommand::Click {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            target: BrowserBackendClickTarget::Element {
+                backend_element_ref: "p1:1".into(),
+            },
+            input_route: BrowserInputRoute::DomEvent,
+        };
+        let click = DeviceCommand::Browser {
+            command: click_command.clone(),
+        };
+        assert_eq!(click.capability(), DeviceCapability::BrowserClick);
+        assert_eq!(click.class(), CapabilityClass::Interact);
+        assert!(DeviceResult::Browser {
+            result: BrowserBackendResult::ClickCompleted {
+                effect: BrowserMutationEffect::Unverifiable,
+            },
+        }
+        .matches_command(&click));
+        assert!(!DeviceResult::Browser {
+            result: BrowserBackendResult::TypeCompleted,
+        }
+        .matches_command(&click));
+
+        assert_eq!(
+            DeviceCapability::BrowserUploadFile.class(),
+            CapabilityClass::Dangerous
+        );
+        assert_eq!(
+            DeviceCapability::BrowserDownload.class(),
+            CapabilityClass::Dangerous
+        );
+    }
+
+    #[test]
     fn exact_screenshot_grant_does_not_authorize_type_text() {
         let authority = GrantAuthority::generate();
         let mut ledger = GrantLedger::new(authority.verifier());
@@ -2007,18 +2102,18 @@ mod tests {
     }
 
     #[test]
-    fn pre_v3_control_and_capability_schemas_fail_closed_during_rolling_upgrade() {
+    fn pre_v4_control_and_capability_schemas_fail_closed_during_rolling_upgrade() {
         let (mut registry, _identity, device_id) = enrolled();
         let mut old_capabilities = capabilities(8);
-        old_capabilities.capability_schema_version = 2;
+        old_capabilities.capability_schema_version = 3;
         assert_eq!(
             registry.connect(&device_id, old_capabilities),
-            Err(ControlError::UnsupportedCapabilitySchema { got: 2 })
+            Err(ControlError::UnsupportedCapabilitySchema { got: 3 })
         );
 
         let session = registry.connect(&device_id, capabilities(9)).unwrap();
         let old_command = CommandEnvelope {
-            schema_version: 2,
+            schema_version: 3,
             device_id,
             device_generation: session.generation,
             capability_revision: session.capabilities.revision,
@@ -2027,7 +2122,7 @@ mod tests {
         };
         assert_eq!(
             validate_command_session(&old_command, &session),
-            Err(ControlError::UnsupportedControlSchema { got: 2 })
+            Err(ControlError::UnsupportedControlSchema { got: 3 })
         );
     }
 
