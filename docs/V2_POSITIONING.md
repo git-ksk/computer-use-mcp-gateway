@@ -145,11 +145,13 @@ External authorization is reduced to the local execution question:
 principal -> stable desktop -> exact DeviceCapability
 ```
 
-CUMG may consume MCP Authorization/OAuth, OIDC, IAM-like systems, SINT-style capability systems, Grantex/Open Agent Auth-class protocols, or other maintained authorization sources.
+CUMG may consume MCP Authorization/OAuth, OIDC, IAM-like systems, SINT-style capability systems, Grantex/Open Agent Auth-class protocols, or other maintained authorization sources. Authentication itself is not CUMG product logic: an external identity system or reviewed authentication edge proves who the caller is, and the northbound adapter reduces that proof to `AuthenticatedClientPrincipal { issuer, subject }`.
 
-Their credentials are not Agent credentials and must not be forwarded southbound as a substitute for a device-scoped execution grant.
+CUMG authorization starts after that reduction. `DeviceCapabilityAuthorizer` answers only whether that authenticated principal may use one stable desktop for one exact `DeviceCapability`. Identity storage, password/session handling, token issuance, and general-purpose account management stay outside CUMG. A self-contained signed JWT therefore does not require a CUMG user database merely to establish identity; authorization storage is a separate concern.
 
-The custom value is not inventing another generic authorization protocol; it is binding an authorized intent to the operation-ownership state machine above.
+The current runtime adapter is RFC 7662 OAuth introspection. OIDC/JWT is the preferred general signed-token direction for providers such as Firebase/Auth0/Cognito/Entra/Keycloak, while a trusted authenticated proxy/tunnel is a valid deployment boundary when the origin is constrained accordingly. A fixed principal is acceptable only for an intentionally single-principal deployment; multi-principal policy requires an authenticated identity to survive the proxy boundary.
+
+Northbound credentials are not Agent credentials and must not be forwarded southbound as a substitute for a device-scoped execution grant. The custom value is not inventing another generic authorization protocol; it is binding an authorized intent to the operation-ownership state machine above.
 
 ### 5. Backend-neutral execution evidence
 

@@ -139,9 +139,9 @@ V1 splits `CUMG_BACKEND_ARGS` on ASCII whitespace and does not implement shell-s
 
 ## Remote access
 
-For V2, keep the northbound MCP listener loopback-only and terminate the public HTTPS resource at a reviewed proxy/load balancer. V2 validates OAuth/introspection before constructing the principal that reaches CUMG or MCPUsage. The Agent connects outbound to the Hub over the existing gRPC/TLS carrier.
+For V2, keep the northbound MCP listener loopback-only and terminate the public HTTPS resource at a reviewed proxy/load balancer. Northbound authentication is external infrastructure: the Hub consumes a verified identity and reduces it to `AuthenticatedClientPrincipal { issuer, subject }`; CUMG then authorizes only the exact `principal -> stable device -> DeviceCapability` tuple. The Agent connects outbound to the Hub over the existing gRPC/TLS carrier.
 
-The older Cloudflare/V1 deployment guidance remains documented for `v1_gateway`; do not confuse that legacy path with the recommended V2 OAuth boundary. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+The current packaged northbound adapter uses OAuth bearer validation through RFC 7662 introspection. That is the current implementation, not the product boundary. Generic OIDC/JWT validation and trusted authenticated-proxy deployments should converge on the same verified-principal boundary rather than adding provider-specific execution logic. The older Cloudflare/V1 deployment remains the reference for a proxy-owned authentication boundary. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Development
 

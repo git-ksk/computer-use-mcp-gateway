@@ -8,7 +8,7 @@ The recommended V2 northbound path is:
 
 ```text
 MCP client
-  -> OAuth bearer verification
+  -> northbound authentication
   -> verified issuer + subject
   -> MCPUsage reserve(1)
   -> exact CUMG device/capability authorization
@@ -19,7 +19,7 @@ MCP client
   -> Agent -> MCP stdio -> Cua
 ```
 
-`reserve()` cannot safely precede OAuth verification because usage identity is derived from the verified issuer and subject. The bearer token itself is stripped at the northbound boundary and is never sent to the usage sidecar.
+`reserve()` cannot safely precede northbound authentication because usage identity is derived from the verified issuer and subject. Authentication credentials remain at the northbound boundary and are never sent to the usage sidecar. The current RFC 7662 adapter strips its bearer token before Hub execution.
 
 The CUMG `operation_id` is passed unchanged as MCPUsage `operationId`. No second logical operation identity is generated.
 

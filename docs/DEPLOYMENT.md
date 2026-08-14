@@ -11,16 +11,15 @@ V2-M1 has a separate production candidate from the V1 loopback gateway. The acce
 ```text
 MCP client
     |
-    | HTTPS + MCP Authorization / OAuth
+    | HTTPS + deployment authentication
     v
-reviewed TLS reverse proxy / load balancer
+external IdP / reviewed TLS reverse proxy / authenticated tunnel
     |
-    | loopback HTTP
+    | verified identity (provider credential stops at northbound authentication)
     v
 v2_hub northbound MCP (default deployment: 127.0.0.1:8081)
     |
     | AuthenticatedClientPrincipal -> stable device -> exact DeviceCapability grant
-    | OAuth token stops here
     |
     | outbound-Agent gRPC bidi over TLS
     v
@@ -30,6 +29,12 @@ v2_agent
 ```
 
 The Agent-facing gRPC listener is a separate Hub service port (example 7443). Agents connect outbound and authenticate again at the application layer with the enrolled Ed25519 device identity. A public deployment must restrict this port at the host/cloud firewall and apply the deployment's normal TCP/TLS connection controls. The in-process session limits begin after transport acceptance and are defense in depth, not a raw handshake-flood defense.
+
+Northbound authentication and CUMG authorization are deliberately separate. The current packaged Hub validates OAuth bearer tokens through RFC 7662 introspection, then constructs `AuthenticatedClientPrincipal { issuer, subject }`. RFC 7662 is one adapter, not a requirement on the CUMG core. The intended adapter boundary also permits generic OIDC/JWT validation and reviewed trusted-proxy/tunnel deployments to produce the same principal. After that point, only `DeviceCapabilityAuthorizer` decides `principal -> device -> exact capability`.
+
+OIDC/JWT validation does not require a CUMG user database merely to identify the caller: signature plus configured issuer/audience/time/subject claims establish the principal. Authorization data is separate. The current default authorization store is the integrity-protected `CUMG_V2_NORTHBOUND_POLICY_FILE`, loaded into an in-process exact-tuple policy. A future database or external policy engine may sit behind `DeviceCapabilityAuthorizer` without changing the execution-safety state machine.
+
+For a trusted authenticated proxy/tunnel, constrain the Hub listener to loopback or an equivalently private origin path. If the deployment needs per-user CUMG policy, the authentication edge must convey a tamper-resistant authenticated identity to the adapter. A fixed configured principal is appropriate only when the deployment intentionally represents one principal. Never trust a caller-provided `X-User`/similar header merely because the listener is called a proxy mode.
 
 ### Linux Hub
 

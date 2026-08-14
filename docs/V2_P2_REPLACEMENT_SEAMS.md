@@ -24,7 +24,7 @@ The replaceable infrastructure boundary is narrower:
 
 | Surface | Current implementation | P2 seam/decision |
 | --- | --- | --- |
-| northbound token validation | OAuth introspection behind `AccessTokenVerifier` | already replaceable; bearer token remains northbound and is stripped before Hub execution |
+| northbound authentication | OAuth introspection behind `AccessTokenVerifier` | token verification is already replaceable; the next northbound generalization should normalize OIDC/JWT or a reviewed trusted-proxy result into the same `AuthenticatedClientPrincipal` without changing downstream authorization |
 | principal -> device -> exact capability authorization | `ClientAuthorizationPolicy` | `DeviceCapabilityAuthorizer` seam added; replacement returns only an exact allow/deny decision |
 | Computer Use execution | `CuaMcpAdapter` | `ComputerUseBackendAdapter` seam added; Cua remains the default implementation |
 | Hub-Agent carrier | signed application protocol over gRPC/TLS | no replacement work; transport is not the current bottleneck |
@@ -34,6 +34,18 @@ The replaceable infrastructure boundary is narrower:
 | persistence | CUMG checkpoints for authoritative execution state | not delegated; external stores may eventually host bytes but cannot redefine state transitions |
 
 ## 2. Adopted seams
+
+### Authentication-to-principal boundary
+
+Authentication infrastructure proves caller identity; CUMG consumes only the normalized result:
+
+```text
+verified external identity -> AuthenticatedClientPrincipal { issuer, subject }
+```
+
+`OAuthIntrospectionVerifier` is the current concrete adapter behind `AccessTokenVerifier`; RFC 7662 is not a product-level requirement. A future generic OIDC/JWT adapter should verify signature and required claims against the configured issuer/audience and then emit the same principal. A trusted authenticated-proxy adapter may emit a proxy-proven identity, or a configured fixed principal for an explicitly single-principal deployment, but must not trust arbitrary client-supplied identity headers.
+
+This seam owns no user/account database. Token issuance, login/session state, password/MFA handling, and identity lifecycle remain with the external IdP or authentication edge.
 
 ### Exact authorization seam
 
