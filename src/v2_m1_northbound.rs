@@ -158,6 +158,66 @@ impl NorthboundMcpConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct TrustedProxyConfig {
+    resource: String,
+    resource_url: Url,
+    principal: AuthenticatedClientPrincipal,
+}
+
+impl fmt::Debug for TrustedProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrustedProxyConfig")
+            .field("resource", &self.resource)
+            .field("principal", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl TrustedProxyConfig {
+    /// Configure an explicitly single-principal deployment behind a reviewed
+    /// authenticated proxy/tunnel. The proxy owns authentication; CUMG never
+    /// trusts caller-supplied identity headers in this mode.
+    pub fn new(
+        resource: impl Into<String>,
+        issuer: impl Into<String>,
+        subject: impl Into<String>,
+    ) -> Result<Self, NorthboundConfigError> {
+        let resource = resource.into();
+        let issuer = issuer.into();
+        let resource_url = validate_https_url(&resource, "MCP resource")?;
+        if resource_url.query().is_some() || resource_url.fragment().is_some() {
+            return Err(NorthboundConfigError::InvalidResourceUri);
+        }
+        validate_https_url(&issuer, "trusted proxy issuer")
+            .map_err(|_| NorthboundConfigError::InvalidTrustedProxyIssuerUri)?;
+        let principal = AuthenticatedClientPrincipal::new(issuer, subject)
+            .map_err(|_| NorthboundConfigError::InvalidTrustedProxyPrincipal)?;
+        Ok(Self {
+            resource,
+            resource_url,
+            principal,
+        })
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub fn issuer(&self) -> &str {
+        &self.principal.issuer
+    }
+
+    pub fn mcp_path(&self) -> &str {
+        let path = self.resource_url.path();
+        if path.is_empty() { "/" } else { path }
+    }
+
+    pub fn principal(&self) -> &AuthenticatedClientPrincipal {
+        &self.principal
+    }
+}
+
 fn validate_https_url(value: &str, _kind: &'static str) -> Result<Url, NorthboundConfigError> {
     let url = Url::parse(value).map_err(|_| NorthboundConfigError::InvalidUrl)?;
     if url.scheme() != "https"
@@ -488,6 +548,70 @@ struct NorthboundAuthContext {
 struct NorthboundAuthState {
     verifier: Arc<dyn AccessTokenVerifier>,
     config: Arc<NorthboundMcpConfig>,
+}
+
+#[derive(Clone)]
+struct TrustedProxyAuthState {
+    principal: AuthenticatedClientPrincipal,
+}
+
+/// Build a northbound MCP resource for an explicitly single-principal deployment
+/// whose loopback origin is reachable only through a reviewed authenticated proxy.
+///
+/// This adapter deliberately does not read `X-User`, Cloudflare identity headers,
+/// or any other caller-controlled identity value. The principal comes only from
+/// operator configuration. Use a signed-token/OIDC adapter for multi-principal use.
+pub fn build_trusted_proxy_router(handler: V2NorthboundMcp, config: TrustedProxyConfig) -> Router {
+    let mut allowed_hosts = vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        "::1".to_owned(),
+    ];
+    if let Some(host) = config.resource_url.host_str() {
+        allowed_hosts.push(host.to_owned());
+    }
+    let http_config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_allowed_hosts(allowed_hosts)
+        .with_stateless_protocol_metadata_required(true);
+    let service = StreamableHttpService::new(
+        move || Ok(handler.clone()),
+        LocalSessionManager::default().into(),
+        http_config,
+    );
+    let state = TrustedProxyAuthState {
+        principal: config.principal.clone(),
+    };
+    Router::new()
+        .nest_service(config.mcp_path(), service)
+        .layer(middleware::from_fn_with_state(state, trusted_proxy_guard))
+}
+
+async fn trusted_proxy_guard(
+    State(state): State<TrustedProxyAuthState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // Authentication is completed by the reviewed proxy before this loopback
+    // listener. Strip known credentials/identity hints so neither rmcp nor the
+    // Hub/Agent path can accidentally consume or log them. None of these values
+    // participates in principal selection.
+    for name in [
+        "authorization",
+        "cf-access-jwt-assertion",
+        "cf-access-authenticated-user-email",
+        "cf-access-client-id",
+        "cf-access-client-secret",
+        "x-user",
+        "x-authenticated-user",
+    ] {
+        request.headers_mut().remove(name);
+    }
+    request.extensions_mut().insert(NorthboundAuthContext {
+        principal: state.principal,
+    });
+    next.run(request).await
 }
 
 pub fn build_northbound_router(
@@ -1373,6 +1497,8 @@ pub enum NorthboundConfigError {
     HttpsRequired,
     InvalidResourceUri,
     InvalidAuthorizationServerUri,
+    InvalidTrustedProxyIssuerUri,
+    InvalidTrustedProxyPrincipal,
     InvalidScope,
     DuplicateScope,
 }
@@ -1439,6 +1565,80 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn trusted_proxy_config_requires_https_and_nonempty_fixed_principal() {
+        assert!(
+            TrustedProxyConfig::new(
+                "https://hub.example/mcp",
+                "https://access.example",
+                "single-principal",
+            )
+            .is_ok()
+        );
+        assert!(
+            TrustedProxyConfig::new(
+                "http://hub.example/mcp",
+                "https://access.example",
+                "single-principal",
+            )
+            .is_err()
+        );
+        assert!(
+            TrustedProxyConfig::new("https://hub.example/mcp", "https://access.example", "",)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_uses_only_configured_principal_and_strips_identity_credentials() {
+        let configured =
+            AuthenticatedClientPrincipal::new("https://access.example", "fixed-user").unwrap();
+        let app = Router::new()
+            .route(
+                "/mcp",
+                get(|request: Request| async move {
+                    let principal = request
+                        .extensions()
+                        .get::<NorthboundAuthContext>()
+                        .map(|auth| auth.principal.clone());
+                    Json(json!({
+                        "issuer": principal.as_ref().map(|p| p.issuer.as_str()),
+                        "subject": principal.as_ref().map(|p| p.subject.as_str()),
+                        "authorization_visible": request.headers().contains_key(AUTHORIZATION),
+                        "cf_jwt_visible": request.headers().contains_key("cf-access-jwt-assertion"),
+                        "x_user_visible": request.headers().contains_key("x-user")
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                TrustedProxyAuthState {
+                    principal: configured,
+                },
+                trusted_proxy_guard,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = Client::new()
+            .get(format!("http://{address}/mcp"))
+            .header(AUTHORIZATION, "Bearer caller-controlled")
+            .header("Cf-Access-Jwt-Assertion", "proxy-credential")
+            .header("X-User", "attacker-selected-user")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["issuer"], "https://access.example");
+        assert_eq!(body["subject"], "fixed-user");
+        assert_eq!(body["authorization_visible"], false);
+        assert_eq!(body["cf_jwt_visible"], false);
+        assert_eq!(body["x_user_visible"], false);
+        task.abort();
     }
 
     #[test]
@@ -1872,6 +2072,90 @@ mod tests {
             .unwrap_or_else(|error| panic!("non-JSON MCP response ({error}): {raw}"));
         let tools = body["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec![TOOL_READ_FILE]);
+
+        task.abort();
+        drop(hub);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_mcp_ignores_caller_identity_and_keeps_exact_policy() {
+        use crate::{
+            v2_m0::{DeviceIdentity, GrantAuthority},
+            v2_m0_transport::HubIdentity,
+            v2_m1_hub::{HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
+        };
+
+        let device_identity = DeviceIdentity::generate();
+        let state_dir = temp_state_dir("trusted-proxy-mcp-http");
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(1),
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_authority: GrantAuthority::generate(),
+                device_verifier: device_identity.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let device_id = hub.device_id().to_owned();
+        let proxy_config = TrustedProxyConfig::new(
+            "https://hub.example/mcp",
+            "https://access.example",
+            "fixed-user",
+        )
+        .unwrap();
+        let mut policy = ClientAuthorizationPolicy::default();
+        policy.allow_device_capability(
+            proxy_config.principal(),
+            &device_id,
+            DeviceCapability::ReadFile,
+        );
+        let router = build_trusted_proxy_router(V2NorthboundMcp::new(handle, policy), proxy_config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let response = Client::new()
+            .post(format!("http://{address}/mcp"))
+            .header("X-User", "attacker-selected-user")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let raw = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "unexpected MCP response: {raw}");
+        let body: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("non-JSON MCP response ({error}): {raw}"));
+        let names: Vec<_> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
