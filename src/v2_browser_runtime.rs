@@ -152,11 +152,27 @@ impl fmt::Debug for BrowserBackendCommand {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserBackendClickTarget {
-    Element,
+    Element { backend_element_ref: String },
     ViewportCss { x: i32, y: i32 },
+}
+
+impl fmt::Debug for BrowserBackendClickTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Element { .. } => f
+                .debug_struct("Element")
+                .field("backend_element_ref", &"[redacted]")
+                .finish(),
+            Self::ViewportCss { x, y } => f
+                .debug_struct("ViewportCss")
+                .field("x", x)
+                .field("y", y)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,7 +398,9 @@ mod tests {
             context_id: CONTEXT.into(),
             backend_target_id: "target".into(),
             backend_tab_id: "tab".into(),
-            target: BrowserBackendClickTarget::Element,
+            target: BrowserBackendClickTarget::Element {
+                backend_element_ref: "p9:7".into(),
+            },
             input_route: BrowserInputRoute::DomEvent,
         };
         assert!(BrowserBackendResult::ClickCompleted {
@@ -394,6 +412,11 @@ mod tests {
 
     #[test]
     fn transport_debug_redacts_backend_refs_paths_text_urls_and_images() {
+        let click_target = BrowserBackendClickTarget::Element {
+            backend_element_ref: "p9:7".into(),
+        };
+        assert!(!format!("{click_target:?}").contains("p9:7"));
+
         let upload = BrowserBackendCommand::Upload {
             context_id: CONTEXT.into(),
             backend_target_id: "target-secret".into(),
