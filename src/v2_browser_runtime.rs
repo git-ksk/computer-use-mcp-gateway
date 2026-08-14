@@ -234,10 +234,8 @@ impl BrowserBackendResult {
     pub fn matches_command(&self, command: &BrowserBackendCommand) -> bool {
         matches!(
             (self, command),
-            (
-                Self::Prepared { .. },
-                BrowserBackendCommand::Prepare { .. }
-            ) | (Self::Bound { .. }, BrowserBackendCommand::Bind { .. })
+            (Self::Prepared { .. }, BrowserBackendCommand::Prepare { .. })
+                | (Self::Bound { .. }, BrowserBackendCommand::Bind { .. })
                 | (Self::Snapshot { .. }, BrowserBackendCommand::Inspect { .. })
                 | (
                     Self::NavigationCompleted,
@@ -248,10 +246,7 @@ impl BrowserBackendResult {
                     BrowserBackendCommand::Click { .. }
                 )
                 | (Self::TypeCompleted, BrowserBackendCommand::Type { .. })
-                | (
-                    Self::DialogCompleted,
-                    BrowserBackendCommand::Dialog { .. }
-                )
+                | (Self::DialogCompleted, BrowserBackendCommand::Dialog { .. })
                 | (
                     Self::PointerCompleted,
                     BrowserBackendCommand::Pointer { .. }
@@ -409,10 +404,12 @@ mod tests {
             },
             input_route: BrowserInputRoute::DomEvent,
         };
-        assert!(BrowserBackendResult::ClickCompleted {
-            effect: BrowserMutationEffect::Unverifiable,
-        }
-        .matches_command(&command));
+        assert!(
+            BrowserBackendResult::ClickCompleted {
+                effect: BrowserMutationEffect::Unverifiable,
+            }
+            .matches_command(&command)
+        );
         assert!(!BrowserBackendResult::TypeCompleted.matches_command(&command));
     }
 
