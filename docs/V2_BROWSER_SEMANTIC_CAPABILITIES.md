@@ -150,6 +150,28 @@ event, or expand desktop scope.
 Completion proves dispatch according to the selected route, not application-level success. Callers
 must verify the expected page state with a fresh browser snapshot.
 
+## Cua 0.19.3 result normalization
+
+Cua 0.19.3 has two reviewed result shapes at the browser adapter boundary. Bind, inspect, navigate,
+and dialog retain their browser-specific structured results. `browser_click`, `browser_type`, and
+`browser_pointer` are projected through Cua's closed action-result chokepoint before CUMG sees them.
+CUMG accepts that projection only when the observed route exactly matches the requested semantic:
+`trusted_input` for trusted input, `dom` for explicit DOM events, and `background` as the browser
+delivery posture. Unknown routes, unknown fields, partial delivery, suspected no-op, or actual
+foreground/pixel/session escalation fail closed.
+
+For an explicit DOM action, Cua may return `effect=unverifiable` with the narrow recommendation
+`target=page, reason=effect_unconfirmed`. This is not evidence that Cua performed another action or
+changed input route; it is a request to verify the already-dispatched page action. CUMG therefore
+returns `verification_required=true` and requires a fresh inspect rather than replaying, foregrounding,
+or escalating automatically.
+
+Cua semantic-ref `states` are provider objects, not northbound authority. CUMG reduces only the
+reviewed state keys and values into a small backend-neutral string vocabulary and ignores unknown
+provider state keys. Browser refusal outcomes are likewise normalized before the generic MCP error
+path: Cua may return `status=refused` without setting MCP `isError`, and only the closed refusal code
+crosses the adapter boundary.
+
 ## Dialog boundary
 
 `BrowserDialog action=inspect` observes only a page-owned JavaScript dialog on one exact bound tab.
@@ -240,6 +262,11 @@ headroom while preserving limits on:
 - typed input text and prompt text;
 - upload ref count;
 - download byte ceiling.
+
+Cua reports viewport CSS dimensions as numeric values and may serialize integral dimensions as JSON
+floating-point values such as `1200.0`. CUMG accepts only finite, positive, mathematically integral
+values that fit the reviewed integer bounds; fractional viewport dimensions are refused rather than
+silently rounded. Pixel-to-CSS scale remains serialized as integer millionths on the signed transport.
 
 Browser page content and screenshots are user data, not telemetry.
 

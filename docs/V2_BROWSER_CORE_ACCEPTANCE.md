@@ -83,6 +83,36 @@ Run against the pinned Cua 0.19.3 shadow Agent on the trusted Mac without changi
 Provider safety refusals are valid outcomes. Acceptance must not turn an unsupported background trusted
 input route into a foreground action simply to obtain a pass.
 
+### Trusted-Mac evidence on 2026-08-14
+
+A disposable loopback V2 shadow using the reviewed branch and the installed Cua 0.19.3 completed the
+following signed northbound -> Hub -> Agent -> Cua checks without changing the persistent V1/V2
+listeners or Cloudflare route:
+
+- discovery exposed Desktop 29 + Browser core 8 tools and no browser transfer tools;
+- existing-profile preparation without provider approval returned only the safe
+  `browser_consent_required` code;
+- isolated preparation, exact native-window bind, navigation, and semantic-v2 inspect succeeded with
+  no raw target/tab/page ids in the northbound result;
+- navigation and fresh snapshots made prior page refs stale, while wrong-kind/content and wrong-action
+  refs were rejected at the CUMG boundary;
+- ref-targeted type was verified by fresh semantic value readback;
+- explicit DOM click returned `effect=unverifiable` plus `verification_required=true`, and a fresh
+  inspect verified the expected DOM state without automatic replay or route/foreground escalation;
+- pointer scroll used a ref carrying scroll authority and a fresh inspect observed the target move from
+  `near_viewport` to `in_viewport`;
+- dialog tracking was armed before the page-owned dialog opened, then inspect minted only an opaque
+  CUMG dialog ref, dismiss consumed it, reuse failed closed, and fresh page state showed dismissal;
+- Agent reconnect invalidated an older-generation browser context before backend dispatch;
+- an intentionally noisy exact-tab PNG produced more than 3.2 million base64 characters and traversed
+  the signed bounded-large result path while keeping screenshot metadata and refs backend-neutral.
+
+The live run also caught and closed four adapter-shape gaps before merge: refusal outcomes with no MCP
+`isError`, object-shaped semantic states, Cua's closed action-result projection for click/type/pointer,
+and integral floating-point viewport dimensions. This evidence does **not** make the PR ready to leave
+draft by itself; final-head CI, reproducible local acceptance, cleanup/session plateau checks, and the
+remaining closeout bullets still apply.
+
 ## Transfer boundary remains separate
 
 `BrowserUploadFile` and `BrowserDownload` may exist in schema v4 so grants, signed transport, rolling

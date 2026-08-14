@@ -147,10 +147,10 @@ pub(crate) async fn execute_cua_browser(
         }
         Err(error) => return Err(BrowserExecutionError::Backend(error)),
     };
+    if let Some(reason) = refusal_reason(&raw) {
+        return Err(BrowserExecutionError::BackendRefused(reason));
+    }
     if raw.is_error == Some(true) {
-        if let Some(reason) = refusal_reason(&raw) {
-            return Err(BrowserExecutionError::BackendRefused(reason));
-        }
         return Err(BrowserExecutionError::BackendToolError);
     }
     normalize_completed(command, &raw).map(BrowserExecutionOutcome::Completed)
@@ -683,12 +683,23 @@ fn normalize_completed(
             input_route,
             ..
         } => {
-            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            let outcome = if is_closed_action_result(&structured) {
+                normalize_browser_action_result(&structured, expected_action_route(*input_route))?
+            } else {
+                require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+                BrowserClosedActionOutcome::Legacy
+            };
             Ok(BrowserBackendResult::ClickCompleted {
-                effect: if *input_route == BrowserInputRoute::DomEvent {
-                    BrowserMutationEffect::Unverifiable
-                } else {
-                    BrowserMutationEffect::Dispatched
+                effect: match outcome {
+                    BrowserClosedActionOutcome::Confirmed => BrowserMutationEffect::Dispatched,
+                    BrowserClosedActionOutcome::Unverifiable => BrowserMutationEffect::Unverifiable,
+                    BrowserClosedActionOutcome::Legacy => {
+                        if *input_route == BrowserInputRoute::DomEvent {
+                            BrowserMutationEffect::Unverifiable
+                        } else {
+                            BrowserMutationEffect::Dispatched
+                        }
+                    }
                 },
             })
         }
@@ -697,7 +708,11 @@ fn normalize_completed(
             backend_tab_id,
             ..
         } => {
-            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            if is_closed_action_result(&structured) {
+                normalize_browser_action_result(&structured, "trusted_input")?;
+            } else {
+                require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            }
             Ok(BrowserBackendResult::TypeCompleted)
         }
         BrowserBackendCommand::Dialog {
@@ -767,14 +782,174 @@ fn normalize_completed(
         BrowserBackendCommand::Pointer {
             backend_target_id,
             backend_tab_id,
+            input_route,
             ..
         } => {
-            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            if is_closed_action_result(&structured) {
+                normalize_browser_action_result(&structured, expected_action_route(*input_route))?;
+            } else {
+                require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            }
             Ok(BrowserBackendResult::PointerCompleted)
         }
         BrowserBackendCommand::Upload { .. } | BrowserBackendCommand::Download { .. } => {
             Err(BrowserExecutionError::UnsupportedTransferBoundary)
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserClosedActionOutcome {
+    Confirmed,
+    Unverifiable,
+    Legacy,
+}
+
+fn expected_action_route(input_route: BrowserInputRoute) -> &'static str {
+    match input_route {
+        BrowserInputRoute::Trusted => "trusted_input",
+        BrowserInputRoute::DomEvent => "dom",
+    }
+}
+
+fn is_closed_action_result(value: &Value) -> bool {
+    value.get("effect").is_some() || value.get("route").is_some()
+}
+
+fn normalize_browser_action_result(
+    value: &Value,
+    expected_route: &str,
+) -> Result<BrowserClosedActionOutcome, BrowserExecutionError> {
+    const ALLOWED_TOP_LEVEL: &[&str] = &["effect", "route", "delivery", "evidence", "escalation"];
+    let object = value
+        .as_object()
+        .ok_or(BrowserExecutionError::InvalidResult(
+            "browser action result was not an object",
+        ))?;
+    if object
+        .keys()
+        .any(|key| !ALLOWED_TOP_LEVEL.contains(&key.as_str()))
+    {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser action result contained unknown fields",
+        ));
+    }
+    let route =
+        object
+            .get("route")
+            .and_then(Value::as_str)
+            .ok_or(BrowserExecutionError::InvalidResult(
+                "browser action result omitted route",
+            ))?;
+    if route != expected_route {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser action result used an unexpected route",
+        ));
+    }
+    let effect = object.get("effect").and_then(Value::as_str).ok_or(
+        BrowserExecutionError::InvalidResult("browser action result omitted effect"),
+    )?;
+    if let Some(escalation) = object.get("escalation").filter(|value| !value.is_null()) {
+        let escalation = escalation
+            .as_object()
+            .ok_or(BrowserExecutionError::InvalidResult(
+                "browser action escalation was not an object",
+            ))?;
+        if escalation
+            .keys()
+            .any(|key| !matches!(key.as_str(), "target" | "reason"))
+        {
+            return Err(BrowserExecutionError::InvalidResult(
+                "browser action escalation contained unknown fields",
+            ));
+        }
+        let verification_only = effect == "unverifiable"
+            && escalation.get("target").and_then(Value::as_str) == Some("page")
+            && escalation.get("reason").and_then(Value::as_str) == Some("effect_unconfirmed");
+        if !verification_only {
+            return Err(BrowserExecutionError::BackendRefused(
+                BrowserRefusalReason::Other,
+            ));
+        }
+    }
+    if let Some(delivery) = object.get("delivery").filter(|value| !value.is_null()) {
+        let delivery = delivery
+            .as_object()
+            .ok_or(BrowserExecutionError::InvalidResult(
+                "browser action delivery was not an object",
+            ))?;
+        if delivery
+            .keys()
+            .any(|key| !matches!(key.as_str(), "mode" | "delivered_count"))
+        {
+            return Err(BrowserExecutionError::InvalidResult(
+                "browser action delivery contained unknown fields",
+            ));
+        }
+        if delivery.get("mode").and_then(Value::as_str) != Some("background") {
+            return Err(BrowserExecutionError::InvalidResult(
+                "browser action delivery was not the browser background route",
+            ));
+        }
+        if let Some(count) = delivery.get("delivered_count") {
+            let count = count.as_u64().ok_or(BrowserExecutionError::InvalidResult(
+                "browser action delivered_count was invalid",
+            ))?;
+            u32::try_from(count).map_err(|_| {
+                BrowserExecutionError::InvalidResult(
+                    "browser action delivered_count exceeded the bound",
+                )
+            })?;
+        }
+    }
+    let evidence_count =
+        if let Some(evidence) = object.get("evidence").filter(|value| !value.is_null()) {
+            let evidence = evidence
+                .as_array()
+                .ok_or(BrowserExecutionError::InvalidResult(
+                    "browser action evidence was not an array",
+                ))?;
+            if evidence.len() > 8 {
+                return Err(BrowserExecutionError::InvalidResult(
+                    "browser action evidence exceeded the bound",
+                ));
+            }
+            for item in evidence {
+                let item = item
+                    .as_object()
+                    .ok_or(BrowserExecutionError::InvalidResult(
+                        "browser action evidence item was not an object",
+                    ))?;
+                if item.len() != 1
+                    || !matches!(
+                        item.get("kind").and_then(Value::as_str),
+                        Some("value_readback" | "window_change")
+                    )
+                {
+                    return Err(BrowserExecutionError::InvalidResult(
+                        "browser action evidence was outside the closed vocabulary",
+                    ));
+                }
+            }
+            evidence.len()
+        } else {
+            0
+        };
+    match effect {
+        "confirmed" if evidence_count > 0 => Ok(BrowserClosedActionOutcome::Confirmed),
+        "confirmed" => Err(BrowserExecutionError::InvalidResult(
+            "confirmed browser action omitted evidence",
+        )),
+        "unverifiable" => Ok(BrowserClosedActionOutcome::Unverifiable),
+        "partial" => Err(BrowserExecutionError::BackendRefused(
+            BrowserRefusalReason::InputIncomplete,
+        )),
+        "refused" | "suspected_noop" => Err(BrowserExecutionError::BackendRefused(
+            BrowserRefusalReason::Other,
+        )),
+        _ => Err(BrowserExecutionError::InvalidResult(
+            "browser action result contained an unknown effect",
+        )),
     }
 }
 
@@ -900,14 +1075,58 @@ fn normalize_screenshot(
 
 fn refusal_reason(raw: &CallToolResult) -> Option<BrowserRefusalReason> {
     let structured = raw.structured_content.as_ref()?;
-    if structured.get("status").and_then(Value::as_str) != Some("refused") {
+    if structured.get("status").and_then(Value::as_str) == Some("refused") {
+        let code = structured
+            .get("refusal")?
+            .get("code")?
+            .as_str()
+            .unwrap_or_default();
+        return Some(closed_refusal_reason(code).unwrap_or(BrowserRefusalReason::Other));
+    }
+    if !matches!(
+        structured.get("effect").and_then(Value::as_str),
+        Some("refused" | "partial")
+    ) {
         return None;
     }
-    let code = structured
-        .get("refusal")?
-        .get("code")?
-        .as_str()
-        .unwrap_or_default();
+    let serialized = serde_json::to_value(raw).ok()?;
+    let text = serialized
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    CLOSED_BROWSER_REFUSAL_CODES
+        .iter()
+        .find(|code| text.contains(**code))
+        .and_then(|code| closed_refusal_reason(code))
+        .or(Some(BrowserRefusalReason::Other))
+}
+
+const CLOSED_BROWSER_REFUSAL_CODES: &[&str] = &[
+    "browser_route_unavailable",
+    "browser_requires_setup",
+    "browser_binding_ambiguous",
+    "browser_binding_stale",
+    "browser_wrong_target_refused",
+    "browser_tab_required",
+    "browser_tab_not_found",
+    "browser_ref_stale",
+    "browser_input_trust_unavailable",
+    "browser_endpoint_owner_mismatch",
+    "browser_consent_required",
+    "browser_consent_revoked",
+    "browser_reconnect_exhausted",
+    "browser_input_incomplete",
+    "browser_action_unavailable",
+    "browser_origin_outside_scope",
+];
+
+fn closed_refusal_reason(code: &str) -> Option<BrowserRefusalReason> {
     Some(match code {
         "browser_route_unavailable" => BrowserRefusalReason::RouteUnavailable,
         "browser_requires_setup" => BrowserRefusalReason::RequiresSetup,
@@ -927,7 +1146,7 @@ fn refusal_reason(raw: &CallToolResult) -> Option<BrowserRefusalReason> {
         "browser_input_incomplete" => BrowserRefusalReason::InputIncomplete,
         "browser_action_unavailable" => BrowserRefusalReason::ActionUnavailable,
         "browser_origin_outside_scope" => BrowserRefusalReason::OriginOutsideScope,
-        _ => BrowserRefusalReason::Other,
+        _ => return None,
     })
 }
 
@@ -978,9 +1197,19 @@ fn positive_u32(
     value: Option<&Value>,
     message: &'static str,
 ) -> Result<u32, BrowserExecutionError> {
-    let raw = value
-        .and_then(Value::as_u64)
-        .ok_or(BrowserExecutionError::InvalidResult(message))?;
+    let value = value.ok_or(BrowserExecutionError::InvalidResult(message))?;
+    let raw = if let Some(raw) = value.as_u64() {
+        raw
+    } else {
+        let raw = value
+            .as_f64()
+            .filter(|raw| raw.is_finite() && *raw > 0.0 && raw.fract() == 0.0)
+            .ok_or(BrowserExecutionError::InvalidResult(message))?;
+        if raw > u32::MAX as f64 {
+            return Err(BrowserExecutionError::InvalidResult(message));
+        }
+        raw as u64
+    };
     let value = u32::try_from(raw).map_err(|_| BrowserExecutionError::InvalidResult(message))?;
     if value == 0 {
         return Err(BrowserExecutionError::InvalidResult(message));
@@ -1137,6 +1366,27 @@ mod tests {
     }
 
     #[test]
+    fn exact_cua_refusal_is_recognized_without_mcp_error_flag() {
+        let raw: CallToolResult = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "refused (browser_consent_required): approval required"}],
+            "structuredContent": {
+                "status": "refused",
+                "refusal": {
+                    "code": "browser_consent_required",
+                    "message": "approval required",
+                    "detail": {"provider_private": "must not escape"}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(raw.is_error, None);
+        assert_eq!(
+            refusal_reason(&raw),
+            Some(BrowserRefusalReason::ConsentRequired)
+        );
+    }
+
+    #[test]
     fn safe_refusal_mapping_uses_only_code_not_provider_message() {
         let raw: CallToolResult = serde_json::from_value(json!({
             "content": [],
@@ -1290,6 +1540,116 @@ mod tests {
                 Err(BrowserExecutionError::InvalidResult(_))
             ));
         }
+    }
+
+    #[test]
+    fn current_cua_closed_action_result_is_accepted_only_for_exact_route() {
+        let valid = json!({
+            "effect": "unverifiable",
+            "route": "trusted_input",
+            "delivery": {"mode": "background", "delivered_count": 10}
+        });
+        assert_eq!(
+            normalize_browser_action_result(&valid, "trusted_input").unwrap(),
+            BrowserClosedActionOutcome::Unverifiable
+        );
+        assert!(matches!(
+            normalize_browser_action_result(&valid, "dom"),
+            Err(BrowserExecutionError::InvalidResult(_))
+        ));
+    }
+
+    #[test]
+    fn closed_browser_action_result_rejects_non_background_delivery() {
+        for mode in ["foreground", "unknown", "not_applicable"] {
+            let value = json!({
+                "effect": "unverifiable",
+                "route": "trusted_input",
+                "delivery": {"mode": mode}
+            });
+            assert!(matches!(
+                normalize_browser_action_result(&value, "trusted_input"),
+                Err(BrowserExecutionError::InvalidResult(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn closed_dom_action_accepts_only_page_verification_recommendation() {
+        let value = json!({
+            "effect": "unverifiable",
+            "route": "dom",
+            "delivery": {"mode": "background"},
+            "escalation": {"target": "page", "reason": "effect_unconfirmed"}
+        });
+        assert_eq!(
+            normalize_browser_action_result(&value, "dom").unwrap(),
+            BrowserClosedActionOutcome::Unverifiable
+        );
+        for escalation in [
+            json!({"target":"foreground","reason":"delivery_failed"}),
+            json!({"target":"pixel","reason":"effect_unconfirmed"}),
+            json!({"target":"session","reason":"route_unavailable"}),
+            json!({"target":"page","reason":"suspected_noop"}),
+        ] {
+            let value = json!({
+                "effect":"unverifiable",
+                "route":"dom",
+                "delivery":{"mode":"background"},
+                "escalation": escalation
+            });
+            assert!(matches!(
+                normalize_browser_action_result(&value, "dom"),
+                Err(BrowserExecutionError::BackendRefused(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn closed_action_result_rejects_escalation_partial_noop_and_unknown_fields() {
+        for value in [
+            json!({
+                "effect":"unverifiable","route":"trusted_input",
+                "escalation":{"target":"foreground","reason":"delivery_failed"}
+            }),
+            json!({
+                "effect":"partial","route":"trusted_input",
+                "delivery":{"mode":"background","delivered_count":1}
+            }),
+            json!({"effect":"suspected_noop","route":"trusted_input"}),
+        ] {
+            assert!(matches!(
+                normalize_browser_action_result(&value, "trusted_input"),
+                Err(BrowserExecutionError::BackendRefused(_))
+            ));
+        }
+        assert!(matches!(
+            normalize_browser_action_result(
+                &json!({"effect":"unverifiable","route":"trusted_input","provider":"secret"}),
+                "trusted_input"
+            ),
+            Err(BrowserExecutionError::InvalidResult(_))
+        ));
+    }
+
+    #[test]
+    fn projected_action_refusal_recovers_only_closed_code_from_text() {
+        let raw: CallToolResult = serde_json::from_value(json!({
+            "content": [{
+                "type":"text",
+                "text":"refused (browser_input_trust_unavailable): provider-private explanation"
+            }],
+            "structuredContent": {
+                "effect":"refused",
+                "route":"trusted_input",
+                "escalation":{"target":"page","reason":"route_unavailable"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            refusal_reason(&raw),
+            Some(BrowserRefusalReason::InputTrustUnavailable)
+        );
     }
 
     #[test]

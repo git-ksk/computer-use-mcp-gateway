@@ -314,11 +314,7 @@ fn normalize_ref_array(
             role: bounded_string(item, "role", MAX_BROWSER_ROLE_BYTES)?,
             name: optional_bounded_string(item, "name", MAX_BROWSER_NAME_BYTES)?,
             value: optional_bounded_string(item, "value", MAX_BROWSER_VALUE_BYTES)?,
-            states: bounded_string_array(
-                item.get("states"),
-                MAX_BROWSER_STATE_VALUES,
-                MAX_BROWSER_STATE_BYTES,
-            )?,
+            states: normalize_states(item.get("states"))?,
             actions,
             frame: bounded_string(item, "frame", MAX_BROWSER_FRAME_BYTES)?,
             visibility: bounded_string(item, "visibility", MAX_BROWSER_VISIBILITY_BYTES)?,
@@ -391,9 +387,19 @@ fn sum_omissions(value: Option<&Value>) -> Result<u32, BrowserNormalizeError> {
 }
 
 fn positive_u32(value: Option<&Value>) -> Result<u32, BrowserNormalizeError> {
-    let raw = value
-        .and_then(Value::as_u64)
-        .ok_or(BrowserNormalizeError::InvalidScreenshotMetadata)?;
+    let value = value.ok_or(BrowserNormalizeError::InvalidScreenshotMetadata)?;
+    let raw = if let Some(raw) = value.as_u64() {
+        raw
+    } else {
+        let raw = value
+            .as_f64()
+            .filter(|raw| raw.is_finite() && *raw > 0.0 && raw.fract() == 0.0)
+            .ok_or(BrowserNormalizeError::InvalidScreenshotMetadata)?;
+        if raw > u32::MAX as f64 {
+            return Err(BrowserNormalizeError::InvalidScreenshotMetadata);
+        }
+        raw as u64
+    };
     let value = u32::try_from(raw).map_err(|_| BrowserNormalizeError::InvalidScreenshotMetadata)?;
     if value == 0 {
         return Err(BrowserNormalizeError::InvalidScreenshotMetadata);
@@ -459,6 +465,60 @@ fn optional_bool(value: &Value, key: &str) -> Result<Option<bool>, BrowserNormal
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(_) => Err(BrowserNormalizeError::InvalidShape),
     }
+}
+
+fn normalize_states(value: Option<&Value>) -> Result<Vec<String>, BrowserNormalizeError> {
+    const KNOWN: &[&str] = &[
+        "checked",
+        "disabled",
+        "editable",
+        "expanded",
+        "focused",
+        "focusable",
+        "pressed",
+        "required",
+        "selected",
+    ];
+    let raw = value
+        .and_then(Value::as_object)
+        .ok_or(BrowserNormalizeError::InvalidShape)?;
+    if raw.len() > MAX_BROWSER_STATE_VALUES {
+        return Err(BrowserNormalizeError::ValueTooLarge);
+    }
+    let mut states = Vec::new();
+    for (key, value) in raw {
+        if !KNOWN.contains(&key.as_str()) || key.len() > MAX_BROWSER_STATE_BYTES {
+            continue;
+        }
+        let normalized = match value {
+            Value::Bool(true) => Some(key.clone()),
+            Value::Bool(false) | Value::Null => None,
+            Value::String(value) if value.eq_ignore_ascii_case("true") => Some(key.clone()),
+            Value::String(value) if value.eq_ignore_ascii_case("false") => None,
+            Value::String(value)
+                if matches!(key.as_str(), "checked" | "pressed")
+                    && value.eq_ignore_ascii_case("mixed") =>
+            {
+                Some(format!("{key}:mixed"))
+            }
+            Value::String(value)
+                if key == "editable"
+                    && matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "plaintext" | "richtext"
+                    ) =>
+            {
+                Some("editable".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(state) = normalized {
+            if !states.contains(&state) {
+                states.push(state);
+            }
+        }
+    }
+    Ok(states)
 }
 
 fn bounded_string_array(
@@ -567,7 +627,7 @@ mod tests {
                 "role": "button",
                 "name": "Save",
                 "value": null,
-                "states": ["enabled"],
+                "states": {"disabled": false},
                 "actions": ["click", "provider_secret_action"],
                 "frame": "main",
                 "visibility": "visible"
@@ -577,7 +637,7 @@ mod tests {
                 "role": "textbox",
                 "name": "Name",
                 "value": "Alice",
-                "states": ["editable", "focused"],
+                "states": {"editable": "plaintext", "focused": true},
                 "actions": ["type"],
                 "frame": "main",
                 "visibility": "visible"
@@ -597,6 +657,32 @@ mod tests {
     }
 
     #[test]
+    fn exact_0193_state_object_maps_to_closed_neutral_states() {
+        let raw = snapshot(json!([{
+            "ref": "p7:1",
+            "role": "textbox",
+            "name": "Name",
+            "value": "Alice",
+            "states": {
+                "editable": "plaintext",
+                "focused": true,
+                "required": false,
+                "checked": "mixed",
+                "provider_future_state": "secret"
+            },
+            "actions": ["type"],
+            "frame": "main",
+            "visibility": "in_viewport"
+        }]));
+        let normalized = normalize_cua_browser_snapshot(&raw, "target", "tab").unwrap();
+        assert_eq!(
+            normalized.action_refs[0].states,
+            vec!["checked:mixed", "editable", "focused"]
+        );
+        assert!(!format!("{:?}", normalized.action_refs[0]).contains("provider_future_state"));
+    }
+
+    #[test]
     fn content_refs_never_gain_action_authority() {
         let mut raw = snapshot(json!([]));
         raw["content_refs"] = json!([{
@@ -604,7 +690,7 @@ mod tests {
             "role": "text",
             "name": "Article",
             "value": null,
-            "states": [],
+            "states": {},
             "actions": ["click"],
             "frame": "main",
             "visibility": "visible"
@@ -633,7 +719,7 @@ mod tests {
             "role": "button",
             "name": "Mystery",
             "value": null,
-            "states": [],
+            "states": {},
             "actions": ["future_backend_action"],
             "frame": "main",
             "visibility": "visible"
@@ -654,7 +740,7 @@ mod tests {
                     "role": "textbox",
                     "name": "field",
                     "value": large_value,
-                    "states": [],
+                    "states": {},
                     "actions": ["type"],
                     "frame": "main",
                     "visibility": "visible"
@@ -680,6 +766,48 @@ mod tests {
         assert_eq!(
             normalize_cua_browser_snapshot(&value, "target", "tab"),
             Err(BrowserNormalizeError::ValueTooLarge)
+        );
+    }
+
+    #[test]
+    fn exact_cua_screenshot_metadata_accepts_integral_f64_viewport_dimensions() {
+        let value = json!({
+            "screenshot": {
+                "mime_type": "image/png",
+                "width": 1280,
+                "height": 720,
+                "coordinate_space": "viewport_css_px",
+                "pixel_to_css_scale_x": 1.0,
+                "pixel_to_css_scale_y": 1.0,
+                "viewport_css_width": 1280.0,
+                "viewport_css_height": 720.0,
+                "source": "Page.captureScreenshot",
+                "scope": "tab_content_viewport",
+                "tab_activation": "preserved",
+                "window_foregrounding": "not_requested"
+            }
+        });
+        assert_eq!(
+            normalize_screenshot_metadata(&value).unwrap(),
+            Some((1280, 720, 1280, 720))
+        );
+    }
+
+    #[test]
+    fn screenshot_viewport_dimensions_reject_fractional_values() {
+        let value = json!({
+            "screenshot": {
+                "mime_type": "image/png",
+                "width": 1280,
+                "height": 720,
+                "coordinate_space": "viewport_css_px",
+                "viewport_css_width": 1279.5,
+                "viewport_css_height": 720.0
+            }
+        });
+        assert_eq!(
+            normalize_screenshot_metadata(&value),
+            Err(BrowserNormalizeError::InvalidScreenshotMetadata)
         );
     }
 
