@@ -328,27 +328,35 @@ pub(crate) fn map_browser_type(
 pub(crate) fn map_browser_dialog(
     request: &BrowserDialogRequest,
     target: &ResolvedBrowserTarget,
-    backend_dialog_id: &ResolvedBrowserHandle,
+    backend_dialog_id: Option<&ResolvedBrowserHandle>,
 ) -> Result<CuaBrowserCall, CuaBrowserMappingError> {
     request.validate()?;
+    if request.dialog_ref.is_some() != backend_dialog_id.is_some() {
+        return Err(CuaBrowserMappingError::ResolutionMismatch);
+    }
     let mut args = Map::new();
     target.insert(&mut args);
     args.insert("session".into(), json!(request.context_id));
-    args.insert("dialog_id".into(), json!(backend_dialog_id.as_str()));
     args.insert(
         "action".into(),
         json!(match request.action {
+            BrowserDialogAction::Inspect => "inspect",
             BrowserDialogAction::Accept => "accept",
             BrowserDialogAction::Dismiss => "dismiss",
         }),
     );
-    args.insert(
-        "delivery_mode".into(),
-        json!(match request.delivery {
-            BrowserDialogDelivery::Background => "background",
-            BrowserDialogDelivery::Foreground => "foreground",
-        }),
-    );
+    if let Some(dialog_id) = backend_dialog_id {
+        args.insert("dialog_id".into(), json!(dialog_id.as_str()));
+    }
+    if request.action != BrowserDialogAction::Inspect {
+        args.insert(
+            "delivery_mode".into(),
+            json!(match request.delivery {
+                BrowserDialogDelivery::Background => "background",
+                BrowserDialogDelivery::Foreground => "foreground",
+            }),
+        );
+    }
     if let Some(prompt_text) = &request.prompt_text {
         args.insert("prompt_text".into(), json!(prompt_text));
     }

@@ -213,6 +213,7 @@ impl BrowserTypeRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserDialogAction {
+    Inspect,
     Accept,
     Dismiss,
 }
@@ -229,7 +230,7 @@ pub struct BrowserDialogRequest {
     pub context_id: String,
     pub target_ref: String,
     pub tab_ref: String,
-    pub dialog_ref: String,
+    pub dialog_ref: Option<String>,
     pub action: BrowserDialogAction,
     pub prompt_text: Option<String>,
     pub delivery: BrowserDialogDelivery,
@@ -240,13 +241,29 @@ impl BrowserDialogRequest {
         validate_context_id(&self.context_id)?;
         validate_public_ref(&self.target_ref)?;
         validate_public_ref(&self.tab_ref)?;
-        validate_public_ref(&self.dialog_ref)?;
-        if let Some(prompt) = &self.prompt_text {
-            if self.action != BrowserDialogAction::Accept {
-                return Err(BrowserContractError::PromptRequiresAccept);
+        match self.action {
+            BrowserDialogAction::Inspect => {
+                if self.dialog_ref.is_some()
+                    || self.prompt_text.is_some()
+                    || self.delivery != BrowserDialogDelivery::Background
+                {
+                    return Err(BrowserContractError::InvalidDialogAction);
+                }
             }
-            if prompt.len() > MAX_BROWSER_PROMPT_TEXT_BYTES {
-                return Err(BrowserContractError::ValueTooLarge);
+            BrowserDialogAction::Accept | BrowserDialogAction::Dismiss => {
+                let dialog_ref = self
+                    .dialog_ref
+                    .as_deref()
+                    .ok_or(BrowserContractError::InvalidDialogAction)?;
+                validate_public_ref(dialog_ref)?;
+                if let Some(prompt) = &self.prompt_text {
+                    if self.action != BrowserDialogAction::Accept {
+                        return Err(BrowserContractError::PromptRequiresAccept);
+                    }
+                    if prompt.len() > MAX_BROWSER_PROMPT_TEXT_BYTES {
+                        return Err(BrowserContractError::ValueTooLarge);
+                    }
+                }
             }
         }
         Ok(())
@@ -427,6 +444,13 @@ pub struct BrowserSnapshotResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDialogResult {
+    pub present: bool,
+    pub dialog_ref: Option<String>,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDownloadResult {
     pub download_ref: String,
     pub bytes_written: u64,
@@ -446,6 +470,7 @@ pub enum BrowserContractError {
     EmptyValue,
     ValueTooLarge,
     PromptRequiresAccept,
+    InvalidDialogAction,
     DestinationRequired,
     InvalidPointerAction,
     InvalidPointerDelta,

@@ -20,6 +20,15 @@ pub const MAX_BROWSER_STATE_BYTES: usize = 256;
 pub const MAX_BROWSER_FRAME_BYTES: usize = 128;
 pub const MAX_BROWSER_VISIBILITY_BYTES: usize = 128;
 pub const MAX_BROWSER_BACKEND_HANDLE_BYTES: usize = 4 * 1024;
+pub const MAX_BROWSER_STRUCTURED_METADATA_BYTES: usize = 2 * 1024 * 1024;
+
+fn enforce_structured_metadata_bound(value: &Value) -> Result<(), BrowserNormalizeError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| BrowserNormalizeError::InvalidShape)?;
+    if bytes.len() > MAX_BROWSER_STRUCTURED_METADATA_BYTES {
+        return Err(BrowserNormalizeError::ValueTooLarge);
+    }
+    Ok(())
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct NormalizedCuaBrowserBinding {
@@ -177,6 +186,7 @@ pub(crate) fn normalize_cua_browser_binding(
     value: &Value,
 ) -> Result<NormalizedCuaBrowserBinding, BrowserNormalizeError> {
     require_ok(value)?;
+    enforce_structured_metadata_bound(value)?;
     if string(value, "mode")? != "bind" {
         return Err(BrowserNormalizeError::InvalidShape);
     }
@@ -220,6 +230,7 @@ pub(crate) fn normalize_cua_browser_snapshot(
     expected_backend_tab: &str,
 ) -> Result<NormalizedCuaBrowserSnapshot, BrowserNormalizeError> {
     require_ok(value)?;
+    enforce_structured_metadata_bound(value)?;
     if string(value, "mode")? != "snapshot" {
         return Err(BrowserNormalizeError::InvalidShape);
     }
@@ -630,6 +641,45 @@ mod tests {
         assert_eq!(
             normalize_cua_browser_snapshot(&raw, "target", "tab"),
             Err(BrowserNormalizeError::InvalidActionRef)
+        );
+    }
+
+    #[test]
+    fn aggregate_snapshot_metadata_is_bounded_below_the_large_result_carrier() {
+        let large_value = "x".repeat(MAX_BROWSER_VALUE_BYTES);
+        let refs: Vec<Value> = (0..40)
+            .map(|index| {
+                json!({
+                    "ref": format!("p1:{index}"),
+                    "role": "textbox",
+                    "name": "field",
+                    "value": large_value,
+                    "states": [],
+                    "actions": ["type"],
+                    "frame": "main",
+                    "visibility": "visible"
+                })
+            })
+            .collect();
+        let value = json!({
+            "status": "ok",
+            "target_id": "target",
+            "tab_id": "tab",
+            "outline": "page",
+            "refs": refs,
+            "content_refs": [],
+            "snapshot": {
+                "format": "semantic_v2",
+                "id": "snapshot",
+                "complete": true,
+                "continuation": null,
+                "omitted": {"refs": 0, "content_refs": 0}
+            }
+        });
+        assert!(serde_json::to_vec(&value).unwrap().len() > MAX_BROWSER_STRUCTURED_METADATA_BYTES);
+        assert_eq!(
+            normalize_cua_browser_snapshot(&value, "target", "tab"),
+            Err(BrowserNormalizeError::ValueTooLarge)
         );
     }
 

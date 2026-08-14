@@ -6,6 +6,7 @@
 //! to native protobuf fields independently later.
 
 use crate::{
+    v2_browser_runtime::BrowserBackendResult,
     v2_m0::DeviceResult,
     v2_m0_transport::{AgentToHub, HubToAgent},
 };
@@ -77,6 +78,10 @@ fn agent_message_limit(message: &AgentToHub) -> usize {
                     | DeviceResult::UiStateVerification { .. }
                     | DeviceResult::ClipboardState { .. }
                     | DeviceResult::RegionCaptured { .. }
+                    | DeviceResult::Browser {
+                        result: BrowserBackendResult::Bound { .. }
+                            | BrowserBackendResult::Snapshot { .. },
+                    }
             ) =>
         {
             MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES
@@ -195,6 +200,72 @@ mod tests {
         let bounded_snapshot_budget =
             max_base64 + (crate::v2_m0::MAX_UI_ELEMENTS * per_element_budget) + 128 * 1024;
         assert!(bounded_snapshot_budget < MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn browser_observation_results_use_large_carrier_but_mutations_do_not() {
+        use crate::v2_browser_runtime::{BrowserBackendResult, BrowserMutationEffect};
+        use crate::v2_m0::{CONTROL_SCHEMA_VERSION, CommandResultEnvelope, DeviceResult};
+        use crate::v2_m0_transport::{AgentToHub, HUB_AGENT_SCHEMA_VERSION, RemoteResult};
+
+        let snapshot = AgentToHub::Result(RemoteResult {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            result: CommandResultEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: "dev-test".into(),
+                device_generation: 1,
+                capability_revision: 1,
+                operation_id: "op-browser-snapshot".into(),
+                result: DeviceResult::Browser {
+                    result: BrowserBackendResult::Snapshot {
+                        backend_snapshot_id: "snapshot".into(),
+                        outline: "x".repeat(96 * 1024),
+                        action_refs: vec![],
+                        content_refs: vec![],
+                        complete: true,
+                        omitted: 0,
+                        backend_continuation: None,
+                        screenshot: None,
+                    },
+                },
+            },
+            signature: vec![0; 64],
+        });
+        let frame = encode_agent_frame(&snapshot).expect("browser snapshot uses large allowance");
+        assert!(frame.signed_message_json.len() > MAX_GRPC_APPLICATION_MESSAGE_BYTES);
+        assert_eq!(decode_agent_frame(frame).unwrap(), snapshot);
+
+        let click = AgentToHub::Result(RemoteResult {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            result: CommandResultEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: "dev-test".into(),
+                device_generation: 1,
+                capability_revision: 1,
+                operation_id: "op-browser-click".into(),
+                result: DeviceResult::Browser {
+                    result: BrowserBackendResult::ClickCompleted {
+                        effect: BrowserMutationEffect::Unverifiable,
+                    },
+                },
+            },
+            signature: vec![0; 64],
+        });
+        assert_eq!(
+            agent_message_limit(&click),
+            MAX_GRPC_APPLICATION_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn browser_snapshot_budget_fits_reviewed_large_result_allowance() {
+        let max_base64 = crate::v2_browser_execute::MAX_BROWSER_SCREENSHOT_BYTES.div_ceil(3) * 4;
+        let metadata = crate::v2_browser_normalize::MAX_BROWSER_STRUCTURED_METADATA_BYTES;
+        let envelope_headroom = 512 * 1024;
+        assert!(
+            max_base64 + metadata + envelope_headroom
+                < MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES
+        );
     }
 
     #[test]

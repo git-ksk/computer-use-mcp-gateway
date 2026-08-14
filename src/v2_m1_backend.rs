@@ -7,6 +7,9 @@
 use crate::backend::{
     BackendCallCancelled, BackendCallTimedOut, ComputerUseBackend, cua::CuaBackend,
 };
+use crate::v2_browser_execute::{
+    BrowserExecutionError, BrowserExecutionOutcome, BrowserRefusalReason, execute_cua_browser,
+};
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
     DeviceResult, InputDeliveryMode, InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES,
@@ -158,6 +161,13 @@ impl CuaMcpAdapter {
                 DeviceCapability::SetUiValue,
                 DeviceCapability::CaptureRegion,
                 DeviceCapability::DesktopScope,
+                DeviceCapability::BrowserInspect,
+                DeviceCapability::BrowserPrepare,
+                DeviceCapability::BrowserNavigate,
+                DeviceCapability::BrowserClick,
+                DeviceCapability::BrowserType,
+                DeviceCapability::BrowserDialog,
+                DeviceCapability::BrowserPointer,
             ],
         }
     }
@@ -217,6 +227,45 @@ impl CuaMcpAdapter {
         command: &DeviceCommand,
         cancellation: watch::Receiver<bool>,
     ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        if let DeviceCommand::Browser { command } = command {
+            return match execute_cua_browser(&self.backend, command, cancellation).await {
+                Ok(BrowserExecutionOutcome::Completed(result)) => {
+                    if !result.matches_command(command) {
+                        return Err(M1BackendError::MalformedResponse(
+                            "browser result type did not match command",
+                        ));
+                    }
+                    Ok(BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                        result,
+                    }))
+                }
+                Ok(BrowserExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                    Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate)
+                }
+                Ok(BrowserExecutionOutcome::TimedOutIndeterminate) => {
+                    Ok(BackendExecutionOutcome::TimedOutIndeterminate)
+                }
+                Err(BrowserExecutionError::InvalidRequest(message)) => {
+                    Err(M1BackendError::InvalidRequest(message))
+                }
+                Err(BrowserExecutionError::Backend(error)) => Err(M1BackendError::Backend(error)),
+                Err(BrowserExecutionError::BackendToolError) => {
+                    Err(M1BackendError::BackendToolError)
+                }
+                Err(BrowserExecutionError::BackendRefused(reason)) => {
+                    Err(M1BackendError::BrowserRefused(reason))
+                }
+                Err(BrowserExecutionError::Normalize(_)) => Err(M1BackendError::MalformedResponse(
+                    "browser result normalization failed",
+                )),
+                Err(BrowserExecutionError::InvalidResult(message)) => {
+                    Err(M1BackendError::MalformedResponse(message))
+                }
+                Err(BrowserExecutionError::UnsupportedTransferBoundary) => Err(
+                    M1BackendError::UnsupportedCommand(command_capability(command)),
+                ),
+            };
+        }
         if let DeviceCommand::ExpandInteractionScope { context_id, .. } = command {
             let start_args = serde_json::json!({
                 "session": context_id,
@@ -866,6 +915,38 @@ fn map_command(
         )),
         DeviceCommand::Browser { .. } => {
             Err(M1BackendError::UnsupportedCommand(command.capability()))
+        }
+    }
+}
+
+fn command_capability(
+    command: &crate::v2_browser_runtime::BrowserBackendCommand,
+) -> DeviceCapability {
+    match command.capability() {
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Inspect => {
+            DeviceCapability::BrowserInspect
+        }
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Prepare => {
+            DeviceCapability::BrowserPrepare
+        }
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Navigate => {
+            DeviceCapability::BrowserNavigate
+        }
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Click => {
+            DeviceCapability::BrowserClick
+        }
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Type => DeviceCapability::BrowserType,
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Dialog => {
+            DeviceCapability::BrowserDialog
+        }
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Pointer => {
+            DeviceCapability::BrowserPointer
+        }
+        crate::v2_browser_runtime::BrowserRuntimeCapability::UploadFile => {
+            DeviceCapability::BrowserUploadFile
+        }
+        crate::v2_browser_runtime::BrowserRuntimeCapability::Download => {
+            DeviceCapability::BrowserDownload
         }
     }
 }
@@ -2252,6 +2333,7 @@ pub enum M1BackendError {
     ScreenshotTooLarge,
     InvalidRequest(&'static str),
     UnsupportedCommand(DeviceCapability),
+    BrowserRefused(BrowserRefusalReason),
 }
 
 impl SafeErrorCode for M1BackendError {
@@ -2264,6 +2346,7 @@ impl SafeErrorCode for M1BackendError {
             Self::ScreenshotTooLarge => "backend_screenshot_too_large",
             Self::InvalidRequest(_) => "backend_invalid_request",
             Self::UnsupportedCommand(_) => "backend_unsupported_command",
+            Self::BrowserRefused(reason) => reason.safe_code(),
         }
     }
 }
@@ -2316,6 +2399,24 @@ mod tests {
             1,
             Duration::from_millis(10),
         )
+    }
+
+    #[test]
+    fn cua_advertises_browser_core_but_not_transfer_boundaries() {
+        let advertisement = fixture(vec![]).advertisement();
+        for capability in [
+            DeviceCapability::BrowserInspect,
+            DeviceCapability::BrowserPrepare,
+            DeviceCapability::BrowserNavigate,
+            DeviceCapability::BrowserClick,
+            DeviceCapability::BrowserType,
+            DeviceCapability::BrowserDialog,
+            DeviceCapability::BrowserPointer,
+        ] {
+            assert!(advertisement.supports(capability), "missing {capability:?}");
+        }
+        assert!(!advertisement.supports(DeviceCapability::BrowserUploadFile));
+        assert!(!advertisement.supports(DeviceCapability::BrowserDownload));
     }
 
     #[tokio::test]

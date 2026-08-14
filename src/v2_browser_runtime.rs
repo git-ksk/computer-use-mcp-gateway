@@ -77,7 +77,7 @@ pub enum BrowserBackendCommand {
         context_id: String,
         backend_target_id: String,
         backend_tab_id: String,
-        backend_dialog_id: String,
+        backend_dialog_id: Option<String>,
         action: BrowserDialogAction,
         prompt_text: Option<String>,
         delivery: BrowserDialogDelivery,
@@ -219,6 +219,11 @@ pub enum BrowserBackendResult {
         effect: BrowserMutationEffect,
     },
     TypeCompleted,
+    DialogObserved {
+        present: bool,
+        backend_dialog_id: Option<String>,
+        kind: Option<String>,
+    },
     DialogCompleted,
     PointerCompleted,
     UploadAssigned {
@@ -246,7 +251,20 @@ impl BrowserBackendResult {
                     BrowserBackendCommand::Click { .. }
                 )
                 | (Self::TypeCompleted, BrowserBackendCommand::Type { .. })
-                | (Self::DialogCompleted, BrowserBackendCommand::Dialog { .. })
+                | (
+                    Self::DialogObserved { .. },
+                    BrowserBackendCommand::Dialog {
+                        action: BrowserDialogAction::Inspect,
+                        ..
+                    }
+                )
+                | (
+                    Self::DialogCompleted,
+                    BrowserBackendCommand::Dialog {
+                        action: BrowserDialogAction::Accept | BrowserDialogAction::Dismiss,
+                        ..
+                    }
+                )
                 | (
                     Self::PointerCompleted,
                     BrowserBackendCommand::Pointer { .. }
@@ -272,6 +290,7 @@ impl fmt::Debug for BrowserBackendResult {
             Self::NavigationCompleted => "navigation_completed",
             Self::ClickCompleted { .. } => "click_completed",
             Self::TypeCompleted => "type_completed",
+            Self::DialogObserved { .. } => "dialog_observed",
             Self::DialogCompleted => "dialog_completed",
             Self::PointerCompleted => "pointer_completed",
             Self::UploadAssigned { .. } => "upload_assigned",

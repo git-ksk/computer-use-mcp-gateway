@@ -9,7 +9,9 @@ use crate::backend::{
 };
 use crate::v2_browser::{
     BrowserDialogAction, BrowserDialogDelivery, BrowserInputRoute, BrowserPointerAction,
-    BrowserPrepareProfileMode, BrowserTypeMode,
+    BrowserPrepareProfileMode, BrowserTypeMode, MAX_BROWSER_PROFILE_NAME_BYTES,
+    MAX_BROWSER_PROMPT_TEXT_BYTES, MAX_BROWSER_QUERY_BYTES, MAX_BROWSER_SCROLL_DELTA_CSS_PX,
+    MAX_BROWSER_TEXT_BYTES, MAX_BROWSER_URL_BYTES,
 };
 use crate::v2_browser_normalize::{
     BrowserNormalizeError, normalize_cua_browser_binding, normalize_cua_browser_snapshot,
@@ -24,15 +26,11 @@ use serde_json::{Map, Value, json};
 use std::fmt;
 use tokio::sync::watch;
 
-const MAX_BROWSER_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_BROWSER_QUERY_BYTES: usize = 8 * 1024;
-const MAX_BROWSER_TEXT_BYTES: usize = 256 * 1024;
-const MAX_BROWSER_URL_BYTES: usize = 16 * 1024;
-const MAX_BROWSER_PROFILE_NAME_BYTES: usize = 128;
-const MAX_BROWSER_DELTA_ABS: i32 = 1_000_000;
+pub(crate) const MAX_BROWSER_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CUA_ISOLATED_PROFILE_NAME_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BrowserExecutionOutcome {
+pub(crate) enum BrowserExecutionOutcome {
     Completed(BrowserBackendResult),
     CancellationPropagatedIndeterminate,
     TimedOutIndeterminate,
@@ -59,8 +57,32 @@ pub enum BrowserRefusalReason {
     Other,
 }
 
+impl BrowserRefusalReason {
+    pub const fn safe_code(self) -> &'static str {
+        match self {
+            Self::RouteUnavailable => "browser_route_unavailable",
+            Self::RequiresSetup => "browser_requires_setup",
+            Self::BindingAmbiguous => "browser_binding_ambiguous",
+            Self::BindingStale => "browser_binding_stale",
+            Self::WrongTarget => "browser_wrong_target_refused",
+            Self::TabRequired => "browser_tab_required",
+            Self::TabNotFound => "browser_tab_not_found",
+            Self::RefStale => "browser_ref_stale",
+            Self::InputTrustUnavailable => "browser_input_trust_unavailable",
+            Self::EndpointOwnerMismatch => "browser_endpoint_owner_mismatch",
+            Self::ConsentRequired => "browser_consent_required",
+            Self::ConsentRevoked => "browser_consent_revoked",
+            Self::ReconnectExhausted => "browser_reconnect_exhausted",
+            Self::InputIncomplete => "browser_input_incomplete",
+            Self::ActionUnavailable => "browser_action_unavailable",
+            Self::OriginOutsideScope => "browser_origin_outside_scope",
+            Self::Other => "browser_refused",
+        }
+    }
+}
+
 #[derive(Debug)]
-pub enum BrowserExecutionError {
+pub(crate) enum BrowserExecutionError {
     InvalidRequest(&'static str),
     Backend(anyhow::Error),
     BackendToolError,
@@ -101,7 +123,7 @@ impl From<BrowserNormalizeError> for BrowserExecutionError {
     }
 }
 
-pub async fn execute_cua_browser(
+pub(crate) async fn execute_cua_browser(
     backend: &CuaBackend,
     command: &BrowserBackendCommand,
     cancellation: watch::Receiver<bool>,
@@ -161,11 +183,15 @@ fn validate_command(command: &BrowserBackendCommand) -> Result<(), BrowserExecut
                     ));
                 }
                 BrowserPrepareProfileMode::IsolatedNamed => {
-                    let name = profile_name.as_deref().ok_or(
-                        BrowserExecutionError::InvalidRequest("named profile requires a name"),
-                    )?;
+                    let name =
+                        profile_name
+                            .as_deref()
+                            .ok_or(BrowserExecutionError::InvalidRequest(
+                                "named profile requires a name",
+                            ))?;
                     if name.is_empty()
                         || name.len() > MAX_BROWSER_PROFILE_NAME_BYTES
+                        || name.len() > MAX_CUA_ISOLATED_PROFILE_NAME_BYTES
                         || name.chars().any(char::is_control)
                         || !name
                             .bytes()
@@ -260,20 +286,39 @@ fn validate_command(command: &BrowserBackendCommand) -> Result<(), BrowserExecut
             backend_dialog_id,
             prompt_text,
             action,
+            delivery,
             ..
         } => {
             validate_target_tab(backend_target_id, backend_tab_id)?;
-            validate_handle(backend_dialog_id)?;
-            if let Some(prompt) = prompt_text {
-                if *action != BrowserDialogAction::Accept {
-                    return Err(BrowserExecutionError::InvalidRequest(
-                        "prompt text is valid only when accepting a dialog",
-                    ));
+            match action {
+                BrowserDialogAction::Inspect => {
+                    if backend_dialog_id.is_some()
+                        || prompt_text.is_some()
+                        || *delivery != BrowserDialogDelivery::Background
+                    {
+                        return Err(BrowserExecutionError::InvalidRequest(
+                            "browser dialog inspect must not carry resolution authority",
+                        ));
+                    }
                 }
-                if prompt.len() > MAX_BROWSER_TEXT_BYTES {
-                    return Err(BrowserExecutionError::InvalidRequest(
-                        "browser prompt text exceeds the bound",
-                    ));
+                BrowserDialogAction::Accept | BrowserDialogAction::Dismiss => {
+                    validate_handle(backend_dialog_id.as_deref().ok_or(
+                        BrowserExecutionError::InvalidRequest(
+                            "browser dialog resolution requires a dialog ref",
+                        ),
+                    )?)?;
+                    if let Some(prompt) = prompt_text {
+                        if *action != BrowserDialogAction::Accept {
+                            return Err(BrowserExecutionError::InvalidRequest(
+                                "prompt text is valid only when accepting a dialog",
+                            ));
+                        }
+                        if prompt.len() > MAX_BROWSER_PROMPT_TEXT_BYTES {
+                            return Err(BrowserExecutionError::InvalidRequest(
+                                "browser prompt text exceeds the bound",
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -289,8 +334,8 @@ fn validate_command(command: &BrowserBackendCommand) -> Result<(), BrowserExecut
         } => {
             validate_target_tab(backend_target_id, backend_tab_id)?;
             validate_handle(backend_element_ref)?;
-            if delta_x.unsigned_abs() > MAX_BROWSER_DELTA_ABS as u32
-                || delta_y.unsigned_abs() > MAX_BROWSER_DELTA_ABS as u32
+            if delta_x.unsigned_abs() > MAX_BROWSER_SCROLL_DELTA_CSS_PX as u32
+                || delta_y.unsigned_abs() > MAX_BROWSER_SCROLL_DELTA_CSS_PX as u32
             {
                 return Err(BrowserExecutionError::InvalidRequest(
                     "browser pointer delta exceeds the bound",
@@ -345,7 +390,10 @@ fn map_command(
                     );
                 }
                 BrowserPrepareProfileMode::ExistingProfile => {
-                    args.insert("window_id".into(), json!(window_id.expect("validated window")));
+                    args.insert(
+                        "window_id".into(),
+                        json!(window_id.expect("validated window")),
+                    );
                     args.insert("strategy".into(), json!({"kind": "existing_profile"}));
                 }
             }
@@ -450,21 +498,26 @@ fn map_command(
             delivery,
         } => {
             target_tab_args(&mut args, context_id, backend_target_id, backend_tab_id);
-            args.insert("dialog_id".into(), json!(backend_dialog_id));
             args.insert(
                 "action".into(),
                 json!(match action {
+                    BrowserDialogAction::Inspect => "inspect",
                     BrowserDialogAction::Accept => "accept",
                     BrowserDialogAction::Dismiss => "dismiss",
                 }),
             );
-            args.insert(
-                "delivery_mode".into(),
-                json!(match delivery {
-                    BrowserDialogDelivery::Background => "background",
-                    BrowserDialogDelivery::Foreground => "foreground",
-                }),
-            );
+            if let Some(dialog_id) = backend_dialog_id {
+                args.insert("dialog_id".into(), json!(dialog_id));
+            }
+            if *action != BrowserDialogAction::Inspect {
+                args.insert(
+                    "delivery_mode".into(),
+                    json!(match delivery {
+                        BrowserDialogDelivery::Background => "background",
+                        BrowserDialogDelivery::Foreground => "foreground",
+                    }),
+                );
+            }
             if let Some(prompt) = prompt_text {
                 args.insert("prompt_text".into(), json!(prompt));
             }
@@ -517,25 +570,18 @@ fn normalize_completed(
     match command {
         BrowserBackendCommand::Prepare { .. } => {
             require_status_ok(&structured)?;
-            let prepared = structured
-                .get("prepared")
-                .and_then(Value::as_bool)
-                .ok_or(BrowserExecutionError::InvalidResult(
+            let prepared = structured.get("prepared").and_then(Value::as_bool).ok_or(
+                BrowserExecutionError::InvalidResult(
                     "browser prepare result omitted prepared state",
-                ))?;
+                ),
+            )?;
             let prepared_process_id = structured
                 .get("prepared_pid")
                 .and_then(Value::as_u64)
                 .map(u32::try_from)
                 .transpose()
                 .map_err(|_| BrowserExecutionError::InvalidResult("invalid prepared process id"))?;
-            let side_effect_count = structured
-                .get("side_effects")
-                .and_then(Value::as_array)
-                .map(|items| u32::try_from(items.len()))
-                .transpose()
-                .map_err(|_| BrowserExecutionError::InvalidResult("too many prepare side effects"))?
-                .unwrap_or(0);
+            let side_effect_count = normalize_prepare_side_effect_count(&structured)?;
             Ok(BrowserBackendResult::Prepared {
                 prepared,
                 prepared_process_id,
@@ -572,6 +618,7 @@ fn normalize_completed(
         } => {
             let snapshot =
                 normalize_cua_browser_snapshot(&structured, backend_target_id, backend_tab_id)?;
+            let backend_continuation = snapshot.backend_continuation().map(str::to_owned);
             let screenshot = if *include_screenshot {
                 Some(normalize_screenshot(raw, &structured)?)
             } else {
@@ -610,12 +657,33 @@ fn normalize_completed(
                     .collect(),
                 complete: snapshot.complete,
                 omitted: snapshot.omitted,
-                backend_continuation: snapshot.backend_continuation().map(str::to_owned),
+                backend_continuation,
                 screenshot,
             })
         }
-        BrowserBackendCommand::Navigate { .. } => Ok(BrowserBackendResult::NavigationCompleted),
-        BrowserBackendCommand::Click { input_route, .. } => {
+        BrowserBackendCommand::Navigate {
+            backend_target_id,
+            backend_tab_id,
+            url,
+            ..
+        } => {
+            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            if structured.get("url").and_then(Value::as_str) != Some(url.as_str())
+                || structured.get("refs_invalidated").and_then(Value::as_bool) != Some(true)
+            {
+                return Err(BrowserExecutionError::InvalidResult(
+                    "browser navigation result did not prove the requested document transition",
+                ));
+            }
+            Ok(BrowserBackendResult::NavigationCompleted)
+        }
+        BrowserBackendCommand::Click {
+            backend_target_id,
+            backend_tab_id,
+            input_route,
+            ..
+        } => {
+            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
             Ok(BrowserBackendResult::ClickCompleted {
                 effect: if *input_route == BrowserInputRoute::DomEvent {
                     BrowserMutationEffect::Unverifiable
@@ -624,13 +692,146 @@ fn normalize_completed(
                 },
             })
         }
-        BrowserBackendCommand::Type { .. } => Ok(BrowserBackendResult::TypeCompleted),
-        BrowserBackendCommand::Dialog { .. } => Ok(BrowserBackendResult::DialogCompleted),
-        BrowserBackendCommand::Pointer { .. } => Ok(BrowserBackendResult::PointerCompleted),
+        BrowserBackendCommand::Type {
+            backend_target_id,
+            backend_tab_id,
+            ..
+        } => {
+            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            Ok(BrowserBackendResult::TypeCompleted)
+        }
+        BrowserBackendCommand::Dialog {
+            backend_target_id,
+            backend_tab_id,
+            backend_dialog_id,
+            action,
+            ..
+        } => {
+            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            if *action == BrowserDialogAction::Inspect {
+                let present = structured.get("present").and_then(Value::as_bool).ok_or(
+                    BrowserExecutionError::InvalidResult(
+                        "browser dialog inspect omitted present state",
+                    ),
+                )?;
+                let backend_dialog_id = structured
+                    .get("dialog_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let kind = structured
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if present != backend_dialog_id.is_some() || present != kind.is_some() {
+                    return Err(BrowserExecutionError::InvalidResult(
+                        "browser dialog inspect returned inconsistent state",
+                    ));
+                }
+                if let Some(kind) = kind.as_deref() {
+                    if !matches!(kind, "alert" | "confirm" | "prompt" | "beforeunload") {
+                        return Err(BrowserExecutionError::InvalidResult(
+                            "browser dialog inspect returned an unknown kind",
+                        ));
+                    }
+                }
+                if let Some(dialog_id) = backend_dialog_id.as_deref() {
+                    validate_handle(dialog_id)?;
+                }
+                Ok(BrowserBackendResult::DialogObserved {
+                    present,
+                    backend_dialog_id,
+                    kind,
+                })
+            } else {
+                let expected_dialog_id =
+                    backend_dialog_id
+                        .as_deref()
+                        .ok_or(BrowserExecutionError::InvalidResult(
+                            "browser dialog resolution omitted requested identity",
+                        ))?;
+                let expected_action = match action {
+                    BrowserDialogAction::Accept => "accept",
+                    BrowserDialogAction::Dismiss => "dismiss",
+                    BrowserDialogAction::Inspect => unreachable!("inspect handled above"),
+                };
+                if structured.get("dialog_id").and_then(Value::as_str) != Some(expected_dialog_id)
+                    || structured.get("action").and_then(Value::as_str) != Some(expected_action)
+                {
+                    return Err(BrowserExecutionError::InvalidResult(
+                        "browser dialog result did not prove the requested resolution",
+                    ));
+                }
+                Ok(BrowserBackendResult::DialogCompleted)
+            }
+        }
+        BrowserBackendCommand::Pointer {
+            backend_target_id,
+            backend_tab_id,
+            ..
+        } => {
+            require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+            Ok(BrowserBackendResult::PointerCompleted)
+        }
         BrowserBackendCommand::Upload { .. } | BrowserBackendCommand::Download { .. } => {
             Err(BrowserExecutionError::UnsupportedTransferBoundary)
         }
     }
+}
+
+fn require_exact_target_tab_ok(
+    structured: &Value,
+    backend_target_id: &str,
+    backend_tab_id: &str,
+) -> Result<(), BrowserExecutionError> {
+    require_status_ok(structured)?;
+    if structured.get("target_id").and_then(Value::as_str) != Some(backend_target_id)
+        || structured.get("tab_id").and_then(Value::as_str) != Some(backend_tab_id)
+    {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser result did not echo the exact target and tab",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_prepare_side_effect_count(structured: &Value) -> Result<u32, BrowserExecutionError> {
+    const KNOWN: &[&str] = &[
+        "launched_browser",
+        "restarted_browser",
+        "created_profile",
+        "reused_driver_profile",
+        "copied_profile_data",
+        "changed_preferences",
+        "displayed_consent_prompt",
+        "opened_setup_page",
+        "closed_setup_page",
+        "enabled_remote_debugging",
+        "used_bounded_pixel_fallback",
+        "focused_setup_address_field",
+        "foregrounded_window",
+        "injected_global_input",
+    ];
+    let side_effects = structured
+        .get("side_effects")
+        .and_then(Value::as_object)
+        .ok_or(BrowserExecutionError::InvalidResult(
+            "browser prepare result omitted side-effect proof",
+        ))?;
+    if side_effects.len() > KNOWN.len()
+        || side_effects
+            .keys()
+            .any(|key| !KNOWN.contains(&key.as_str()))
+    {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser prepare result contained unknown side-effect proof",
+        ));
+    }
+    side_effects.values().try_fold(0_u32, |count, value| {
+        let enabled = value.as_bool().ok_or(BrowserExecutionError::InvalidResult(
+            "browser prepare side-effect proof was not boolean",
+        ))?;
+        Ok(count + u32::from(enabled))
+    })
 }
 
 fn normalize_screenshot(
@@ -644,16 +845,17 @@ fn normalize_screenshot(
             "browser screenshot metadata missing",
         ))?;
     if screenshot.get("mime_type").and_then(Value::as_str) != Some("image/png")
-        || screenshot.get("coordinate_space").and_then(Value::as_str)
-            != Some("viewport_css_px")
+        || screenshot.get("coordinate_space").and_then(Value::as_str) != Some("viewport_css_px")
     {
         return Err(BrowserExecutionError::InvalidResult(
             "invalid browser screenshot metadata",
         ));
     }
     let width_pixels = positive_u32(screenshot.get("width"), "invalid browser screenshot width")?;
-    let height_pixels =
-        positive_u32(screenshot.get("height"), "invalid browser screenshot height")?;
+    let height_pixels = positive_u32(
+        screenshot.get("height"),
+        "invalid browser screenshot height",
+    )?;
     let viewport_css_width = positive_u32(
         screenshot.get("viewport_css_width"),
         "invalid browser viewport width",
@@ -711,7 +913,9 @@ fn refusal_reason(raw: &CallToolResult) -> Option<BrowserRefusalReason> {
         "browser_requires_setup" => BrowserRefusalReason::RequiresSetup,
         "browser_binding_ambiguous" => BrowserRefusalReason::BindingAmbiguous,
         "browser_binding_stale" => BrowserRefusalReason::BindingStale,
-        "browser_wrong_target" => BrowserRefusalReason::WrongTarget,
+        "browser_wrong_target_refused" | "browser_wrong_target" => {
+            BrowserRefusalReason::WrongTarget
+        }
         "browser_tab_required" => BrowserRefusalReason::TabRequired,
         "browser_tab_not_found" => BrowserRefusalReason::TabNotFound,
         "browser_ref_stale" => BrowserRefusalReason::RefStale,
@@ -730,7 +934,6 @@ fn refusal_reason(raw: &CallToolResult) -> Option<BrowserRefusalReason> {
 fn structured_value(raw: &CallToolResult) -> Result<Value, BrowserExecutionError> {
     raw.structured_content
         .clone()
-        .map(Value::Object)
         .ok_or(BrowserExecutionError::InvalidResult(
             "browser backend result omitted structured content",
         ))
@@ -750,12 +953,9 @@ fn image_data_base64(raw: &CallToolResult) -> Result<String, BrowserExecutionErr
     let value = serde_json::to_value(raw).map_err(|_| {
         BrowserExecutionError::InvalidResult("browser result could not be serialized")
     })?;
-    let content = value
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or(BrowserExecutionError::InvalidResult(
-            "browser result omitted content",
-        ))?;
+    let content = value.get("content").and_then(Value::as_array).ok_or(
+        BrowserExecutionError::InvalidResult("browser result omitted content"),
+    )?;
     for item in content {
         if item.get("type").and_then(Value::as_str) == Some("image")
             && item.get("mimeType").and_then(Value::as_str) == Some("image/png")
@@ -774,7 +974,10 @@ fn image_data_base64(raw: &CallToolResult) -> Result<String, BrowserExecutionErr
     ))
 }
 
-fn positive_u32(value: Option<&Value>, message: &'static str) -> Result<u32, BrowserExecutionError> {
+fn positive_u32(
+    value: Option<&Value>,
+    message: &'static str,
+) -> Result<u32, BrowserExecutionError> {
     let raw = value
         .and_then(Value::as_u64)
         .ok_or(BrowserExecutionError::InvalidResult(message))?;
@@ -858,7 +1061,8 @@ fn validate_url(value: &str) -> Result<(), BrowserExecutionError> {
         ));
     }
     let lower = value.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("about:") {
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("about:")
+    {
         Ok(())
     } else {
         Err(BrowserExecutionError::InvalidRequest(
@@ -948,6 +1152,262 @@ mod tests {
         .unwrap();
         assert_eq!(refusal_reason(&raw), Some(BrowserRefusalReason::RefStale));
         assert!(!format!("{:?}", refusal_reason(&raw)).contains("provider-secret-message"));
+    }
+
+    #[test]
+    fn prepare_normalizes_exact_0193_side_effect_object_without_exposing_details() {
+        let command = BrowserBackendCommand::Prepare {
+            context_id: CONTEXT.into(),
+            process_id: 42,
+            window_id: None,
+            allow_launch: true,
+            profile_mode: BrowserPrepareProfileMode::IsolatedNew,
+            profile_name: None,
+        };
+        let mut raw = CallToolResult::success(vec![]);
+        raw.structured_content = Some(json!({
+            "status": "ok",
+            "prepared": true,
+            "prepared_pid": 43,
+            "side_effects": {
+                "launched_browser": true,
+                "restarted_browser": false,
+                "created_profile": true,
+                "reused_driver_profile": false,
+                "copied_profile_data": false,
+                "changed_preferences": false,
+                "displayed_consent_prompt": false,
+                "opened_setup_page": false,
+                "closed_setup_page": false,
+                "enabled_remote_debugging": false,
+                "used_bounded_pixel_fallback": false,
+                "focused_setup_address_field": false,
+                "foregrounded_window": false,
+                "injected_global_input": false
+            }
+        }));
+        assert_eq!(
+            normalize_completed(&command, &raw).unwrap(),
+            BrowserBackendResult::Prepared {
+                prepared: true,
+                prepared_process_id: Some(43),
+                side_effect_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn cua_named_profile_limit_fails_before_backend_dispatch() {
+        let command = BrowserBackendCommand::Prepare {
+            context_id: CONTEXT.into(),
+            process_id: 42,
+            window_id: None,
+            allow_launch: true,
+            profile_mode: BrowserPrepareProfileMode::IsolatedNamed,
+            profile_name: Some("a".repeat(MAX_CUA_ISOLATED_PROFILE_NAME_BYTES + 1)),
+        };
+        assert!(matches!(
+            validate_command(&command),
+            Err(BrowserExecutionError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn dialog_inspect_maps_without_resolution_authority() {
+        let command = BrowserBackendCommand::Dialog {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_dialog_id: None,
+            action: BrowserDialogAction::Inspect,
+            prompt_text: None,
+            delivery: BrowserDialogDelivery::Background,
+        };
+        validate_command(&command).unwrap();
+        let (tool, args) = map_command(&command).unwrap();
+        assert_eq!(tool, "browser_dialog");
+        let args = args.unwrap();
+        assert_eq!(args["action"], json!("inspect"));
+        assert_eq!(args["target_id"], json!("target"));
+        assert_eq!(args["tab_id"], json!("tab"));
+        assert_eq!(args["session"], json!(CONTEXT));
+        assert!(!args.contains_key("dialog_id"));
+        assert!(!args.contains_key("delivery_mode"));
+        assert!(!args.contains_key("prompt_text"));
+    }
+
+    #[test]
+    fn dialog_inspect_normalizes_exact_0193_shape() {
+        let command = BrowserBackendCommand::Dialog {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_dialog_id: None,
+            action: BrowserDialogAction::Inspect,
+            prompt_text: None,
+            delivery: BrowserDialogDelivery::Background,
+        };
+        let mut raw = CallToolResult::success(vec![]);
+        raw.structured_content = Some(json!({
+            "status": "ok",
+            "target_id": "target",
+            "tab_id": "tab",
+            "present": true,
+            "dialog_id": "dialog-7:3",
+            "kind": "prompt"
+        }));
+        assert_eq!(
+            normalize_completed(&command, &raw).unwrap(),
+            BrowserBackendResult::DialogObserved {
+                present: true,
+                backend_dialog_id: Some("dialog-7:3".into()),
+                kind: Some("prompt".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn dialog_inspect_rejects_inconsistent_backend_state() {
+        let command = BrowserBackendCommand::Dialog {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_dialog_id: None,
+            action: BrowserDialogAction::Inspect,
+            prompt_text: None,
+            delivery: BrowserDialogDelivery::Background,
+        };
+        for structured in [
+            json!({"status":"ok","target_id":"target","tab_id":"tab","present":false,"dialog_id":"dialog-1","kind":"alert"}),
+            json!({"status":"ok","target_id":"target","tab_id":"tab","present":true,"dialog_id":"dialog-1"}),
+            json!({"status":"ok","target_id":"target","tab_id":"tab","present":true,"kind":"alert"}),
+            json!({"status":"ok","target_id":"target","tab_id":"tab","present":true,"dialog_id":"dialog-1","kind":"custom"}),
+        ] {
+            let mut raw = CallToolResult::success(vec![]);
+            raw.structured_content = Some(structured);
+            assert!(matches!(
+                normalize_completed(&command, &raw),
+                Err(BrowserExecutionError::InvalidResult(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn mutation_success_requires_exact_target_and_tab_echo() {
+        let command = BrowserBackendCommand::Navigate {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            url: "https://example.com".into(),
+        };
+        for structured in [
+            json!({
+                "status":"ok","target_id":"wrong","tab_id":"tab",
+                "url":"https://example.com","refs_invalidated":true
+            }),
+            json!({
+                "status":"ok","target_id":"target","tab_id":"wrong",
+                "url":"https://example.com","refs_invalidated":true
+            }),
+            json!({
+                "status":"ok","target_id":"target","tab_id":"tab",
+                "url":"https://other.example","refs_invalidated":true
+            }),
+            json!({
+                "status":"ok","target_id":"target","tab_id":"tab",
+                "url":"https://example.com","refs_invalidated":false
+            }),
+        ] {
+            let mut raw = CallToolResult::success(vec![]);
+            raw.structured_content = Some(structured);
+            assert!(matches!(
+                normalize_completed(&command, &raw),
+                Err(BrowserExecutionError::InvalidResult(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn dialog_resolution_requires_exact_dialog_and_action_echo() {
+        let command = BrowserBackendCommand::Dialog {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_dialog_id: Some("dialog-7".into()),
+            action: BrowserDialogAction::Accept,
+            prompt_text: None,
+            delivery: BrowserDialogDelivery::Background,
+        };
+        for structured in [
+            json!({
+                "status":"ok","target_id":"target","tab_id":"tab",
+                "dialog_id":"dialog-8","kind":"alert","action":"accept"
+            }),
+            json!({
+                "status":"ok","target_id":"target","tab_id":"tab",
+                "dialog_id":"dialog-7","kind":"alert","action":"dismiss"
+            }),
+        ] {
+            let mut raw = CallToolResult::success(vec![]);
+            raw.structured_content = Some(structured);
+            assert!(matches!(
+                normalize_completed(&command, &raw),
+                Err(BrowserExecutionError::InvalidResult(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn dialog_resolution_preserves_explicit_delivery_without_fallback() {
+        let command = BrowserBackendCommand::Dialog {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_dialog_id: Some("dialog-7:3".into()),
+            action: BrowserDialogAction::Accept,
+            prompt_text: Some("answer".into()),
+            delivery: BrowserDialogDelivery::Foreground,
+        };
+        let (_, args) = map_command(&command).unwrap();
+        let args = args.unwrap();
+        assert_eq!(args["action"], json!("accept"));
+        assert_eq!(args["dialog_id"], json!("dialog-7:3"));
+        assert_eq!(args["delivery_mode"], json!("foreground"));
+        assert_eq!(args["prompt_text"], json!("answer"));
+    }
+
+    #[test]
+    fn resolved_runtime_limits_do_not_exceed_public_browser_contract() {
+        let oversized_query = "q".repeat(MAX_BROWSER_QUERY_BYTES + 1);
+        let command = BrowserBackendCommand::Inspect {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_scope_ref: None,
+            query: Some(oversized_query),
+            backend_continuation: None,
+            include_screenshot: false,
+        };
+        assert!(matches!(
+            validate_command(&command),
+            Err(BrowserExecutionError::InvalidRequest(_))
+        ));
+
+        let command = BrowserBackendCommand::Pointer {
+            context_id: CONTEXT.into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_element_ref: "p1:1".into(),
+            action: BrowserPointerAction::Scroll,
+            backend_destination_ref: None,
+            delta_x: MAX_BROWSER_SCROLL_DELTA_CSS_PX + 1,
+            delta_y: 0,
+            input_route: BrowserInputRoute::Trusted,
+        };
+        assert!(matches!(
+            validate_command(&command),
+            Err(BrowserExecutionError::InvalidRequest(_))
+        ));
     }
 
     #[test]

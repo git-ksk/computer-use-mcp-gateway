@@ -70,15 +70,15 @@ method escape hatch.
 | 33 | `get_accessibility_tree` | integrated | `ListApplications` + `ListWindows`; no raw backend tree contract |
 | 34 | `zoom` | semantic, current | bounded window-local `CaptureRegion`; no hidden `from_zoom` state |
 | 35 | `page` | intentionally excluded/replaced | typed browser surface; arbitrary JS is not standard parity |
-| 36 | `get_browser_state` | semantic, planned | `BrowserInspect` |
-| 37 | `browser_prepare` | semantic, planned | `BrowserPrepare`; preserve Cua/backend authorization/refusal |
-| 38 | `browser_navigate` | semantic, planned | `BrowserNavigate` |
-| 39 | `browser_click` | semantic, planned | `BrowserClick` using scoped page refs |
-| 40 | `browser_type` | semantic, planned | `BrowserType` using scoped page refs |
-| 41 | `browser_dialog` | semantic, planned | `BrowserDialog` |
+| 36 | `get_browser_state` | semantic, core-wired | `BrowserInspect` |
+| 37 | `browser_prepare` | semantic, core-wired | `BrowserPrepare`; preserve Cua/backend authorization/refusal |
+| 38 | `browser_navigate` | semantic, core-wired | `BrowserNavigate` |
+| 39 | `browser_click` | semantic, core-wired | `BrowserClick` using scoped page refs |
+| 40 | `browser_type` | semantic, core-wired | `BrowserType` using scoped page refs |
+| 41 | `browser_dialog` | semantic, core-wired | `BrowserDialog` |
 | 42 | `browser_set_input_files` | semantic, planned | dedicated `BrowserUploadFile`; only CUMG-issued file refs |
 | 43 | `browser_download` | semantic, planned | dedicated `BrowserDownload`; bounded destination/size/overwrite |
-| 44 | `browser_pointer` | semantic, planned | `BrowserPointer` with explicit browser viewport coordinates |
+| 44 | `browser_pointer` | semantic, core-wired | `BrowserPointer` with explicit browser viewport coordinates |
 | 45 | `start_recording` | operator/test-only | local acceptance/regression tooling |
 | 46 | `stop_recording` | operator/test-only | local acceptance/regression tooling |
 | 47 | `get_recording_state` | operator/test-only | local acceptance/regression tooling |
@@ -93,7 +93,8 @@ method escape hatch.
 
 ## Desktop parity status
 
-The desktop semantic phase currently exposes 29 northbound tools on the Cua 0.19.3 shadow Agent.
+The desktop-only semantic baseline exposes 29 northbound tools on the Cua 0.19.3 shadow Agent. The
+browser core adds eight typed tools when the corresponding live advertisement and policy permit them.
 There is no generic Cua call/proxy tool. `tools/list` is the exact policy/live-advertisement
 intersection, and an offline Agent exposes no semantic device tools.
 
@@ -144,8 +145,8 @@ launch -> discover window -> inspect -> frame/menu/element action
 Browser workflow:
 
 ```text
-bind/prepare -> inspect -> navigate -> semantic interaction
--> dialog -> explicit upload/download -> verify
+bind/prepare -> inspect -> navigate -> semantic interaction -> dialog -> verify
+-> [separate transfer closeout: explicit upload/download]
 ```
 
 Both workflows must preserve CUMG operation IDs, exact capability authorization, generation fencing,

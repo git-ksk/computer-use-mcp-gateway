@@ -32,8 +32,8 @@ open interaction context
 -> bind exact (process, window)
 -> inspect selected tab and mint CUMG refs
 -> navigate / click / type / pointer / dialog
--> explicit upload / download when separately authorized
 -> fresh inspect for verification
+-> [later transfer closeout: explicit upload / download]
 -> close interaction context
 ```
 
@@ -51,13 +51,17 @@ The planned browser runtime surface is:
 | browser navigate | `BrowserNavigate` | exact target/tab navigation; `http`, `https`, or `about` only |
 | browser click | `BrowserClick` | current page ref preferred; typed viewport CSS coordinates only on the trusted route |
 | browser type | `BrowserType` | current editable ref; bounded insert/keystroke mode and explicit replace semantics |
-| browser dialog | `BrowserDialog` | current opaque page-dialog ref; accept/dismiss with bounded prompt text |
+| browser dialog | `BrowserDialog` | inspect page-owned dialog, mint opaque ref, then explicit accept/dismiss with bounded prompt text |
 | browser pointer | `BrowserPointer` | hover/right-click/double-click/scroll/drag through current semantic refs |
 | browser upload | `BrowserUploadFile` | exact upload capability; CUMG-issued file refs only |
 | browser download | `BrowserDownload` | exact download capability; bounded destination root, size, and overwrite policy |
 
 No generic `page`, `call_tool`, `raw_cua`, raw CDP method, CSS selector escape hatch, or JavaScript
 evaluation surface is introduced.
+
+The current core runtime advertises only prepare, bind/inspect, navigate, click, type, dialog, and
+pointer. `BrowserUploadFile` and `BrowserDownload` are schema-visible for rolling compatibility but are
+not live-advertised until the independent transfer closeout is complete.
 
 ## Exact browser binding
 
@@ -69,8 +73,7 @@ Heuristic title matching is read-only evidence, never action authority. A moved 
 endpoint-owner mismatch, stale geometry, ambiguous native window, Agent reconnect, or capability
 revision change invalidates the binding. CUMG never selects a similar-looking target as fallback.
 
-The adapter maps the backend target and tab identifiers into `ScopedBackendRefRegistry` entries. At
-minimum:
+The Hub maps backend browser identifiers into the browser-specific `BrowserRefRegistry`. At minimum:
 
 ```text
 BrowserTarget
@@ -94,9 +97,11 @@ The normalized observation may contain:
 - an opaque continuation capability;
 - optional bounded exact-tab screenshot and viewport CSS dimensions.
 
-A fresh snapshot invalidates older page-action refs for that tab. Navigation also invalidates them.
-Unknown, stale, cross-context, wrong-generation, wrong-revision, wrong-tab, and wrong-kind refs fail
-closed. A content ref is not automatically an action ref.
+A fresh snapshot invalidates older snapshot/action/content/continuation refs for that tab. A
+page-owned dialog ref is independent of semantic snapshot pagination and survives a mere snapshot
+refresh; navigation, a fresh dialog inspection, successful dialog resolution, or context fencing
+invalidates it. Unknown, stale, cross-context, wrong-generation, wrong-revision, wrong-tab, and
+wrong-kind refs fail closed. A content ref is not automatically an action ref.
 
 Page text, labels, URLs, attributes, and dialog text are untrusted application content. They cannot
 grant approval, change policy, expand scope, select a capability, or override the caller's request.
@@ -147,13 +152,17 @@ must verify the expected page state with a fresh browser snapshot.
 
 ## Dialog boundary
 
-`BrowserDialog` resolves only page-owned dialogs represented by a current opaque CUMG dialog ref.
-Browser permission UI, authentication sheets, native file pickers, save panels, browser chrome, and
-other native dialogs remain on the native window semantic path.
+`BrowserDialog action=inspect` observes only a page-owned JavaScript dialog on one exact bound tab.
+The backend dialog id terminates at the Hub and, when a dialog is present, is replaced by a fresh
+opaque CUMG dialog ref. Inspect carries no dialog ref, prompt text, or resolution authority. Browser
+permission UI, authentication sheets, native file pickers, save panels, browser chrome, and other
+native dialogs remain on the native window semantic path.
 
-Prompt text is accepted only with an explicit accept action and remains bounded. Delivery posture is
-explicit. A backend refusal for background dialog resolution is not permission for an automatic
-foreground retry.
+Accept/dismiss require the current dialog ref. Prompt text is accepted only with an explicit accept
+action and remains bounded. Successful resolution consumes the ref. A fresh dialog inspection
+replaces the prior dialog ref; navigation invalidates it. Delivery posture is explicit. A backend
+refusal for background dialog resolution leaves the current ref available for an explicit caller
+decision but is not permission for an automatic foreground retry.
 
 ## Upload boundary
 
@@ -215,9 +224,11 @@ legacy Cua `page` mutations as an implicit browser API fallback.
 
 ## Carrier and privacy
 
-Ordinary command/control frames retain the existing 64 KiB application bound. Browser semantic
-snapshots and exact-tab screenshots require the same reviewed bounded-large-result treatment already
-used for desktop screenshots/UI snapshots, with explicit limits on:
+Ordinary command/control frames retain the existing 64 KiB application bound. Browser bind/snapshot
+observations use the existing reviewed 28 MiB bounded-large gRPC result allowance; Browser mutations
+remain on the ordinary bound. Normalized browser structured metadata is capped at 2 MiB and PNG
+screenshot bytes at 16 MiB before the signed result is emitted. This leaves explicit carrier-envelope
+headroom while preserving limits on:
 
 - screenshot bytes and dimensions;
 - outline bytes;

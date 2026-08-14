@@ -5,6 +5,7 @@
 //! reconnect, grant validation, replay barriers, direct process execution, and
 //! cancellation. An optional external Cua MCP adapter adds typed GUI capabilities.
 
+use crate::v2_browser_execute::BrowserRefusalReason;
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
     CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
@@ -1078,9 +1079,38 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         AgentOperationError::Filesystem(_)
         | AgentOperationError::Process(_)
         | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Backend(M1BackendError::BrowserRefused(reason)) => {
+            browser_refusal_error_code(*reason)
+        }
         AgentOperationError::Backend(_) | AgentOperationError::WorkerPanicked => {
             DeviceErrorCode::InternalFailure
         }
+    }
+}
+
+fn browser_refusal_error_code(reason: BrowserRefusalReason) -> DeviceErrorCode {
+    match reason {
+        BrowserRefusalReason::RouteUnavailable => DeviceErrorCode::BrowserRouteUnavailable,
+        BrowserRefusalReason::RequiresSetup => DeviceErrorCode::BrowserRequiresSetup,
+        BrowserRefusalReason::BindingAmbiguous => DeviceErrorCode::BrowserBindingAmbiguous,
+        BrowserRefusalReason::BindingStale => DeviceErrorCode::BrowserBindingStale,
+        BrowserRefusalReason::WrongTarget => DeviceErrorCode::BrowserWrongTargetRefused,
+        BrowserRefusalReason::TabRequired => DeviceErrorCode::BrowserTabRequired,
+        BrowserRefusalReason::TabNotFound => DeviceErrorCode::BrowserTabNotFound,
+        BrowserRefusalReason::RefStale => DeviceErrorCode::BrowserRefStale,
+        BrowserRefusalReason::InputTrustUnavailable => {
+            DeviceErrorCode::BrowserInputTrustUnavailable
+        }
+        BrowserRefusalReason::EndpointOwnerMismatch => {
+            DeviceErrorCode::BrowserEndpointOwnerMismatch
+        }
+        BrowserRefusalReason::ConsentRequired => DeviceErrorCode::BrowserConsentRequired,
+        BrowserRefusalReason::ConsentRevoked => DeviceErrorCode::BrowserConsentRevoked,
+        BrowserRefusalReason::ReconnectExhausted => DeviceErrorCode::BrowserReconnectExhausted,
+        BrowserRefusalReason::InputIncomplete => DeviceErrorCode::BrowserInputIncomplete,
+        BrowserRefusalReason::ActionUnavailable => DeviceErrorCode::BrowserActionUnavailable,
+        BrowserRefusalReason::OriginOutsideScope => DeviceErrorCode::BrowserOriginOutsideScope,
+        BrowserRefusalReason::Other => DeviceErrorCode::BrowserRefused,
     }
 }
 

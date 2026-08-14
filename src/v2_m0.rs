@@ -1322,6 +1322,75 @@ pub enum DeviceErrorCode {
     NotFound,
     IoFailure,
     InternalFailure,
+    BrowserRouteUnavailable,
+    BrowserRequiresSetup,
+    BrowserBindingAmbiguous,
+    BrowserBindingStale,
+    BrowserWrongTargetRefused,
+    BrowserTabRequired,
+    BrowserTabNotFound,
+    BrowserRefStale,
+    BrowserInputTrustUnavailable,
+    BrowserEndpointOwnerMismatch,
+    BrowserConsentRequired,
+    BrowserConsentRevoked,
+    BrowserReconnectExhausted,
+    BrowserInputIncomplete,
+    BrowserActionUnavailable,
+    BrowserOriginOutsideScope,
+    BrowserRefused,
+}
+
+impl DeviceErrorCode {
+    pub const fn safe_code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::PermissionDenied => "permission_denied",
+            Self::NotFound => "not_found",
+            Self::IoFailure => "io_failure",
+            Self::InternalFailure => "internal_failure",
+            Self::BrowserRouteUnavailable => "browser_route_unavailable",
+            Self::BrowserRequiresSetup => "browser_requires_setup",
+            Self::BrowserBindingAmbiguous => "browser_binding_ambiguous",
+            Self::BrowserBindingStale => "browser_binding_stale",
+            Self::BrowserWrongTargetRefused => "browser_wrong_target_refused",
+            Self::BrowserTabRequired => "browser_tab_required",
+            Self::BrowserTabNotFound => "browser_tab_not_found",
+            Self::BrowserRefStale => "browser_ref_stale",
+            Self::BrowserInputTrustUnavailable => "browser_input_trust_unavailable",
+            Self::BrowserEndpointOwnerMismatch => "browser_endpoint_owner_mismatch",
+            Self::BrowserConsentRequired => "browser_consent_required",
+            Self::BrowserConsentRevoked => "browser_consent_revoked",
+            Self::BrowserReconnectExhausted => "browser_reconnect_exhausted",
+            Self::BrowserInputIncomplete => "browser_input_incomplete",
+            Self::BrowserActionUnavailable => "browser_action_unavailable",
+            Self::BrowserOriginOutsideScope => "browser_origin_outside_scope",
+            Self::BrowserRefused => "browser_refused",
+        }
+    }
+
+    pub const fn is_browser_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::BrowserRouteUnavailable
+                | Self::BrowserRequiresSetup
+                | Self::BrowserBindingAmbiguous
+                | Self::BrowserBindingStale
+                | Self::BrowserWrongTargetRefused
+                | Self::BrowserTabRequired
+                | Self::BrowserTabNotFound
+                | Self::BrowserRefStale
+                | Self::BrowserInputTrustUnavailable
+                | Self::BrowserEndpointOwnerMismatch
+                | Self::BrowserConsentRequired
+                | Self::BrowserConsentRevoked
+                | Self::BrowserReconnectExhausted
+                | Self::BrowserInputIncomplete
+                | Self::BrowserActionUnavailable
+                | Self::BrowserOriginOutsideScope
+                | Self::BrowserRefused
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1934,6 +2003,74 @@ mod tests {
             DeviceCommand::TypeText { text: "x".into() }.capability(),
             DeviceCapability::TypeText
         );
+    }
+
+    #[test]
+    fn browser_refusal_codes_have_closed_safe_wire_names() {
+        let cases = [
+            (
+                DeviceErrorCode::BrowserRouteUnavailable,
+                "browser_route_unavailable",
+            ),
+            (
+                DeviceErrorCode::BrowserRequiresSetup,
+                "browser_requires_setup",
+            ),
+            (
+                DeviceErrorCode::BrowserBindingAmbiguous,
+                "browser_binding_ambiguous",
+            ),
+            (
+                DeviceErrorCode::BrowserBindingStale,
+                "browser_binding_stale",
+            ),
+            (
+                DeviceErrorCode::BrowserWrongTargetRefused,
+                "browser_wrong_target_refused",
+            ),
+            (DeviceErrorCode::BrowserTabRequired, "browser_tab_required"),
+            (DeviceErrorCode::BrowserTabNotFound, "browser_tab_not_found"),
+            (DeviceErrorCode::BrowserRefStale, "browser_ref_stale"),
+            (
+                DeviceErrorCode::BrowserInputTrustUnavailable,
+                "browser_input_trust_unavailable",
+            ),
+            (
+                DeviceErrorCode::BrowserEndpointOwnerMismatch,
+                "browser_endpoint_owner_mismatch",
+            ),
+            (
+                DeviceErrorCode::BrowserConsentRequired,
+                "browser_consent_required",
+            ),
+            (
+                DeviceErrorCode::BrowserConsentRevoked,
+                "browser_consent_revoked",
+            ),
+            (
+                DeviceErrorCode::BrowserReconnectExhausted,
+                "browser_reconnect_exhausted",
+            ),
+            (
+                DeviceErrorCode::BrowserInputIncomplete,
+                "browser_input_incomplete",
+            ),
+            (
+                DeviceErrorCode::BrowserActionUnavailable,
+                "browser_action_unavailable",
+            ),
+            (
+                DeviceErrorCode::BrowserOriginOutsideScope,
+                "browser_origin_outside_scope",
+            ),
+            (DeviceErrorCode::BrowserRefused, "browser_refused"),
+        ];
+        for (code, wire) in cases {
+            assert!(code.is_browser_refusal());
+            assert_eq!(code.safe_code(), wire);
+            assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(wire));
+        }
+        assert!(!DeviceErrorCode::InternalFailure.is_browser_refusal());
     }
 
     #[test]

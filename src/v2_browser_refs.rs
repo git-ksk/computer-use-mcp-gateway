@@ -29,11 +29,7 @@ impl BrowserRefKind {
     fn snapshot_bound(self) -> bool {
         matches!(
             self,
-            Self::Snapshot
-                | Self::ActionElement
-                | Self::ContentElement
-                | Self::Continuation
-                | Self::Dialog
+            Self::Snapshot | Self::ActionElement | Self::ContentElement | Self::Continuation
         )
     }
 }
@@ -241,17 +237,17 @@ impl BrowserRefRegistry {
         context: &InteractionContextBinding,
         target_ref: &str,
         tab_ref: &str,
-        snapshot_ref: &str,
         backend_dialog: &str,
     ) -> Result<String, BrowserRefError> {
-        self.require_snapshot(context, target_ref, tab_ref, snapshot_ref)?;
+        self.resolve_target_tab(context, target_ref, tab_ref)?;
+        self.invalidate_dialogs_for_tab(context, target_ref, tab_ref);
         self.mint(
             context,
             BrowserRefKind::Dialog,
             backend_dialog,
             Some(target_ref),
             Some(tab_ref),
-            Some(snapshot_ref),
+            None,
             &[],
             false,
         )
@@ -282,6 +278,20 @@ impl BrowserRefRegistry {
         element_ref: &str,
         required: BrowserAction,
     ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
+        self.resolve_any_action(context, target_ref, tab_ref, element_ref, &[required])
+    }
+
+    pub fn resolve_any_action(
+        &self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        element_ref: &str,
+        allowed: &[BrowserAction],
+    ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
+        if allowed.is_empty() {
+            return Err(BrowserRefError::ActionUnavailable);
+        }
         let resolved = self.resolve_page_ref(
             context,
             target_ref,
@@ -290,7 +300,10 @@ impl BrowserRefRegistry {
             &[BrowserRefKind::ActionElement],
         )?;
         let reference = self.require_owned(element_ref, context)?;
-        if !reference.actions.contains(&required) {
+        if !allowed
+            .iter()
+            .any(|action| reference.actions.contains(action))
+        {
             return Err(BrowserRefError::ActionUnavailable);
         }
         Ok(resolved)
@@ -322,13 +335,40 @@ impl BrowserRefRegistry {
         tab_ref: &str,
         dialog_ref: &str,
     ) -> Result<ResolvedBrowserPageRef, BrowserRefError> {
-        self.resolve_page_ref(
-            context,
-            target_ref,
-            tab_ref,
-            dialog_ref,
-            &[BrowserRefKind::Dialog],
-        )
+        self.resolve_target_tab(context, target_ref, tab_ref)?;
+        let reference = self.require_kind(dialog_ref, context, BrowserRefKind::Dialog)?;
+        if reference.target_ref.as_deref() != Some(target_ref)
+            || reference.tab_ref.as_deref() != Some(tab_ref)
+        {
+            return Err(BrowserRefError::RelationMismatch);
+        }
+        Ok(ResolvedBrowserPageRef {
+            backend_ref: reference.backend_ref.clone(),
+            kind: reference.kind,
+        })
+    }
+
+    pub fn invalidate_tab_dialogs(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+    ) -> Result<(), BrowserRefError> {
+        self.resolve_target_tab(context, target_ref, tab_ref)?;
+        self.invalidate_dialogs_for_tab(context, target_ref, tab_ref);
+        Ok(())
+    }
+
+    pub fn complete_dialog(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+        dialog_ref: &str,
+    ) -> Result<(), BrowserRefError> {
+        self.resolve_dialog(context, target_ref, tab_ref, dialog_ref)?;
+        self.refs.remove(dialog_ref);
+        Ok(())
     }
 
     /// Continuations are opaque single-use capabilities.
@@ -367,7 +407,22 @@ impl BrowserRefRegistry {
     ) -> Result<(), BrowserRefError> {
         self.resolve_target_tab(context, target_ref, tab_ref)?;
         self.invalidate_snapshot_bound_for_tab(context, target_ref, tab_ref);
+        self.invalidate_dialogs_for_tab(context, target_ref, tab_ref);
         Ok(())
+    }
+
+    fn invalidate_dialogs_for_tab(
+        &mut self,
+        context: &InteractionContextBinding,
+        target_ref: &str,
+        tab_ref: &str,
+    ) {
+        self.refs.retain(|_, reference| {
+            reference.context_id != context.id.as_str()
+                || reference.target_ref.as_deref() != Some(target_ref)
+                || reference.tab_ref.as_deref() != Some(tab_ref)
+                || reference.kind != BrowserRefKind::Dialog
+        });
     }
 
     pub fn invalidate_context(&mut self, context_id: &str) {
@@ -385,6 +440,12 @@ impl BrowserRefRegistry {
         self.refs.retain(|_, reference| {
             reference.device_id != device_id || reference.capability_revision == revision
         });
+    }
+
+    pub(crate) fn discard_refs(&mut self, public_refs: &[String]) {
+        for public_ref in public_refs {
+            self.refs.remove(public_ref);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -781,6 +842,100 @@ mod tests {
             refs.consume_continuation(&context, &target, &tab, &continuation),
             Err(BrowserRefError::UnknownRef)
         );
+    }
+
+    #[test]
+    fn dialog_refs_are_tab_bound_and_survive_semantic_snapshot_refresh() {
+        let context = context(4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        let dialog = refs
+            .mint_dialog(&context, &target, &tab, "dialog-generation-one")
+            .unwrap();
+        let _snapshot = refs
+            .begin_snapshot(&context, &target, &tab, "snapshot")
+            .unwrap();
+        assert_eq!(
+            refs.resolve_dialog(&context, &target, &tab, &dialog)
+                .unwrap()
+                .backend_ref,
+            "dialog-generation-one"
+        );
+    }
+
+    #[test]
+    fn fresh_dialog_replaces_old_and_successful_resolution_consumes_current_ref() {
+        let context = context(4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        let first = refs
+            .mint_dialog(&context, &target, &tab, "dialog-generation-one")
+            .unwrap();
+        let second = refs
+            .mint_dialog(&context, &target, &tab, "dialog-generation-two")
+            .unwrap();
+        assert_eq!(
+            refs.resolve_dialog(&context, &target, &tab, &first),
+            Err(BrowserRefError::UnknownRef)
+        );
+        refs.complete_dialog(&context, &target, &tab, &second)
+            .unwrap();
+        assert_eq!(
+            refs.resolve_dialog(&context, &target, &tab, &second),
+            Err(BrowserRefError::UnknownRef)
+        );
+    }
+
+    #[test]
+    fn navigation_invalidates_dialog_ref() {
+        let context = context(4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        let dialog = refs
+            .mint_dialog(&context, &target, &tab, "dialog-generation-one")
+            .unwrap();
+        refs.invalidate_tab_document(&context, &target, &tab)
+            .unwrap();
+        assert_eq!(
+            refs.resolve_dialog(&context, &target, &tab, &dialog),
+            Err(BrowserRefError::UnknownRef)
+        );
+    }
+
+    #[test]
+    fn repeated_snapshot_and_dialog_refresh_plateaus_registry_state() {
+        let context = context(4, 9);
+        let mut refs = BrowserRefRegistry::default();
+        let (target, tab) = bound_tab(&mut refs, &context);
+        for index in 0..10_000 {
+            let snapshot = refs
+                .begin_snapshot(&context, &target, &tab, &format!("snapshot-{index}"))
+                .unwrap();
+            refs.mint_action_element(
+                &context,
+                &target,
+                &tab,
+                &snapshot,
+                &format!("p{index}:1"),
+                &[BrowserAction::Click],
+            )
+            .unwrap();
+            refs.mint_content_element(&context, &target, &tab, &snapshot, &format!("p{index}:2"))
+                .unwrap();
+            refs.mint_continuation(
+                &context,
+                &target,
+                &tab,
+                &snapshot,
+                &format!("continuation-{index}"),
+            )
+            .unwrap();
+            refs.mint_dialog(&context, &target, &tab, &format!("dialog-{index}"))
+                .unwrap();
+            // target + tab + current snapshot/action/content/continuation + current dialog
+            assert!(refs.len() <= 7);
+        }
+        assert!(refs.len() <= 7);
     }
 
     #[test]

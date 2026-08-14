@@ -30,9 +30,10 @@ The production V1 route is not changed by this work.
    to desktop scope is not silently downgraded; the caller closes it and opens a fresh context.
 4. Bind is exact-or-refuse. `binding_quality != exact` or `mutation_allowed != true` cannot mint
    actionable CUMG target/tab refs.
-5. A fresh semantic snapshot invalidates the prior snapshot/action/content/continuation/dialog refs
-   for that exact tab. Navigation invalidates that tab's document refs. Other bound tabs are not
-   invalidated merely because one tab navigated.
+5. A fresh semantic snapshot invalidates the prior snapshot/action/content/continuation refs for that
+   exact tab. Dialog refs are tab/document-bound rather than snapshot-pagination-bound: a fresh dialog
+   inspection replaces the prior dialog ref, successful resolution consumes it, and navigation
+   invalidates it. Other bound tabs are not invalidated merely because one tab navigated.
 6. Page action refs carry the exact CUMG action set observed in the fresh snapshot. A `type`-only ref
    cannot authorize click; a content ref cannot authorize any mutation.
 7. Unknown backend actions never become CUMG authority. They remain observation-only until a reviewed
@@ -46,6 +47,17 @@ The production V1 route is not changed by this work.
 11. Browser provider refusal messages are not returned or logged verbatim. Only reviewed semantic
     refusal codes may cross the adapter boundary.
 12. Control and capability schema v4 mixing fails closed against pre-v4 peers.
+13. Browser core requires a fresh `WindowScoped` InteractionContext. A context monotonically expanded
+    to `DesktopScoped` cannot be silently downgraded for browser use.
+14. Only Browser bind/snapshot observations receive the reviewed bounded-large result allowance;
+    transfer capabilities remain unadvertised and mutations retain the ordinary carrier bound.
+
+## Current core advertisement
+
+The core branch advertises exactly eight northbound browser tools when the matching live capability
+and policy are present: `browser_prepare`, `browser_bind`, `browser_inspect`, `browser_navigate`,
+`browser_click`, `browser_type`, `browser_dialog`, and `browser_pointer`. Browser upload/download are
+not present in tool discovery.
 
 ## Core real-Cua acceptance
 
@@ -60,7 +72,8 @@ Run against the pinned Cua 0.19.3 shadow Agent on the trusted Mac without changi
 - perform one safe navigate and prove prior page refs are stale;
 - perform one ref-targeted click using an explicitly chosen route and verify from a fresh snapshot;
 - perform one ref-targeted type and verify from a fresh snapshot;
-- exercise a page-owned dialog when a deterministic fixture is available;
+- inspect a page-owned dialog, prove only a CUMG dialog ref is returned, resolve it explicitly, and
+  prove the resolved ref is consumed;
 - exercise a bounded pointer action and verify from fresh browser state;
 - prove wrong-context, closed-context, wrong-generation, wrong-revision, wrong-target/tab, and stale
   snapshot refs fail closed;
