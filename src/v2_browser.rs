@@ -5,6 +5,7 @@
 //! backend after normal principal/device capability authorization and
 //! InteractionContext generation/revision fencing.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -17,8 +18,14 @@ pub const MAX_BROWSER_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_BROWSER_PROMPT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_BROWSER_PROFILE_NAME_BYTES: usize = 128;
 pub const MAX_BROWSER_UPLOAD_FILES: usize = 32;
-pub const MAX_BROWSER_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_BROWSER_UPLOAD_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_BROWSER_UPLOAD_BASE64_BYTES: usize = MAX_BROWSER_UPLOAD_FILE_BYTES.div_ceil(3) * 4;
+pub const MAX_BROWSER_UPLOAD_NAME_BYTES: usize = 255;
+pub const MAX_BROWSER_DOWNLOAD_FILES: usize = 32;
+pub const MAX_BROWSER_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_BROWSER_DOWNLOAD_NAME_BYTES: usize = 255;
+pub const MAX_BROWSER_DOWNLOAD_BASE64_BYTES: usize =
+    (MAX_BROWSER_DOWNLOAD_BYTES as usize).div_ceil(3) * 4;
 pub const MAX_BROWSER_SCROLL_DELTA_CSS_PX: i32 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +338,36 @@ impl BrowserPointerRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserStageUploadRequest {
+    pub context_id: String,
+    /// Caller-visible basename only. No local source path is accepted.
+    pub file_name: String,
+    /// File bytes transported through the dedicated bounded upload staging boundary.
+    pub data_base64: String,
+}
+
+impl BrowserStageUploadRequest {
+    pub fn validate(&self) -> Result<usize, BrowserContractError> {
+        validate_context_id(&self.context_id)?;
+        validate_transfer_basename(
+            &self.file_name,
+            MAX_BROWSER_UPLOAD_NAME_BYTES,
+            BrowserContractError::InvalidUploadName,
+        )?;
+        if self.data_base64.len() > MAX_BROWSER_UPLOAD_BASE64_BYTES {
+            return Err(BrowserContractError::UploadFileTooLarge);
+        }
+        let decoded = STANDARD
+            .decode(self.data_base64.as_bytes())
+            .map_err(|_| BrowserContractError::InvalidUploadData)?;
+        if decoded.len() > MAX_BROWSER_UPLOAD_FILE_BYTES {
+            return Err(BrowserContractError::UploadFileTooLarge);
+        }
+        Ok(decoded.len())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserUploadRequest {
     pub context_id: String,
     pub target_ref: String,
@@ -366,11 +403,8 @@ pub struct BrowserDownloadRequest {
     pub target_ref: String,
     pub tab_ref: String,
     pub element_ref: String,
-    /// CUMG-issued destination-root capability. No arbitrary local path crosses
-    /// the northbound browser contract.
-    pub destination_root_ref: String,
-    /// Caller-chosen path-safe basename inside the approved destination root.
-    /// This is not the server-provided filename.
+    /// Caller-chosen logical basename inside Agent-private download staging.
+    /// No caller-selected host directory or raw local path is accepted.
     pub destination_name: String,
     pub max_bytes: u64,
     pub overwrite: bool,
@@ -382,7 +416,6 @@ impl BrowserDownloadRequest {
         validate_public_ref(&self.target_ref)?;
         validate_public_ref(&self.tab_ref)?;
         validate_public_ref(&self.element_ref)?;
-        validate_public_ref(&self.destination_root_ref)?;
         validate_download_destination_name(&self.destination_name)?;
         if self.max_bytes == 0 || self.max_bytes > MAX_BROWSER_DOWNLOAD_BYTES {
             return Err(BrowserContractError::InvalidDownloadBound);
@@ -399,7 +432,6 @@ pub enum BrowserAction {
     Pointer,
     Scroll,
     Upload,
-    Download,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,9 +488,18 @@ pub struct BrowserDialogResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserStagedUploadResult {
+    pub file_ref: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDownloadResult {
     pub download_ref: String,
+    pub destination_name: String,
     pub bytes_written: u64,
+    /// Bounded bytes returned from Agent-private staging; never a host path.
+    pub data_base64: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,6 +522,9 @@ pub enum BrowserContractError {
     InvalidPointerDelta,
     InvalidUploadSet,
     DuplicateFileRef,
+    InvalidUploadName,
+    InvalidUploadData,
+    UploadFileTooLarge,
     InvalidDownloadBound,
     InvalidDownloadName,
 }
@@ -539,9 +583,29 @@ fn validate_profile_name(value: &str) -> Result<(), BrowserContractError> {
     Ok(())
 }
 
-fn validate_download_destination_name(value: &str) -> Result<(), BrowserContractError> {
+pub(crate) fn validate_download_destination_name(value: &str) -> Result<(), BrowserContractError> {
+    validate_transfer_basename(
+        value,
+        MAX_BROWSER_DOWNLOAD_NAME_BYTES,
+        BrowserContractError::InvalidDownloadName,
+    )
+}
+
+pub(crate) fn validate_upload_file_name(value: &str) -> Result<(), BrowserContractError> {
+    validate_transfer_basename(
+        value,
+        MAX_BROWSER_UPLOAD_NAME_BYTES,
+        BrowserContractError::InvalidUploadName,
+    )
+}
+
+fn validate_transfer_basename(
+    value: &str,
+    max_bytes: usize,
+    error: BrowserContractError,
+) -> Result<(), BrowserContractError> {
     if value.is_empty()
-        || value.len() > MAX_BROWSER_DOWNLOAD_NAME_BYTES
+        || value.len() > max_bytes
         || value.trim() != value
         || value == "."
         || value == ".."
@@ -551,7 +615,7 @@ fn validate_download_destination_name(value: &str) -> Result<(), BrowserContract
             .any(|ch| matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'))
         || value.ends_with('.')
     {
-        return Err(BrowserContractError::InvalidDownloadName);
+        return Err(error.clone());
     }
 
     let reserved_stem = value
@@ -564,7 +628,7 @@ fn validate_download_destination_name(value: &str) -> Result<(), BrowserContract
             && (reserved_stem.starts_with("COM") || reserved_stem.starts_with("LPT"))
             && matches!(reserved_stem.as_bytes()[3], b'1'..=b'9'));
     if reserved {
-        return Err(BrowserContractError::InvalidDownloadName);
+        return Err(error);
     }
     Ok(())
 }
@@ -673,6 +737,32 @@ mod tests {
     }
 
     #[test]
+    fn upload_staging_accepts_bytes_and_safe_basename_but_no_path() {
+        let request = BrowserStageUploadRequest {
+            context_id: CONTEXT.into(),
+            file_name: "report.txt".into(),
+            data_base64: STANDARD.encode(b"hello"),
+        };
+        assert_eq!(request.validate().unwrap(), 5);
+        assert_eq!(
+            BrowserStageUploadRequest {
+                file_name: "../secret.txt".into(),
+                ..request.clone()
+            }
+            .validate(),
+            Err(BrowserContractError::InvalidUploadName)
+        );
+        assert_eq!(
+            BrowserStageUploadRequest {
+                data_base64: "not base64***".into(),
+                ..request
+            }
+            .validate(),
+            Err(BrowserContractError::InvalidUploadData)
+        );
+    }
+
+    #[test]
     fn upload_accepts_only_bounded_unique_cumg_refs() {
         BrowserUploadRequest {
             context_id: CONTEXT.into(),
@@ -699,13 +789,12 @@ mod tests {
     }
 
     #[test]
-    fn download_requires_an_opaque_destination_capability_and_explicit_size_bound() {
+    fn download_uses_agent_private_staging_and_explicit_size_bound() {
         BrowserDownloadRequest {
             context_id: CONTEXT.into(),
             target_ref: reference(1),
             tab_ref: reference(2),
             element_ref: reference(3),
-            destination_root_ref: reference(4),
             destination_name: "download.bin".into(),
             max_bytes: 8 * 1024 * 1024,
             overwrite: false,
@@ -719,7 +808,6 @@ mod tests {
                 target_ref: reference(1),
                 tab_ref: reference(2),
                 element_ref: reference(3),
-                destination_root_ref: reference(4),
                 destination_name: "download.bin".into(),
                 max_bytes: 0,
                 overwrite: true,
@@ -741,7 +829,6 @@ mod tests {
                     target_ref: reference(1),
                     tab_ref: reference(2),
                     element_ref: reference(3),
-                    destination_root_ref: reference(4),
                     destination_name: invalid_name.into(),
                     max_bytes: 1024,
                     overwrite: false,

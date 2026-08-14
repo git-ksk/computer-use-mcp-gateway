@@ -338,7 +338,6 @@ fn normalize_actions(value: Option<&Value>) -> Result<Vec<BrowserAction>, Browse
             "pointer" => Some(BrowserAction::Pointer),
             "scroll" => Some(BrowserAction::Scroll),
             "upload" => Some(BrowserAction::Upload),
-            "download" => Some(BrowserAction::Download),
             _ => None,
         };
         if let Some(action) = action {

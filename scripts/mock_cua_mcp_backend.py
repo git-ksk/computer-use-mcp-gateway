@@ -17,12 +17,24 @@ PROTOCOL_VERSION = "2025-11-25"
 pending: dict[object, str] = {}
 DRAG_MARKER: Path | None = None
 CANCEL_MARKER: Path | None = None
+TRANSFER_MARKER: Path | None = None
+SLOW_BROWSER_UPLOAD = False
+SLOW_BROWSER_DOWNLOAD = False
+FAIL_BROWSER_UPLOAD = False
+FAIL_BROWSER_DOWNLOAD = False
+DOWNLOAD_PAYLOAD = b"fixture-download"
 
 
 def args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--drag-marker")
     parser.add_argument("--cancel-marker")
+    parser.add_argument("--transfer-marker")
+    parser.add_argument("--slow-browser-upload", action="store_true")
+    parser.add_argument("--slow-browser-download", action="store_true")
+    parser.add_argument("--fail-browser-upload", action="store_true")
+    parser.add_argument("--fail-browser-download", action="store_true")
+    parser.add_argument("--download-payload", default="fixture-download")
     return parser.parse_args()
 
 
@@ -77,6 +89,8 @@ def handle_request(message: dict) -> None:
                     {"name": "get_screen_size", "inputSchema": {"type": "object"}},
                     {"name": "click", "inputSchema": {"type": "object"}},
                     {"name": "drag", "inputSchema": {"type": "object"}},
+                    {"name": "browser_set_input_files", "inputSchema": {"type": "object"}},
+                    {"name": "browser_download", "inputSchema": {"type": "object"}},
                 ]
             },
         )
@@ -95,6 +109,65 @@ def handle_request(message: dict) -> None:
     elif name == "drag":
         pending[request_id] = name
         append(DRAG_MARKER, request_id)
+    elif name == "browser_set_input_files":
+        arguments = params.get("arguments") or {}
+        files = arguments.get("files") or []
+        append(TRANSFER_MARKER, {"tool": name, "args": arguments})
+        if FAIL_BROWSER_UPLOAD:
+            result(
+                request_id,
+                {"content": [{"type": "text", "text": "upload failed"}], "isError": True},
+            )
+        elif SLOW_BROWSER_UPLOAD:
+            pending[request_id] = name
+        elif not files or not all(Path(value).is_absolute() and Path(value).is_file() for value in files):
+            result(
+                request_id,
+                {"content": [{"type": "text", "text": "invalid staged file"}], "isError": True},
+            )
+        else:
+            success(
+                request_id,
+                {
+                    "status": "ok",
+                    "target_id": arguments.get("target_id"),
+                    "tab_id": arguments.get("tab_id"),
+                    "ref": arguments.get("ref"),
+                    "file_count": len(files),
+                },
+            )
+    elif name == "browser_download":
+        arguments = params.get("arguments") or {}
+        append(TRANSFER_MARKER, {"tool": name, "args": arguments})
+        if FAIL_BROWSER_DOWNLOAD:
+            result(
+                request_id,
+                {"content": [{"type": "text", "text": "download failed"}], "isError": True},
+            )
+        elif arguments.get("_cua_browser_download_mcp_host_approved") is not True:
+            success(
+                request_id,
+                {
+                    "status": "refused",
+                    "refusal": {"code": "browser_consent_required", "message": "approval required"},
+                },
+            )
+        elif SLOW_BROWSER_DOWNLOAD:
+            pending[request_id] = name
+        else:
+            root = Path(arguments.get("destination_root", ""))
+            if not root.is_absolute() or not root.is_dir():
+                result(
+                    request_id,
+                    {"content": [{"type": "text", "text": "invalid destination"}], "isError": True},
+                )
+            else:
+                download_id = "fixture-download-guid"
+                (root / download_id).write_bytes(DOWNLOAD_PAYLOAD)
+                success(
+                    request_id,
+                    {"status": "completed", "download_id": download_id, "bytes": len(DOWNLOAD_PAYLOAD)},
+                )
     else:
         result(
             request_id,
@@ -119,10 +192,18 @@ def handle_notification(message: dict) -> None:
 
 
 def main() -> None:
-    global DRAG_MARKER, CANCEL_MARKER
+    global DRAG_MARKER, CANCEL_MARKER, TRANSFER_MARKER
+    global SLOW_BROWSER_UPLOAD, SLOW_BROWSER_DOWNLOAD
+    global FAIL_BROWSER_UPLOAD, FAIL_BROWSER_DOWNLOAD, DOWNLOAD_PAYLOAD
     parsed = args()
     DRAG_MARKER = Path(parsed.drag_marker) if parsed.drag_marker else None
     CANCEL_MARKER = Path(parsed.cancel_marker) if parsed.cancel_marker else None
+    TRANSFER_MARKER = Path(parsed.transfer_marker) if parsed.transfer_marker else None
+    SLOW_BROWSER_UPLOAD = parsed.slow_browser_upload
+    SLOW_BROWSER_DOWNLOAD = parsed.slow_browser_download
+    FAIL_BROWSER_UPLOAD = parsed.fail_browser_upload
+    FAIL_BROWSER_DOWNLOAD = parsed.fail_browser_download
+    DOWNLOAD_PAYLOAD = parsed.download_payload.encode("utf-8")
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:

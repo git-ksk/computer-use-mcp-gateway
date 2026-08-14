@@ -211,7 +211,7 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::DesktopScope,
                 ));
             }
-            DeviceCommand::Browser { .. } => {
+            DeviceCommand::StageBrowserUploadFile { .. } | DeviceCommand::Browser { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     command.capability(),
                 ));

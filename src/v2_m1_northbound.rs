@@ -12,30 +12,34 @@ use crate::{
     v2_browser::{
         BrowserAction, BrowserBindRequest, BrowserBindingResult, BrowserClickRequest,
         BrowserClickTarget, BrowserContractError, BrowserDialogAction, BrowserDialogRequest,
-        BrowserDialogResult, BrowserInspectRequest, BrowserNavigateRequest, BrowserPointerAction,
-        BrowserPointerRequest, BrowserPrepareRequest, BrowserSemanticRef, BrowserSnapshotResult,
-        BrowserTabSummary, BrowserTypeRequest, MAX_BROWSER_PROFILE_NAME_BYTES,
+        BrowserDialogResult, BrowserDownloadRequest, BrowserDownloadResult, BrowserInspectRequest,
+        BrowserNavigateRequest, BrowserPointerAction, BrowserPointerRequest, BrowserPrepareRequest,
+        BrowserSemanticRef, BrowserSnapshotResult, BrowserStageUploadRequest,
+        BrowserStagedUploadResult, BrowserTabSummary, BrowserTypeRequest, BrowserUploadRequest,
+        MAX_BROWSER_DOWNLOAD_BASE64_BYTES, MAX_BROWSER_DOWNLOAD_BYTES,
+        MAX_BROWSER_DOWNLOAD_NAME_BYTES, MAX_BROWSER_PROFILE_NAME_BYTES,
         MAX_BROWSER_PROMPT_TEXT_BYTES, MAX_BROWSER_QUERY_BYTES, MAX_BROWSER_SCROLL_DELTA_CSS_PX,
-        MAX_BROWSER_TEXT_BYTES, MAX_BROWSER_URL_BYTES,
+        MAX_BROWSER_TEXT_BYTES, MAX_BROWSER_UPLOAD_BASE64_BYTES, MAX_BROWSER_UPLOAD_FILES,
+        MAX_BROWSER_UPLOAD_NAME_BYTES, MAX_BROWSER_URL_BYTES,
     },
     v2_browser_refs::{BrowserRefError, BrowserRefRegistry, DEFAULT_MAX_BROWSER_REFS_PER_CONTEXT},
     v2_browser_runtime::{
         BrowserBackendClickTarget, BrowserBackendCommand, BrowserBackendResult,
-        BrowserBackendSemanticRef,
+        BrowserBackendSemanticRef, BrowserStagedUploadFile,
     },
     v2_execution_safety::OperationOwner,
     v2_interaction_context::{
         DEFAULT_MAX_REFS_PER_CONTEXT, InteractionContextBinding, InteractionContextId,
         InteractionContextLimits, InteractionContextManager, InteractionScope,
-        ScopedBackendRefRegistry, ScopedRefKind,
+        ScopedBackendRefRegistry, ScopedRefError, ScopedRefKind,
     },
     v2_m0::{
-        CapabilityAdvertisement, DeviceCapability, DeviceCommand, DeviceResult, InputDeliveryMode,
-        InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES, MAX_KEYBOARD_MODIFIERS,
-        MAX_MENU_PATH_SEGMENTS, MAX_MENU_SEGMENT_BYTES, MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS,
-        MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton, PointerTarget, ProcessEnvVar,
-        ProcessRequest, ScrollDirection, ScrollGranularity, ScrollTarget, ShellRequest,
-        UiPredicate, UiRect, UiRole,
+        BrowserUploadPayload, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
+        DeviceResult, InputDeliveryMode, InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES,
+        MAX_KEYBOARD_MODIFIERS, MAX_MENU_PATH_SEGMENTS, MAX_MENU_SEGMENT_BYTES,
+        MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
+        PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
+        ScrollTarget, ShellRequest, UiPredicate, UiRect, UiRole,
     },
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
@@ -44,6 +48,7 @@ use crate::{
 use async_trait::async_trait;
 use axum::{
     Json, Router,
+    extract::DefaultBodyLimit,
     extract::{Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -54,6 +59,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, redirect::Policy as RedirectPolicy};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -118,6 +124,9 @@ const TOOL_BROWSER_CLICK: &str = "browser_click";
 const TOOL_BROWSER_TYPE: &str = "browser_type";
 const TOOL_BROWSER_DIALOG: &str = "browser_dialog";
 const TOOL_BROWSER_POINTER: &str = "browser_pointer";
+const TOOL_BROWSER_STAGE_UPLOAD_FILE: &str = "browser_stage_upload_file";
+const TOOL_BROWSER_UPLOAD_FILE: &str = "browser_upload_file";
+const TOOL_BROWSER_DOWNLOAD: &str = "browser_download_file";
 
 const CONTEXT_ELIGIBLE_CAPABILITIES: &[DeviceCapability] = &[
     DeviceCapability::Screenshot,
@@ -147,6 +156,8 @@ const CONTEXT_ELIGIBLE_CAPABILITIES: &[DeviceCapability] = &[
     DeviceCapability::BrowserType,
     DeviceCapability::BrowserDialog,
     DeviceCapability::BrowserPointer,
+    DeviceCapability::BrowserUploadFile,
+    DeviceCapability::BrowserDownload,
 ];
 
 #[derive(Debug, Clone)]
@@ -673,6 +684,7 @@ pub fn build_trusted_proxy_router(handler: V2NorthboundMcp, config: TrustedProxy
     };
     Router::new()
         .nest_service(config.mcp_path(), service)
+        .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state, trusted_proxy_guard))
 }
 
@@ -732,6 +744,7 @@ pub fn build_northbound_router(
     };
     let protected = Router::new()
         .nest_service(config.mcp_path(), service)
+        .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             auth_state,
             oauth_resource_guard,
@@ -1697,8 +1710,192 @@ impl V2NorthboundMcp {
                     public_dialog_ref: None,
                 })
             }
+            TOOL_BROWSER_UPLOAD_FILE => {
+                let request: BrowserUploadRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, element, staged_files) = {
+                    let mut state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let element = state
+                        .browser_refs
+                        .resolve_action(
+                            &binding,
+                            &request.target_ref,
+                            &request.tab_ref,
+                            &request.element_ref,
+                            BrowserAction::Upload,
+                        )
+                        .map_err(browser_ref_error_to_mcp)?;
+                    let handles = state
+                        .refs
+                        .consume_many(&request.file_refs, &binding, ScopedRefKind::UploadFile)
+                        .map_err(scoped_ref_error_to_mcp)?;
+                    let files = handles
+                        .into_iter()
+                        .map(|backend_file_handle| BrowserStagedUploadFile {
+                            backend_file_handle,
+                        })
+                        .collect();
+                    (resolved, element, files)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Upload {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_element_ref: element.backend_ref,
+                        staged_files,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
+            TOOL_BROWSER_DOWNLOAD => {
+                let request: BrowserDownloadRequest = parse_arguments(arguments)?;
+                request.validate().map_err(browser_contract_error_to_mcp)?;
+                let binding = self
+                    .validate_browser_interaction_context(principal, &request.context_id)
+                    .await?;
+                let (resolved, element) = {
+                    let state = self.interactions.lock().await;
+                    let resolved = state
+                        .browser_refs
+                        .resolve_target_tab(&binding, &request.target_ref, &request.tab_ref)
+                        .map_err(browser_ref_error_to_mcp)?;
+                    // Cua's current download primitive activates an exact clickable ref and
+                    // independently proves that a download begins/completes. It does not mint
+                    // a separate semantic "download" action in snapshots.
+                    let element = state
+                        .browser_refs
+                        .resolve_action(
+                            &binding,
+                            &request.target_ref,
+                            &request.tab_ref,
+                            &request.element_ref,
+                            BrowserAction::Click,
+                        )
+                        .map_err(browser_ref_error_to_mcp)?;
+                    (resolved, element)
+                };
+                Ok(PreparedBrowserCall {
+                    binding,
+                    command: BrowserBackendCommand::Download {
+                        context_id: request.context_id,
+                        backend_target_id: resolved.backend_target,
+                        backend_tab_id: resolved.backend_tab,
+                        backend_element_ref: element.backend_ref,
+                        destination_name: request.destination_name,
+                        max_bytes: request.max_bytes,
+                        overwrite: request.overwrite,
+                    },
+                    public_target_ref: Some(request.target_ref),
+                    public_tab_ref: Some(request.tab_ref),
+                    public_dialog_ref: None,
+                })
+            }
             _ => Err(McpError::invalid_params("Unknown V2 browser tool", None)),
         }
+    }
+
+    async fn call_browser_stage_upload(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        arguments: Option<JsonObject>,
+        operation_id: String,
+        usage: UsageLease,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let request: BrowserStageUploadRequest = match parse_arguments(arguments) {
+            Ok(request) => request,
+            Err(error) => {
+                settle_usage_best_effort(
+                    &usage,
+                    UsageSettlement::Zero,
+                    "invalid_browser_upload_stage",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let expected_bytes = match request.validate() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                settle_usage_best_effort(
+                    &usage,
+                    UsageSettlement::Zero,
+                    "invalid_browser_upload_stage",
+                )
+                .await;
+                return Err(browser_contract_error_to_mcp(error));
+            }
+        };
+        let binding = match self
+            .validate_browser_interaction_context(principal, &request.context_id)
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                settle_usage_best_effort(
+                    &usage,
+                    UsageSettlement::Zero,
+                    "invalid_browser_upload_context",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let result = self
+            .execute_command(
+                principal,
+                operation_id,
+                DeviceCommand::StageBrowserUploadFile {
+                    context_id: request.context_id,
+                    file_name: request.file_name,
+                    data_base64: BrowserUploadPayload::after_contract_validation(
+                        request.data_base64,
+                    ),
+                    expected_bytes: expected_bytes as u64,
+                },
+                usage,
+                context,
+            )
+            .await?;
+        let DeviceResult::BrowserUploadStaged {
+            backend_file_handle,
+            bytes,
+        } = result
+        else {
+            return Err(McpError::internal_error(
+                "Browser upload staging result mismatch",
+                None,
+            ));
+        };
+        if bytes != expected_bytes as u64 {
+            return Err(McpError::internal_error(
+                "Browser upload staging byte count mismatch",
+                None,
+            ));
+        }
+        let file_ref = self
+            .interactions
+            .lock()
+            .await
+            .refs
+            .mint(&binding, ScopedRefKind::UploadFile, &backend_file_handle)
+            .map_err(scoped_ref_mint_error_to_mcp)?;
+        browser_json_response(
+            serde_json::to_value(BrowserStagedUploadResult { file_ref, bytes }).map_err(|_| {
+                McpError::internal_error("Browser upload staging response failed", None)
+            })?,
+        )
     }
 
     async fn call_browser_tool(
@@ -2050,6 +2247,68 @@ impl V2NorthboundMcp {
                     "verification_required": true,
                 }))
             }
+            (
+                BrowserBackendResult::UploadAssigned { file_count },
+                BrowserBackendCommand::Upload { .. },
+            ) => browser_json_response(json!({
+                "type": "browser_upload_completed",
+                "completed": true,
+                "file_count": file_count,
+                "verification_required": true,
+            })),
+            (
+                BrowserBackendResult::DownloadCompleted {
+                    backend_download_handle,
+                    destination_name,
+                    bytes_written,
+                    data_base64,
+                },
+                BrowserBackendCommand::Download {
+                    destination_name: requested_name,
+                    max_bytes,
+                    ..
+                },
+            ) => {
+                let decoded_bytes = STANDARD.decode(data_base64.as_bytes()).map_err(|_| {
+                    McpError::internal_error(
+                        "Browser download result violated the bounded contract",
+                        None,
+                    )
+                })?;
+                if destination_name != *requested_name
+                    || bytes_written > *max_bytes
+                    || bytes_written > MAX_BROWSER_DOWNLOAD_BYTES
+                    || data_base64.len() > MAX_BROWSER_DOWNLOAD_BASE64_BYTES
+                    || u64::try_from(decoded_bytes.len()).ok() != Some(bytes_written)
+                {
+                    return Err(McpError::internal_error(
+                        "Browser download result violated the bounded contract",
+                        None,
+                    ));
+                }
+                let download_ref = self
+                    .interactions
+                    .lock()
+                    .await
+                    .refs
+                    .mint(
+                        &prepared.binding,
+                        ScopedRefKind::DownloadFile,
+                        &backend_download_handle,
+                    )
+                    .map_err(scoped_ref_mint_error_to_mcp)?;
+                browser_json_response(
+                    serde_json::to_value(BrowserDownloadResult {
+                        download_ref,
+                        destination_name,
+                        bytes_written,
+                        data_base64,
+                    })
+                    .map_err(|_| {
+                        McpError::internal_error("Browser download serialization failed", None)
+                    })?,
+                )
+            }
             _ => Err(McpError::internal_error(
                 "Browser result did not match the requested semantic",
                 None,
@@ -2234,6 +2493,18 @@ impl ServerHandler for V2NorthboundMcp {
         if let Err(error) = self.authorize(&auth.principal, capability) {
             settle_usage_best_effort(&usage, UsageSettlement::Zero, "authorization_denied").await;
             return Err(error);
+        }
+
+        if request.name.as_ref() == TOOL_BROWSER_STAGE_UPLOAD_FILE {
+            return self
+                .call_browser_stage_upload(
+                    &auth.principal,
+                    request.arguments,
+                    operation_id,
+                    usage,
+                    &context,
+                )
+                .await;
         }
 
         if is_browser_tool(request.name.as_ref()) {
@@ -2961,6 +3232,8 @@ fn is_browser_tool(name: &str) -> bool {
             | TOOL_BROWSER_TYPE
             | TOOL_BROWSER_DIALOG
             | TOOL_BROWSER_POINTER
+            | TOOL_BROWSER_UPLOAD_FILE
+            | TOOL_BROWSER_DOWNLOAD
     )
 }
 
@@ -2973,6 +3246,17 @@ fn browser_ref_error_to_mcp(_: BrowserRefError) -> McpError {
         "Browser ref is stale, invalid, or unavailable for this action",
         None,
     )
+}
+
+fn scoped_ref_error_to_mcp(_: ScopedRefError) -> McpError {
+    McpError::invalid_request(
+        "Scoped ref is stale, invalid, or unavailable for this action",
+        None,
+    )
+}
+
+fn scoped_ref_mint_error_to_mcp(_: ScopedRefError) -> McpError {
+    McpError::internal_error("Scoped ref registry unavailable", None)
 }
 
 fn browser_ref_mint_error_to_mcp(_: BrowserRefError) -> McpError {
@@ -3136,6 +3420,10 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_BROWSER_TYPE => Some(DeviceCapability::BrowserType),
         TOOL_BROWSER_DIALOG => Some(DeviceCapability::BrowserDialog),
         TOOL_BROWSER_POINTER => Some(DeviceCapability::BrowserPointer),
+        TOOL_BROWSER_STAGE_UPLOAD_FILE | TOOL_BROWSER_UPLOAD_FILE => {
+            Some(DeviceCapability::BrowserUploadFile)
+        }
+        TOOL_BROWSER_DOWNLOAD => Some(DeviceCapability::BrowserDownload),
         _ => None,
     }
 }
@@ -3279,6 +3567,51 @@ fn all_tools() -> Vec<Tool> {
                     ("input_route", browser_input_route_schema()),
                 ],
                 &["context_id", "target_ref", "tab_ref", "element_ref", "action", "delta_x", "delta_y", "input_route"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_STAGE_UPLOAD_FILE,
+            "Stage one bounded browser-upload payload on the Agent and return an opaque CUMG file ref. No local filesystem path is accepted or returned.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("file_name", json!({"type":"string","minLength":1,"maxLength":MAX_BROWSER_UPLOAD_NAME_BYTES})),
+                    ("data_base64", json!({"type":"string","minLength":1,"maxLength":MAX_BROWSER_UPLOAD_BASE64_BYTES})),
+                ],
+                &["context_id", "file_name", "data_base64"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_UPLOAD_FILE,
+            "Assign previously staged opaque CUMG file refs to an exact current file-input semantic ref. No backend ids or local paths are accepted.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("file_refs", bounded_array_schema(scoped_ref_schema(), 1, MAX_BROWSER_UPLOAD_FILES as u64)),
+                ],
+                &["context_id", "target_ref", "tab_ref", "element_ref", "file_refs"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_BROWSER_DOWNLOAD,
+            "Trigger one exact browser download into Agent-private staging and return a bounded opaque CUMG result ref plus bytes. No host destination path is accepted or returned.",
+            object_schema(
+                vec![
+                    ("context_id", interaction_context_id_schema()),
+                    ("target_ref", scoped_ref_schema()),
+                    ("tab_ref", scoped_ref_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("destination_name", json!({"type":"string","minLength":1,"maxLength":MAX_BROWSER_DOWNLOAD_NAME_BYTES})),
+                    ("max_bytes", json!({"type":"integer","minimum":1,"maximum":MAX_BROWSER_DOWNLOAD_BYTES})),
+                    ("overwrite", json!({"type":"boolean"})),
+                ],
+                &["context_id", "target_ref", "tab_ref", "element_ref", "destination_name", "max_bytes", "overwrite"],
             ),
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
@@ -5562,6 +5895,15 @@ mod tests {
             (TOOL_BROWSER_TYPE, DeviceCapability::BrowserType),
             (TOOL_BROWSER_DIALOG, DeviceCapability::BrowserDialog),
             (TOOL_BROWSER_POINTER, DeviceCapability::BrowserPointer),
+            (
+                TOOL_BROWSER_STAGE_UPLOAD_FILE,
+                DeviceCapability::BrowserUploadFile,
+            ),
+            (
+                TOOL_BROWSER_UPLOAD_FILE,
+                DeviceCapability::BrowserUploadFile,
+            ),
+            (TOOL_BROWSER_DOWNLOAD, DeviceCapability::BrowserDownload),
         ];
         for (tool, capability) in mappings {
             assert_eq!(tool_capability(tool), Some(capability));
@@ -5601,7 +5943,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_tool_schemas_expose_only_cumg_semantics_and_no_transfer_surface() {
+    fn browser_tool_schemas_expose_only_cumg_semantics_and_safe_transfer_surface() {
         let tools = all_tools();
         let browser_names = [
             TOOL_BROWSER_PREPARE,
@@ -5612,6 +5954,9 @@ mod tests {
             TOOL_BROWSER_TYPE,
             TOOL_BROWSER_DIALOG,
             TOOL_BROWSER_POINTER,
+            TOOL_BROWSER_STAGE_UPLOAD_FILE,
+            TOOL_BROWSER_UPLOAD_FILE,
+            TOOL_BROWSER_DOWNLOAD,
         ];
         for name in browser_names {
             let tool = tools
@@ -5627,9 +5972,19 @@ mod tests {
             assert!(!schema.contains("proxy"));
         }
         assert!(
-            !tools
+            tools
                 .iter()
-                .any(|tool| tool.name.as_ref() == "browser_upload")
+                .any(|tool| tool.name.as_ref() == TOOL_BROWSER_STAGE_UPLOAD_FILE)
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == TOOL_BROWSER_UPLOAD_FILE)
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == TOOL_BROWSER_DOWNLOAD)
         );
         assert!(
             !tools

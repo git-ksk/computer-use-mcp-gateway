@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 4;
+pub const CONTROL_SCHEMA_VERSION: u16 = 5;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
@@ -373,6 +373,26 @@ pub struct UiImage {
     pub height_pixels: u32,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BrowserUploadPayload(String);
+
+impl BrowserUploadPayload {
+    pub(crate) fn after_contract_validation(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BrowserUploadPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BrowserUploadPayload([redacted])")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceCommand {
@@ -545,6 +565,12 @@ pub enum DeviceCommand {
         context_id: String,
         reason: String,
     },
+    StageBrowserUploadFile {
+        context_id: String,
+        file_name: String,
+        data_base64: BrowserUploadPayload,
+        expected_bytes: u64,
+    },
     Browser {
         command: BrowserBackendCommand,
     },
@@ -588,6 +614,7 @@ impl DeviceCommand {
             Self::SetUiValue { .. } => DeviceCapability::SetUiValue,
             Self::CaptureRegion { .. } => DeviceCapability::CaptureRegion,
             Self::ExpandInteractionScope { .. } => DeviceCapability::DesktopScope,
+            Self::StageBrowserUploadFile { .. } => DeviceCapability::BrowserUploadFile,
             Self::Browser { command } => browser_device_capability(command.capability()),
         }
     }
@@ -1489,6 +1516,10 @@ pub enum DeviceResult {
         predicates: Vec<UiPredicateResult>,
         screenshot: Option<UiImage>,
     },
+    BrowserUploadStaged {
+        backend_file_handle: String,
+        bytes: u64,
+    },
     Browser {
         result: BrowserBackendResult,
     },
@@ -1593,6 +1624,10 @@ impl DeviceResult {
                 | (
                     Self::InteractionScopeExpanded,
                     DeviceCommand::ExpandInteractionScope { .. }
+                )
+                | (
+                    Self::BrowserUploadStaged { .. },
+                    DeviceCommand::StageBrowserUploadFile { .. }
                 )
                 | (Self::Error { .. }, _)
         )

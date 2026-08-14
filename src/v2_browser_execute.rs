@@ -20,6 +20,7 @@ use crate::v2_browser_runtime::{
     BrowserBackendClickTarget, BrowserBackendCommand, BrowserBackendResult,
     BrowserBackendScreenshot, BrowserBackendSemanticRef, BrowserBackendTab, BrowserMutationEffect,
 };
+use crate::v2_browser_staging::ResolvedStagedUpload;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{Map, Value, json};
@@ -154,6 +155,165 @@ pub(crate) async fn execute_cua_browser(
         return Err(BrowserExecutionError::BackendToolError);
     }
     normalize_completed(command, &raw).map(BrowserExecutionOutcome::Completed)
+}
+
+const CUA_BROWSER_DOWNLOAD_APPROVAL_ARG: &str = "_cua_browser_download_mcp_host_approved";
+
+pub(crate) async fn execute_cua_browser_upload(
+    backend: &CuaBackend,
+    command: &BrowserBackendCommand,
+    files: &[ResolvedStagedUpload],
+    cancellation: watch::Receiver<bool>,
+) -> Result<BrowserExecutionOutcome, BrowserExecutionError> {
+    validate_command(command)?;
+    let BrowserBackendCommand::Upload {
+        context_id,
+        backend_target_id,
+        backend_tab_id,
+        backend_element_ref,
+        staged_files,
+    } = command
+    else {
+        return Err(BrowserExecutionError::UnsupportedTransferBoundary);
+    };
+    if files.len() != staged_files.len() {
+        return Err(BrowserExecutionError::InvalidRequest(
+            "browser upload resolution mismatch",
+        ));
+    }
+    let mut args = Map::new();
+    target_tab_args(&mut args, context_id, backend_target_id, backend_tab_id);
+    args.insert("ref".into(), json!(backend_element_ref));
+    args.insert(
+        "files".into(),
+        Value::Array(
+            files
+                .iter()
+                .map(|file| json!(file.canonical_path()))
+                .collect(),
+        ),
+    );
+    let raw = match backend
+        .call_tool("browser_set_input_files", Some(args), cancellation)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) if error.downcast_ref::<BackendCallCancelled>().is_some() => {
+            return Ok(BrowserExecutionOutcome::CancellationPropagatedIndeterminate);
+        }
+        Err(error) if error.downcast_ref::<BackendCallTimedOut>().is_some() => {
+            return Ok(BrowserExecutionOutcome::TimedOutIndeterminate);
+        }
+        Err(error) => return Err(BrowserExecutionError::Backend(error)),
+    };
+    if let Some(reason) = refusal_reason(&raw) {
+        return Err(BrowserExecutionError::BackendRefused(reason));
+    }
+    if raw.is_error == Some(true) {
+        return Err(BrowserExecutionError::BackendToolError);
+    }
+    let structured = structured_value(&raw)?;
+    require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+    if structured.get("ref").and_then(Value::as_str) != Some(backend_element_ref.as_str()) {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser upload result ref mismatch",
+        ));
+    }
+    let file_count = structured
+        .get("file_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(BrowserExecutionError::InvalidResult(
+            "browser upload result omitted file_count",
+        ))?;
+    if usize::try_from(file_count).ok() != Some(files.len()) {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser upload file_count mismatch",
+        ));
+    }
+    Ok(BrowserExecutionOutcome::Completed(
+        BrowserBackendResult::UploadAssigned { file_count },
+    ))
+}
+
+pub(crate) async fn execute_cua_browser_download(
+    backend: &CuaBackend,
+    command: &BrowserBackendCommand,
+    destination_root: &str,
+    cancellation: watch::Receiver<bool>,
+) -> Result<BrowserExecutionOutcome, BrowserExecutionError> {
+    validate_command(command)?;
+    let BrowserBackendCommand::Download {
+        context_id,
+        backend_target_id,
+        backend_tab_id,
+        backend_element_ref,
+        max_bytes,
+        ..
+    } = command
+    else {
+        return Err(BrowserExecutionError::UnsupportedTransferBoundary);
+    };
+    if destination_root.is_empty() || destination_root.contains('\0') {
+        return Err(BrowserExecutionError::InvalidRequest(
+            "invalid Agent-private browser download root",
+        ));
+    }
+    let mut args = Map::new();
+    target_tab_args(&mut args, context_id, backend_target_id, backend_tab_id);
+    args.insert("ref".into(), json!(backend_element_ref));
+    args.insert("destination_root".into(), json!(destination_root));
+    // CUMG has already granted the exact dangerous BrowserDownload capability.
+    // This private adapter flag bridges that explicit host approval to Cua; it is
+    // never part of the northbound schema and never caller-controlled.
+    args.insert(CUA_BROWSER_DOWNLOAD_APPROVAL_ARG.into(), json!(true));
+    let raw = match backend
+        .call_tool("browser_download", Some(args), cancellation)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) if error.downcast_ref::<BackendCallCancelled>().is_some() => {
+            return Ok(BrowserExecutionOutcome::CancellationPropagatedIndeterminate);
+        }
+        Err(error) if error.downcast_ref::<BackendCallTimedOut>().is_some() => {
+            return Ok(BrowserExecutionOutcome::TimedOutIndeterminate);
+        }
+        Err(error) => return Err(BrowserExecutionError::Backend(error)),
+    };
+    if let Some(reason) = refusal_reason(&raw) {
+        return Err(BrowserExecutionError::BackendRefused(reason));
+    }
+    if raw.is_error == Some(true) {
+        return Err(BrowserExecutionError::BackendToolError);
+    }
+    let structured = structured_value(&raw)?;
+    if structured.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser download did not prove completion",
+        ));
+    }
+    let backend_download_id = structured
+        .get("download_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512 && !value.contains('\0'))
+        .ok_or(BrowserExecutionError::InvalidResult(
+            "browser download omitted a bounded opaque id",
+        ))?
+        .to_owned();
+    let bytes_written = structured.get("bytes").and_then(Value::as_u64).ok_or(
+        BrowserExecutionError::InvalidResult("browser download omitted byte count"),
+    )?;
+    if bytes_written > *max_bytes || bytes_written > crate::v2_browser::MAX_BROWSER_DOWNLOAD_BYTES {
+        return Err(BrowserExecutionError::InvalidResult(
+            "browser download exceeded the CUMG byte bound",
+        ));
+    }
+    Ok(BrowserExecutionOutcome::Completed(
+        BrowserBackendResult::DownloadStaged {
+            backend_download_id,
+            bytes_written,
+        },
+    ))
 }
 
 fn validate_command(command: &BrowserBackendCommand) -> Result<(), BrowserExecutionError> {
@@ -353,7 +513,49 @@ fn validate_command(command: &BrowserBackendCommand) -> Result<(), BrowserExecut
                 ));
             }
         }
-        BrowserBackendCommand::Upload { .. } | BrowserBackendCommand::Download { .. } => {}
+        BrowserBackendCommand::Upload {
+            backend_target_id,
+            backend_tab_id,
+            backend_element_ref,
+            staged_files,
+            ..
+        } => {
+            validate_target_tab(backend_target_id, backend_tab_id)?;
+            validate_handle(backend_element_ref)?;
+            if staged_files.is_empty()
+                || staged_files.len() > crate::v2_browser::MAX_BROWSER_UPLOAD_FILES
+            {
+                return Err(BrowserExecutionError::InvalidRequest(
+                    "invalid browser upload set",
+                ));
+            }
+            for file in staged_files {
+                validate_handle(&file.backend_file_handle)?;
+            }
+        }
+        BrowserBackendCommand::Download {
+            backend_target_id,
+            backend_tab_id,
+            backend_element_ref,
+            destination_name,
+            max_bytes,
+            ..
+        } => {
+            validate_target_tab(backend_target_id, backend_tab_id)?;
+            validate_handle(backend_element_ref)?;
+            crate::v2_browser::validate_download_destination_name(destination_name).map_err(
+                |_| {
+                    BrowserExecutionError::InvalidRequest(
+                        "invalid browser download destination name",
+                    )
+                },
+            )?;
+            if *max_bytes == 0 || *max_bytes > crate::v2_browser::MAX_BROWSER_DOWNLOAD_BYTES {
+                return Err(BrowserExecutionError::InvalidRequest(
+                    "invalid browser download byte bound",
+                ));
+            }
+        }
         BrowserBackendCommand::Bind { .. } => {}
     }
     Ok(())
@@ -1322,7 +1524,7 @@ mod tests {
             backend_target_id: "target".into(),
             backend_tab_id: "tab".into(),
             backend_element_ref: "p1:1".into(),
-            staging_root: "/tmp/cumg-download".into(),
+            destination_name: "download.bin".into(),
             max_bytes: 1024,
             overwrite: false,
         };

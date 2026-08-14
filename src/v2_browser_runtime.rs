@@ -105,7 +105,8 @@ pub enum BrowserBackendCommand {
         backend_target_id: String,
         backend_tab_id: String,
         backend_element_ref: String,
-        staging_root: String,
+        /// Logical basename only; the Agent chooses the private staging root.
+        destination_name: String,
         max_bytes: u64,
         overwrite: bool,
     },
@@ -177,15 +178,14 @@ impl fmt::Debug for BrowserBackendClickTarget {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserStagedUploadFile {
-    pub path: String,
-    pub expected_bytes: u64,
+    /// Agent-private opaque handle. This is never a local filesystem path.
+    pub backend_file_handle: String,
 }
 
 impl fmt::Debug for BrowserStagedUploadFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BrowserStagedUploadFile")
-            .field("path", &"[redacted]")
-            .field("expected_bytes", &self.expected_bytes)
+            .field("backend_file_handle", &"[redacted]")
             .finish()
     }
 }
@@ -229,9 +229,17 @@ pub enum BrowserBackendResult {
     UploadAssigned {
         file_count: u32,
     },
+    /// Adapter-private completion evidence. The Agent must finalize private staging
+    /// before this can cross the signed control boundary.
     DownloadStaged {
         backend_download_id: String,
         bytes_written: u64,
+    },
+    DownloadCompleted {
+        backend_download_handle: String,
+        destination_name: String,
+        bytes_written: u64,
+        data_base64: String,
     },
 }
 
@@ -274,7 +282,7 @@ impl BrowserBackendResult {
                     BrowserBackendCommand::Upload { .. }
                 )
                 | (
-                    Self::DownloadStaged { .. },
+                    Self::DownloadStaged { .. } | Self::DownloadCompleted { .. },
                     BrowserBackendCommand::Download { .. }
                 )
         )
@@ -295,6 +303,7 @@ impl fmt::Debug for BrowserBackendResult {
             Self::PointerCompleted => "pointer_completed",
             Self::UploadAssigned { .. } => "upload_assigned",
             Self::DownloadStaged { .. } => "download_staged",
+            Self::DownloadCompleted { .. } => "download_completed",
         };
         f.debug_struct("BrowserBackendResult")
             .field("kind", &kind)
@@ -445,12 +454,11 @@ mod tests {
             backend_tab_id: "tab-secret".into(),
             backend_element_ref: "p9:7".into(),
             staged_files: vec![BrowserStagedUploadFile {
-                path: "/tmp/cumg/secret.txt".into(),
-                expected_bytes: 42,
+                backend_file_handle: "upload_secret_handle".into(),
             }],
         };
         let debug = format!("{upload:?}");
-        assert!(!debug.contains("secret.txt"));
+        assert!(!debug.contains("upload_secret_handle"));
         assert!(!debug.contains("p9:7"));
 
         let screenshot = BrowserBackendScreenshot {

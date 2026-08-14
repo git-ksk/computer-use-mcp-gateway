@@ -9,7 +9,9 @@ use crate::backend::{
 };
 use crate::v2_browser_execute::{
     BrowserExecutionError, BrowserExecutionOutcome, BrowserRefusalReason, execute_cua_browser,
+    execute_cua_browser_download, execute_cua_browser_upload,
 };
+use crate::v2_browser_staging::{PreparedBrowserDownload, ResolvedStagedUpload};
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
     DeviceResult, InputDeliveryMode, InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES,
@@ -82,6 +84,28 @@ pub trait ComputerUseBackendAdapter: Send + Sync {
         command: &DeviceCommand,
         cancellation: watch::Receiver<bool>,
     ) -> Result<BackendExecutionOutcome, M1BackendError>;
+
+    async fn execute_browser_upload(
+        &self,
+        _command: &crate::v2_browser_runtime::BrowserBackendCommand,
+        _files: &[ResolvedStagedUpload],
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        Err(M1BackendError::UnsupportedCommand(
+            DeviceCapability::BrowserUploadFile,
+        ))
+    }
+
+    async fn execute_browser_download(
+        &self,
+        _command: &crate::v2_browser_runtime::BrowserBackendCommand,
+        _prepared: &PreparedBrowserDownload,
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        Err(M1BackendError::UnsupportedCommand(
+            DeviceCapability::BrowserDownload,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -168,6 +192,8 @@ impl CuaMcpAdapter {
                 DeviceCapability::BrowserType,
                 DeviceCapability::BrowserDialog,
                 DeviceCapability::BrowserPointer,
+                DeviceCapability::BrowserUploadFile,
+                DeviceCapability::BrowserDownload,
             ],
         }
     }
@@ -220,6 +246,103 @@ impl CuaMcpAdapter {
             return Err(M1BackendError::BackendToolError);
         }
         Ok(())
+    }
+
+    pub async fn execute_browser_upload(
+        &self,
+        command: &crate::v2_browser_runtime::BrowserBackendCommand,
+        files: &[ResolvedStagedUpload],
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        match execute_cua_browser_upload(&self.backend, command, files, cancellation).await {
+            Ok(BrowserExecutionOutcome::Completed(result)) => {
+                if !result.matches_command(command) {
+                    return Err(M1BackendError::MalformedResponse(
+                        "browser upload result type did not match command",
+                    ));
+                }
+                Ok(BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                    result,
+                }))
+            }
+            Ok(BrowserExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate)
+            }
+            Ok(BrowserExecutionOutcome::TimedOutIndeterminate) => {
+                Ok(BackendExecutionOutcome::TimedOutIndeterminate)
+            }
+            Err(BrowserExecutionError::InvalidRequest(message)) => {
+                Err(M1BackendError::InvalidRequest(message))
+            }
+            Err(BrowserExecutionError::Backend(error)) => Err(M1BackendError::Backend(error)),
+            Err(BrowserExecutionError::BackendToolError) => Err(M1BackendError::BackendToolError),
+            Err(BrowserExecutionError::BackendRefused(reason)) => {
+                Err(M1BackendError::BrowserRefused(reason))
+            }
+            Err(BrowserExecutionError::Normalize(_)) => Err(M1BackendError::MalformedResponse(
+                "browser upload result normalization failed",
+            )),
+            Err(BrowserExecutionError::InvalidResult(message)) => {
+                Err(M1BackendError::MalformedResponse(message))
+            }
+            Err(BrowserExecutionError::UnsupportedTransferBoundary) => Err(
+                M1BackendError::UnsupportedCommand(DeviceCapability::BrowserUploadFile),
+            ),
+        }
+    }
+
+    pub async fn execute_browser_download(
+        &self,
+        command: &crate::v2_browser_runtime::BrowserBackendCommand,
+        prepared: &PreparedBrowserDownload,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        match execute_cua_browser_download(
+            &self.backend,
+            command,
+            prepared.canonical_root(),
+            cancellation,
+        )
+        .await
+        {
+            Ok(BrowserExecutionOutcome::Completed(result)) => {
+                if !matches!(
+                    result,
+                    crate::v2_browser_runtime::BrowserBackendResult::DownloadStaged { .. }
+                ) || !result.matches_command(command)
+                {
+                    return Err(M1BackendError::MalformedResponse(
+                        "browser download result type did not match command",
+                    ));
+                }
+                Ok(BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                    result,
+                }))
+            }
+            Ok(BrowserExecutionOutcome::CancellationPropagatedIndeterminate) => {
+                Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate)
+            }
+            Ok(BrowserExecutionOutcome::TimedOutIndeterminate) => {
+                Ok(BackendExecutionOutcome::TimedOutIndeterminate)
+            }
+            Err(BrowserExecutionError::InvalidRequest(message)) => {
+                Err(M1BackendError::InvalidRequest(message))
+            }
+            Err(BrowserExecutionError::Backend(error)) => Err(M1BackendError::Backend(error)),
+            Err(BrowserExecutionError::BackendToolError) => Err(M1BackendError::BackendToolError),
+            Err(BrowserExecutionError::BackendRefused(reason)) => {
+                Err(M1BackendError::BrowserRefused(reason))
+            }
+            Err(BrowserExecutionError::Normalize(_)) => Err(M1BackendError::MalformedResponse(
+                "browser download result normalization failed",
+            )),
+            Err(BrowserExecutionError::InvalidResult(message)) => {
+                Err(M1BackendError::MalformedResponse(message))
+            }
+            Err(BrowserExecutionError::UnsupportedTransferBoundary) => Err(
+                M1BackendError::UnsupportedCommand(DeviceCapability::BrowserDownload),
+            ),
+        }
     }
 
     pub async fn execute(
@@ -409,6 +532,24 @@ impl ComputerUseBackendAdapter for CuaMcpAdapter {
         cancellation: watch::Receiver<bool>,
     ) -> Result<BackendExecutionOutcome, M1BackendError> {
         CuaMcpAdapter::execute(self, command, cancellation).await
+    }
+
+    async fn execute_browser_upload(
+        &self,
+        command: &crate::v2_browser_runtime::BrowserBackendCommand,
+        files: &[ResolvedStagedUpload],
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        CuaMcpAdapter::execute_browser_upload(self, command, files, cancellation).await
+    }
+
+    async fn execute_browser_download(
+        &self,
+        command: &crate::v2_browser_runtime::BrowserBackendCommand,
+        prepared: &PreparedBrowserDownload,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        CuaMcpAdapter::execute_browser_download(self, command, prepared, cancellation).await
     }
 }
 
@@ -913,7 +1054,7 @@ fn map_command(
         DeviceCommand::ListDirectory { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ListDirectory,
         )),
-        DeviceCommand::Browser { .. } => {
+        DeviceCommand::StageBrowserUploadFile { .. } | DeviceCommand::Browser { .. } => {
             Err(M1BackendError::UnsupportedCommand(command.capability()))
         }
     }
@@ -1046,7 +1187,7 @@ fn normalize_result(
         DeviceCommand::ListDirectory { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ListDirectory,
         )),
-        DeviceCommand::Browser { .. } => {
+        DeviceCommand::StageBrowserUploadFile { .. } | DeviceCommand::Browser { .. } => {
             Err(M1BackendError::UnsupportedCommand(command.capability()))
         }
     }
@@ -2401,8 +2542,16 @@ mod tests {
         )
     }
 
+    fn transfer_state_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "cumg-{label}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
     #[test]
-    fn cua_advertises_browser_core_but_not_transfer_boundaries() {
+    fn cua_advertises_complete_browser_core_and_transfer_surface() {
         let advertisement = fixture(vec![]).advertisement();
         for capability in [
             DeviceCapability::BrowserInspect,
@@ -2415,8 +2564,502 @@ mod tests {
         ] {
             assert!(advertisement.supports(capability), "missing {capability:?}");
         }
-        assert!(!advertisement.supports(DeviceCapability::BrowserUploadFile));
-        assert!(!advertisement.supports(DeviceCapability::BrowserDownload));
+        assert!(advertisement.supports(DeviceCapability::BrowserUploadFile));
+        assert!(advertisement.supports(DeviceCapability::BrowserDownload));
+    }
+
+    #[tokio::test]
+    async fn cua_transfer_adapter_uses_only_agent_private_staging() {
+        use crate::v2_browser_runtime::{
+            BrowserBackendCommand, BrowserBackendResult, BrowserStagedUploadFile,
+        };
+        use crate::v2_browser_staging::{BrowserDownloadStagingBroker, BrowserUploadStagingBroker};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let state = transfer_state_dir("transfer-happy");
+        fs::create_dir_all(&state).unwrap();
+        let upload = BrowserUploadStagingBroker::new(&state).unwrap();
+        let staged = upload
+            .stage(
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                "payload.txt",
+                &STANDARD.encode(b"upload"),
+                6,
+            )
+            .unwrap();
+        let resolved = upload
+            .resolve(&staged.handle, "ctx_0123456789abcdef0123456789abcdef", 1, 1)
+            .unwrap();
+        let upload_command = BrowserBackendCommand::Upload {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_element_ref: "p1:upload".into(),
+            staged_files: vec![BrowserStagedUploadFile {
+                backend_file_handle: staged.handle,
+            }],
+        };
+        let adapter = fixture(vec!["scripts/mock_cua_mcp_backend.py".into()]);
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        assert_eq!(
+            adapter
+                .execute_browser_upload(&upload_command, &[resolved], cancel_rx.clone())
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                result: BrowserBackendResult::UploadAssigned { file_count: 1 },
+            })
+        );
+
+        let download = BrowserDownloadStagingBroker::new(&state).unwrap();
+        let prepared = download
+            .prepare(
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                "artifact.txt",
+                1024,
+                false,
+            )
+            .unwrap();
+        let download_command = BrowserBackendCommand::Download {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_element_ref: "p1:download".into(),
+            destination_name: "artifact.txt".into(),
+            max_bytes: 1024,
+            overwrite: false,
+        };
+        let result = adapter
+            .execute_browser_download(&download_command, &prepared, cancel_rx)
+            .await
+            .unwrap();
+        let (download_id, bytes) = match result {
+            BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                result:
+                    BrowserBackendResult::DownloadStaged {
+                        backend_download_id,
+                        bytes_written,
+                    },
+            }) => (backend_download_id, bytes_written),
+            other => panic!("unexpected download result: {other:?}"),
+        };
+        let finalized = download
+            .finalize(
+                prepared.operation_handle(),
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                &download_id,
+                bytes,
+            )
+            .unwrap();
+        assert_eq!(
+            STANDARD.decode(&finalized.data_base64).unwrap(),
+            b"fixture-download"
+        );
+        assert!(!format!("{finalized:?}").contains(prepared.canonical_root()));
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[tokio::test]
+    async fn cua_transfer_backend_failures_are_definite_errors() {
+        use crate::v2_browser_runtime::{BrowserBackendCommand, BrowserStagedUploadFile};
+        use crate::v2_browser_staging::{BrowserDownloadStagingBroker, BrowserUploadStagingBroker};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let state = transfer_state_dir("transfer-failure");
+        fs::create_dir_all(&state).unwrap();
+        let upload = BrowserUploadStagingBroker::new(&state).unwrap();
+        let staged = upload
+            .stage(
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                "payload.txt",
+                &STANDARD.encode(b"upload"),
+                6,
+            )
+            .unwrap();
+        let resolved = upload
+            .resolve(&staged.handle, "ctx_0123456789abcdef0123456789abcdef", 1, 1)
+            .unwrap();
+        let upload_command = BrowserBackendCommand::Upload {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_element_ref: "p1:upload".into(),
+            staged_files: vec![BrowserStagedUploadFile {
+                backend_file_handle: staged.handle,
+            }],
+        };
+        let upload_adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--fail-browser-upload".into(),
+        ]);
+        upload_adapter.connect().await.unwrap();
+        let (_tx, rx) = watch::channel(false);
+        assert!(matches!(
+            upload_adapter
+                .execute_browser_upload(&upload_command, &[resolved], rx)
+                .await,
+            Err(M1BackendError::BackendToolError)
+        ));
+        upload_adapter.shutdown().await.unwrap();
+
+        let download = BrowserDownloadStagingBroker::new(&state).unwrap();
+        let prepared = download
+            .prepare(
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                "artifact.txt",
+                1024,
+                false,
+            )
+            .unwrap();
+        let command = BrowserBackendCommand::Download {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_element_ref: "p1:download".into(),
+            destination_name: "artifact.txt".into(),
+            max_bytes: 1024,
+            overwrite: false,
+        };
+        let download_adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--fail-browser-download".into(),
+        ]);
+        download_adapter.connect().await.unwrap();
+        let (_tx, rx) = watch::channel(false);
+        assert!(matches!(
+            download_adapter
+                .execute_browser_download(&command, &prepared, rx)
+                .await,
+            Err(M1BackendError::BackendToolError)
+        ));
+        download_adapter.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[tokio::test]
+    async fn cua_download_timeout_and_cancellation_are_indeterminate() {
+        use crate::v2_browser_runtime::BrowserBackendCommand;
+        use crate::v2_browser_staging::BrowserDownloadStagingBroker;
+
+        let state = transfer_state_dir("transfer-indeterminate");
+        fs::create_dir_all(&state).unwrap();
+        let download = BrowserDownloadStagingBroker::new(&state).unwrap();
+        let command = BrowserBackendCommand::Download {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_element_ref: "p1:download".into(),
+            destination_name: "artifact.txt".into(),
+            max_bytes: 1024,
+            overwrite: false,
+        };
+
+        let prepared = download
+            .prepare(
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                "artifact.txt",
+                1024,
+                false,
+            )
+            .unwrap();
+        let timeout_adapter = fixture_with_timeout(
+            vec![
+                "scripts/mock_cua_mcp_backend.py".into(),
+                "--slow-browser-download".into(),
+            ],
+            Duration::from_millis(100),
+        );
+        timeout_adapter.connect().await.unwrap();
+        let (_tx, rx) = watch::channel(false);
+        assert_eq!(
+            timeout_adapter
+                .execute_browser_download(&command, &prepared, rx)
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::TimedOutIndeterminate
+        );
+        timeout_adapter.shutdown().await.unwrap();
+        download
+            .abort(
+                prepared.operation_handle(),
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+            )
+            .unwrap();
+
+        let marker = state.join("download-called");
+        let prepared = download
+            .prepare(
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                "artifact.txt",
+                1024,
+                false,
+            )
+            .unwrap();
+        let cancel_adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--slow-browser-download".into(),
+            "--transfer-marker".into(),
+            marker.to_string_lossy().into_owned(),
+        ]);
+        cancel_adapter.connect().await.unwrap();
+        let (cancel_tx, rx) = watch::channel(false);
+        let adapter = cancel_adapter.clone();
+        let command_for_task = command.clone();
+        let prepared_for_task = prepared.clone();
+        let task = tokio::spawn(async move {
+            adapter
+                .execute_browser_download(&command_for_task, &prepared_for_task, rx)
+                .await
+        });
+        wait_for_file(&marker).await;
+        cancel_tx.send(true).unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            BackendExecutionOutcome::CancellationPropagatedIndeterminate
+        );
+        cancel_adapter.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[tokio::test]
+    async fn cua_upload_timeout_and_cancellation_are_indeterminate() {
+        use crate::v2_browser_runtime::{BrowserBackendCommand, BrowserStagedUploadFile};
+        use crate::v2_browser_staging::BrowserUploadStagingBroker;
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let state = transfer_state_dir("upload-indeterminate");
+        fs::create_dir_all(&state).unwrap();
+        let upload = BrowserUploadStagingBroker::new(&state).unwrap();
+        let staged = upload
+            .stage(
+                "ctx_0123456789abcdef0123456789abcdef",
+                1,
+                1,
+                "payload.txt",
+                &STANDARD.encode(b"upload"),
+                6,
+            )
+            .unwrap();
+        let resolved = upload
+            .resolve(&staged.handle, "ctx_0123456789abcdef0123456789abcdef", 1, 1)
+            .unwrap();
+        let command = BrowserBackendCommand::Upload {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            backend_target_id: "target".into(),
+            backend_tab_id: "tab".into(),
+            backend_element_ref: "p1:upload".into(),
+            staged_files: vec![BrowserStagedUploadFile {
+                backend_file_handle: staged.handle,
+            }],
+        };
+
+        let timeout_adapter = fixture_with_timeout(
+            vec![
+                "scripts/mock_cua_mcp_backend.py".into(),
+                "--slow-browser-upload".into(),
+            ],
+            Duration::from_millis(100),
+        );
+        timeout_adapter.connect().await.unwrap();
+        let (_tx, rx) = watch::channel(false);
+        assert_eq!(
+            timeout_adapter
+                .execute_browser_upload(&command, std::slice::from_ref(&resolved), rx)
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::TimedOutIndeterminate
+        );
+        timeout_adapter.shutdown().await.unwrap();
+
+        let marker = state.join("upload-called");
+        let cancel_adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--slow-browser-upload".into(),
+            "--transfer-marker".into(),
+            marker.to_string_lossy().into_owned(),
+        ]);
+        cancel_adapter.connect().await.unwrap();
+        let (cancel_tx, rx) = watch::channel(false);
+        let adapter = cancel_adapter.clone();
+        let command_for_task = command.clone();
+        let resolved_for_task = resolved.clone();
+        let task = tokio::spawn(async move {
+            adapter
+                .execute_browser_upload(&command_for_task, &[resolved_for_task], rx)
+                .await
+        });
+        wait_for_file(&marker).await;
+        cancel_tx.send(true).unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            BackendExecutionOutcome::CancellationPropagatedIndeterminate
+        );
+        cancel_adapter.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[tokio::test]
+    #[ignore = "trusted-mac real-Cua browser transfer acceptance"]
+    async fn real_cua_browser_transfer_acceptance() {
+        use crate::v2_browser_runtime::{
+            BrowserBackendCommand, BrowserBackendResult, BrowserStagedUploadFile,
+        };
+        use crate::v2_browser_staging::{BrowserDownloadStagingBroker, BrowserUploadStagingBroker};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        assert_eq!(
+            std::env::var("CUMG_V2_BROWSER_TRANSFER_E2E_ACK").as_deref(),
+            Ok("1"),
+            "explicit trusted-Mac acknowledgement required"
+        );
+        let command = std::env::var("CUMG_V2_CUA_COMMAND")
+            .unwrap_or_else(|_| "/Users/sawadakousuke/.local/bin/cua-driver".into());
+        let target = std::env::var("CUMG_V2_BROWSER_TARGET_ID").unwrap();
+        let tab = std::env::var("CUMG_V2_BROWSER_TAB_ID").unwrap();
+        let upload_ref = std::env::var("CUMG_V2_BROWSER_UPLOAD_REF").unwrap();
+        let download_ref = std::env::var("CUMG_V2_BROWSER_DOWNLOAD_REF").unwrap();
+        let context = "ctx_0123456789abcdef0123456789abcdef";
+        let state = transfer_state_dir("real-transfer");
+        fs::create_dir_all(&state).unwrap();
+
+        let adapter = CuaMcpAdapter::new(
+            command,
+            vec!["mcp".into()],
+            "0.19.3",
+            "macos",
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(40),
+            1,
+            Duration::from_millis(50),
+        );
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let upload_staging = BrowserUploadStagingBroker::new(&state).unwrap();
+        let staged = upload_staging
+            .stage(
+                context,
+                1,
+                1,
+                "harmless-upload.txt",
+                &STANDARD.encode(b"harmless-real-cua-upload\n"),
+                25,
+            )
+            .unwrap();
+        let resolved = upload_staging
+            .resolve(&staged.handle, context, 1, 1)
+            .unwrap();
+        let upload_command = BrowserBackendCommand::Upload {
+            context_id: context.into(),
+            backend_target_id: target.clone(),
+            backend_tab_id: tab.clone(),
+            backend_element_ref: upload_ref,
+            staged_files: vec![BrowserStagedUploadFile {
+                backend_file_handle: staged.handle.clone(),
+            }],
+        };
+        assert_eq!(
+            adapter
+                .execute_browser_upload(&upload_command, &[resolved], cancel_rx.clone())
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                result: BrowserBackendResult::UploadAssigned { file_count: 1 },
+            })
+        );
+        upload_staging
+            .consume_handles(&[staged.handle], context, 1, 1)
+            .unwrap();
+
+        let download_staging = BrowserDownloadStagingBroker::new(&state).unwrap();
+        let prepared = download_staging
+            .prepare(context, 1, 1, "artifact.txt", 1024, false)
+            .unwrap();
+        let download_command = BrowserBackendCommand::Download {
+            context_id: context.into(),
+            backend_target_id: target.clone(),
+            backend_tab_id: tab.clone(),
+            backend_element_ref: download_ref,
+            destination_name: "artifact.txt".into(),
+            max_bytes: 1024,
+            overwrite: false,
+        };
+        let staged_result = adapter
+            .execute_browser_download(&download_command, &prepared, cancel_rx)
+            .await
+            .unwrap();
+        let (download_id, bytes) = match staged_result {
+            BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                result:
+                    BrowserBackendResult::DownloadStaged {
+                        backend_download_id,
+                        bytes_written,
+                    },
+            }) => (backend_download_id, bytes_written),
+            other => panic!("unexpected real-Cua download result: {other:?}"),
+        };
+        let finalized = download_staging
+            .finalize(
+                prepared.operation_handle(),
+                context,
+                1,
+                1,
+                &download_id,
+                bytes,
+            )
+            .unwrap();
+        assert_eq!(
+            STANDARD.decode(&finalized.data_base64).unwrap(),
+            b"deterministic-browser-download\n"
+        );
+        assert_eq!(finalized.destination_name, "artifact.txt");
+        assert!(finalized.backend_download_handle.starts_with("download_"));
+
+        let refused = download_staging
+            .prepare(context, 1, 1, "refused.txt", 1024, false)
+            .unwrap();
+        let stale_command = BrowserBackendCommand::Download {
+            context_id: context.into(),
+            backend_target_id: target,
+            backend_tab_id: tab,
+            backend_element_ref: "p999999:999999".into(),
+            destination_name: "refused.txt".into(),
+            max_bytes: 1024,
+            overwrite: false,
+        };
+        let (_failure_tx, failure_rx) = watch::channel(false);
+        assert!(matches!(
+            adapter
+                .execute_browser_download(&stale_command, &refused, failure_rx)
+                .await,
+            Err(M1BackendError::BrowserRefused(_))
+        ));
+        download_staging
+            .abort(refused.operation_handle(), context, 1, 1)
+            .unwrap();
+
+        adapter.end_interaction_session(context).await.unwrap();
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(state);
     }
 
     #[tokio::test]
