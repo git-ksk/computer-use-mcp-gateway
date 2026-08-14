@@ -14,6 +14,12 @@ pub const CAPABILITY_SCHEMA_VERSION: u16 = 2;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
 pub const MAX_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_WINDOW_RESULTS: usize = 512;
+pub const MAX_UI_ELEMENTS: usize = 512;
+pub const MAX_UI_QUERY_BYTES: usize = 1_024;
+pub const MAX_UI_TEXT_BYTES: usize = 2 * 1024;
+pub const MAX_UI_REF_BYTES: usize = 512;
+pub const MAX_UI_PREDICATES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +43,10 @@ pub enum DeviceCapability {
     Shell,
     ReadFile,
     ListDirectory,
+    ListWindows,
+    LaunchApplication,
+    InspectWindow,
+    VerifyUiState,
 }
 
 impl DeviceCapability {
@@ -46,8 +56,12 @@ impl DeviceCapability {
             | Self::ScreenGeometry
             | Self::Screenshot
             | Self::ReadFile
-            | Self::ListDirectory => CapabilityClass::Observe,
+            | Self::ListDirectory
+            | Self::ListWindows
+            | Self::InspectWindow
+            | Self::VerifyUiState => CapabilityClass::Observe,
             Self::PointerClick | Self::PointerDrag | Self::TypeText => CapabilityClass::Interact,
+            Self::LaunchApplication => CapabilityClass::System,
             // Direct process and free-form shell execution can mutate arbitrary
             // local state and are therefore never implied by observe/interact access.
             Self::ExecuteProcess | Self::Shell => CapabilityClass::Dangerous,
@@ -114,6 +128,112 @@ pub struct DirectoryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub window_id: u64,
+    pub process_id: u32,
+    pub application: String,
+    pub title: String,
+    pub bounds: UiRect,
+    pub is_on_screen: bool,
+    pub on_current_workspace: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiRole {
+    Window,
+    Button,
+    Text,
+    TextField,
+    Checkbox,
+    RadioButton,
+    Link,
+    Menu,
+    MenuItem,
+    Toolbar,
+    Tab,
+    List,
+    ListItem,
+    Table,
+    Row,
+    Cell,
+    Group,
+    Image,
+    Slider,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiElement {
+    pub element_ref: String,
+    pub role: UiRole,
+    pub label: Option<String>,
+    pub value: Option<String>,
+    pub bounds: Option<UiRect>,
+    pub enabled: Option<bool>,
+    pub selected: Option<bool>,
+    pub parent_ref: Option<String>,
+    pub depth: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiElementSelector {
+    pub role: Option<UiRole>,
+    pub label_contains: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiPredicate {
+    WindowExists {
+        exists: bool,
+    },
+    WindowBounds {
+        bounds: UiRect,
+        tolerance_px: u32,
+    },
+    ElementExists {
+        selector: UiElementSelector,
+    },
+    ElementState {
+        selector: UiElementSelector,
+        enabled: Option<bool>,
+        selected: Option<bool>,
+        value_equals: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Satisfied,
+    Unsatisfied,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPredicateResult {
+    pub status: VerificationStatus,
+    pub unknown_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiImage {
+    pub data_base64: String,
+    pub mime_type: String,
+    pub width_pixels: u32,
+    pub height_pixels: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceCommand {
     ListApplications,
@@ -146,6 +266,32 @@ pub enum DeviceCommand {
     ListDirectory {
         path: String,
     },
+    ListWindows {
+        process_id: Option<u32>,
+        on_screen_only: bool,
+    },
+    LaunchApplication {
+        identifier: Option<String>,
+        name: Option<String>,
+        targets: Vec<String>,
+        new_instance: bool,
+    },
+    InspectWindow {
+        process_id: u32,
+        window_id: u64,
+        query: Option<String>,
+        max_elements: u32,
+        max_depth: u32,
+        include_screenshot: bool,
+    },
+    VerifyUiState {
+        process_id: u32,
+        window_id: u64,
+        predicates: Vec<UiPredicate>,
+        timeout_ms: u64,
+        stable_samples: u8,
+        include_screenshot: bool,
+    },
 }
 
 impl DeviceCommand {
@@ -161,6 +307,10 @@ impl DeviceCommand {
             Self::Shell { .. } => DeviceCapability::Shell,
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
             Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
+            Self::ListWindows { .. } => DeviceCapability::ListWindows,
+            Self::LaunchApplication { .. } => DeviceCapability::LaunchApplication,
+            Self::InspectWindow { .. } => DeviceCapability::InspectWindow,
+            Self::VerifyUiState { .. } => DeviceCapability::VerifyUiState,
         }
     }
 
@@ -916,6 +1066,34 @@ pub enum DeviceResult {
         entries: Vec<DirectoryEntry>,
         truncated: bool,
     },
+    Windows {
+        windows: Vec<WindowInfo>,
+        truncated: bool,
+    },
+    ApplicationLaunched {
+        process_id: u32,
+        identifier: Option<String>,
+        name: String,
+        process_running: bool,
+        window_ready: bool,
+        windows: Vec<WindowInfo>,
+        windows_truncated: bool,
+    },
+    WindowSnapshot {
+        snapshot_ref: String,
+        process_id: u32,
+        window_id: u64,
+        elements: Vec<UiElement>,
+        elements_complete: bool,
+        screenshot: Option<UiImage>,
+    },
+    UiStateVerification {
+        status: VerificationStatus,
+        stable: bool,
+        samples: u32,
+        predicates: Vec<UiPredicateResult>,
+        screenshot: Option<UiImage>,
+    },
     Error {
         code: DeviceErrorCode,
     },
@@ -943,6 +1121,19 @@ impl DeviceResult {
                 | (
                     Self::DirectoryEntries { .. },
                     DeviceCommand::ListDirectory { .. }
+                )
+                | (Self::Windows { .. }, DeviceCommand::ListWindows { .. })
+                | (
+                    Self::ApplicationLaunched { .. },
+                    DeviceCommand::LaunchApplication { .. }
+                )
+                | (
+                    Self::WindowSnapshot { .. },
+                    DeviceCommand::InspectWindow { .. }
+                )
+                | (
+                    Self::UiStateVerification { .. },
+                    DeviceCommand::VerifyUiState { .. }
                 )
                 | (Self::Error { .. }, _)
         )

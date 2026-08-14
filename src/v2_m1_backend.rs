@@ -9,7 +9,10 @@ use crate::backend::{
 };
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
-    DeviceResult, MAX_SCREENSHOT_BYTES, MAX_TYPE_TEXT_BYTES,
+    DeviceResult, MAX_SCREENSHOT_BYTES, MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES,
+    MAX_UI_QUERY_BYTES, MAX_UI_REF_BYTES, MAX_UI_TEXT_BYTES, MAX_WINDOW_RESULTS, UiElement,
+    UiElementSelector, UiImage, UiPredicate, UiPredicateResult, UiRect, UiRole, VerificationStatus,
+    WindowInfo,
 };
 use crate::v2_m0_transport::CancellationDisposition;
 use crate::v2_observability::SafeErrorCode;
@@ -18,8 +21,8 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::Value;
-use std::fmt;
 use std::time::Duration;
+use std::{collections::HashMap, fmt};
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +132,10 @@ impl CuaMcpAdapter {
                 DeviceCapability::PointerClick,
                 DeviceCapability::PointerDrag,
                 DeviceCapability::TypeText,
+                DeviceCapability::ListWindows,
+                DeviceCapability::LaunchApplication,
+                DeviceCapability::InspectWindow,
+                DeviceCapability::VerifyUiState,
             ],
         }
     }
@@ -184,6 +191,8 @@ impl CuaMcpAdapter {
             DeviceCommand::PointerDrag { .. } => DeviceResult::PointerDragCompleted,
             DeviceCommand::TypeText { .. } => DeviceResult::TypeTextCompleted,
             DeviceCommand::Screenshot => normalize_screenshot_result(&raw)?,
+            DeviceCommand::InspectWindow { .. } => normalize_window_snapshot_result(command, &raw)?,
+            DeviceCommand::VerifyUiState { .. } => normalize_ui_verification_result(command, &raw)?,
             _ => {
                 let value = structured_value(&raw)?;
                 normalize_result(command, &value)?
@@ -276,6 +285,108 @@ fn map_command(
                 .cloned(),
             ))
         }
+        DeviceCommand::ListWindows {
+            process_id,
+            on_screen_only,
+        } => Ok((
+            "list_windows",
+            serde_json::json!({
+                "pid": process_id,
+                "on_screen_only": on_screen_only,
+            })
+            .as_object()
+            .cloned(),
+        )),
+        DeviceCommand::LaunchApplication {
+            identifier,
+            name,
+            targets,
+            new_instance,
+        } => {
+            validate_application_selector(identifier.as_deref(), name.as_deref(), targets)?;
+            Ok((
+                "launch_app",
+                serde_json::json!({
+                    "bundle_id": identifier,
+                    "name": name,
+                    "urls": targets,
+                    "creates_new_application_instance": new_instance,
+                })
+                .as_object()
+                .cloned(),
+            ))
+        }
+        DeviceCommand::InspectWindow {
+            process_id,
+            window_id,
+            query,
+            max_elements,
+            max_depth,
+            include_screenshot,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if query
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_UI_QUERY_BYTES)
+                || *max_elements == 0
+                || (*max_elements as usize) > MAX_UI_ELEMENTS
+                || *max_depth == 0
+                || *max_depth > 64
+            {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid window inspection bounds",
+                ));
+            }
+            Ok((
+                "get_window_state",
+                serde_json::json!({
+                    "pid": process_id,
+                    "window_id": window_id,
+                    "query": query,
+                    "max_elements": max_elements,
+                    "max_depth": max_depth,
+                    "include_screenshot": include_screenshot,
+                })
+                .as_object()
+                .cloned(),
+            ))
+        }
+        DeviceCommand::VerifyUiState {
+            process_id,
+            window_id,
+            predicates,
+            timeout_ms,
+            stable_samples,
+            include_screenshot,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if predicates.is_empty()
+                || predicates.len() > MAX_UI_PREDICATES
+                || *timeout_ms > 10_000
+                || !(1..=5).contains(stable_samples)
+            {
+                return Err(M1BackendError::InvalidRequest(
+                    "invalid UI verification bounds",
+                ));
+            }
+            let expect = predicates
+                .iter()
+                .map(map_ui_predicate)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((
+                "verify_state",
+                serde_json::json!({
+                    "pid": process_id,
+                    "window_id": window_id,
+                    "expect": expect,
+                    "timeout_ms": timeout_ms,
+                    "stable_samples": stable_samples,
+                    "include_screenshot": include_screenshot,
+                })
+                .as_object()
+                .cloned(),
+            ))
+        }
         DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ExecuteProcess,
         )),
@@ -344,6 +455,14 @@ fn normalize_result(
         DeviceCommand::Screenshot => Err(M1BackendError::MalformedResponse(
             "screenshot result requires image-content normalization",
         )),
+        DeviceCommand::ListWindows { .. } => normalize_windows_result(value),
+        DeviceCommand::LaunchApplication { .. } => normalize_application_launch_result(value),
+        DeviceCommand::InspectWindow { .. } => Err(M1BackendError::MalformedResponse(
+            "window snapshot requires full tool-result normalization",
+        )),
+        DeviceCommand::VerifyUiState { .. } => Err(M1BackendError::MalformedResponse(
+            "UI verification requires full tool-result normalization",
+        )),
         DeviceCommand::ExecuteProcess { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ExecuteProcess,
         )),
@@ -357,6 +476,676 @@ fn normalize_result(
             DeviceCapability::ListDirectory,
         )),
     }
+}
+
+fn validate_application_selector(
+    identifier: Option<&str>,
+    name: Option<&str>,
+    targets: &[String],
+) -> Result<(), M1BackendError> {
+    let valid_identifier =
+        identifier.is_some_and(|value| !value.trim().is_empty() && value.len() <= 512);
+    let valid_name = name.is_some_and(|value| !value.trim().is_empty() && value.len() <= 512);
+    if !valid_identifier && !valid_name {
+        return Err(M1BackendError::InvalidRequest(
+            "application identifier or name is required",
+        ));
+    }
+    if targets.len() > 16
+        || targets
+            .iter()
+            .any(|target| target.is_empty() || target.len() > 4096)
+    {
+        return Err(M1BackendError::InvalidRequest(
+            "invalid application launch targets",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_window_target(process_id: u32, window_id: u64) -> Result<(), M1BackendError> {
+    if process_id == 0 || window_id == 0 {
+        return Err(M1BackendError::InvalidRequest(
+            "process_id and window_id must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn map_ui_predicate(predicate: &UiPredicate) -> Result<Value, M1BackendError> {
+    match predicate {
+        UiPredicate::WindowExists { exists } => Ok(serde_json::json!({
+            "window": { "exists": exists }
+        })),
+        UiPredicate::WindowBounds {
+            bounds,
+            tolerance_px,
+        } => {
+            if *tolerance_px > 100 {
+                return Err(M1BackendError::InvalidRequest(
+                    "window-bound tolerance must be <= 100 px",
+                ));
+            }
+            Ok(serde_json::json!({
+                "window": {
+                    "bounds": {
+                        "x": bounds.x,
+                        "y": bounds.y,
+                        "width": bounds.width,
+                        "height": bounds.height,
+                        "tolerance_px": tolerance_px,
+                    }
+                }
+            }))
+        }
+        UiPredicate::ElementExists { selector } => Ok(serde_json::json!({
+            "element": {
+                "exists": true,
+                "selector": map_element_selector(selector)?,
+            }
+        })),
+        UiPredicate::ElementState {
+            selector,
+            enabled,
+            selected,
+            value_equals,
+        } => {
+            if enabled.is_none() && selected.is_none() && value_equals.is_none() {
+                return Err(M1BackendError::InvalidRequest(
+                    "element-state predicate requires a state",
+                ));
+            }
+            if value_equals
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_TYPE_TEXT_BYTES)
+            {
+                return Err(M1BackendError::InvalidRequest(
+                    "element value predicate is too large",
+                ));
+            }
+            Ok(serde_json::json!({
+                "element": {
+                    "selector": map_element_selector(selector)?,
+                    "enabled": enabled,
+                    "selected": selected,
+                    "value_equals": value_equals,
+                }
+            }))
+        }
+    }
+}
+
+fn map_element_selector(selector: &UiElementSelector) -> Result<Value, M1BackendError> {
+    if selector.role.is_none() && selector.label_contains.is_none() {
+        return Err(M1BackendError::InvalidRequest("empty UI element selector"));
+    }
+    if selector
+        .label_contains
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > MAX_UI_QUERY_BYTES)
+    {
+        return Err(M1BackendError::InvalidRequest("invalid UI selector label"));
+    }
+    let role = selector.role.map(ui_role_to_cua).transpose()?;
+    Ok(serde_json::json!({
+        "role": role,
+        "label_contains": selector.label_contains,
+    }))
+}
+
+fn ui_role_to_cua(role: UiRole) -> Result<&'static str, M1BackendError> {
+    let role = match role {
+        UiRole::Window => "AXWindow",
+        UiRole::Button => "AXButton",
+        UiRole::Text => "AXStaticText",
+        UiRole::TextField => "AXTextField",
+        UiRole::Checkbox => "AXCheckBox",
+        UiRole::RadioButton => "AXRadioButton",
+        UiRole::Link => "AXLink",
+        UiRole::Menu => "AXMenu",
+        UiRole::MenuItem => "AXMenuItem",
+        UiRole::Toolbar => "AXToolbar",
+        UiRole::Tab => "AXTabGroup",
+        UiRole::List => "AXList",
+        UiRole::ListItem => "AXRow",
+        UiRole::Table => "AXTable",
+        UiRole::Row => "AXRow",
+        UiRole::Cell => "AXCell",
+        UiRole::Group => "AXGroup",
+        UiRole::Image => "AXImage",
+        UiRole::Slider => "AXSlider",
+        UiRole::Other => {
+            return Err(M1BackendError::InvalidRequest(
+                "other UI role cannot be used as a selector",
+            ));
+        }
+    };
+    Ok(role)
+}
+
+fn normalize_windows_result(value: &Value) -> Result<DeviceResult, M1BackendError> {
+    let windows =
+        value
+            .get("windows")
+            .and_then(Value::as_array)
+            .ok_or(M1BackendError::MalformedResponse(
+                "list_windows missing windows",
+            ))?;
+    let truncated = windows.len() > MAX_WINDOW_RESULTS;
+    let normalized = windows
+        .iter()
+        .take(MAX_WINDOW_RESULTS)
+        .map(normalize_window)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DeviceResult::Windows {
+        windows: normalized,
+        truncated,
+    })
+}
+
+fn normalize_application_launch_result(value: &Value) -> Result<DeviceResult, M1BackendError> {
+    let process_id = json_u32(value, "pid")?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or(M1BackendError::MalformedResponse("launch_app missing name"))?;
+    let name = bounded_string(name, MAX_UI_TEXT_BYTES, "launch_app name is too large")?;
+    let identifier = value
+        .get("bundle_id")
+        .and_then(Value::as_str)
+        .map(|value| {
+            bounded_string(
+                value,
+                MAX_UI_REF_BYTES,
+                "launch_app identifier is too large",
+            )
+        })
+        .transpose()?;
+    let state = value.get("launch_state").and_then(Value::as_object).ok_or(
+        M1BackendError::MalformedResponse("launch_app missing launch_state"),
+    )?;
+    let process_running = state
+        .get("process_running")
+        .and_then(Value::as_bool)
+        .ok_or(M1BackendError::MalformedResponse(
+            "launch state missing process_running",
+        ))?;
+    let window_ready = state.get("window_ready").and_then(Value::as_bool).ok_or(
+        M1BackendError::MalformedResponse("launch state missing window_ready"),
+    )?;
+    let windows =
+        value
+            .get("windows")
+            .and_then(Value::as_array)
+            .ok_or(M1BackendError::MalformedResponse(
+                "launch_app missing windows",
+            ))?;
+    let windows_truncated = windows.len() > MAX_WINDOW_RESULTS;
+    let windows = windows
+        .iter()
+        .take(MAX_WINDOW_RESULTS)
+        .map(normalize_window)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DeviceResult::ApplicationLaunched {
+        process_id,
+        identifier,
+        name,
+        process_running,
+        window_ready,
+        windows,
+        windows_truncated,
+    })
+}
+
+fn normalize_window(value: &Value) -> Result<WindowInfo, M1BackendError> {
+    let window_id =
+        value
+            .get("window_id")
+            .and_then(Value::as_u64)
+            .ok_or(M1BackendError::MalformedResponse(
+                "window missing window_id",
+            ))?;
+    let process_id = json_u32(value, "pid")?;
+    let application = bounded_string(
+        value
+            .get("app_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        MAX_UI_TEXT_BYTES,
+        "window application name is too large",
+    )?;
+    let title = bounded_string(
+        value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        MAX_UI_TEXT_BYTES,
+        "window title is too large",
+    )?;
+    let bounds = value
+        .get("bounds")
+        .ok_or(M1BackendError::MalformedResponse("window missing bounds"))
+        .and_then(normalize_rect)?;
+    let is_on_screen = value.get("is_on_screen").and_then(Value::as_bool).ok_or(
+        M1BackendError::MalformedResponse("window missing is_on_screen"),
+    )?;
+    let on_current_workspace = match value.get("on_current_space") {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::Null) | None => None,
+        _ => {
+            return Err(M1BackendError::MalformedResponse(
+                "invalid on_current_space",
+            ));
+        }
+    };
+    Ok(WindowInfo {
+        window_id,
+        process_id,
+        application,
+        title,
+        bounds,
+        is_on_screen,
+        on_current_workspace,
+    })
+}
+
+fn normalize_rect(value: &Value) -> Result<UiRect, M1BackendError> {
+    let object = value
+        .as_object()
+        .ok_or(M1BackendError::MalformedResponse("invalid rectangle"))?;
+    let x = json_i32_number(object.get("x"), "rectangle x")?;
+    let y = json_i32_number(object.get("y"), "rectangle y")?;
+    let width = json_u32_number(
+        object.get("width").or_else(|| object.get("w")),
+        "rectangle width",
+    )?;
+    let height = json_u32_number(
+        object.get("height").or_else(|| object.get("h")),
+        "rectangle height",
+    )?;
+    if width == 0 || height == 0 {
+        return Err(M1BackendError::MalformedResponse(
+            "rectangle must be positive",
+        ));
+    }
+    Ok(UiRect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn normalize_window_snapshot_result(
+    command: &DeviceCommand,
+    result: &CallToolResult,
+) -> Result<DeviceResult, M1BackendError> {
+    let DeviceCommand::InspectWindow {
+        process_id,
+        window_id,
+        include_screenshot,
+        ..
+    } = command
+    else {
+        return Err(M1BackendError::MalformedResponse("wrong snapshot command"));
+    };
+    let value = structured_value(result)?;
+    let snapshot_ref = value.get("snapshot_id").and_then(Value::as_str).ok_or(
+        M1BackendError::MalformedResponse("get_window_state missing snapshot_id"),
+    )?;
+    let snapshot_ref = bounded_string(
+        snapshot_ref,
+        MAX_UI_REF_BYTES,
+        "get_window_state snapshot_id is too large",
+    )?;
+    let returned_pid = json_u32(&value, "pid")?;
+    let returned_window_id =
+        value
+            .get("window_id")
+            .and_then(Value::as_u64)
+            .ok_or(M1BackendError::MalformedResponse(
+                "get_window_state missing window_id",
+            ))?;
+    if returned_pid != *process_id || returned_window_id != *window_id {
+        return Err(M1BackendError::MalformedResponse(
+            "window snapshot target mismatch",
+        ));
+    }
+    let raw_elements = value.get("elements").and_then(Value::as_array).ok_or(
+        M1BackendError::MalformedResponse("get_window_state missing elements"),
+    )?;
+    if raw_elements.len() > MAX_UI_ELEMENTS {
+        return Err(M1BackendError::MalformedResponse("too many UI elements"));
+    }
+    let refs: HashMap<u64, String> = raw_elements
+        .iter()
+        .filter_map(|element| {
+            let index = element.get("element_index")?.as_u64()?;
+            let token = element.get("element_token")?.as_str()?.to_owned();
+            Some((index, token))
+        })
+        .collect();
+    let elements = raw_elements
+        .iter()
+        .map(|element| normalize_ui_element(element, &refs))
+        .collect::<Result<Vec<_>, _>>()?;
+    let elements_complete = value
+        .get("elements_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let screenshot = if *include_screenshot {
+        Some(extract_png_image(result)?)
+    } else {
+        if result
+            .content
+            .iter()
+            .any(|content| content.as_image().is_some())
+        {
+            return Err(M1BackendError::MalformedResponse(
+                "unexpected image for screenshot-disabled inspection",
+            ));
+        }
+        None
+    };
+    Ok(DeviceResult::WindowSnapshot {
+        snapshot_ref,
+        process_id: returned_pid,
+        window_id: returned_window_id,
+        elements,
+        elements_complete,
+        screenshot,
+    })
+}
+
+fn normalize_ui_element(
+    value: &Value,
+    refs: &HashMap<u64, String>,
+) -> Result<UiElement, M1BackendError> {
+    let element_ref = value.get("element_token").and_then(Value::as_str).ok_or(
+        M1BackendError::MalformedResponse("UI element missing element_token"),
+    )?;
+    let element_ref = bounded_string(
+        element_ref,
+        MAX_UI_REF_BYTES,
+        "UI element token is too large",
+    )?;
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .map(normalize_cua_role)
+        .ok_or(M1BackendError::MalformedResponse("UI element missing role"))?;
+    let label = bounded_optional_string(
+        value.get("label"),
+        MAX_UI_TEXT_BYTES,
+        "UI element label is too large",
+    )?;
+    let element_value = bounded_optional_string(
+        value.get("value"),
+        MAX_UI_TEXT_BYTES,
+        "UI element value is too large",
+    )?;
+    let bounds = match value.get("frame") {
+        Some(Value::Object(_)) => Some(normalize_rect(&value["frame"])?),
+        Some(Value::Null) | None => None,
+        _ => {
+            return Err(M1BackendError::MalformedResponse(
+                "invalid UI element frame",
+            ));
+        }
+    };
+    let enabled = optional_bool(value.get("enabled"))?;
+    let selected = optional_bool(value.get("selected"))?;
+    let parent_ref = match value.get("parent_index") {
+        Some(Value::Number(number)) => number.as_u64().and_then(|index| refs.get(&index).cloned()),
+        Some(Value::Null) | None => None,
+        _ => return Err(M1BackendError::MalformedResponse("invalid parent_index")),
+    };
+    let depth =
+        value
+            .get("depth")
+            .and_then(Value::as_u64)
+            .ok_or(M1BackendError::MalformedResponse(
+                "UI element missing depth",
+            ))?;
+    let depth = u16::try_from(depth).map_err(|_| M1BackendError::NumericOverflow)?;
+    Ok(UiElement {
+        element_ref,
+        role,
+        label,
+        value: element_value,
+        bounds,
+        enabled,
+        selected,
+        parent_ref,
+        depth,
+    })
+}
+
+fn normalize_cua_role(role: &str) -> UiRole {
+    match role {
+        "AXWindow" => UiRole::Window,
+        "AXButton" => UiRole::Button,
+        "AXStaticText" => UiRole::Text,
+        "AXTextField" | "AXTextArea" => UiRole::TextField,
+        "AXCheckBox" => UiRole::Checkbox,
+        "AXRadioButton" => UiRole::RadioButton,
+        "AXLink" => UiRole::Link,
+        "AXMenu" => UiRole::Menu,
+        "AXMenuItem" | "AXMenuBarItem" => UiRole::MenuItem,
+        "AXToolbar" => UiRole::Toolbar,
+        "AXTabGroup" => UiRole::Tab,
+        "AXList" => UiRole::List,
+        "AXOutline" => UiRole::List,
+        "AXTable" => UiRole::Table,
+        "AXRow" => UiRole::Row,
+        "AXCell" => UiRole::Cell,
+        "AXGroup" => UiRole::Group,
+        "AXImage" => UiRole::Image,
+        "AXSlider" => UiRole::Slider,
+        _ => UiRole::Other,
+    }
+}
+
+fn normalize_ui_verification_result(
+    command: &DeviceCommand,
+    result: &CallToolResult,
+) -> Result<DeviceResult, M1BackendError> {
+    let DeviceCommand::VerifyUiState {
+        predicates: expected,
+        include_screenshot,
+        ..
+    } = command
+    else {
+        return Err(M1BackendError::MalformedResponse(
+            "wrong verification command",
+        ));
+    };
+    let value = structured_value(result)?;
+    let status = parse_verification_status(value.get("status").and_then(Value::as_str).ok_or(
+        M1BackendError::MalformedResponse("verify_state missing status"),
+    )?)?;
+    let stable =
+        value
+            .get("stable")
+            .and_then(Value::as_bool)
+            .ok_or(M1BackendError::MalformedResponse(
+                "verify_state missing stable",
+            ))?;
+    let samples = json_u32(&value, "samples")?;
+    let raw_predicates = value.get("predicates").and_then(Value::as_array).ok_or(
+        M1BackendError::MalformedResponse("verify_state missing predicates"),
+    )?;
+    if raw_predicates.len() != expected.len() {
+        return Err(M1BackendError::MalformedResponse(
+            "verification predicate count mismatch",
+        ));
+    }
+    let predicates = raw_predicates
+        .iter()
+        .map(|predicate| {
+            let status = predicate
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or(M1BackendError::MalformedResponse(
+                    "predicate missing status",
+                ))
+                .and_then(parse_verification_status)?;
+            let unknown_reason = bounded_optional_string(
+                predicate.get("unknown_reason"),
+                MAX_UI_TEXT_BYTES,
+                "verification unknown reason is too large",
+            )?;
+            Ok(UiPredicateResult {
+                status,
+                unknown_reason,
+            })
+        })
+        .collect::<Result<Vec<_>, M1BackendError>>()?;
+    let screenshot = if *include_screenshot {
+        Some(extract_png_image(result)?)
+    } else {
+        if result
+            .content
+            .iter()
+            .any(|content| content.as_image().is_some())
+        {
+            return Err(M1BackendError::MalformedResponse(
+                "unexpected image for screenshot-disabled verification",
+            ));
+        }
+        None
+    };
+    Ok(DeviceResult::UiStateVerification {
+        status,
+        stable,
+        samples,
+        predicates,
+        screenshot,
+    })
+}
+
+fn parse_verification_status(value: &str) -> Result<VerificationStatus, M1BackendError> {
+    match value {
+        "satisfied" => Ok(VerificationStatus::Satisfied),
+        "unsatisfied" => Ok(VerificationStatus::Unsatisfied),
+        "unknown" => Ok(VerificationStatus::Unknown),
+        _ => Err(M1BackendError::MalformedResponse(
+            "invalid verification status",
+        )),
+    }
+}
+
+fn extract_png_image(result: &CallToolResult) -> Result<UiImage, M1BackendError> {
+    let mut images = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_image());
+    let image = images.next().ok_or(M1BackendError::MalformedResponse(
+        "missing PNG image content",
+    ))?;
+    if images.next().is_some() || image.mime_type != "image/png" {
+        return Err(M1BackendError::MalformedResponse(
+            "ambiguous PNG image content",
+        ));
+    }
+    let max_encoded = MAX_SCREENSHOT_BYTES.div_ceil(3) * 4;
+    if image.data.len() > max_encoded {
+        return Err(M1BackendError::ScreenshotTooLarge);
+    }
+    let decoded = STANDARD
+        .decode(image.data.as_bytes())
+        .map_err(|_| M1BackendError::MalformedResponse("screenshot base64 is invalid"))?;
+    if decoded.len() > MAX_SCREENSHOT_BYTES {
+        return Err(M1BackendError::ScreenshotTooLarge);
+    }
+    let (width_pixels, height_pixels) = png_dimensions(&decoded)?;
+    Ok(UiImage {
+        data_base64: image.data.clone(),
+        mime_type: image.mime_type.clone(),
+        width_pixels,
+        height_pixels,
+    })
+}
+
+fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), M1BackendError> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || &bytes[12..16] != b"IHDR" {
+        return Err(M1BackendError::MalformedResponse(
+            "image content is not a PNG",
+        ));
+    }
+    let width = u32::from_be_bytes(
+        bytes[16..20]
+            .try_into()
+            .map_err(|_| M1BackendError::MalformedResponse("invalid PNG width"))?,
+    );
+    let height = u32::from_be_bytes(
+        bytes[20..24]
+            .try_into()
+            .map_err(|_| M1BackendError::MalformedResponse("invalid PNG height"))?,
+    );
+    if width == 0 || height == 0 {
+        return Err(M1BackendError::MalformedResponse(
+            "PNG dimensions must be positive",
+        ));
+    }
+    Ok((width, height))
+}
+
+fn bounded_string(
+    value: &str,
+    max_bytes: usize,
+    error: &'static str,
+) -> Result<String, M1BackendError> {
+    if value.len() > max_bytes {
+        return Err(M1BackendError::MalformedResponse(error));
+    }
+    Ok(value.to_owned())
+}
+
+fn bounded_optional_string(
+    value: Option<&Value>,
+    max_bytes: usize,
+    error: &'static str,
+) -> Result<Option<String>, M1BackendError> {
+    optional_string(value)?
+        .map(|value| bounded_string(&value, max_bytes, error))
+        .transpose()
+}
+
+fn optional_string(value: Option<&Value>) -> Result<Option<String>, M1BackendError> {
+    match value {
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) | None => Ok(None),
+        _ => Err(M1BackendError::MalformedResponse("invalid optional string")),
+    }
+}
+
+fn optional_bool(value: Option<&Value>) -> Result<Option<bool>, M1BackendError> {
+    match value {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        _ => Err(M1BackendError::MalformedResponse("invalid optional bool")),
+    }
+}
+
+fn json_i32_number(value: Option<&Value>, name: &'static str) -> Result<i32, M1BackendError> {
+    let value = value
+        .and_then(Value::as_f64)
+        .ok_or(M1BackendError::MalformedResponse(name))?;
+    if !value.is_finite() || value < i32::MIN as f64 || value > i32::MAX as f64 {
+        return Err(M1BackendError::NumericOverflow);
+    }
+    Ok(value.round() as i32)
+}
+
+fn json_u32_number(value: Option<&Value>, name: &'static str) -> Result<u32, M1BackendError> {
+    let value = value
+        .and_then(Value::as_f64)
+        .ok_or(M1BackendError::MalformedResponse(name))?;
+    if !value.is_finite() || value < 0.0 || value > u32::MAX as f64 {
+        return Err(M1BackendError::NumericOverflow);
+    }
+    Ok(value.round() as u32)
 }
 
 fn normalize_screenshot_result(result: &CallToolResult) -> Result<DeviceResult, M1BackendError> {
@@ -547,11 +1336,127 @@ mod tests {
                     &DeviceCommand::TypeText {
                         text: "fixture text".into(),
                     },
-                    cancel_rx,
+                    cancel_rx.clone(),
                 )
                 .await
                 .unwrap(),
             BackendExecutionOutcome::Completed(DeviceResult::TypeTextCompleted)
+        );
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::ListWindows {
+                        process_id: Some(101),
+                        on_screen_only: true,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::Windows {
+                windows: vec![WindowInfo {
+                    window_id: 77,
+                    process_id: 101,
+                    application: "Fixture A".into(),
+                    title: "Main".into(),
+                    bounds: UiRect {
+                        x: 10,
+                        y: 20,
+                        width: 800,
+                        height: 600
+                    },
+                    is_on_screen: true,
+                    on_current_workspace: Some(true),
+                }],
+                truncated: false,
+            })
+        );
+        assert!(matches!(
+            adapter
+                .execute(
+                    &DeviceCommand::LaunchApplication {
+                        identifier: Some("fixture.app".into()),
+                        name: None,
+                        targets: vec![],
+                        new_instance: false,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::ApplicationLaunched {
+                process_id: 101,
+                process_running: true,
+                window_ready: true,
+                ..
+            })
+        ));
+        let inspected = adapter
+            .execute(
+                &DeviceCommand::InspectWindow {
+                    process_id: 101,
+                    window_id: 77,
+                    query: None,
+                    max_elements: 50,
+                    max_depth: 10,
+                    include_screenshot: true,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        match inspected {
+            BackendExecutionOutcome::Completed(DeviceResult::WindowSnapshot {
+                snapshot_ref,
+                elements,
+                elements_complete,
+                screenshot,
+                ..
+            }) => {
+                assert_eq!(snapshot_ref, "sfixture1");
+                assert!(elements_complete);
+                assert_eq!(elements.len(), 2);
+                assert_eq!(elements[0].role, UiRole::Window);
+                assert_eq!(elements[1].role, UiRole::Button);
+                assert_eq!(elements[1].parent_ref.as_deref(), Some("sfixture1:0"));
+                let screenshot = screenshot.unwrap();
+                assert_eq!(
+                    (screenshot.width_pixels, screenshot.height_pixels),
+                    (230, 408)
+                );
+            }
+            other => panic!("unexpected inspection result: {other:?}"),
+        }
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::VerifyUiState {
+                        process_id: 101,
+                        window_id: 77,
+                        predicates: vec![UiPredicate::ElementExists {
+                            selector: UiElementSelector {
+                                role: Some(UiRole::Button),
+                                label_contains: Some("Run".into()),
+                            },
+                        }],
+                        timeout_ms: 0,
+                        stable_samples: 1,
+                        include_screenshot: false,
+                    },
+                    cancel_rx,
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::UiStateVerification {
+                status: VerificationStatus::Satisfied,
+                stable: true,
+                samples: 1,
+                predicates: vec![UiPredicateResult {
+                    status: VerificationStatus::Satisfied,
+                    unknown_reason: None,
+                }],
+                screenshot: None,
+            })
         );
         adapter.shutdown().await.unwrap();
     }
@@ -678,6 +1583,39 @@ mod tests {
             }),
             Err(M1BackendError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn gui_semantic_commands_map_to_cua_without_leaking_cua_names_northbound() {
+        let (tool, args) = map_command(&DeviceCommand::ListWindows {
+            process_id: Some(42),
+            on_screen_only: true,
+        })
+        .unwrap();
+        assert_eq!(tool, "list_windows");
+        assert_eq!(Value::Object(args.unwrap())["pid"], 42);
+
+        let (tool, args) = map_command(&DeviceCommand::VerifyUiState {
+            process_id: 42,
+            window_id: 7,
+            predicates: vec![UiPredicate::ElementExists {
+                selector: UiElementSelector {
+                    role: Some(UiRole::Button),
+                    label_contains: Some("Save".into()),
+                },
+            }],
+            timeout_ms: 1000,
+            stable_samples: 2,
+            include_screenshot: false,
+        })
+        .unwrap();
+        assert_eq!(tool, "verify_state");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["expect"][0]["element"]["selector"]["role"], "AXButton");
+        assert_eq!(
+            args["expect"][0]["element"]["selector"]["label_contains"],
+            "Save"
+        );
     }
 
     #[test]

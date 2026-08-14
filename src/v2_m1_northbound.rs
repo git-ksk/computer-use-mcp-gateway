@@ -11,8 +11,9 @@ use crate::v2_observability::SafeErrorCode;
 use crate::{
     v2_execution_safety::OperationOwner,
     v2_m0::{
-        DeviceCapability, DeviceCommand, DeviceResult, MAX_TYPE_TEXT_BYTES, PointerButton,
-        ProcessEnvVar, ProcessRequest, ShellRequest,
+        CapabilityAdvertisement, DeviceCapability, DeviceCommand, DeviceResult,
+        MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
+        ProcessEnvVar, ProcessRequest, ShellRequest, UiPredicate, UiRole,
     },
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
@@ -67,6 +68,10 @@ const TOOL_EXECUTE_PROCESS: &str = "execute_process";
 const TOOL_SHELL: &str = "shell";
 const TOOL_READ_FILE: &str = "read_file";
 const TOOL_LIST_DIRECTORY: &str = "list_directory";
+const TOOL_LIST_WINDOWS: &str = "list_windows";
+const TOOL_LAUNCH_APPLICATION: &str = "launch_application";
+const TOOL_INSPECT_WINDOW: &str = "inspect_window";
+const TOOL_VERIFY_UI_STATE: &str = "verify_ui_state";
 
 #[derive(Debug, Clone)]
 pub struct NorthboundMcpConfig {
@@ -928,7 +933,8 @@ impl V2NorthboundMcp {
             })
     }
 
-    fn tools_for(&self, principal: &AuthenticatedClientPrincipal) -> Vec<Tool> {
+    async fn tools_for(&self, principal: &AuthenticatedClientPrincipal) -> Vec<Tool> {
+        let capabilities = self.hub.current_capabilities().await;
         all_tools()
             .into_iter()
             .filter(|tool| {
@@ -936,6 +942,7 @@ impl V2NorthboundMcp {
                     self.authorizer
                         .authorize_device_capability(principal, self.hub.device_id(), capability)
                         .is_ok()
+                        && capability_is_live_or_unknown(capabilities.as_ref(), capability)
                 })
             })
             .collect()
@@ -1034,7 +1041,7 @@ impl ServerHandler for V2NorthboundMcp {
     ) -> Result<ListToolsResult, McpError> {
         let auth = Self::auth_context(&context)?;
         Ok(ListToolsResult {
-            tools: self.tools_for(&auth.principal),
+            tools: self.tools_for(&auth.principal).await,
             ..Default::default()
         })
     }
@@ -1142,6 +1149,68 @@ impl ServerHandler for V2NorthboundMcp {
                 let args: PathArgs = parse_arguments(request.arguments)?;
                 Ok(DeviceCommand::ListDirectory { path: args.path })
             }
+            TOOL_LIST_WINDOWS => {
+                let args: ListWindowsArgs = parse_arguments(request.arguments)?;
+                Ok(DeviceCommand::ListWindows {
+                    process_id: args.process_id,
+                    on_screen_only: args.on_screen_only,
+                })
+            }
+            TOOL_LAUNCH_APPLICATION => {
+                let args: LaunchApplicationArgs = parse_arguments(request.arguments)?;
+                validate_launch_args(&args)?;
+                Ok(DeviceCommand::LaunchApplication {
+                    identifier: args.identifier,
+                    name: args.name,
+                    targets: args.targets,
+                    new_instance: args.new_instance,
+                })
+            }
+            TOOL_INSPECT_WINDOW => {
+                let args: InspectWindowArgs = parse_arguments(request.arguments)?;
+                validate_window_args(args.process_id, args.window_id)?;
+                if args
+                    .query
+                    .as_ref()
+                    .is_some_and(|query| query.len() > MAX_UI_QUERY_BYTES)
+                    || args.max_elements == 0
+                    || (args.max_elements as usize) > MAX_UI_ELEMENTS
+                    || args.max_depth == 0
+                    || args.max_depth > 64
+                {
+                    return Err(McpError::invalid_params(
+                        "Invalid window inspection bounds",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::InspectWindow {
+                    process_id: args.process_id,
+                    window_id: args.window_id,
+                    query: args.query,
+                    max_elements: args.max_elements,
+                    max_depth: args.max_depth,
+                    include_screenshot: args.include_screenshot,
+                })
+            }
+            TOOL_VERIFY_UI_STATE => {
+                let args: VerifyUiStateArgs = parse_arguments(request.arguments)?;
+                validate_window_args(args.process_id, args.window_id)?;
+                validate_ui_predicates(&args.expect)?;
+                if args.timeout_ms > 10_000 || !(1..=5).contains(&args.stable_samples) {
+                    return Err(McpError::invalid_params(
+                        "Invalid UI verification bounds",
+                        None,
+                    ));
+                }
+                Ok(DeviceCommand::VerifyUiState {
+                    process_id: args.process_id,
+                    window_id: args.window_id,
+                    predicates: args.expect,
+                    timeout_ms: args.timeout_ms,
+                    stable_samples: args.stable_samples,
+                    include_screenshot: args.include_screenshot,
+                })
+            }
             _ => Err(McpError::invalid_params("Unknown V2 Hub tool", None)),
         })();
         let command = match command_result {
@@ -1173,6 +1242,66 @@ impl ServerHandler for V2NorthboundMcp {
                 ])
                 .into())
             }
+            DeviceResult::WindowSnapshot {
+                snapshot_ref,
+                process_id,
+                window_id,
+                elements,
+                elements_complete,
+                screenshot,
+            } => {
+                let screenshot_metadata = screenshot.as_ref().map(|image| {
+                    json!({
+                        "mime_type": image.mime_type,
+                        "width_pixels": image.width_pixels,
+                        "height_pixels": image.height_pixels,
+                    })
+                });
+                let metadata = json!({
+                    "type": "window_snapshot",
+                    "snapshot_ref": snapshot_ref,
+                    "process_id": process_id,
+                    "window_id": window_id,
+                    "elements": elements,
+                    "elements_complete": elements_complete,
+                    "screenshot": screenshot_metadata,
+                });
+                let mut content = Vec::new();
+                if let Some(image) = screenshot {
+                    content.push(ContentBlock::image(image.data_base64, image.mime_type));
+                }
+                content.push(ContentBlock::text(metadata.to_string()));
+                Ok(CallToolResult::success(content).into())
+            }
+            DeviceResult::UiStateVerification {
+                status,
+                stable,
+                samples,
+                predicates,
+                screenshot,
+            } => {
+                let screenshot_metadata = screenshot.as_ref().map(|image| {
+                    json!({
+                        "mime_type": image.mime_type,
+                        "width_pixels": image.width_pixels,
+                        "height_pixels": image.height_pixels,
+                    })
+                });
+                let metadata = json!({
+                    "type": "ui_state_verification",
+                    "status": status,
+                    "stable": stable,
+                    "samples": samples,
+                    "predicates": predicates,
+                    "screenshot": screenshot_metadata,
+                });
+                let mut content = Vec::new();
+                if let Some(image) = screenshot {
+                    content.push(ContentBlock::image(image.data_base64, image.mime_type));
+                }
+                content.push(ContentBlock::text(metadata.to_string()));
+                Ok(CallToolResult::success(content).into())
+            }
             other => {
                 let value = serde_json::to_string(&other).map_err(|_| {
                     McpError::internal_error("Failed to serialize device result", None)
@@ -1183,6 +1312,13 @@ impl ServerHandler for V2NorthboundMcp {
     }
 }
 
+fn capability_is_live_or_unknown(
+    advertisement: Option<&CapabilityAdvertisement>,
+    capability: DeviceCapability,
+) -> bool {
+    advertisement.is_none_or(|advertisement| advertisement.supports(capability))
+}
+
 fn command_is_read_only(command: &DeviceCommand) -> bool {
     matches!(
         command,
@@ -1191,6 +1327,9 @@ fn command_is_read_only(command: &DeviceCommand) -> bool {
             | DeviceCommand::Screenshot
             | DeviceCommand::ReadFile { .. }
             | DeviceCommand::ListDirectory { .. }
+            | DeviceCommand::ListWindows { .. }
+            | DeviceCommand::InspectWindow { .. }
+            | DeviceCommand::VerifyUiState { .. }
     )
 }
 
@@ -1269,6 +1408,10 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_SHELL => Some(DeviceCapability::Shell),
         TOOL_READ_FILE => Some(DeviceCapability::ReadFile),
         TOOL_LIST_DIRECTORY => Some(DeviceCapability::ListDirectory),
+        TOOL_LIST_WINDOWS => Some(DeviceCapability::ListWindows),
+        TOOL_LAUNCH_APPLICATION => Some(DeviceCapability::LaunchApplication),
+        TOOL_INSPECT_WINDOW => Some(DeviceCapability::InspectWindow),
+        TOOL_VERIFY_UI_STATE => Some(DeviceCapability::VerifyUiState),
         _ => None,
     }
 }
@@ -1368,6 +1511,64 @@ fn all_tools() -> Vec<Tool> {
             object_schema(vec![("path", string_schema())], &["path"]),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_LIST_WINDOWS,
+            "List top-level windows through the enrolled computer-use backend using a backend-neutral window model.",
+            object_schema(
+                vec![
+                    ("process_id", positive_integer_schema()),
+                    ("on_screen_only", boolean_schema()),
+                ],
+                &[],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_LAUNCH_APPLICATION,
+            "Launch an application through the enrolled computer-use backend using an opaque application identifier or display name.",
+            object_schema(
+                vec![
+                    ("identifier", string_schema()),
+                    ("name", string_schema()),
+                    ("targets", array_schema(string_schema())),
+                    ("new_instance", boolean_schema()),
+                ],
+                &[],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_INSPECT_WINDOW,
+            "Inspect one exact top-level window as a bounded backend-neutral UI element snapshot, optionally with a window screenshot.",
+            object_schema(
+                vec![
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("query", bounded_ui_query_schema()),
+                    ("max_elements", bounded_positive_integer_schema(MAX_UI_ELEMENTS as u64)),
+                    ("max_depth", bounded_positive_integer_schema(64)),
+                    ("include_screenshot", boolean_schema()),
+                ],
+                &["process_id", "window_id"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_VERIFY_UI_STATE,
+            "Verify bounded predicates against one exact window. Unknown never implies success.",
+            object_schema(
+                vec![
+                    ("process_id", positive_integer_schema()),
+                    ("window_id", positive_integer_schema()),
+                    ("expect", bounded_array_schema(ui_predicate_schema(), 1, MAX_UI_PREDICATES as u64)),
+                    ("timeout_ms", bounded_nonnegative_integer_schema(10_000)),
+                    ("stable_samples", bounded_positive_integer_schema(5)),
+                    ("include_screenshot", boolean_schema()),
+                ],
+                &["process_id", "window_id", "expect"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
     ]
 }
 
@@ -1414,6 +1615,271 @@ fn signed_integer_schema() -> Value {
 
 fn positive_integer_schema() -> Value {
     json!({ "type": "integer", "minimum": 1 })
+}
+
+fn bounded_positive_integer_schema(maximum: u64) -> Value {
+    json!({ "type": "integer", "minimum": 1, "maximum": maximum })
+}
+
+fn bounded_nonnegative_integer_schema(maximum: u64) -> Value {
+    json!({ "type": "integer", "minimum": 0, "maximum": maximum })
+}
+
+fn boolean_schema() -> Value {
+    json!({ "type": "boolean" })
+}
+
+fn bounded_ui_query_schema() -> Value {
+    json!({ "type": "string", "minLength": 1, "maxLength": MAX_UI_QUERY_BYTES })
+}
+
+fn bounded_array_schema(items: Value, minimum: u64, maximum: u64) -> Value {
+    json!({ "type": "array", "items": items, "minItems": minimum, "maxItems": maximum })
+}
+
+fn ui_role_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "window", "button", "text", "text_field", "checkbox", "radio_button",
+            "link", "menu", "menu_item", "toolbar", "tab", "list", "list_item",
+            "table", "row", "cell", "group", "image", "slider"
+        ]
+    })
+}
+
+fn ui_selector_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "role": ui_role_schema(),
+            "label_contains": bounded_ui_query_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn ui_rect_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "x": {"type":"integer"},
+            "y": {"type":"integer"},
+            "width": {"type":"integer","minimum":1},
+            "height": {"type":"integer","minimum":1}
+        },
+        "required": ["x","y","width","height"],
+        "additionalProperties": false
+    })
+}
+
+fn ui_predicate_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"type":{"const":"window_exists"},"exists":{"type":"boolean"}},
+                "required": ["type","exists"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {"type":{"const":"window_bounds"},"bounds":ui_rect_schema(),"tolerance_px":{"type":"integer","minimum":0,"maximum":100}},
+                "required": ["type","bounds","tolerance_px"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {"type":{"const":"element_exists"},"selector":ui_selector_schema()},
+                "required": ["type","selector"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type":{"const":"element_state"},
+                    "selector":ui_selector_schema(),
+                    "enabled":{"type":"boolean"},
+                    "selected":{"type":"boolean"},
+                    "value_equals":{"type":"string","maxLength":MAX_TYPE_TEXT_BYTES}
+                },
+                "required": ["type","selector"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListWindowsArgs {
+    process_id: Option<u32>,
+    #[serde(default)]
+    on_screen_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchApplicationArgs {
+    identifier: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    targets: Vec<String>,
+    #[serde(default)]
+    new_instance: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectWindowArgs {
+    process_id: u32,
+    window_id: u64,
+    query: Option<String>,
+    #[serde(default = "default_max_ui_elements")]
+    max_elements: u32,
+    #[serde(default = "default_max_ui_depth")]
+    max_depth: u32,
+    #[serde(default = "default_true")]
+    include_screenshot: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyUiStateArgs {
+    process_id: u32,
+    window_id: u64,
+    expect: Vec<UiPredicate>,
+    #[serde(default = "default_verify_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_stable_samples")]
+    stable_samples: u8,
+    #[serde(default)]
+    include_screenshot: bool,
+}
+
+fn default_max_ui_elements() -> u32 {
+    500
+}
+fn default_max_ui_depth() -> u32 {
+    25
+}
+fn default_verify_timeout_ms() -> u64 {
+    5_000
+}
+fn default_stable_samples() -> u8 {
+    2
+}
+fn default_true() -> bool {
+    true
+}
+
+fn validate_window_args(process_id: u32, window_id: u64) -> Result<(), McpError> {
+    if process_id == 0 || window_id == 0 {
+        return Err(McpError::invalid_params(
+            "process_id and window_id must be positive",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_launch_args(args: &LaunchApplicationArgs) -> Result<(), McpError> {
+    let identifier = args
+        .identifier
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let name = args
+        .name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if identifier.is_none() && name.is_none() {
+        return Err(McpError::invalid_params(
+            "identifier or name is required",
+            None,
+        ));
+    }
+    if identifier.is_some_and(|value| value.len() > 512)
+        || name.is_some_and(|value| value.len() > 512)
+        || args.targets.len() > 16
+        || args
+            .targets
+            .iter()
+            .any(|target| target.is_empty() || target.len() > 4096)
+    {
+        return Err(McpError::invalid_params(
+            "Invalid application launch arguments",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ui_predicates(predicates: &[UiPredicate]) -> Result<(), McpError> {
+    if predicates.is_empty() || predicates.len() > MAX_UI_PREDICATES {
+        return Err(McpError::invalid_params(
+            "expect must contain 1..=8 predicates",
+            None,
+        ));
+    }
+    for predicate in predicates {
+        match predicate {
+            UiPredicate::WindowExists { .. } => {}
+            UiPredicate::WindowBounds {
+                bounds,
+                tolerance_px,
+            } => {
+                if bounds.width == 0 || bounds.height == 0 || *tolerance_px > 100 {
+                    return Err(McpError::invalid_params(
+                        "Invalid window-bounds predicate",
+                        None,
+                    ));
+                }
+            }
+            UiPredicate::ElementExists { selector } => validate_ui_selector(selector)?,
+            UiPredicate::ElementState {
+                selector,
+                enabled,
+                selected,
+                value_equals,
+            } => {
+                validate_ui_selector(selector)?;
+                if enabled.is_none() && selected.is_none() && value_equals.is_none() {
+                    return Err(McpError::invalid_params(
+                        "Element-state predicate requires a state",
+                        None,
+                    ));
+                }
+                if value_equals
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_TYPE_TEXT_BYTES)
+                {
+                    return Err(McpError::invalid_params(
+                        "Element value predicate is too large",
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ui_selector(selector: &crate::v2_m0::UiElementSelector) -> Result<(), McpError> {
+    if selector.role.is_none() && selector.label_contains.is_none() {
+        return Err(McpError::invalid_params(
+            "UI selector cannot be empty",
+            None,
+        ));
+    }
+    if selector.role == Some(UiRole::Other)
+        || selector
+            .label_contains
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_UI_QUERY_BYTES)
+    {
+        return Err(McpError::invalid_params("Invalid UI selector", None));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2194,6 +2660,32 @@ mod tests {
     }
 
     #[test]
+    fn live_backend_advertisement_narrows_semantic_discovery_fail_closed() {
+        let advertisement = CapabilityAdvertisement {
+            backend: "fixture".into(),
+            backend_version: "1".into(),
+            platform: "test".into(),
+            capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+            revision: 1,
+            supported: vec![DeviceCapability::ListWindows],
+        };
+        assert!(capability_is_live_or_unknown(
+            Some(&advertisement),
+            DeviceCapability::ListWindows,
+        ));
+        assert!(!capability_is_live_or_unknown(
+            Some(&advertisement),
+            DeviceCapability::InspectWindow,
+        ));
+        // Offline discovery keeps the authorized semantic contract visible; dispatch
+        // still fails closed as AgentOffline until a new live advertisement exists.
+        assert!(capability_is_live_or_unknown(
+            None,
+            DeviceCapability::InspectWindow,
+        ));
+    }
+
+    #[test]
     fn northbound_exposes_existing_exact_cua_capabilities_without_generic_raw_tool() {
         let mappings = [
             (TOOL_LIST_APPS, DeviceCapability::ListApplications),
@@ -2206,6 +2698,10 @@ mod tests {
             (TOOL_SHELL, DeviceCapability::Shell),
             (TOOL_READ_FILE, DeviceCapability::ReadFile),
             (TOOL_LIST_DIRECTORY, DeviceCapability::ListDirectory),
+            (TOOL_LIST_WINDOWS, DeviceCapability::ListWindows),
+            (TOOL_LAUNCH_APPLICATION, DeviceCapability::LaunchApplication),
+            (TOOL_INSPECT_WINDOW, DeviceCapability::InspectWindow),
+            (TOOL_VERIFY_UI_STATE, DeviceCapability::VerifyUiState),
         ];
         for (tool, capability) in mappings {
             assert_eq!(tool_capability(tool), Some(capability));
@@ -2249,6 +2745,24 @@ mod tests {
     #[test]
     fn screenshot_failure_is_read_only_but_type_text_is_mutating_for_accounting() {
         assert!(command_is_read_only(&DeviceCommand::Screenshot));
+        assert!(command_is_read_only(&DeviceCommand::ListWindows {
+            process_id: None,
+            on_screen_only: true,
+        }));
+        assert!(command_is_read_only(&DeviceCommand::InspectWindow {
+            process_id: 1,
+            window_id: 1,
+            query: None,
+            max_elements: 10,
+            max_depth: 5,
+            include_screenshot: false,
+        }));
+        assert!(!command_is_read_only(&DeviceCommand::LaunchApplication {
+            identifier: Some("app".into()),
+            name: None,
+            targets: vec![],
+            new_instance: false,
+        }));
         assert!(!command_is_read_only(&DeviceCommand::TypeText {
             text: "x".into(),
         }));

@@ -18,13 +18,14 @@ pub mod proto {
 use proto::{AgentFrame, HubFrame};
 
 pub const MAX_GRPC_APPLICATION_MESSAGE_BYTES: usize = 64 * 1024;
-pub const MAX_GRPC_SCREENSHOT_APPLICATION_MESSAGE_BYTES: usize = 24 * 1024 * 1024;
+pub const MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES: usize = 28 * 1024 * 1024;
 // Tonic limits the encoded Protobuf message, which includes the bytes-field tag
 // and varint length in addition to the signed application payload. Ordinary
-// application messages remain capped at 64 KiB. Only a typed screenshot result
-// may use the larger, still-bounded allowance needed for a base64 PNG.
+// application messages remain capped at 64 KiB. Bounded image/UI observation
+// results may use the larger allowance needed for a base64 PNG plus normalized
+// window/UI metadata.
 pub const MAX_GRPC_TRANSPORT_MESSAGE_BYTES: usize =
-    MAX_GRPC_SCREENSHOT_APPLICATION_MESSAGE_BYTES + 1024;
+    MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES + 1024;
 
 pub fn encode_agent_frame(message: &AgentToHub) -> Result<AgentFrame, GrpcCarrierError> {
     let bytes = serde_json::to_vec(message).map_err(GrpcCarrierError::Serialization)?;
@@ -37,7 +38,7 @@ pub fn encode_agent_frame(message: &AgentToHub) -> Result<AgentFrame, GrpcCarrie
 pub fn decode_agent_frame(frame: AgentFrame) -> Result<AgentToHub, GrpcCarrierError> {
     enforce_bound(
         frame.signed_message_json.len(),
-        MAX_GRPC_SCREENSHOT_APPLICATION_MESSAGE_BYTES,
+        MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES,
     )?;
     let message: AgentToHub = serde_json::from_slice(&frame.signed_message_json)
         .map_err(GrpcCarrierError::Serialization)?;
@@ -67,9 +68,16 @@ pub fn decode_hub_frame(frame: HubFrame) -> Result<HubToAgent, GrpcCarrierError>
 fn agent_message_limit(message: &AgentToHub) -> usize {
     match message {
         AgentToHub::Result(remote)
-            if matches!(remote.result.result, DeviceResult::Screenshot { .. }) =>
+            if matches!(
+                remote.result.result,
+                DeviceResult::Screenshot { .. }
+                    | DeviceResult::Windows { .. }
+                    | DeviceResult::ApplicationLaunched { .. }
+                    | DeviceResult::WindowSnapshot { .. }
+                    | DeviceResult::UiStateVerification { .. }
+            ) =>
         {
-            MAX_GRPC_SCREENSHOT_APPLICATION_MESSAGE_BYTES
+            MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES
         }
         _ => MAX_GRPC_APPLICATION_MESSAGE_BYTES,
     }
@@ -174,7 +182,17 @@ mod tests {
     #[test]
     fn screenshot_carrier_allowance_covers_the_bounded_base64_payload() {
         let max_base64 = crate::v2_m0::MAX_SCREENSHOT_BYTES.div_ceil(3) * 4;
-        assert!(max_base64 + 64 * 1024 < MAX_GRPC_SCREENSHOT_APPLICATION_MESSAGE_BYTES);
+        assert!(max_base64 + 64 * 1024 < MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn large_result_allowance_covers_max_png_plus_bounded_ui_snapshot_metadata() {
+        let max_base64 = crate::v2_m0::MAX_SCREENSHOT_BYTES.div_ceil(3) * 4;
+        let per_element_budget =
+            (crate::v2_m0::MAX_UI_TEXT_BYTES * 2) + (crate::v2_m0::MAX_UI_REF_BYTES * 2) + 512;
+        let bounded_snapshot_budget =
+            max_base64 + (crate::v2_m0::MAX_UI_ELEMENTS * per_element_budget) + 128 * 1024;
+        assert!(bounded_snapshot_budget < MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES);
     }
 
     #[test]
@@ -203,7 +221,7 @@ mod tests {
         let frame =
             encode_agent_frame(&result).expect("typed screenshot fits screenshot allowance");
         assert!(frame.signed_message_json.len() > MAX_GRPC_APPLICATION_MESSAGE_BYTES);
-        assert!(frame.signed_message_json.len() <= MAX_GRPC_SCREENSHOT_APPLICATION_MESSAGE_BYTES);
+        assert!(frame.signed_message_json.len() <= MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES);
         assert_eq!(decode_agent_frame(frame).unwrap(), result);
     }
 }

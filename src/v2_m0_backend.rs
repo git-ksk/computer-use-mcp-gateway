@@ -196,6 +196,26 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::ListDirectory,
                 ));
             }
+            DeviceCommand::ListWindows { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::ListWindows,
+                ));
+            }
+            DeviceCommand::LaunchApplication { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::LaunchApplication,
+                ));
+            }
+            DeviceCommand::InspectWindow { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::InspectWindow,
+                ));
+            }
+            DeviceCommand::VerifyUiState { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::VerifyUiState,
+                ));
+            }
         };
         validate_adapter_result(command, &result)?;
         Ok(result)
