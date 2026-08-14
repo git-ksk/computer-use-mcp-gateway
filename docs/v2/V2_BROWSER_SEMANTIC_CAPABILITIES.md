@@ -33,7 +33,7 @@ open interaction context
 -> inspect selected tab and mint CUMG refs
 -> navigate / click / type / pointer / dialog
 -> fresh inspect for verification
--> [later transfer closeout: explicit upload / download]
+-> explicit bounded upload / download
 -> close interaction context
 ```
 
@@ -42,7 +42,7 @@ terminates those backend identifiers at the adapter and exposes only its own opa
 
 ## Semantic capabilities
 
-The planned browser runtime surface is:
+The browser runtime surface is:
 
 | Northbound semantic | Exact capability | Contract |
 |---|---|---|
@@ -54,14 +54,12 @@ The planned browser runtime surface is:
 | browser dialog | `BrowserDialog` | inspect page-owned dialog, mint opaque ref, then explicit accept/dismiss with bounded prompt text |
 | browser pointer | `BrowserPointer` | hover/right-click/double-click/scroll/drag through current semantic refs |
 | browser upload | `BrowserUploadFile` | exact upload capability; CUMG-issued file refs only |
-| browser download | `BrowserDownload` | exact download capability; bounded destination root, size, and overwrite policy |
+| browser download | `BrowserDownload` | exact download capability; Agent-private staging, path-safe logical name, size, and overwrite policy |
 
 No generic `page`, `call_tool`, `raw_cua`, raw CDP method, CSS selector escape hatch, or JavaScript
 evaluation surface is introduced.
 
-The current core runtime advertises only prepare, bind/inspect, navigate, click, type, dialog, and
-pointer. `BrowserUploadFile` and `BrowserDownload` are schema-visible for rolling compatibility but are
-not live-advertised until the independent transfer closeout is complete.
+The current Cua runtime advertises prepare, bind/inspect, navigate, click, type, dialog, pointer, and the completed `BrowserUploadFile`/`BrowserDownload` transfer capabilities. An adapter must not advertise either transfer capability unless it implements the reviewed private-staging contract.
 
 ## Exact browser binding
 
@@ -221,21 +219,22 @@ BrowserDownload {
   target_ref,
   tab_ref,
   element_ref,
-  destination_root_ref,
   destination_name,
   max_bytes,
   overwrite
 }
 ```
 
-`destination_root_ref` is a CUMG-issued storage capability, not a caller-provided arbitrary path.
-`destination_name` is a caller-chosen, path-safe basename inside that root; it is never inferred
-from an untrusted server filename. `max_bytes` is mandatory and bounded by the protocol-wide
-absolute ceiling. Overwrite behavior applies to that exact destination name on every request.
+There is deliberately no destination-root/path parameter. `destination_name` is only a caller-chosen,
+path-safe logical basename in the Agent-private transfer namespace; it is never inferred from an
+untrusted server filename. `max_bytes` is mandatory and capped at 16 MiB. Overwrite behavior applies
+to that logical name only after a replacement has safely completed.
 
-The normal result contains only an opaque download ref and byte count. Source URL, server filename,
-and resolved local destination path are not necessary northbound authority and should remain hidden
-unless a separately reviewed product requirement introduces them.
+The Agent creates a private per-operation canonical directory and passes that southbound to Cua. On
+completion it independently proves direct regular-file identity, exact parent containment and byte
+count before a bounded read. The normal result contains an opaque context-scoped download ref,
+logical name, byte count, and bounded base64 data. Source URL, server filename, Cua download id, and
+resolved host path never become northbound authority.
 
 ## Browser chrome and unsupported engines
 
@@ -248,9 +247,7 @@ legacy Cua `page` mutations as an implicit browser API fallback.
 
 ## Carrier and privacy
 
-Ordinary command/control frames retain the existing 64 KiB application bound. Browser bind/snapshot
-observations use the existing reviewed 28 MiB bounded-large gRPC result allowance; Browser mutations
-remain on the ordinary bound. Normalized browser structured metadata is capped at 2 MiB and PNG
+Ordinary command/control frames retain the existing 64 KiB application bound. Browser bind/snapshot observations and the explicitly bounded transfer carriers use the reviewed 28 MiB large-message allowance. Upload/download payloads are capped at 16 MiB before base64/envelope overhead; ordinary Browser core mutations remain on the ordinary bound. Normalized browser structured metadata is capped at 2 MiB and PNG
 screenshot bytes at 16 MiB before the signed result is emitted. This leaves explicit carrier-envelope
 headroom while preserving limits on:
 
@@ -293,7 +290,7 @@ Browser parity is complete only when all of the following are true:
 7. backend input-trust refusal is preserved without automatic foreground or route switching;
 8. page dialogs use fresh opaque dialog refs and native dialogs remain excluded;
 9. upload has no local-path northbound field and accepts only exact CUMG file refs;
-10. download binds destination root, path-safe destination name, byte ceiling, and overwrite policy independently;
+10. download binds Agent-private staging, path-safe logical name, byte ceiling, and overwrite policy independently;
 11. ambiguous cancellation/timeout still creates the ordinary CUMG indeterminate/quarantine state;
 12. close/expiry/reconnect removes all browser refs and backend session state;
 13. resource/ref counts plateau under repeated browser context cycles;

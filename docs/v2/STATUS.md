@@ -4,7 +4,7 @@ Status as of 2026-08-15:
 
 - **Desktop semantic path:** complete and accepted.
 - **Browser core semantic path:** complete and accepted for prepare, bind, inspect, navigate, click, type, dialog, and pointer semantics.
-- **Browser transfer:** not started. Upload/download remain intentionally unsupported and unadvertised until a separate transfer closeout is completed.
+- **Browser transfer:** complete and accepted. Upload/download use scoped CUMG refs plus Agent-private bounded staging; no arbitrary host path is exposed northbound.
 - **V1 production:** unchanged by the V2 development branch. V1 regression and conformance coverage remains required during V2 work.
 
 ## Active contracts
@@ -22,6 +22,7 @@ Status as of 2026-08-15:
 ## Acceptance evidence
 
 - [`acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) — Browser core closeout.
+- [`acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) — Browser transfer contract, threat controls, automated coverage, and trusted-Mac real-Cua evidence.
 - [`acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md`](acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md) — trusted physical Desktop acceptance procedure/evidence.
 - [`acceptance/V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md) — earlier secure-Agent milestone acceptance retained as evidence.
 

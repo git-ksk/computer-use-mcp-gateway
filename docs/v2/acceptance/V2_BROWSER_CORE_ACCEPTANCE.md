@@ -2,8 +2,7 @@
 
 ## Scope
 
-This document defines the closeout gate for the **core** browser semantic path. It does not mark the
-separate upload/download transfer boundary complete.
+This document records the closeout gate for the **core** browser semantic path. The separate transfer closeout is now complete and is recorded in [`V2_BROWSER_TRANSFER_ACCEPTANCE.md`](V2_BROWSER_TRANSFER_ACCEPTANCE.md).
 
 The core path is:
 
@@ -49,15 +48,11 @@ The production V1 route is not changed by this work.
 12. Control and capability schema v4 mixing fails closed against pre-v4 peers.
 13. Browser core requires a fresh `WindowScoped` InteractionContext. A context monotonically expanded
     to `DesktopScoped` cannot be silently downgraded for browser use.
-14. Only Browser bind/snapshot observations receive the reviewed bounded-large result allowance;
-    transfer capabilities remain unadvertised and mutations retain the ordinary carrier bound.
+14. Browser bind/snapshot observations and the explicitly bounded 16 MiB transfer carriers may use the reviewed bounded-large result allowance; ordinary Browser core mutations retain the ordinary carrier bound.
 
 ## Current core advertisement
 
-The core branch advertises exactly eight northbound browser tools when the matching live capability
-and policy are present: `browser_prepare`, `browser_bind`, `browser_inspect`, `browser_navigate`,
-`browser_click`, `browser_type`, `browser_dialog`, and `browser_pointer`. Browser upload/download are
-not present in tool discovery.
+The core set remains eight northbound browser tools when the matching live capability and policy are present: `browser_prepare`, `browser_bind`, `browser_inspect`, `browser_navigate`, `browser_click`, `browser_type`, `browser_dialog`, and `browser_pointer`. The completed transfer surface adds `browser_stage_upload_file`, `browser_upload_file`, and `browser_download_file` only when the exact live transfer capability and policy permit them.
 
 ## Core real-Cua acceptance
 
@@ -113,32 +108,15 @@ and integral floating-point viewport dimensions. This evidence does **not** make
 draft by itself; final-head CI, reproducible local acceptance, cleanup/session plateau checks, and the
 remaining closeout bullets still apply.
 
-## Transfer boundary remains separate
+## Transfer boundary closeout
 
-`BrowserUploadFile` and `BrowserDownload` may exist in schema v4 so grants, signed transport, rolling
-upgrade, and exact capability identities are reviewable, but they must **not** be advertised live until
-the transfer implementation is complete.
+The transfer boundary completed on 2026-08-15. Upload uses bounded northbound bytes -> a one-shot scoped CUMG file ref -> Agent-private regular-file staging -> real Cua `browser_set_input_files`. Download accepts no host destination path: it uses an exact click-capable page ref, a logical path-safe name, a mandatory 16 MiB-or-smaller bound, and explicit overwrite semantics; the Agent supplies its own private per-operation root to Cua `browser_download`, revalidates the direct regular-file result, and returns only a scoped result ref plus bounded bytes/metadata.
 
-Upload completion requires:
+Symlink/path escape, stale/cross-session/generation/revision refs, file replacement, collision/overwrite, partial/oversized completion, definite backend failure, and cancellation/timeout behavior are covered by dedicated tests. Cancellation/timeout after dispatch remains indeterminate and uses the existing quarantine/no-replay state machine.
 
-- a CUMG-issued file ref;
-- local canonical regular-file validation without symlink traversal;
-- explicit staging/lifetime cleanup;
-- exact `BrowserUploadFile` authorization;
-- no arbitrary public path forwarded to Cua.
+Trusted-Mac acceptance against installed Cua 0.19.3 passed with a harmless upload, deterministic download, and stale-ref refusal without changing V1/Cloudflare or bypassing Cua/TCC authorization. See [`V2_BROWSER_TRANSFER_ACCEPTANCE.md`](V2_BROWSER_TRANSFER_ACCEPTANCE.md).
 
-Download completion requires:
-
-- a CUMG-issued destination-root ref;
-- an existing canonical local root;
-- a caller-chosen path-safe destination basename, never an untrusted server filename;
-- a hard byte ceiling enforced during transfer, not only checked afterward;
-- explicit overwrite policy enforced before destination mutation;
-- exact `BrowserDownload` authorization and reviewed mapping to Cua's host-approval proof;
-- deterministic cleanup/restoration on success, refusal, timeout, cancellation, and disconnect.
-
-Until those gates pass, upload/download are unsupported rather than silently falling back to raw Cua
-paths or unbounded download behavior.
+**Browser transfer complete.**
 
 ## PR closeout
 
@@ -152,5 +130,4 @@ The browser PR is ready to leave draft only after:
 - no raw Cua/CDP escape hatch is present;
 - production V1/Cloudflare has not changed.
 
-The final V1 -> V2 cutover remains a later repository-level gate after the complete Cua 0.19.3 parity
-matrix, browser transfer closeout, and actual GatewayMCP/ChatGPT path smoke are complete.
+The final V1 -> V2 cutover remains a later repository-level gate after the complete Cua 0.19.3 parity matrix and actual GatewayMCP/ChatGPT path smoke are complete. PR #44 remains Draft and unmerged for this closeout.

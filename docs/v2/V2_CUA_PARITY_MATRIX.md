@@ -76,8 +76,8 @@ method escape hatch.
 | 39 | `browser_click` | semantic, core-wired | `BrowserClick` using scoped page refs |
 | 40 | `browser_type` | semantic, core-wired | `BrowserType` using scoped page refs |
 | 41 | `browser_dialog` | semantic, core-wired | `BrowserDialog` |
-| 42 | `browser_set_input_files` | semantic, planned | dedicated `BrowserUploadFile`; only CUMG-issued file refs |
-| 43 | `browser_download` | semantic, planned | dedicated `BrowserDownload`; bounded destination/size/overwrite |
+| 42 | `browser_set_input_files` | semantic, core-wired | `BrowserUploadFile`; one-shot CUMG file refs resolve only to Agent-private staged regular files |
+| 43 | `browser_download` | semantic, core-wired | `BrowserDownload`; exact click ref + Agent-private destination root + bounded result ref/data |
 | 44 | `browser_pointer` | semantic, core-wired | `BrowserPointer` with explicit browser viewport coordinates |
 | 45 | `start_recording` | operator/test-only | local acceptance/regression tooling |
 | 46 | `stop_recording` | operator/test-only | local acceptance/regression tooling |
@@ -146,7 +146,7 @@ Browser workflow:
 
 ```text
 bind/prepare -> inspect -> navigate -> semantic interaction -> dialog -> verify
--> [separate transfer closeout: explicit upload/download]
+-> explicit bounded upload/download
 ```
 
 Both workflows must preserve CUMG operation IDs, exact capability authorization, generation fencing,
