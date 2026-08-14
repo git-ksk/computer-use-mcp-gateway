@@ -665,9 +665,10 @@ mod tests {
                 &[BrowserAction::Click, BrowserAction::Pointer],
             )
             .unwrap();
-        assert!(refs
-            .resolve_action(&context, &target, &tab, &action, BrowserAction::Click)
-            .is_ok());
+        assert!(
+            refs.resolve_action(&context, &target, &tab, &action, BrowserAction::Click)
+                .is_ok()
+        );
         assert_eq!(
             refs.resolve_action(&context, &target, &tab, &action, BrowserAction::Type),
             Err(BrowserRefError::ActionUnavailable)
@@ -694,18 +695,13 @@ mod tests {
             .mint_content_element(&context, &target, &tab, &snapshot, "content")
             .unwrap();
         assert_eq!(
-            refs.resolve_action(
-                &context,
-                &target,
-                &tab,
-                &content,
-                BrowserAction::Click,
-            ),
+            refs.resolve_action(&context, &target, &tab, &content, BrowserAction::Click,),
             Err(BrowserRefError::KindMismatch)
         );
-        assert!(refs
-            .resolve_scope_ref(&context, &target, &tab, &content)
-            .is_ok());
+        assert!(
+            refs.resolve_scope_ref(&context, &target, &tab, &content)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -754,15 +750,16 @@ mod tests {
             ),
             Err(BrowserRefError::UnknownRef)
         );
-        assert!(refs
-            .resolve_action(
+        assert!(
+            refs.resolve_action(
                 &context,
                 &target,
                 &second_tab,
                 &second_element,
                 BrowserAction::Click,
             )
-            .is_ok());
+            .is_ok()
+        );
     }
 
     #[test]
