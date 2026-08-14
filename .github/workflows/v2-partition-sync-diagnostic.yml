@@ -1,0 +1,65 @@
+name: V2 partition sync diagnostic
+
+on:
+  push:
+    branches:
+      - feat/v2-browser-semantic-parity
+    paths:
+      - .github/workflows/v2-partition-sync-diagnostic.yml
+
+jobs:
+  repeat-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: feat/v2-browser-semantic-parity
+      - name: Synchronize partition test on actual local worker start
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/v2_m1_partition_recovery.rs')
+          s = p.read_text()
+          s = s.replace(
+              '    let effect_marker = root.join("effect.txt");\n',
+              '    let effect_marker = root.join("effect.txt");\n    let started_marker = root.join("started.txt");\n',
+              1,
+          )
+          s = s.replace(
+              '    let command = format!(\n        "sleep 1; printf ambiguous-effect > \'{}\'",\n        effect_marker.display()\n    );\n',
+              '    let command = format!(\n        "printf started > \'{}\'; sleep 1; printf ambiguous-effect > \'{}\'",\n        started_marker.display(),\n        effect_marker.display()\n    );\n',
+              1,
+          )
+          s = s.replace(
+              '    tokio::time::sleep(Duration::from_millis(120)).await;\n\n    // Drop the Agent network/runtime future after the Hub has durably marked\n',
+              '    tokio::time::timeout(Duration::from_secs(3), async {\n        while !started_marker.is_file() {\n            tokio::time::sleep(Duration::from_millis(10)).await;\n        }\n    })\n    .await\n    .context("Agent local worker did not start before partition")?;\n\n    // Drop the Agent network/runtime future after the local worker has started and the Hub has durably marked\n',
+              1,
+          )
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff -- tests/v2_m1_partition_recovery.rs
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Repeat synchronized partition recovery
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          for i in $(seq 1 20); do
+            echo "===== partition iteration $i ====="
+            cargo test --locked --test v2_m1_partition_recovery -- --nocapture
+          done
+
+      - name: Repeat multi-device recovery
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          for i in $(seq 1 20); do
+            echo "===== multi-device iteration $i ====="
+            cargo test --locked --test v2_p1_multi_device_e2e -- --nocapture
+          done
