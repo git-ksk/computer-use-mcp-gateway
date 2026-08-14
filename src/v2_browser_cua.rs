@@ -195,7 +195,11 @@ pub(crate) fn map_browser_prepare(
         BrowserPrepareProfileMode::ExistingProfile => {
             args.insert(
                 "window_id".into(),
-                json!(request.window_id.expect("validated existing-profile window")),
+                json!(
+                    request
+                        .window_id
+                        .expect("validated existing-profile window")
+                ),
             );
             args.insert("strategy".into(), json!({"kind": "existing_profile"}));
             // Existing-profile runtime grants/host authorization are intentionally
@@ -242,7 +246,10 @@ pub(crate) fn map_browser_inspect(
     target.insert(&mut args);
     args.insert("session".into(), json!(request.context_id));
     args.insert("snapshot_format".into(), json!("semantic_v2"));
-    args.insert("include_screenshot".into(), json!(request.include_screenshot));
+    args.insert(
+        "include_screenshot".into(),
+        json!(request.include_screenshot),
+    );
     if let Some(query) = &request.query {
         args.insert("query".into(), json!(query));
     }
@@ -276,7 +283,10 @@ pub(crate) fn map_browser_click(
     let mut args = Map::new();
     target.insert(&mut args);
     args.insert("session".into(), json!(request.context_id));
-    args.insert("input_route".into(), json!(input_route(request.input_route)));
+    args.insert(
+        "input_route".into(),
+        json!(input_route(request.input_route)),
+    );
     match &request.target {
         BrowserClickTarget::Element { .. } => {
             let element = backend_element_ref.ok_or(CuaBrowserMappingError::ResolutionMismatch)?;
@@ -359,7 +369,10 @@ pub(crate) fn map_browser_pointer(
     target.insert(&mut args);
     args.insert("session".into(), json!(request.context_id));
     args.insert("ref".into(), json!(backend_element_ref.as_str()));
-    args.insert("input_route".into(), json!(input_route(request.input_route)));
+    args.insert(
+        "input_route".into(),
+        json!(input_route(request.input_route)),
+    );
     args.insert(
         "action".into(),
         json!(match request.action {
@@ -463,8 +476,8 @@ fn validate_resolved_absolute_path(value: &str) -> Result<(), CuaBrowserMappingE
 mod tests {
     use super::*;
     use crate::v2_browser::{
-        BrowserClickTarget, BrowserDownloadRequest, BrowserPointerAction, BrowserPrepareProfileMode,
-        BrowserPrepareRequest, BrowserUploadRequest,
+        BrowserClickTarget, BrowserDownloadRequest, BrowserPointerAction,
+        BrowserPrepareProfileMode, BrowserPrepareRequest, BrowserUploadRequest,
     };
 
     const CONTEXT: &str = "ctx_0123456789abcdef0123456789abcdef";
@@ -503,9 +516,16 @@ mod tests {
         })
         .unwrap();
         assert_eq!(call.tool(), "browser_prepare");
-        assert_eq!(call.arguments()["strategy"], json!({"kind": "existing_profile"}));
+        assert_eq!(
+            call.arguments()["strategy"],
+            json!({"kind": "existing_profile"})
+        );
         assert!(!call.arguments().contains_key("approval_token"));
-        assert!(!call.arguments().contains_key(CUA_DOWNLOAD_HOST_APPROVAL_ARG));
+        assert!(
+            !call
+                .arguments()
+                .contains_key(CUA_DOWNLOAD_HOST_APPROVAL_ARG)
+        );
     }
 
     #[test]
@@ -519,7 +539,8 @@ mod tests {
             },
             input_route: BrowserInputRoute::DomEvent,
         };
-        let call = map_browser_click(&request, &target(), Some(&handle("backend-element"))).unwrap();
+        let call =
+            map_browser_click(&request, &target(), Some(&handle("backend-element"))).unwrap();
         assert_eq!(call.tool(), "browser_click");
         assert_eq!(call.arguments()["ref"], json!("backend-element"));
         assert_ne!(call.arguments()["ref"], json!(public_ref(3)));
@@ -552,12 +573,17 @@ mod tests {
             element_ref: public_ref(3),
             file_refs: vec![public_ref(4)],
         };
-        let file = ResolvedUploadFilePath::from_file_ref_resolution("/tmp/proven-upload.txt".into())
-            .unwrap();
-        let call = map_browser_upload(&request, &target(), &handle("backend-upload"), &[file])
-            .unwrap();
+        let file =
+            ResolvedUploadFilePath::from_file_ref_resolution("/tmp/proven-upload.txt".into())
+                .unwrap();
+        let call =
+            map_browser_upload(&request, &target(), &handle("backend-upload"), &[file]).unwrap();
         assert_eq!(call.arguments()["paths"], json!(["/tmp/proven-upload.txt"]));
-        assert!(!serde_json::to_string(&request).unwrap().contains("/tmp/proven-upload.txt"));
+        assert!(
+            !serde_json::to_string(&request)
+                .unwrap()
+                .contains("/tmp/proven-upload.txt")
+        );
     }
 
     #[test]
@@ -580,7 +606,11 @@ mod tests {
             CuaDownloadHostApproval::NotApproved,
         )
         .unwrap();
-        assert!(!denied.arguments().contains_key(CUA_DOWNLOAD_HOST_APPROVAL_ARG));
+        assert!(
+            !denied
+                .arguments()
+                .contains_key(CUA_DOWNLOAD_HOST_APPROVAL_ARG)
+        );
 
         let approved = map_browser_download(
             &request,
@@ -590,12 +620,17 @@ mod tests {
             CuaDownloadHostApproval::ApprovedAfterExactCapabilityAuthorization,
         )
         .unwrap();
-        assert_eq!(approved.arguments()[CUA_DOWNLOAD_HOST_APPROVAL_ARG], json!(true));
-        assert!(!serde_json::to_value(&request)
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .contains_key(CUA_DOWNLOAD_HOST_APPROVAL_ARG));
+        assert_eq!(
+            approved.arguments()[CUA_DOWNLOAD_HOST_APPROVAL_ARG],
+            json!(true)
+        );
+        assert!(
+            !serde_json::to_value(&request)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key(CUA_DOWNLOAD_HOST_APPROVAL_ARG)
+        );
     }
 
     #[test]
@@ -629,8 +664,9 @@ mod tests {
     fn adapter_debug_output_redacts_backend_browser_material_and_paths() {
         let target = target();
         assert!(!format!("{target:?}").contains("backend-target-secret"));
-        let path = ResolvedUploadFilePath::from_file_ref_resolution("/tmp/secret-upload.txt".into())
-            .unwrap();
+        let path =
+            ResolvedUploadFilePath::from_file_ref_resolution("/tmp/secret-upload.txt".into())
+                .unwrap();
         assert!(!format!("{path:?}").contains("secret-upload"));
         let call = map_browser_bind(CONTEXT, 42, 7).unwrap();
         assert!(!format!("{call:?}").contains(CONTEXT));
