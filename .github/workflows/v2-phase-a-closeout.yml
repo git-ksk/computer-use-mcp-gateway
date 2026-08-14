@@ -1,4 +1,4 @@
-name: V2 Phase A closeout
+name: V2 Phase A strict evidence
 
 on:
   push:
@@ -13,10 +13,16 @@ permissions:
 jobs:
   recovery-stability:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Restore original heartbeat deadline
+        run: |
+          sed -i 's/heartbeat_interval: Duration::from_millis(500)/heartbeat_interval: Duration::from_millis(50)/' tests/v2_m1_partition_recovery.rs
+          grep -q 'heartbeat_interval: Duration::from_millis(50)' tests/v2_m1_partition_recovery.rs
+          ! grep -q 'heartbeat_interval: Duration::from_millis(500)' tests/v2_m1_partition_recovery.rs
 
       - name: Install Rust 1.88
         run: |
@@ -36,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           for i in $(seq 1 50); do
-            echo "===== partition iteration $i ====="
+            echo "===== strict partition iteration $i ====="
             cargo test --locked --test v2_m1_partition_recovery -- --nocapture
           done
 
@@ -46,6 +52,6 @@ jobs:
         run: |
           set -euo pipefail
           for i in $(seq 1 50); do
-            echo "===== multi-device iteration $i ====="
+            echo "===== strict multi-device iteration $i ====="
             cargo test --locked --test v2_p1_multi_device_e2e -- --nocapture
           done
