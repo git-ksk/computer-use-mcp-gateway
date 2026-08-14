@@ -19,6 +19,10 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
+// This E2E validates the shared desktop ownership/quarantine boundary rather
+// than sub-second heartbeat timeout behavior.
+const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn temp_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "cumg-{name}-{}-{}",
@@ -69,7 +73,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
     let (hub, handle) = SingleDeviceHub::new(
         HubServiceConfig {
             state_dir: hub_state.clone(),
-            heartbeat_timeout: Duration::from_millis(700),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
             max_queued_per_device: 4,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 60,
