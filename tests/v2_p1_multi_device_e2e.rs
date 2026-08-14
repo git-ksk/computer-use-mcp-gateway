@@ -269,7 +269,7 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
             "--cancel-marker".into(),
             cancel_marker.to_string_lossy().into_owned(),
         ],
-        backend_version: "fixture".into(),
+        backend_version: "1.0.0".into(),
         platform: "test".into(),
         revision: 1,
         connect_timeout: Duration::from_secs(3),

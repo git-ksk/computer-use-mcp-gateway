@@ -36,6 +36,7 @@ pub struct CuaBackend {
     tool_timeout: Duration,
     reconnect_attempts: u32,
     reconnect_backoff: Duration,
+    expected_server_version: Option<String>,
     service: Arc<Mutex<Option<RunningService<RoleClient, ()>>>>,
     backend_pid: Arc<Mutex<Option<u32>>>,
     reconnect_lock: Arc<Mutex<()>>,
@@ -69,11 +70,23 @@ impl CuaBackend {
             tool_timeout,
             reconnect_attempts: reconnect_attempts.max(1),
             reconnect_backoff,
+            expected_server_version: None,
             service: Arc::new(Mutex::new(None)),
             backend_pid: Arc::new(Mutex::new(None)),
             reconnect_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Require the MCP server handshake to report an exact implementation version.
+    /// The check runs on every backend connection, including reconnects, so a
+    /// package/daemon update cannot silently widen the reviewed compatibility target.
+    pub fn with_expected_server_version(mut self, version: impl Into<String>) -> Self {
+        let version = version.into();
+        if !version.trim().is_empty() {
+            self.expected_server_version = Some(version);
+        }
+        self
     }
 
     async fn is_connected(&self) -> bool {
@@ -104,10 +117,22 @@ impl CuaBackend {
         let transport =
             TokioChildProcess::new(command).context("failed to spawn Cua MCP backend process")?;
         let pid = transport.id();
-        let service = timeout(self.connect_timeout, ().serve(transport))
+        let mut service = timeout(self.connect_timeout, ().serve(transport))
             .await
             .context("timed out initializing Cua MCP backend")?
             .context("failed to initialize Cua MCP backend")?;
+
+        if let Some(expected) = self.expected_server_version.as_deref() {
+            let actual = service.peer().peer_info().and_then(|info| {
+                info.server_info
+                    .as_ref()
+                    .map(|server| server.version.clone())
+            });
+            if actual.as_deref() != Some(expected) {
+                let _ = timeout(self.connect_timeout, service.close()).await;
+                bail!("Cua MCP backend version does not match the configured compatibility target");
+            }
+        }
 
         *self.service.lock().await = Some(service);
         *self.backend_pid.lock().await = pid;
@@ -403,6 +428,41 @@ mod tests {
         assert_eq!(parse_ps_cpu_time("2-01:02:03"), Some(176_523.0));
         assert_eq!(parse_ps_cpu_time("00:00.25"), Some(0.25));
         assert_eq!(parse_ps_cpu_time("garbage"), None);
+    }
+
+    #[tokio::test]
+    async fn exact_server_version_pin_accepts_match_and_rejects_mismatch() {
+        let matching = CuaBackend::new(
+            "python3",
+            vec!["scripts/mock_mcp_backend.py".into()],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            Duration::from_millis(10),
+        )
+        .with_expected_server_version("1.0.0");
+        matching
+            .connect()
+            .await
+            .expect("matching MCP server version must connect");
+        matching
+            .shutdown()
+            .await
+            .expect("matching fixture shuts down");
+
+        let mismatched = CuaBackend::new(
+            "python3",
+            vec!["scripts/mock_mcp_backend.py".into()],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            Duration::from_millis(10),
+        )
+        .with_expected_server_version("9.9.9");
+        assert!(
+            mismatched.connect().await.is_err(),
+            "mismatched MCP server version must fail closed"
+        );
     }
 
     #[tokio::test]

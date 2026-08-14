@@ -52,7 +52,7 @@ use axum::{
     extract::{Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        header::{AUTHORIZATION, ORIGIN, WWW_AUTHENTICATE},
         request::Parts,
     },
     middleware::{self, Next},
@@ -652,6 +652,57 @@ struct NorthboundAuthState {
 #[derive(Clone)]
 struct TrustedProxyAuthState {
     principal: AuthenticatedClientPrincipal,
+    resource_url: Url,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExactOriginError {
+    BadRequest,
+    Forbidden,
+}
+
+impl ExactOriginError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::BadRequest => (
+                StatusCode::BAD_REQUEST,
+                "Bad Request: invalid Origin header",
+            )
+                .into_response(),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "Forbidden: Origin header is not allowed",
+            )
+                .into_response(),
+        }
+    }
+}
+
+fn validate_exact_browser_origin(
+    headers: &HeaderMap,
+    resource_url: &Url,
+) -> Result<(), ExactOriginError> {
+    let mut values = headers.get_all(ORIGIN).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(ExactOriginError::BadRequest);
+    }
+    let raw = value.to_str().map_err(|_| ExactOriginError::BadRequest)?;
+    let origin = Url::parse(raw).map_err(|_| ExactOriginError::BadRequest)?;
+    if !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(ExactOriginError::BadRequest);
+    }
+    if origin.origin() != resource_url.origin() {
+        return Err(ExactOriginError::Forbidden);
+    }
+    Ok(())
 }
 
 /// Build a northbound MCP resource for an explicitly single-principal deployment
@@ -669,10 +720,12 @@ pub fn build_trusted_proxy_router(handler: V2NorthboundMcp, config: TrustedProxy
     if let Some(host) = config.resource_url.host_str() {
         allowed_hosts.push(host.to_owned());
     }
+    let allowed_origins = vec![config.resource_url.origin().ascii_serialization()];
     let http_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_allowed_hosts(allowed_hosts)
+        .with_allowed_origins(allowed_origins)
         .with_stateless_protocol_metadata_required(true);
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -681,6 +734,7 @@ pub fn build_trusted_proxy_router(handler: V2NorthboundMcp, config: TrustedProxy
     );
     let state = TrustedProxyAuthState {
         principal: config.principal.clone(),
+        resource_url: config.resource_url.clone(),
     };
     Router::new()
         .nest_service(config.mcp_path(), service)
@@ -693,6 +747,9 @@ async fn trusted_proxy_guard(
     mut request: Request,
     next: Next,
 ) -> Response {
+    if let Err(error) = validate_exact_browser_origin(request.headers(), &state.resource_url) {
+        return error.into_response();
+    }
     // Authentication is completed by the reviewed proxy before this loopback
     // listener. Strip known credentials/identity hints so neither rmcp nor the
     // Hub/Agent path can accidentally consume or log them. None of these values
@@ -728,10 +785,12 @@ pub fn build_northbound_router(
     if let Some(host) = config.resource_url.host_str() {
         allowed_hosts.push(host.to_owned());
     }
+    let allowed_origins = vec![config.resource_url.origin().ascii_serialization()];
     let http_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_allowed_hosts(allowed_hosts)
+        .with_allowed_origins(allowed_origins)
         .with_stateless_protocol_metadata_required(true);
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -768,6 +827,10 @@ async fn oauth_resource_guard(
     mut request: Request,
     next: Next,
 ) -> Response {
+    if let Err(error) = validate_exact_browser_origin(request.headers(), &state.config.resource_url)
+    {
+        return error.into_response();
+    }
     if query_contains_access_token(request.uri().query()) {
         return oauth_error_response(
             StatusCode::BAD_REQUEST,
@@ -5089,6 +5152,7 @@ mod tests {
             .layer(middleware::from_fn_with_state(
                 TrustedProxyAuthState {
                     principal: configured,
+                    resource_url: Url::parse("https://hub.example/mcp").unwrap(),
                 },
                 trusted_proxy_guard,
             ));
@@ -5676,9 +5740,46 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
 
+        let rejected = Client::new()
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("northbound-only-token")
+            .header("Origin", "https://evil.example")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let wrong_port = Client::new()
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("northbound-only-token")
+            .header("Origin", "https://hub.example:8443")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_port.status(), StatusCode::FORBIDDEN);
+
         let response = Client::new()
             .post(format!("http://{address}/mcp"))
             .bearer_auth("northbound-only-token")
+            .header("Origin", "https://hub.example")
             .header("MCP-Protocol-Version", "2026-07-28")
             .header("Mcp-Method", "tools/list")
             .header("Accept", "application/json, text/event-stream")
@@ -5761,8 +5862,45 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
 
+        let rejected = Client::new()
+            .post(format!("http://{address}/mcp"))
+            .header("Origin", "https://evil.example")
+            .header("X-User", "attacker-selected-user")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let wrong_port = Client::new()
+            .post(format!("http://{address}/mcp"))
+            .header("Origin", "https://hub.example:8443")
+            .header("X-User", "attacker-selected-user")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .header("Accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_port.status(), StatusCode::FORBIDDEN);
+
         let response = Client::new()
             .post(format!("http://{address}/mcp"))
+            .header("Origin", "https://hub.example")
             .header("X-User", "attacker-selected-user")
             .header("MCP-Protocol-Version", "2026-07-28")
             .header("Mcp-Method", "tools/list")

@@ -21,6 +21,7 @@
     <key>CUMG_V2_ALLOWED_CWD_ROOTS</key><string>@HOME@</string>
     <key>CUMG_V2_CUA_COMMAND</key><string>@HOME@/.local/bin/cua-driver</string>
     <key>CUMG_V2_CUA_ARGS</key><string>mcp</string>
+    <key>CUMG_V2_CUA_BACKEND_VERSION</key><string>0.19.3</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
