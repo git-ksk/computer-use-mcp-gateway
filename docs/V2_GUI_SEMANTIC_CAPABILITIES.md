@@ -93,6 +93,8 @@ Those operations describe the executor's local lifecycle or perception machinery
 
 This prevents CUMG authorization policy from becoming a mirror of one backend's implementation API.
 
+The complete Cua 0.19.3 disposition is tracked in [`V2_CUA_PARITY_MATRIX.md`](V2_CUA_PARITY_MATRIX.md). Stateful backend workflows use the CUMG-owned [`InteractionContext`](V2_INTERACTION_CONTEXT.md) boundary; transport sessions and backend session identifiers are not authorization identity.
+
 ## Adding another GUI semantic capability
 
 A backend feature should be promoted into the CUMG contract only when all of these are true:

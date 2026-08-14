@@ -22,6 +22,7 @@ pub mod v2_m1_hub;
 pub mod v2_m1_northbound;
 
 pub mod v2_execution_safety;
+pub mod v2_interaction_context;
 pub mod v2_limits;
 pub mod v2_multi_device;
 pub mod v2_observability;
