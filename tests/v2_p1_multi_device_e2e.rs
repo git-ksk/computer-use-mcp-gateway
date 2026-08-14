@@ -22,6 +22,12 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
+// This E2E proves ownership/quarantine/restart isolation, not heartbeat timeout
+// precision. Keep scheduling slack well above the 50 ms Agent heartbeat so a
+// briefly descheduled hosted runner cannot turn the fixture into SessionClosed.
+const E2E_EVENTUALLY: Duration = Duration::from_secs(10);
+const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn temp_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "cumg-{name}-{}-{}",
@@ -49,7 +55,7 @@ fn stable_device_id(identity: &DeviceIdentity) -> String {
 fn hub_config(state_dir: PathBuf) -> HubServiceConfig {
     HubServiceConfig {
         state_dir,
-        heartbeat_timeout: Duration::from_millis(700),
+        heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
         max_queued_per_device: 4,
         max_agent_sessions: 2,
         max_agent_session_starts_per_minute: 120,
@@ -109,7 +115,7 @@ fn agent_config(
 }
 
 async fn wait_online(handle: &HubHandle) -> Result<u64> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(E2E_EVENTUALLY, async {
         loop {
             if let Some(generation) = handle.current_generation().await {
                 return generation;
@@ -122,7 +128,7 @@ async fn wait_online(handle: &HubHandle) -> Result<u64> {
 }
 
 async fn wait_new_generation(handle: &HubHandle, old: u64) -> Result<u64> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(E2E_EVENTUALLY, async {
         loop {
             if let Some(generation) = handle.current_generation().await
                 && generation > old
@@ -137,7 +143,7 @@ async fn wait_new_generation(handle: &HubHandle, old: u64) -> Result<u64> {
 }
 
 async fn wait_file(path: &std::path::Path) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(E2E_EVENTUALLY, async {
         while !path.is_file() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
