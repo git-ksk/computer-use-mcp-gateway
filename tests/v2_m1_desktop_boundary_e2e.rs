@@ -128,7 +128,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
                     "--cancel-marker".into(),
                     cancel_marker.to_string_lossy().into_owned(),
                 ],
-                backend_version: "fixture".into(),
+                backend_version: "1.0.0".into(),
                 platform: "test".into(),
                 revision: 1,
                 connect_timeout: Duration::from_secs(3),

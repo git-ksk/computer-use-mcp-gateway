@@ -250,9 +250,10 @@ Configure the Hub endpoint/domain, stable device ID, device secret, Hub/grant pu
 ```text
 CUMG_V2_CUA_COMMAND=cua-driver
 CUMG_V2_CUA_ARGS=mcp
+CUMG_V2_CUA_BACKEND_VERSION=0.19.3
 ```
 
-Cua stays behind the Agent over MCP stdio. On macOS, keep the Agent/Cua in the logged-in user session and do not bypass TCC prompts or move GUI automation into a headless system daemon.
+Cua stays behind the Agent over MCP stdio. Set `CUMG_V2_CUA_BACKEND_VERSION` to the exact reviewed compatibility target in production. When set to a concrete value, the Agent verifies the Cua MCP handshake `serverInfo.version` on every connection and reconnect and fails closed on drift. The `external` default is an explicit unpinned mode for custom deployments, not the recommended production setting for the reviewed Cua path. On macOS, keep the Agent/Cua in the logged-in user session and do not bypass TCC prompts or move GUI automation into a headless system daemon.
 
 ## 9. Optional runtime usage quota
 
@@ -271,6 +272,7 @@ This is non-durable runtime/session quota, not billing. Restarting the packaged 
 
 Before exposing the northbound MCP resource, verify all of these independently:
 
+- `cua-driver --version` matches the configured `CUMG_V2_CUA_BACKEND_VERSION`;
 - `cua-driver call list_apps` works on the desktop;
 - the V2 Agent connects with the expected stable device and a fresh generation;
 - northbound OAuth produces only the intended issuer+subject principal;

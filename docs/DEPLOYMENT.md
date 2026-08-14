@@ -72,7 +72,9 @@ Install `packaging/systemd/cumg-v2-agent.service` as a **user service** and cust
 
 ### macOS Agent
 
-Customize `packaging/launchd/com.github.git-ksk.cumg-v2-agent.plist`, replacing `@BINARY@` and `@HOME@`, then install it as a user LaunchAgent. Cua-backed GUI automation must run in the logged-in user session so Accessibility/Screen Recording TCC attribution remains explicit. Secret/trust files live outside the repository under the user's Application Support tree with restrictive permissions.
+Customize `packaging/launchd/com.github.git-ksk.cumg-v2-agent.plist`, replacing `@BINARY@` and `@HOME@`, then install it as a user LaunchAgent. Cua-backed GUI automation must run in the logged-in user session so Accessibility/Screen Recording TCC attribution remains explicit. Secret/trust files live outside the repository under the user's Application Support tree with restrictive permissions. Keep `CUMG_V2_CUA_BACKEND_VERSION` pinned to the exact reviewed Cua version; a concrete value is checked against the MCP handshake on initial connection and reconnect.
+
+For an existing V1 production endpoint moving to V2, follow the guarded [`V2 production cutover runbook`](v2/V2_PRODUCTION_CUTOVER.md). Do not treat a successful local V2 start as permission to stop V1.
 
 ### Overload and observability
 

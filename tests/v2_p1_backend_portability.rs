@@ -211,7 +211,7 @@ async fn cua_and_reference_unknown_outcomes_use_the_same_authoritative_core_sema
     let cua = CuaMcpAdapter::new(
         "python3",
         vec![fixture.to_string_lossy().into_owned()],
-        "fixture",
+        "1.0.0",
         "test",
         1,
         Duration::from_secs(3),

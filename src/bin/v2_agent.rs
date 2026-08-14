@@ -61,6 +61,8 @@ struct Config {
     cua_command: Option<String>,
     #[arg(long = "cua-arg", env = "CUMG_V2_CUA_ARGS", value_delimiter = ',')]
     cua_args: Vec<String>,
+    /// Exact MCP serverInfo.version compatibility target for Cua.
+    /// The default `external` disables the runtime version pin for custom deployments.
     #[arg(long, env = "CUMG_V2_CUA_BACKEND_VERSION", default_value = "external")]
     cua_backend_version: String,
     #[arg(long, env = "CUMG_V2_CUA_CONNECT_TIMEOUT_SECS", default_value_t = 10)]

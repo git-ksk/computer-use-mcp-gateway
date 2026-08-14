@@ -139,16 +139,23 @@ impl CuaMcpAdapter {
         reconnect_attempts: u32,
         reconnect_backoff: Duration,
     ) -> Self {
+        let backend_version = backend_version.into();
+        let backend = CuaBackend::new(
+            command,
+            args,
+            connect_timeout,
+            tool_timeout,
+            reconnect_attempts,
+            reconnect_backoff,
+        );
+        let backend = if backend_version == "external" {
+            backend
+        } else {
+            backend.with_expected_server_version(backend_version.clone())
+        };
         Self {
-            backend: CuaBackend::new(
-                command,
-                args,
-                connect_timeout,
-                tool_timeout,
-                reconnect_attempts,
-                reconnect_backoff,
-            ),
-            backend_version: backend_version.into(),
+            backend,
+            backend_version,
             platform: platform.into(),
             revision,
         }
@@ -2532,7 +2539,7 @@ mod tests {
         CuaMcpAdapter::new(
             "python3",
             args,
-            "fixture",
+            "1.0.0",
             "test",
             1,
             Duration::from_secs(5),
