@@ -1428,12 +1428,24 @@ fn normalize_windows_result(value: &Value) -> Result<DeviceResult, M1BackendErro
             .ok_or(M1BackendError::MalformedResponse(
                 "list_windows missing windows",
             ))?;
-    let truncated = windows.len() > MAX_WINDOW_RESULTS;
-    let normalized = windows
-        .iter()
-        .take(MAX_WINDOW_RESULTS)
-        .map(normalize_window)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut normalized = Vec::with_capacity(windows.len().min(MAX_WINDOW_RESULTS));
+    let mut truncated = false;
+    for window in windows {
+        let Some(window) = normalize_listed_window(window)? else {
+            // Cua may report zero-area helper/agent windows in the top-level
+            // observation feed. They cannot be targeted by the V2 window
+            // contract, so omit them from ListWindows rather than failing the
+            // entire read-only observation. All other fields are still parsed
+            // and validated before omission, and exact target/snapshot paths
+            // keep strict positive geometry.
+            continue;
+        };
+        if normalized.len() == MAX_WINDOW_RESULTS {
+            truncated = true;
+            break;
+        }
+        normalized.push(window);
+    }
     Ok(DeviceResult::Windows {
         windows: normalized,
         truncated,
@@ -1495,6 +1507,19 @@ fn normalize_application_launch_result(value: &Value) -> Result<DeviceResult, M1
 }
 
 fn normalize_window(value: &Value) -> Result<WindowInfo, M1BackendError> {
+    normalize_window_record(value, false)?.ok_or(M1BackendError::MalformedResponse(
+        "rectangle must be positive",
+    ))
+}
+
+fn normalize_listed_window(value: &Value) -> Result<Option<WindowInfo>, M1BackendError> {
+    normalize_window_record(value, true)
+}
+
+fn normalize_window_record(
+    value: &Value,
+    omit_zero_area: bool,
+) -> Result<Option<WindowInfo>, M1BackendError> {
     let window_id =
         value
             .get("window_id")
@@ -1522,7 +1547,7 @@ fn normalize_window(value: &Value) -> Result<WindowInfo, M1BackendError> {
     let bounds = value
         .get("bounds")
         .ok_or(M1BackendError::MalformedResponse("window missing bounds"))
-        .and_then(normalize_rect)?;
+        .and_then(normalize_rect_allow_zero)?;
     let is_on_screen = value.get("is_on_screen").and_then(Value::as_bool).ok_or(
         M1BackendError::MalformedResponse("window missing is_on_screen"),
     )?;
@@ -1535,7 +1560,15 @@ fn normalize_window(value: &Value) -> Result<WindowInfo, M1BackendError> {
             ));
         }
     };
-    Ok(WindowInfo {
+    if bounds.width == 0 || bounds.height == 0 {
+        if omit_zero_area {
+            return Ok(None);
+        }
+        return Err(M1BackendError::MalformedResponse(
+            "rectangle must be positive",
+        ));
+    }
+    Ok(Some(WindowInfo {
         window_id,
         process_id,
         application,
@@ -1543,10 +1576,20 @@ fn normalize_window(value: &Value) -> Result<WindowInfo, M1BackendError> {
         bounds,
         is_on_screen,
         on_current_workspace,
-    })
+    }))
 }
 
 fn normalize_rect(value: &Value) -> Result<UiRect, M1BackendError> {
+    let rect = normalize_rect_allow_zero(value)?;
+    if rect.width == 0 || rect.height == 0 {
+        return Err(M1BackendError::MalformedResponse(
+            "rectangle must be positive",
+        ));
+    }
+    Ok(rect)
+}
+
+fn normalize_rect_allow_zero(value: &Value) -> Result<UiRect, M1BackendError> {
     let object = value
         .as_object()
         .ok_or(M1BackendError::MalformedResponse("invalid rectangle"))?;
@@ -1560,11 +1603,6 @@ fn normalize_rect(value: &Value) -> Result<UiRect, M1BackendError> {
         object.get("height").or_else(|| object.get("h")),
         "rectangle height",
     )?;
-    if width == 0 || height == 0 {
-        return Err(M1BackendError::MalformedResponse(
-            "rectangle must be positive",
-        ));
-    }
     Ok(UiRect {
         x,
         y,
@@ -3600,6 +3638,135 @@ mod tests {
             BackendExecutionOutcome::Completed(DeviceResult::InteractionScopeExpanded)
         );
         adapter.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn list_windows_omits_zero_area_backend_records_but_keeps_strict_validation() {
+        let value = serde_json::json!({
+            "windows": [
+                {
+                    "window_id": 1,
+                    "pid": 10,
+                    "app_name": "Helper",
+                    "title": "",
+                    "bounds": {"x": 0, "y": 0, "width": 0, "height": 0},
+                    "is_on_screen": false,
+                    "on_current_space": null
+                },
+                {
+                    "window_id": 2,
+                    "pid": 11,
+                    "app_name": "App",
+                    "title": "Main",
+                    "bounds": {"x": 10, "y": 20, "width": 800, "height": 600},
+                    "is_on_screen": true,
+                    "on_current_space": true
+                }
+            ]
+        });
+        assert_eq!(
+            normalize_windows_result(&value).unwrap(),
+            DeviceResult::Windows {
+                windows: vec![WindowInfo {
+                    window_id: 2,
+                    process_id: 11,
+                    application: "App".into(),
+                    title: "Main".into(),
+                    bounds: UiRect {
+                        x: 10,
+                        y: 20,
+                        width: 800,
+                        height: 600,
+                    },
+                    is_on_screen: true,
+                    on_current_workspace: Some(true),
+                }],
+                truncated: false,
+            }
+        );
+
+        let malformed = serde_json::json!({
+            "windows": [{
+                "window_id": 3,
+                "pid": 12,
+                "app_name": "Broken",
+                "title": "",
+                "bounds": {"x": 0, "y": 0, "width": 0, "height": 0},
+                "on_current_space": null
+            }]
+        });
+        assert!(matches!(
+            normalize_windows_result(&malformed),
+            Err(M1BackendError::MalformedResponse(
+                "window missing is_on_screen"
+            ))
+        ));
+
+        let zero_area_target = serde_json::json!({
+            "window_id": 4,
+            "pid": 13,
+            "app_name": "Helper",
+            "title": "",
+            "bounds": {"x": 0, "y": 0, "width": 0, "height": 10},
+            "is_on_screen": false,
+            "on_current_space": null
+        });
+        assert!(matches!(
+            normalize_window(&zero_area_target),
+            Err(M1BackendError::MalformedResponse(
+                "rectangle must be positive"
+            ))
+        ));
+
+        let mut bounded = Vec::new();
+        for index in 0..MAX_WINDOW_RESULTS {
+            bounded.push(serde_json::json!({
+                "window_id": index as u64 + 10,
+                "pid": 100,
+                "app_name": "App",
+                "title": "Window",
+                "bounds": {"x": 0, "y": 0, "width": 10, "height": 10},
+                "is_on_screen": true,
+                "on_current_space": true
+            }));
+        }
+        bounded.push(serde_json::json!({
+            "window_id": 999_998,
+            "pid": 100,
+            "app_name": "Helper",
+            "title": "",
+            "bounds": {"x": 0, "y": 0, "width": 0, "height": 0},
+            "is_on_screen": false,
+            "on_current_space": null
+        }));
+        let at_limit =
+            normalize_windows_result(&serde_json::json!({"windows": bounded.clone()})).unwrap();
+        assert!(matches!(
+            at_limit,
+            DeviceResult::Windows {
+                truncated: false,
+                ..
+            }
+        ));
+
+        bounded.push(serde_json::json!({
+            "window_id": 999_999,
+            "pid": 100,
+            "app_name": "App",
+            "title": "Overflow",
+            "bounds": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "is_on_screen": true,
+            "on_current_space": true
+        }));
+        let over_limit =
+            normalize_windows_result(&serde_json::json!({"windows": bounded})).unwrap();
+        assert!(matches!(
+            over_limit,
+            DeviceResult::Windows {
+                truncated: true,
+                ..
+            }
+        ));
     }
 
     #[test]

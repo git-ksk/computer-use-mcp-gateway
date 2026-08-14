@@ -124,6 +124,9 @@ indeterminate resolution remain bound to the authenticated principal.
 `InspectWindow` does not forward an AX/UIA/AT-SPI tree verbatim. The adapter reduces backend fields
 into bounded CUMG data such as `UiRect`, `WindowInfo`, `UiElement`, and semantic `UiRole` values.
 Unknown provider-specific roles normalize to `other` rather than escaping backend vocabulary.
+`ListWindows` validates every provider record but omits zero-area helper/agent windows because they
+cannot be targeted by the V2 window contract. Exact window targets and snapshots continue to require
+strictly positive geometry; malformed non-geometry fields still fail closed.
 
 Desktop actions use typed coordinates/targets such as `DesktopPhysical`, `WindowPhysical`,
 `InputTarget`, and `ScrollTarget`. CUMG does not expose Cua's hidden `from_zoom` coordinate state.
