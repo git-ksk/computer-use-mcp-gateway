@@ -1,5 +1,7 @@
 # Architecture
 
+> **Note:** This is the canonical English architecture guide. A Japanese translation is available at [ARCHITECTURE.ja.md](ARCHITECTURE.ja.md).
+
 V2 Hub + V2 Agent is the recommended runtime. V1 is retained as `v1_gateway` for regression/reference.
 
 ## V1 legacy/reference

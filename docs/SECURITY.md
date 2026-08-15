@@ -1,5 +1,7 @@
 # Security
 
+> **Note:** This is the canonical English security guide. A Japanese translation is available at [SECURITY.ja.md](SECURITY.ja.md).
+
 Computer-use grants a client access to sensitive desktop capabilities. Treat this gateway as a security boundary, not merely a transport adapter.
 
 ## V1 defaults

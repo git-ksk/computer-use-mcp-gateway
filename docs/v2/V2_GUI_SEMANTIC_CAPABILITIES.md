@@ -1,5 +1,7 @@
 # V2 GUI semantic capabilities
 
+> **Note:** This is the canonical English V2 GUI semantic capabilities description. A Japanese translation is available at [V2_GUI_SEMANTIC_CAPABILITIES.ja.md](V2_GUI_SEMANTIC_CAPABILITIES.ja.md).
+
 ## Purpose
 
 V2 does not make a configured Computer Use backend's MCP tool names part of the CUMG product

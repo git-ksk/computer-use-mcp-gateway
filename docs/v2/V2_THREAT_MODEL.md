@@ -1,5 +1,7 @@
 # V2 threat model
 
+> **Japanese:** [V2_THREAT_MODEL.ja.md](V2_THREAT_MODEL.ja.md)
+
 Status: **V2-M1 trust-model baseline**. M0 assumptions remain the foundation; M1 transport/process controls and residual deployment gaps are reflected below.
 
 This document defines the security claims and non-claims for the delegated device capability control plane. It is intentionally stricter than a feature list: a control is not considered effective against a component that owns the key or execution surface needed to bypass that control.

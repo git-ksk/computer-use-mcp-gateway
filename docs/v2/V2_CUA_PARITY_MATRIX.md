@@ -1,5 +1,7 @@
 # V2 Cua parity matrix
 
+> **Note:** This is the canonical English V2 Cua parity matrix. A Japanese translation is available at [V2_CUA_PARITY_MATRIX.ja.md](V2_CUA_PARITY_MATRIX.ja.md).
+
 ## Goal
 
 CUMG V2 parity is behavioral, not a promise to mirror every Cua MCP tool name.
@@ -39,7 +41,7 @@ method escape hatch.
 | 2 | `list_windows` | semantic, current | `ListWindows` / `list_windows` |
 | 3 | `get_window_state` | semantic, current | `InspectWindow` / `inspect_window` |
 | 4 | `verify_state` | semantic, current | `VerifyUiState` / `verify_ui_state` |
-| 5 | `launch_app` | semantic, current | `LaunchApplication` / `launch_application` |
+| 5 | `launch_app` | semantic, current | `LaunchApplication` / `launch_application`; CUMG launch remains bounded to reviewed identifier/name targets and does not expose Cua `additional_arguments` or `webkit_inspector_port` |
 | 6 | `kill_app` | semantic, current | `TerminateApplication` |
 | 7 | `bring_to_front` | semantic, current | `ActivateWindow` with exact-window verification evidence |
 | 8 | `set_window_frame` | semantic, current | `SetWindowFrame` |
@@ -54,7 +56,7 @@ method escape hatch.
 | 17 | `set_value` | semantic, current | `SetUiValue` using scoped CUMG element refs |
 | 18 | `scroll` | semantic, current | `Scroll` with explicit coordinate space/target |
 | 19 | `clipboard_read` | semantic, current | `ClipboardRead` with bounded output and sensitive-data treatment |
-| 20 | `clipboard_write` | semantic, current | `ClipboardWrite` with bounded input |
+| 20 | `clipboard_write` | semantic, current | `ClipboardWrite` with bounded plain-text input only |
 | 21 | `get_screen_size` | semantic, current | `ScreenGeometry` / `get_screen_size` |
 | 22 | `get_desktop_state` | integrated, current | contextual `Screenshot` after explicit `DesktopScope` expansion |
 | 23 | `get_cursor_position` | semantic, current | `PointerPosition` |
@@ -117,6 +119,11 @@ Current desktop runtime acceptance covers:
 Cua safety refusals remain authoritative. A background key/scroll may be refused when the provider
 cannot prove which sibling window of one PID would receive process-scoped input; CUMG never turns
 that refusal into an automatic foreground or desktop escalation.
+
+Known parity gaps remain:
+
+- `ClipboardWrite` is plain-text only. V1/Cua image or file clipboard writes are not current V2 parity.
+- `LaunchApplication` does not expose Cua `additional_arguments` or `webkit_inspector_port`; those remain parity gaps rather than hidden passthrough behavior.
 
 `CONTROL_SCHEMA_VERSION` is version 7 and `CAPABILITY_SCHEMA_VERSION` remains version 4. Control
 schema mismatches and capability-advertisement schema mismatches fail closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded
