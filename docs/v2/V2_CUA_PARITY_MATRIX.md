@@ -41,7 +41,7 @@ method escape hatch.
 | 2 | `list_windows` | semantic, current | `ListWindows` / `list_windows` |
 | 3 | `get_window_state` | semantic, current | `InspectWindow` / `inspect_window` |
 | 4 | `verify_state` | semantic, current | `VerifyUiState` / `verify_ui_state` |
-| 5 | `launch_app` | semantic, current | `LaunchApplication` / `launch_application`; CUMG launch remains bounded to reviewed identifier/name targets and does not expose Cua `additional_arguments` or `webkit_inspector_port` |
+| 5 | `launch_app` | semantic, current | `LaunchApplication` / `launch_application`; V2 does **not** currently expose V1/Cua `additional_arguments` or `webkit_inspector_port` |
 | 6 | `kill_app` | semantic, current | `TerminateApplication` |
 | 7 | `bring_to_front` | semantic, current | `ActivateWindow` with exact-window verification evidence |
 | 8 | `set_window_frame` | semantic, current | `SetWindowFrame` |
@@ -56,7 +56,7 @@ method escape hatch.
 | 17 | `set_value` | semantic, current | `SetUiValue` using scoped CUMG element refs |
 | 18 | `scroll` | semantic, current | `Scroll` with explicit coordinate space/target |
 | 19 | `clipboard_read` | semantic, current | `ClipboardRead` with bounded output and sensitive-data treatment |
-| 20 | `clipboard_write` | semantic, current | `ClipboardWrite` with bounded plain-text input only |
+| 20 | `clipboard_write` | semantic, current | `ClipboardWrite` with bounded **plain-text-only** input; V1/Cua image/file clipboard write parity is not implemented |
 | 21 | `get_screen_size` | semantic, current | `ScreenGeometry` / `get_screen_size` |
 | 22 | `get_desktop_state` | integrated, current | contextual `Screenshot` after explicit `DesktopScope` expansion |
 | 23 | `get_cursor_position` | semantic, current | `PointerPosition` |
@@ -120,10 +120,10 @@ Cua safety refusals remain authoritative. A background key/scroll may be refused
 cannot prove which sibling window of one PID would receive process-scoped input; CUMG never turns
 that refusal into an automatic foreground or desktop escalation.
 
-Known parity gaps remain:
+Known parity gaps are explicit rather than hidden behind passthrough behavior:
 
-- `ClipboardWrite` is plain-text only. V1/Cua image or file clipboard writes are not current V2 parity.
-- `LaunchApplication` does not expose Cua `additional_arguments` or `webkit_inspector_port`; those remain parity gaps rather than hidden passthrough behavior.
+- `ClipboardWrite` currently supports plain text only. V1/Cua image and file clipboard writes are **not** implemented in V2.
+- `LaunchApplication` does not currently expose V1/Cua `additional_arguments` or `webkit_inspector_port`.
 
 `CONTROL_SCHEMA_VERSION` is version 7 and `CAPABILITY_SCHEMA_VERSION` remains version 4. Control
 schema mismatches and capability-advertisement schema mismatches fail closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded

@@ -7,7 +7,7 @@
 - **デスクトップセマンティックパス:** 完了済み・受容済み。同一コンテキストでのネイティブ要素の click/type/key ターゲティングと、実 Cua バックグラウンドの AX 要素アクションエビデンスを含みます。
 - **ブラウザコアセマンティックパス:** prepare、bind、inspect、navigate、click、type、dialog、pointer の各セマンティクスについて完了済み・受容済み。
 - **ブラウザ転送:** 完了済み・受容済み。アップロード/ダウンロードは、スコープ付き CUMG refs と Agent プライベートな境界付きステージングを使用します。任意のホストパスが northbound に公開されることはありません。
-- **ディスパッチ後あいまい性の堅牢化:** 変更を伴う汎用バックエンドエラー、不正または証明不能な完了、ディスパッチ後の応答喪失は、まず `BackendOutcomeIndeterminate` として分類され、耐久性のある `Indeterminate(BackendOutcomeUnproven)` として永続化され、キューされた作業をキャンセルし、明示的な永続化ゲート付きの解決（リトライ・リプレイなし）までデバイスを隔離（quarantine）したままにします。読み取り専用コマンドは依然として明確なバックエンド失敗を返すことがあります。northbound に返される運用上の失敗は、トランスポート漏洩や `ExceptionGroup` 形状ではなく、`isError=true` を持つ境界付き MCP `CallToolResult` エラーとクローズドな CUMG コードに限定されます。実 Cua のブラウザアラート受容が、issue #47 の観測可能な副作用ケースをカバーします。
+- **ディスパッチ後あいまい性の堅牢化:** 変更を伴うコマンドのディスパッチ後に汎用バックエンドエラー、不正／証明不能な完了、または応答喪失が発生した場合、adapter/Agent 境界で `BackendOutcomeIndeterminate` と分類し、Hub は reason `BackendOutcomeUnproven` を持つ耐久性のある `Indeterminate` として永続化します。そのデスクトップのキュー済み作業をキャンセルし、明示的かつ永続化ゲート付きの解決までデバイスを隔離します。自動リトライ／リプレイは行いません。読み取り専用のバックエンド失敗は確定的な失敗のまま扱える場合があります。northbound の運用上の失敗は、transport/provider/`ExceptionGroup` を漏らさず、`isError=true` とクローズドな CUMG コードを持つ境界付き MCP `CallToolResult` エラーとして返します。実 Cua の browser alert acceptance が issue #47 の観測可能な副作用ケースをカバーします。
 - **V1 本番:** V2 開発ブランチによって変更されていません。V1 の回帰・適合性カバレッジは、V2 作業中も引き続き必要です。
 
 ## 有効な契約

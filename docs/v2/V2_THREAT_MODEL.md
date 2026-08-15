@@ -2,7 +2,7 @@
 
 > **Japanese:** [V2_THREAT_MODEL.ja.md](V2_THREAT_MODEL.ja.md)
 
-Status: **V2-M1 trust-model baseline**. M0 assumptions remain the foundation; M1 transport/process controls and residual deployment gaps are reflected below.
+Status: **V2-M1 trust-model baseline**. M0 assumptions remain the foundation; accepted M1 transport/process controls, post-M1 execution-safety hardening, and residual deployment responsibilities are reflected below.
 
 This document defines the security claims and non-claims for the delegated device capability control plane. It is intentionally stricter than a feature list: a control is not considered effective against a component that owns the key or execution surface needed to bypass that control.
 
@@ -84,9 +84,9 @@ Controls:
 - global admission and per-device queues are bounded;
 - the Hub-Agent protocol exposes typed semantic commands rather than arbitrary Cua tool names/arguments.
 
-The M1 northbound boundary now implements the MCP Authorization protected-resource side rather than a new OAuth server. `v2_hub` publishes RFC 9728 metadata, requires header bearer presentation, validates tokens through a configured RFC 7662 introspection endpoint, binds accepted tokens to the configured MCP resource audience, and constructs `AuthenticatedClientPrincipal` from the verified subject plus the configured authorization-server issuer. Required OAuth scopes gate entry to the MCP resource, while the separate local principal -> device -> exact `DeviceCapability` policy remains authoritative for delegated device access. The bearer header is removed before rmcp handler dispatch and no bearer field exists in the typed Hub-to-Agent command/grant path.
+The M1 northbound boundary implements the MCP Authorization protected-resource side rather than a new OAuth server. `v2_hub` publishes RFC 9728 metadata, requires header bearer presentation, validates tokens through a configured RFC 7662 introspection endpoint, binds accepted tokens to the configured MCP resource audience, and constructs `AuthenticatedClientPrincipal` from the verified subject plus the configured authorization-server issuer. Required OAuth scopes gate entry to the MCP resource, while the separate local principal -> device -> exact `DeviceCapability` policy remains authoritative for delegated device access. The bearer header is removed before rmcp handler dispatch and no bearer field exists in the typed Hub-to-Agent command/grant path.
 
-Residual risk: authorization-server/introspection availability and credential compromise remain deployment trust dependencies; public HTTPS termination and rate limiting still sit outside the current loopback northbound listener. A compromised Hub can still mint valid Agent grants using its own grant authority, so OAuth does not reduce the already-documented fully-compromised-Hub trust failure.
+Residual risk: authorization-server/introspection availability and credential compromise remain deployment trust dependencies; public HTTPS termination and transport-edge rate limiting remain deployment responsibilities outside the loopback northbound listener. A compromised Hub can still mint valid Agent grants using its own grant authority, so OAuth does not reduce the already-documented fully-compromised-Hub trust failure.
 
 ### Compromised Hub
 
@@ -147,7 +147,7 @@ Controls already proven in M0:
 
 Post-M1 P0 execution-safety details and residual recovery assumptions are recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
 
-Current M1 evidence includes TLS-protected gRPC bidirectional streaming with pinned certificate trust/domain validation plus independent Ed25519 application authentication. The earlier raw-TLS transport remains a regression/reference implementation and is TLS 1.3-only with a dedicated ALPN. An operator-facing single-device `v2_hub` daemon now exists and is covered together with `v2_agent` by an end-to-end TLS/gRPC test. Residual deployment risk remains: public endpoint hardening, connection/TLS-handshake rate limits, real northbound authentication, and production certificate lifecycle are not yet complete, so this is not yet a production exposure claim.
+Current M1 evidence includes TLS-protected gRPC bidirectional streaming with pinned certificate trust/domain validation plus independent Ed25519 application authentication. The earlier raw-TLS transport remains a regression/reference implementation and is TLS 1.3-only with a dedicated ALPN. The operator-facing `v2_hub` daemon and `v2_agent` are covered by end-to-end TLS/gRPC tests. Public-edge firewall/reverse-proxy controls, raw transport handshake shedding, external authorization-service availability, and credential/certificate custody remain deployment responsibilities; they are not permission to weaken the accepted application-level safety model.
 
 ### Replay and stale-state attacker
 
@@ -157,7 +157,7 @@ Controls:
 - unknown/retired grant-signing keys fail closed;
 - device generation changes on reconnect and credential rotation;
 - capability revisions are checked on every command/result;
-- operation IDs are retained as terminal/indeterminate state and cannot be silently reused; M1 still needs bounded pruning/rollover semantics for terminal Agent tombstones during extremely long-lived generations;
+- operation IDs cannot be silently reused; completed/cancelled Agent replay tombstones are bounded by authenticated device generation, while Hub `Indeterminate` operations remain durable until explicit resolution;
 - handshake proof replay fails against fresh nonces.
 
 Completed/cancelled replay tombstones are bounded by authenticated device generation. A fresh generation makes older signed commands stale before they reach the execution gate, so old terminal IDs may be pruned. `Indeterminate` Hub operations are intentionally exempt from this pruning and continue to quarantine the device until explicit operator resolution.
@@ -182,13 +182,13 @@ Rules:
 
 - cancellation before dispatch prevents Agent execution;
 - cancellation after dispatch is a signed Hub->Agent request and signed Agent acknowledgement;
-- an Agent persists terminal operation IDs across restart to reject local replay; the retained set is not yet bounded inside one very long-lived generation and is an M1 acceptance item;
+- Agent terminal replay tombstones are generation-bounded and may be pruned only after a fresh authenticated generation makes old signed commands stale; Hub `Indeterminate` operations remain durable and quarantine the device until explicit resolution;
 - a Hub connection loss after dispatch marks the operation `indeterminate`;
 - `indeterminate`, `completed`, and `cancelled` operation IDs cannot be re-admitted;
 - an `indeterminate` operation quarantines its device at Hub admission, so a different operation is also rejected until explicit resolution;
 - reconnect does not transfer an existing generation-bound operation lease.
 
-Agent-native process cancellation is stronger than GUI-backend cancellation: Unix process groups and Windows Job Objects terminate the supervised process tree, and background descendants are also cleaned up when the top-level process completes. The Cua MCP adapter instead propagates cancellation to the exact in-flight downstream request ID, but propagation is not treated as proof that a desktop side effect stopped. A propagated cancellation or timeout therefore maps to an `indeterminate` disposition and device quarantine. The same rule applies when a mutating request was dispatched and the backend later returns a generic tool error, a malformed/unprovable completion, or loses the response channel: those failure shapes do not prove non-execution and are classified as `BackendOutcomeUnproven`. Read-only commands may still return a definite backend error. Lack of backend-level proof of non-execution must never be interpreted as successful cancellation or safe retry.
+Agent-native process cancellation is stronger than GUI-backend cancellation: Unix process groups and Windows Job Objects terminate the supervised process tree, and background descendants are also cleaned up when the top-level process completes. The Cua MCP adapter instead propagates cancellation to the exact in-flight downstream request ID, but propagation is not treated as proof that a desktop side effect stopped. A propagated cancellation or timeout therefore maps to an `indeterminate` disposition and device quarantine. The same rule applies when a mutating request was dispatched and the backend later returns a generic tool error, a malformed/unprovable completion, or loses the response channel: those failure shapes do not prove non-execution. At the adapter/Agent boundary they are classified as `BackendOutcomeIndeterminate`; the Hub persists durable `Indeterminate` with reason `BackendOutcomeUnproven`, cancels queued work for that desktop, and requires explicit persistence-gated resolution before reuse. Read-only commands may still return a definite backend error. Lack of backend-level proof of non-execution must never be interpreted as successful cancellation, safe retry, or permission to replay.
 
 ## Browser transfer data boundary
 
@@ -240,4 +240,4 @@ The threat model still requires the deployment to preserve these external respon
 - default telemetry must remain payload-free. Enabling collector/proxy body logging or high-sensitivity debug capture creates a separate sensitive-data boundary;
 - an `indeterminate` operation must remain quarantined until explicit resolution. Network recovery, backend reconnect, or service restart is not permission to replay it.
 
-These are deployment assumptions/residual risks, not missing V2-M1 protocol features. Multi-machine identity, fleet attestation, and native GUI adapters are intentionally deferred to later milestones.
+These are deployment assumptions/residual risks, not missing V2-M1 protocol features. Multi-machine identity, fleet attestation, and additional native GUI backends remain intentionally deferred to later milestones.

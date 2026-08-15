@@ -237,7 +237,7 @@ cargo run --locked --bin v2_hub -- --help
 
 必要な Hub/grant/device公開鍵/TLS/state パスと、Agent 向け gRPC バインドを設定してください。northbound MCP を公開するには、ループバックの `CUMG_V2_MCP_BIND`、正規の公開 HTTPS リソース、および [`DEPLOYMENT.md`](DEPLOYMENT.md) の正確な principal -> device -> `DeviceCapability` ポリシーを設定してください。明示的に単一 principal の認証トンネルには、OAuth RFC 7662 イントロスペクションまたはパッケージ化された trusted-proxy 固定 principal モードのいずれかを選択してください。どちらも、CUMG の認可の前に同一の `AuthenticatedClientPrincipal` にアイデンティティを還元します。この 2 つのモードは相互排他的です。
 
-northbound MCP は素の Cua プロキシではありません。現在の型付き V2 契約は、Agent ネイティブのプロセス/シェル実行と境界付きファイルシステム観測、ネイティブの同一コンテキスト要素アクションを含む Desktop セマンティック能力、そして正確なポリシーとライブ広告が許可する場合の Browser セマンティック能力と境界付きアップロード/ダウンロード転送にグループ化されています。ディスカバリは、正確な認可と、Agent がオンラインである間はそのライブ `CapabilityAdvertisement` によってフィルタリングされます。[`V2_GUI_SEMANTIC_CAPABILITIES.ja.md`](v2/V2_GUI_SEMANTIC_CAPABILITIES.ja.md) と [`V2_BROWSER_SEMANTIC_CAPABILITIES.md`](v2/V2_BROWSER_SEMANTIC_CAPABILITIES.md) を参照してください。
+northbound MCP は素の Cua プロキシではありません。現在の型付き V2 契約は、Agent ネイティブのプロセス／シェル実行と境界付きファイルシステム観測、同一コンテキストのネイティブ要素ターゲット／アクションを含む Desktop セマンティック能力、そして正確なポリシーとライブ `CapabilityAdvertisement` が許可する場合の Browser セマンティック能力と境界付きアップロード／ダウンロード転送に分かれます。ディスカバリは正確な認可と Agent のライブ広告で絞り込まれ、Agent がオフラインの場合はセマンティックなデバイスツールを公開しません。[`V2_GUI_SEMANTIC_CAPABILITIES.ja.md`](v2/V2_GUI_SEMANTIC_CAPABILITIES.ja.md)、[`V2_BROWSER_SEMANTIC_CAPABILITIES.md`](v2/V2_BROWSER_SEMANTIC_CAPABILITIES.md)、[`V2_CUA_PARITY_MATRIX.ja.md`](v2/V2_CUA_PARITY_MATRIX.ja.md) を参照してください。
 
 ## 8. 管理対象デスクトップで V2 Agent を起動する
 

@@ -37,7 +37,7 @@ Cua ツールは、以下のいずれかに分類されたときのみ「完成�
 | 2 | `list_windows` | semantic, current | `ListWindows` / `list_windows` |
 | 3 | `get_window_state` | semantic, current | `InspectWindow` / `inspect_window` |
 | 4 | `verify_state` | semantic, current | `VerifyUiState` / `verify_ui_state` |
-| 5 | `launch_app` | semantic, current | `LaunchApplication` / `launch_application`; CUMG の起動は、レビュー済みの識別子/名前ターゲットに境界付けられたままであり、Cua の `additional_arguments` や `webkit_inspector_port` を公開しません |
+| 5 | `launch_app` | semantic, current | `LaunchApplication` / `launch_application`; V2 は現在、V1/Cua の `additional_arguments` と `webkit_inspector_port` を**公開しません** |
 | 6 | `kill_app` | semantic, current | `TerminateApplication` |
 | 7 | `bring_to_front` | semantic, current | 正確なウィンドウ検証エビデンス付きの `ActivateWindow` |
 | 8 | `set_window_frame` | semantic, current | `SetWindowFrame` |
@@ -52,7 +52,7 @@ Cua ツールは、以下のいずれかに分類されたときのみ「完成�
 | 17 | `set_value` | semantic, current | スコープ付き CUMG 要素 refs を使用する `SetUiValue` |
 | 18 | `scroll` | semantic, current | 明示的な座標空間/ターゲットを持つ `Scroll` |
 | 19 | `clipboard_read` | semantic, current | 境界付き出力と機密データ処理を備えた `ClipboardRead` |
-| 20 | `clipboard_write` | semantic, current | 境界付きプレーンテキスト入力のみを扱う `ClipboardWrite` |
+| 20 | `clipboard_write` | semantic, current | 境界付きの **plain-text-only** 入力を扱う `ClipboardWrite`; V1/Cua の image/file clipboard write parity は未実装 |
 | 21 | `get_screen_size` | semantic, current | `ScreenGeometry` / `get_screen_size` |
 | 22 | `get_desktop_state` | integrated, current | 明示的な `DesktopScope` 拡張後の文脈上の `Screenshot` |
 | 23 | `get_cursor_position` | semantic, current | `PointerPosition` |
@@ -111,10 +111,10 @@ Cua ツールは、以下のいずれかに分類されたときのみ「完成�
 
 Cua の安全性拒否は引き続き権威（authoritative）です。プロバイダーが、1 つの PID のどの兄弟ウィンドウがプロセススコープ入力を受け取るかを証明できない場合、バックグラウンドのキー/スクロールは拒否されることがあります。CUMG は、その拒否を自動的なフォアグラウンドまたはデスクトップへのエスカレーションに変えることは決してありません。
 
-既知のパリティギャップは残っています:
+既知のパリティギャップは、隠れたパススルー挙動にせず明示します:
 
-- `ClipboardWrite` はプレーンテキストのみです。V1/Cua の画像またはファイルのクリップボード書き込みは、現在の V2 パリティではありません。
-- `LaunchApplication` は、Cua の `additional_arguments` や `webkit_inspector_port` を公開しません。これらは、隠れたパススルー挙動ではなく、パリティギャップのままです。
+- `ClipboardWrite` が現在対応するのは plain text のみです。V1/Cua の image clipboard write と file clipboard write は **V2 では未実装**です。
+- `LaunchApplication` は現在、V1/Cua の `additional_arguments` と `webkit_inspector_port` を公開していません。これらは **未parity** です。
 
 `CONTROL_SCHEMA_VERSION` はバージョン 7、`CAPABILITY_SCHEMA_VERSION` はバージョン 4 のままです。コントロールスキーマの不一致と能力広告スキーマの不一致は、フェイルクローズ（fail closed）されます。通常の署名付き Hub/Agent メッセージは 64 KiB のアプリケーションバウンドを保持しますが、境界付きの image/UI/clipboard/region 観察は、レビュー済みの大きな結果（large-result）許容量を使用します。クリップボードのプレーンテキストは 1 MiB に制限されます。
 
