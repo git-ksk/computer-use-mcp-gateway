@@ -225,6 +225,16 @@ CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" \
 
 Historical P1 physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`; that self-hosted-runner mechanism is retained only as historical evidence and is no longer the repository execution model. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](v2/acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md), [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), and [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXECUTION_SAFETY.md).
 
+For the issue #47 post-effect browser-error regression, run the separate isolated Chrome fixture:
+
+```bash
+CUMG_V2_ISSUE47_E2E_ACK=1 \
+CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" \
+./scripts/v2_issue47_browser_alert_acceptance.sh
+```
+
+This acceptance proves that a visible JS alert followed by a generic Cua tool error is treated as an indeterminate mutating outcome rather than a retry-safe failure.
+
 The local fixture requires an ordinary visible macOS Desktop. Cua `launch_app` starts the application in the background; if the Mac is sitting on a different Space, the launched TextEdit window can be off-Space and `get_window_state` can return an empty Accessibility element set even though launch/window/screenshot calls themselves succeed. This is a physical-acceptance precondition only and does not alter the V2 execution-safety state machine.
 
 ## V2-M1 final acceptance

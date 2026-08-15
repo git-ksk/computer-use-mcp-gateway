@@ -63,6 +63,7 @@ impl OperationOwner {
 pub enum IndeterminateReason {
     CancellationUnproven,
     BackendTimedOut,
+    BackendOutcomeUnproven,
     ConnectionLost,
     HubRestartAfterDispatch,
     AgentRestartAfterDispatch,

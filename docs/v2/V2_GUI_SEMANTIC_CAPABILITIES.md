@@ -75,7 +75,7 @@ If the Agent is offline, there is no live advertisement and no semantic device t
 reconnect may produce a new device generation or capability revision; stateful requests are fenced
 against both, so a discovery/dispatch race fails closed.
 
-The control schema is version 6 and the capability-advertisement schema remains version 4. Hub and
+The control schema is version 7 and the capability-advertisement schema remains version 4. Hub and
 Agent control-schema mismatches fail closed; capability advertisements with another schema version are
 also rejected rather than interpreted as an ambiguous rolling-upgrade compatibility mode.
 
@@ -142,6 +142,8 @@ Background delivery remains the first rung where the semantic command permits it
 refusals remain authoritative. For example, Cua may reject a process-scoped background key when one
 PID owns multiple eligible windows and exact delivery cannot be proven; CUMG does not silently turn
 that into a foreground action.
+
+For execution-safety classification, the semantic command itself defines whether it is read-only. A generic backend error, response loss, or malformed/unprovable completion after dispatch of a mutating command is not accepted as terminal failure evidence; it becomes `BackendOutcomeUnproven` quarantine. The corresponding event on an explicitly read-only command remains a definite backend error. Reviewed semantic refusals keep their typed refusal codes.
 
 ## Bounded carrier and privacy
 

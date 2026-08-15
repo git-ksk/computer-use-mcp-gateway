@@ -118,7 +118,7 @@ Cua safety refusals remain authoritative. A background key/scroll may be refused
 cannot prove which sibling window of one PID would receive process-scoped input; CUMG never turns
 that refusal into an automatic foreground or desktop escalation.
 
-`CONTROL_SCHEMA_VERSION` is version 6 and `CAPABILITY_SCHEMA_VERSION` remains version 4. Control
+`CONTROL_SCHEMA_VERSION` is version 7 and `CAPABILITY_SCHEMA_VERSION` remains version 4. Control
 schema mismatches and capability-advertisement schema mismatches fail closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded
 image/UI/clipboard/region observations use the reviewed large-result allowance. Clipboard plain text
 is capped at 1 MiB.

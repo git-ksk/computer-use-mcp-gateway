@@ -18,6 +18,10 @@ pending: dict[object, str] = {}
 DRAG_MARKER: Path | None = None
 CANCEL_MARKER: Path | None = None
 TRANSFER_MARKER: Path | None = None
+AMBIGUOUS_CLICK_MARKER: Path | None = None
+AMBIGUOUS_BROWSER_CLICK_MARKER: Path | None = None
+DROP_AFTER_CLICK_MARKER: Path | None = None
+FAIL_LIST_APPS = False
 SLOW_BROWSER_UPLOAD = False
 SLOW_BROWSER_DOWNLOAD = False
 FAIL_BROWSER_UPLOAD = False
@@ -30,6 +34,10 @@ def args() -> argparse.Namespace:
     parser.add_argument("--drag-marker")
     parser.add_argument("--cancel-marker")
     parser.add_argument("--transfer-marker")
+    parser.add_argument("--ambiguous-click-marker")
+    parser.add_argument("--ambiguous-browser-click-marker")
+    parser.add_argument("--drop-after-click-marker")
+    parser.add_argument("--fail-list-apps", action="store_true")
     parser.add_argument("--slow-browser-upload", action="store_true")
     parser.add_argument("--slow-browser-download", action="store_true")
     parser.add_argument("--fail-browser-upload", action="store_true")
@@ -89,6 +97,7 @@ def handle_request(message: dict) -> None:
                     {"name": "get_screen_size", "inputSchema": {"type": "object"}},
                     {"name": "click", "inputSchema": {"type": "object"}},
                     {"name": "drag", "inputSchema": {"type": "object"}},
+                    {"name": "browser_click", "inputSchema": {"type": "object"}},
                     {"name": "browser_set_input_files", "inputSchema": {"type": "object"}},
                     {"name": "browser_download", "inputSchema": {"type": "object"}},
                 ]
@@ -101,11 +110,44 @@ def handle_request(message: dict) -> None:
 
     name = params.get("name")
     if name == "list_apps":
-        success(request_id, {"apps": [{"name": "Fixture App", "pid": 42}]})
+        if FAIL_LIST_APPS:
+            result(
+                request_id,
+                {"content": [{"type": "text", "text": "fixture read failure"}], "isError": True},
+            )
+        else:
+            success(request_id, {"apps": [{"name": "Fixture App", "pid": 42}]})
     elif name == "get_screen_size":
         success(request_id, {"width": 1440, "height": 900, "scale_factor": 2.0})
     elif name == "click":
-        success(request_id)
+        if DROP_AFTER_CLICK_MARKER is not None:
+            append(DROP_AFTER_CLICK_MARKER, {"tool": name, "dispatched": True})
+            raise SystemExit(0)
+        if AMBIGUOUS_CLICK_MARKER is not None:
+            append(AMBIGUOUS_CLICK_MARKER, {"tool": name, "dispatched": True})
+            result(
+                request_id,
+                {"content": [{"type": "text", "text": "fixture post-effect failure"}], "isError": True},
+            )
+        else:
+            success(request_id)
+    elif name == "browser_click":
+        if AMBIGUOUS_BROWSER_CLICK_MARKER is not None:
+            append(AMBIGUOUS_BROWSER_CLICK_MARKER, {"tool": name, "dispatched": True})
+            result(
+                request_id,
+                {"content": [{"type": "text", "text": "fixture post-effect browser failure"}], "isError": True},
+            )
+        else:
+            success(
+                request_id,
+                {
+                    "status": "ok",
+                    "target_id": (params.get("arguments") or {}).get("target_id"),
+                    "tab_id": (params.get("arguments") or {}).get("tab_id"),
+                    "effect": "unverifiable",
+                },
+            )
     elif name == "drag":
         pending[request_id] = name
         append(DRAG_MARKER, request_id)
@@ -193,12 +235,26 @@ def handle_notification(message: dict) -> None:
 
 def main() -> None:
     global DRAG_MARKER, CANCEL_MARKER, TRANSFER_MARKER
+    global AMBIGUOUS_CLICK_MARKER, AMBIGUOUS_BROWSER_CLICK_MARKER, DROP_AFTER_CLICK_MARKER
+    global FAIL_LIST_APPS
     global SLOW_BROWSER_UPLOAD, SLOW_BROWSER_DOWNLOAD
     global FAIL_BROWSER_UPLOAD, FAIL_BROWSER_DOWNLOAD, DOWNLOAD_PAYLOAD
     parsed = args()
     DRAG_MARKER = Path(parsed.drag_marker) if parsed.drag_marker else None
     CANCEL_MARKER = Path(parsed.cancel_marker) if parsed.cancel_marker else None
     TRANSFER_MARKER = Path(parsed.transfer_marker) if parsed.transfer_marker else None
+    AMBIGUOUS_CLICK_MARKER = (
+        Path(parsed.ambiguous_click_marker) if parsed.ambiguous_click_marker else None
+    )
+    AMBIGUOUS_BROWSER_CLICK_MARKER = (
+        Path(parsed.ambiguous_browser_click_marker)
+        if parsed.ambiguous_browser_click_marker
+        else None
+    )
+    DROP_AFTER_CLICK_MARKER = (
+        Path(parsed.drop_after_click_marker) if parsed.drop_after_click_marker else None
+    )
+    FAIL_LIST_APPS = parsed.fail_list_apps
     SLOW_BROWSER_UPLOAD = parsed.slow_browser_upload
     SLOW_BROWSER_DOWNLOAD = parsed.slow_browser_download
     FAIL_BROWSER_UPLOAD = parsed.fail_browser_upload

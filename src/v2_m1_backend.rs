@@ -5,7 +5,8 @@
 //! than as proof that a desktop action did not happen.
 
 use crate::backend::{
-    BackendCallCancelled, BackendCallTimedOut, ComputerUseBackend, cua::CuaBackend,
+    BackendCallCancelled, BackendCallResponseLost, BackendCallTimedOut, ComputerUseBackend,
+    cua::CuaBackend,
 };
 use crate::v2_browser_execute::{
     BrowserExecutionError, BrowserExecutionOutcome, BrowserRefusalReason, execute_cua_browser,
@@ -38,6 +39,7 @@ pub enum BackendExecutionOutcome {
     Completed(DeviceResult),
     CancellationPropagatedIndeterminate,
     TimedOutIndeterminate,
+    BackendOutcomeIndeterminate,
 }
 
 impl BackendExecutionOutcome {
@@ -46,12 +48,13 @@ impl BackendExecutionOutcome {
             Self::Completed(_) => "completed",
             Self::CancellationPropagatedIndeterminate => "cancellation_propagated_indeterminate",
             Self::TimedOutIndeterminate => "timed_out_indeterminate",
+            Self::BackendOutcomeIndeterminate => "backend_outcome_indeterminate",
         }
     }
 
     pub fn cancellation_disposition(&self) -> Option<CancellationDisposition> {
         match self {
-            Self::Completed(_) => None,
+            Self::Completed(_) | Self::BackendOutcomeIndeterminate => None,
             Self::CancellationPropagatedIndeterminate | Self::TimedOutIndeterminate => {
                 Some(CancellationDisposition::IndeterminateAfterPropagation)
             }
@@ -279,6 +282,9 @@ impl CuaMcpAdapter {
             Ok(BrowserExecutionOutcome::TimedOutIndeterminate) => {
                 Ok(BackendExecutionOutcome::TimedOutIndeterminate)
             }
+            Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate) => {
+                Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
+            }
             Err(BrowserExecutionError::InvalidRequest(message)) => {
                 Err(M1BackendError::InvalidRequest(message))
             }
@@ -333,6 +339,9 @@ impl CuaMcpAdapter {
             Ok(BrowserExecutionOutcome::TimedOutIndeterminate) => {
                 Ok(BackendExecutionOutcome::TimedOutIndeterminate)
             }
+            Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate) => {
+                Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
+            }
             Err(BrowserExecutionError::InvalidRequest(message)) => {
                 Err(M1BackendError::InvalidRequest(message))
             }
@@ -375,6 +384,9 @@ impl CuaMcpAdapter {
                 }
                 Ok(BrowserExecutionOutcome::TimedOutIndeterminate) => {
                     Ok(BackendExecutionOutcome::TimedOutIndeterminate)
+                }
+                Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate) => {
+                    Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
                 }
                 Err(BrowserExecutionError::InvalidRequest(message)) => {
                     Err(M1BackendError::InvalidRequest(message))
@@ -419,6 +431,12 @@ impl CuaMcpAdapter {
                     );
                     return Ok(BackendExecutionOutcome::TimedOutIndeterminate);
                 }
+                Err(error) if error.downcast_ref::<BackendCallResponseLost>().is_some() => {
+                    crate::v2_observability::backend_failure(
+                        crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
+                    );
+                    return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
+                }
                 Err(error) => {
                     crate::v2_observability::backend_failure(
                         crate::v2_observability::BackendFailureReason::Tool,
@@ -428,9 +446,9 @@ impl CuaMcpAdapter {
             };
             if started.is_error == Some(true) {
                 crate::v2_observability::backend_failure(
-                    crate::v2_observability::BackendFailureReason::Tool,
+                    crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
                 );
-                return Err(M1BackendError::BackendToolError);
+                return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
             }
         }
         let (tool, arguments) = map_command(command)?;
@@ -445,6 +463,15 @@ impl CuaMcpAdapter {
                 );
                 return Ok(BackendExecutionOutcome::TimedOutIndeterminate);
             }
+            Err(error) if error.downcast_ref::<BackendCallResponseLost>().is_some() => {
+                crate::v2_observability::backend_failure(
+                    crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
+                );
+                if command.is_read_only() {
+                    return Err(M1BackendError::Backend(error));
+                }
+                return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
+            }
             Err(error) => {
                 crate::v2_observability::backend_failure(
                     crate::v2_observability::BackendFailureReason::Tool,
@@ -453,66 +480,86 @@ impl CuaMcpAdapter {
             }
         };
         if raw.is_error == Some(true) {
-            crate::v2_observability::backend_failure(
-                crate::v2_observability::BackendFailureReason::Tool,
-            );
-            return Err(M1BackendError::BackendToolError);
+            crate::v2_observability::backend_failure(if command.is_read_only() {
+                crate::v2_observability::BackendFailureReason::Tool
+            } else {
+                crate::v2_observability::BackendFailureReason::AmbiguousOutcome
+            });
+            if command.is_read_only() {
+                return Err(M1BackendError::BackendToolError);
+            }
+            return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
         }
-        let result = match command {
-            DeviceCommand::PointerClick { .. } | DeviceCommand::PointerClickAdvanced { .. } => {
-                DeviceResult::PointerClickCompleted
-            }
-            DeviceCommand::PointerDrag { .. } | DeviceCommand::PointerDragAdvanced { .. } => {
-                DeviceResult::PointerDragCompleted
-            }
-            DeviceCommand::TypeText { .. } | DeviceCommand::TypeTextAdvanced { .. } => {
-                DeviceResult::TypeTextCompleted
-            }
-            DeviceCommand::TerminateApplication { process_id } => {
-                DeviceResult::ApplicationTerminated {
-                    process_id: *process_id,
+        let result: Result<DeviceResult, M1BackendError> = (|| {
+            Ok(match command {
+                DeviceCommand::PointerClick { .. } | DeviceCommand::PointerClickAdvanced { .. } => {
+                    DeviceResult::PointerClickCompleted
                 }
+                DeviceCommand::PointerDrag { .. } | DeviceCommand::PointerDragAdvanced { .. } => {
+                    DeviceResult::PointerDragCompleted
+                }
+                DeviceCommand::TypeText { .. } | DeviceCommand::TypeTextAdvanced { .. } => {
+                    DeviceResult::TypeTextCompleted
+                }
+                DeviceCommand::TerminateApplication { process_id } => {
+                    DeviceResult::ApplicationTerminated {
+                        process_id: *process_id,
+                    }
+                }
+                DeviceCommand::ActivateWindow { .. } => {
+                    normalize_window_activation_result(command, &raw)?
+                }
+                DeviceCommand::SetWindowFrame {
+                    process_id,
+                    window_id,
+                    bounds,
+                    ..
+                } => DeviceResult::WindowFrameSet {
+                    process_id: *process_id,
+                    window_id: *window_id,
+                    bounds: bounds.clone(),
+                },
+                DeviceCommand::InvokeMenu { .. } => DeviceResult::MenuInvoked,
+                DeviceCommand::KeyboardInput { .. } => DeviceResult::KeyboardInputCompleted,
+                DeviceCommand::Scroll { .. } => DeviceResult::ScrollCompleted,
+                DeviceCommand::ClipboardRead { .. } => normalize_clipboard_read_result(&raw)?,
+                DeviceCommand::ClipboardWrite { .. } => normalize_clipboard_write_result(&raw)?,
+                DeviceCommand::PointerPosition { .. } => normalize_pointer_position_result(&raw)?,
+                DeviceCommand::MovePointer { .. } => DeviceResult::PointerMoveCompleted,
+                DeviceCommand::SetUiValue { .. } => DeviceResult::UiValueSet,
+                DeviceCommand::CaptureRegion { .. } => DeviceResult::RegionCaptured {
+                    image: normalize_region_capture_result(&raw)?,
+                },
+                DeviceCommand::ExpandInteractionScope { .. } => {
+                    DeviceResult::InteractionScopeExpanded
+                }
+                DeviceCommand::Screenshot | DeviceCommand::ScreenshotContextual { .. } => {
+                    normalize_screenshot_result(&raw)?
+                }
+                DeviceCommand::InspectWindow { .. }
+                | DeviceCommand::InspectWindowContextual { .. } => {
+                    normalize_window_snapshot_result(command, &raw)?
+                }
+                DeviceCommand::VerifyUiState { .. }
+                | DeviceCommand::VerifyUiStateContextual { .. } => {
+                    normalize_ui_verification_result(command, &raw)?
+                }
+                _ => {
+                    let value = structured_value(&raw)?;
+                    normalize_result(command, &value)?
+                }
+            })
+        })();
+        match result {
+            Ok(result) => Ok(BackendExecutionOutcome::Completed(result)),
+            Err(_error) if !command.is_read_only() => {
+                crate::v2_observability::backend_failure(
+                    crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
+                );
+                Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
             }
-            DeviceCommand::ActivateWindow { .. } => {
-                normalize_window_activation_result(command, &raw)?
-            }
-            DeviceCommand::SetWindowFrame {
-                process_id,
-                window_id,
-                bounds,
-                ..
-            } => DeviceResult::WindowFrameSet {
-                process_id: *process_id,
-                window_id: *window_id,
-                bounds: bounds.clone(),
-            },
-            DeviceCommand::InvokeMenu { .. } => DeviceResult::MenuInvoked,
-            DeviceCommand::KeyboardInput { .. } => DeviceResult::KeyboardInputCompleted,
-            DeviceCommand::Scroll { .. } => DeviceResult::ScrollCompleted,
-            DeviceCommand::ClipboardRead { .. } => normalize_clipboard_read_result(&raw)?,
-            DeviceCommand::ClipboardWrite { .. } => normalize_clipboard_write_result(&raw)?,
-            DeviceCommand::PointerPosition { .. } => normalize_pointer_position_result(&raw)?,
-            DeviceCommand::MovePointer { .. } => DeviceResult::PointerMoveCompleted,
-            DeviceCommand::SetUiValue { .. } => DeviceResult::UiValueSet,
-            DeviceCommand::CaptureRegion { .. } => DeviceResult::RegionCaptured {
-                image: normalize_region_capture_result(&raw)?,
-            },
-            DeviceCommand::ExpandInteractionScope { .. } => DeviceResult::InteractionScopeExpanded,
-            DeviceCommand::Screenshot | DeviceCommand::ScreenshotContextual { .. } => {
-                normalize_screenshot_result(&raw)?
-            }
-            DeviceCommand::InspectWindow { .. } | DeviceCommand::InspectWindowContextual { .. } => {
-                normalize_window_snapshot_result(command, &raw)?
-            }
-            DeviceCommand::VerifyUiState { .. } | DeviceCommand::VerifyUiStateContextual { .. } => {
-                normalize_ui_verification_result(command, &raw)?
-            }
-            _ => {
-                let value = structured_value(&raw)?;
-                normalize_result(command, &value)?
-            }
-        };
-        Ok(BackendExecutionOutcome::Completed(result))
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -2664,6 +2711,114 @@ mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn post_dispatch_backend_tool_errors_are_indeterminate_only_for_mutations() {
+        use crate::v2_browser::BrowserInputRoute;
+        use crate::v2_browser_runtime::{BrowserBackendClickTarget, BrowserBackendCommand};
+
+        let click_marker = transfer_state_dir("ambiguous-click-marker");
+        let adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--ambiguous-click-marker".into(),
+            click_marker.to_string_lossy().into_owned(),
+        ]);
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::PointerClick {
+                        x: 10,
+                        y: 20,
+                        button: crate::v2_m0::PointerButton::Left,
+                    },
+                    cancel_rx,
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::BackendOutcomeIndeterminate
+        );
+        assert!(
+            click_marker.exists(),
+            "fixture must prove dispatch before error"
+        );
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_file(&click_marker);
+
+        let browser_marker = transfer_state_dir("ambiguous-browser-click-marker");
+        let adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--ambiguous-browser-click-marker".into(),
+            browser_marker.to_string_lossy().into_owned(),
+        ]);
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let browser_click = DeviceCommand::Browser {
+            command: BrowserBackendCommand::Click {
+                context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+                backend_target_id: "target".into(),
+                backend_tab_id: "tab".into(),
+                target: BrowserBackendClickTarget::Element {
+                    backend_element_ref: "p1:1".into(),
+                },
+                input_route: BrowserInputRoute::DomEvent,
+            },
+        };
+        assert_eq!(
+            adapter.execute(&browser_click, cancel_rx).await.unwrap(),
+            BackendExecutionOutcome::BackendOutcomeIndeterminate
+        );
+        assert!(
+            browser_marker.exists(),
+            "browser fixture must prove dispatch before error"
+        );
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_file(&browser_marker);
+
+        let response_loss_marker = transfer_state_dir("response-loss-click-marker");
+        let adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--drop-after-click-marker".into(),
+            response_loss_marker.to_string_lossy().into_owned(),
+        ]);
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::PointerClick {
+                        x: 30,
+                        y: 40,
+                        button: crate::v2_m0::PointerButton::Left,
+                    },
+                    cancel_rx,
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::BackendOutcomeIndeterminate
+        );
+        assert!(
+            response_loss_marker.exists(),
+            "fixture must prove dispatch before response loss"
+        );
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_file(&response_loss_marker);
+
+        let adapter = fixture(vec![
+            "scripts/mock_cua_mcp_backend.py".into(),
+            "--fail-list-apps".into(),
+        ]);
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        assert!(matches!(
+            adapter
+                .execute(&DeviceCommand::ListApplications, cancel_rx)
+                .await,
+            Err(M1BackendError::BackendToolError)
+        ));
+        adapter.shutdown().await.unwrap();
+    }
+
     #[test]
     fn cua_advertises_complete_browser_core_and_transfer_surface() {
         let advertisement = fixture(vec![]).advertisement();
@@ -2782,7 +2937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cua_transfer_backend_failures_are_definite_errors() {
+    async fn cua_transfer_backend_failures_after_dispatch_are_indeterminate() {
         use crate::v2_browser_runtime::{BrowserBackendCommand, BrowserStagedUploadFile};
         use crate::v2_browser_staging::{BrowserDownloadStagingBroker, BrowserUploadStagingBroker};
         use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -2822,7 +2977,7 @@ mod tests {
             upload_adapter
                 .execute_browser_upload(&upload_command, &[resolved], rx)
                 .await,
-            Err(M1BackendError::BackendToolError)
+            Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
         ));
         upload_adapter.shutdown().await.unwrap();
 
@@ -2856,7 +3011,7 @@ mod tests {
             download_adapter
                 .execute_browser_download(&command, &prepared, rx)
                 .await,
-            Err(M1BackendError::BackendToolError)
+            Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
         ));
         download_adapter.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(state);
@@ -3174,6 +3329,224 @@ mod tests {
         adapter.end_interaction_session(context).await.unwrap();
         adapter.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(state);
+    }
+
+    #[tokio::test]
+    #[ignore = "trusted-mac real-Cua issue #47 browser alert acceptance"]
+    async fn real_cua_browser_alert_backend_error_is_indeterminate() {
+        use crate::v2_browser::{BrowserAction, BrowserInputRoute};
+        use crate::v2_browser_runtime::{
+            BrowserBackendClickTarget, BrowserBackendCommand, BrowserBackendResult,
+        };
+
+        assert_eq!(
+            std::env::var("CUMG_V2_ISSUE47_E2E_ACK").as_deref(),
+            Ok("1"),
+            "explicit trusted-Mac acknowledgement required"
+        );
+        let command = std::env::var("CUMG_V2_CUA_COMMAND")
+            .unwrap_or_else(|_| "/Users/sawadakousuke/.local/bin/cua-driver".into());
+        let process_id: u32 = std::env::var("CUMG_V2_ISSUE47_BROWSER_PID")
+            .expect("CUMG_V2_ISSUE47_BROWSER_PID is required")
+            .parse()
+            .expect("browser pid must be u32");
+        let context = format!("ctx_{:032x}", rand::random::<u128>());
+        let adapter = CuaMcpAdapter::new(
+            command,
+            vec!["mcp".into()],
+            "0.19.3",
+            "macos",
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            1,
+            Duration::from_millis(50),
+        );
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let mut window_id = None;
+        for _ in 0..30 {
+            let windows = adapter
+                .execute(
+                    &DeviceCommand::ListWindows {
+                        process_id: Some(process_id),
+                        on_screen_only: true,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap();
+            if let BackendExecutionOutcome::Completed(DeviceResult::Windows { windows, .. }) =
+                windows
+                && let Some(window) = windows.into_iter().find(|window| {
+                    window.is_on_screen
+                        && window.title == "CUMG issue47"
+                        && window.bounds.width >= 400
+                        && window.bounds.height >= 300
+                })
+            {
+                window_id = Some(window.window_id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let window_id =
+            window_id.expect("isolated issue #47 Chrome window did not become observable");
+
+        let bound = adapter
+            .execute(
+                &DeviceCommand::Browser {
+                    command: BrowserBackendCommand::Bind {
+                        context_id: context.clone(),
+                        process_id,
+                        window_id,
+                    },
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let (target, tab) = match bound {
+            BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                result:
+                    BrowserBackendResult::Bound {
+                        backend_target_id,
+                        tabs,
+                        ..
+                    },
+            }) => {
+                let tab = tabs
+                    .iter()
+                    .find(|tab| tab.active == Some(true))
+                    .or_else(|| tabs.first())
+                    .cloned()
+                    .expect("bound browser must expose a tab");
+                (backend_target_id, tab.backend_tab_id)
+            }
+            other => panic!("unexpected browser bind result: {other:?}"),
+        };
+
+        let inspected = adapter
+            .execute(
+                &DeviceCommand::Browser {
+                    command: BrowserBackendCommand::Inspect {
+                        context_id: context.clone(),
+                        backend_target_id: target.clone(),
+                        backend_tab_id: tab.clone(),
+                        backend_scope_ref: None,
+                        query: Some("alert".into()),
+                        backend_continuation: None,
+                        include_screenshot: false,
+                    },
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let alert_ref = match inspected {
+            BackendExecutionOutcome::Completed(DeviceResult::Browser {
+                result: BrowserBackendResult::Snapshot { action_refs, .. },
+            }) => action_refs
+                .into_iter()
+                .find(|reference| {
+                    reference.actions.contains(&BrowserAction::Click)
+                        && reference
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("alert"))
+                })
+                .map(|reference| reference.backend_ref)
+                .expect("fixture alert button must expose a click ref"),
+            other => panic!("unexpected browser inspect result: {other:?}"),
+        };
+
+        let click = adapter
+            .execute(
+                &DeviceCommand::Browser {
+                    command: BrowserBackendCommand::Click {
+                        context_id: context.clone(),
+                        backend_target_id: target,
+                        backend_tab_id: tab,
+                        target: BrowserBackendClickTarget::Element {
+                            backend_element_ref: alert_ref,
+                        },
+                        input_route: BrowserInputRoute::DomEvent,
+                    },
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(click, BackendExecutionOutcome::BackendOutcomeIndeterminate);
+
+        // The exact issue #47 condition is a backend failure after a visible
+        // effect. Prove the JS alert is actually present independently through
+        // the native window surface; do not infer it from the browser error.
+        let mut observed_alert = false;
+        for _ in 0..20 {
+            let windows = adapter
+                .execute(
+                    &DeviceCommand::ListWindows {
+                        process_id: Some(process_id),
+                        on_screen_only: true,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap();
+            if let BackendExecutionOutcome::Completed(DeviceResult::Windows { windows, .. }) =
+                windows
+            {
+                for window in windows {
+                    if window.window_id == window_id || window.bounds.width < 200 {
+                        continue;
+                    }
+                    let inspected = adapter
+                        .execute(
+                            &DeviceCommand::InspectWindow {
+                                process_id,
+                                window_id: window.window_id,
+                                query: Some("GATEWAY_ALERT_OK".into()),
+                                max_elements: 64,
+                                max_depth: 8,
+                                include_screenshot: false,
+                            },
+                            cancel_rx.clone(),
+                        )
+                        .await;
+                    if let Ok(BackendExecutionOutcome::Completed(DeviceResult::WindowSnapshot {
+                        elements,
+                        ..
+                    })) = inspected
+                        && elements.iter().any(|element| {
+                            element
+                                .label
+                                .as_deref()
+                                .is_some_and(|label| label.contains("GATEWAY_ALERT_OK"))
+                                || element
+                                    .value
+                                    .as_deref()
+                                    .is_some_and(|value| value.contains("GATEWAY_ALERT_OK"))
+                        })
+                    {
+                        observed_alert = true;
+                        break;
+                    }
+                }
+            }
+            if observed_alert {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            observed_alert,
+            "browser click must have produced the visible alert before the backend error"
+        );
+
+        adapter.end_interaction_session(&context).await.unwrap();
+        adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ Status as of 2026-08-15:
 - **Desktop semantic path:** complete and accepted, including same-context native element click/type/key targeting and real-Cua background AX element-action evidence.
 - **Browser core semantic path:** complete and accepted for prepare, bind, inspect, navigate, click, type, dialog, and pointer semantics.
 - **Browser transfer:** complete and accepted. Upload/download use scoped CUMG refs plus Agent-private bounded staging; no arbitrary host path is exposed northbound.
+- **Post-dispatch ambiguity hardening:** mutating backend errors, malformed/unprovable completions, and response loss are quarantined as `BackendOutcomeUnproven`; runtime failures are returned as stable MCP tool-error results rather than leaking transport/exception shapes. Real-Cua browser-alert acceptance covers the observable-side-effect case from issue #47.
 - **V1 production:** unchanged by the V2 development branch. V1 regression and conformance coverage remains required during V2 work.
 
 ## Active contracts

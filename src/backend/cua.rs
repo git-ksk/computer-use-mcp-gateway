@@ -7,8 +7,8 @@
 //! daemon. Do not replace that lifecycle with a raw `cua-driver serve` spawn.
 
 use super::{
-    BackendCallCancelled, BackendCallTimedOut, BackendHealth, BackendResourceMetrics,
-    ComputerUseBackend,
+    BackendCallCancelled, BackendCallResponseLost, BackendCallTimedOut, BackendHealth,
+    BackendResourceMetrics, ComputerUseBackend,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -379,9 +379,13 @@ impl ComputerUseBackend for CuaBackend {
                 match result {
                     Ok(ServerResult::CallToolResult(result)) => Ok(result),
                     Ok(_) => bail!("Cua MCP tool call returned an unsupported multi-round-trip response"),
-                    Err(error) => {
+                    Err(_error) => {
                         self.recover_after_failure().await;
-                        Err(error).context("Cua MCP tool call failed; connection recovered for the next call")
+                        // The request handle was created before awaiting the response, so
+                        // the backend may already have executed the operation. Do not
+                        // expose transport internals or let mutating callers treat this
+                        // as proof that no side effect occurred.
+                        Err(anyhow!(BackendCallResponseLost))
                     }
                 }
             }

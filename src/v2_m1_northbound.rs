@@ -1915,7 +1915,7 @@ impl V2NorthboundMcp {
                 return Err(error);
             }
         };
-        let result = self
+        let execution = self
             .execute_command(
                 principal,
                 operation_id,
@@ -1930,7 +1930,11 @@ impl V2NorthboundMcp {
                 usage,
                 context,
             )
-            .await?;
+            .await;
+        let result = match execution {
+            Ok(result) => result,
+            Err(error) => return Ok(execution_error_response(error)),
+        };
         let DeviceResult::BrowserUploadStaged {
             backend_file_handle,
             bytes,
@@ -1984,9 +1988,13 @@ impl V2NorthboundMcp {
         let command = DeviceCommand::Browser {
             command: prepared.command.clone(),
         };
-        let result = self
+        let result = match self
             .execute_command(principal, operation_id, command, usage, context)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return Ok(execution_error_response(error)),
+        };
         self.publicize_browser_result(prepared, result).await
     }
 
@@ -2425,7 +2433,7 @@ impl V2NorthboundMcp {
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
         let owner = OperationOwner::from_principal(principal);
-        let read_only = command_is_read_only(&command);
+        let read_only = command.is_read_only();
         let pending = match self
             .hub
             .start_command_as_with_id(
@@ -3062,9 +3070,13 @@ impl ServerHandler for V2NorthboundMcp {
             _ => None,
         };
 
-        let mut result = self
+        let mut result = match self
             .execute_command(&auth.principal, operation_id, command, usage, &context)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return Ok(execution_error_response(error)),
+        };
         if publicize_snapshot {
             let binding = interaction_binding.as_ref().ok_or_else(|| {
                 McpError::internal_error("Contextual snapshot lost its interaction binding", None)
@@ -3399,34 +3411,6 @@ fn publicize_browser_semantic_ref(
     }
 }
 
-fn command_is_read_only(command: &DeviceCommand) -> bool {
-    matches!(
-        command,
-        DeviceCommand::ListApplications
-            | DeviceCommand::ScreenGeometry
-            | DeviceCommand::Screenshot
-            | DeviceCommand::ScreenshotContextual { .. }
-            | DeviceCommand::ReadFile { .. }
-            | DeviceCommand::ListDirectory { .. }
-            | DeviceCommand::ListWindows { .. }
-            | DeviceCommand::InspectWindow { .. }
-            | DeviceCommand::InspectWindowContextual { .. }
-            | DeviceCommand::VerifyUiState { .. }
-            | DeviceCommand::VerifyUiStateContextual { .. }
-            | DeviceCommand::ClipboardRead { .. }
-            | DeviceCommand::PointerPosition { .. }
-            | DeviceCommand::CaptureRegion { .. }
-            | DeviceCommand::Browser {
-                command: BrowserBackendCommand::Bind { .. }
-                    | BrowserBackendCommand::Inspect { .. }
-                    | BrowserBackendCommand::Dialog {
-                        action: BrowserDialogAction::Inspect,
-                        ..
-                    },
-            }
-    )
-}
-
 fn usage_settlement_for_error(
     dispatched: bool,
     read_only: bool,
@@ -3477,23 +3461,85 @@ fn usage_error_to_mcp(error: UsageError) -> McpError {
 }
 
 fn hub_error_to_mcp(error: HubCommandError) -> McpError {
-    let message = match error {
-        HubCommandError::AgentOffline => "Agent is offline",
-        HubCommandError::Busy => "Device is busy",
-        HubCommandError::DeviceIndeterminate { .. } | HubCommandError::Indeterminate => {
-            "Device execution state is indeterminate"
+    let (message, code, operation_id) = match error {
+        HubCommandError::AgentOffline => ("Agent is offline", "agent_offline", None),
+        HubCommandError::Busy => ("Device is busy", "busy", None),
+        HubCommandError::DeviceIndeterminate { operation_id } => (
+            "Device execution state is indeterminate",
+            "device_indeterminate",
+            Some(operation_id),
+        ),
+        HubCommandError::Indeterminate => (
+            "Device execution state is indeterminate",
+            "device_indeterminate",
+            None,
+        ),
+        HubCommandError::CancelledBeforeDispatch => (
+            "Operation was cancelled before dispatch",
+            "cancelled_before_dispatch",
+            None,
+        ),
+        HubCommandError::UsageUnavailable => (
+            "Usage accounting is temporarily unavailable",
+            "usage_unavailable",
+            None,
+        ),
+        HubCommandError::Remote(code) => {
+            let message = if code.is_browser_refusal() {
+                "Browser operation was refused"
+            } else {
+                "Device operation was rejected or could not be completed"
+            };
+            return McpError::invalid_request(message, Some(json!({"code": code.safe_code()})));
         }
-        HubCommandError::CancelledBeforeDispatch => "Operation was cancelled before dispatch",
-        HubCommandError::UsageUnavailable => "Usage accounting is temporarily unavailable",
-        HubCommandError::Remote(code) if code.is_browser_refusal() => {
-            return McpError::invalid_request(
-                "Browser operation was refused",
-                Some(json!({"code": code.safe_code()})),
-            );
+        HubCommandError::SessionSuperseded => {
+            ("Device session was superseded", "session_superseded", None)
         }
-        _ => "Device operation was rejected or could not be completed",
+        HubCommandError::SessionClosed => ("Device session closed", "session_closed", None),
+        HubCommandError::OperationReplay => {
+            ("Operation replay was rejected", "operation_replay", None)
+        }
+        HubCommandError::UnknownOperation => ("Operation is unknown", "unknown_operation", None),
+        HubCommandError::Rejected => (
+            "Device operation was rejected or could not be completed",
+            "rejected",
+            None,
+        ),
+        HubCommandError::UnexpectedResult => (
+            "Device operation returned an unexpected result",
+            "unexpected_result",
+            None,
+        ),
     };
-    McpError::invalid_request(message, None)
+    let mut data = json!({"code": code});
+    if let Some(operation_id) = operation_id {
+        data["operation_id"] = json!(operation_id);
+    }
+    McpError::invalid_request(message, Some(data))
+}
+
+fn execution_error_response(error: McpError) -> CallToolResponse {
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool_call_cancelled");
+    let mut payload = json!({
+        "type": "tool_error",
+        "code": code,
+        "message": error.message,
+        "retry_safe": false,
+    });
+    if let Some(operation_id) = error
+        .data
+        .as_ref()
+        .and_then(|value| value.get("operation_id"))
+        .and_then(Value::as_str)
+    {
+        payload["operation_id"] = json!(operation_id);
+    }
+    CallToolResult::error(vec![ContentBlock::text(payload.to_string())]).into()
 }
 
 fn tool_capability(name: &str) -> Option<DeviceCapability> {
@@ -6361,6 +6407,38 @@ mod tests {
     }
 
     #[test]
+    fn operational_failures_are_tool_results_not_protocol_errors() {
+        let response =
+            execution_error_response(hub_error_to_mcp(HubCommandError::DeviceIndeterminate {
+                operation_id: "op_0123456789abcdef0123456789abcdef".into(),
+            }));
+        let serialized = match response {
+            CallToolResponse::Complete(result) => {
+                assert_eq!(result.is_error, Some(true));
+                serde_json::to_string(&result).unwrap()
+            }
+            other => panic!("unexpected tool response: {other:?}"),
+        };
+        assert!(serialized.contains("device_indeterminate"));
+        assert!(serialized.contains("retry_safe"));
+        assert!(serialized.contains("op_0123456789abcdef0123456789abcdef"));
+        assert!(!serialized.contains("ExceptionGroup"));
+
+        let response = execution_error_response(hub_error_to_mcp(HubCommandError::Remote(
+            crate::v2_m0::DeviceErrorCode::BrowserConsentRequired,
+        )));
+        let serialized = match response {
+            CallToolResponse::Complete(result) => {
+                assert_eq!(result.is_error, Some(true));
+                serde_json::to_string(&result).unwrap()
+            }
+            other => panic!("unexpected tool response: {other:?}"),
+        };
+        assert!(serialized.contains("browser_consent_required"));
+        assert!(!serialized.contains("provider"));
+    }
+
+    #[test]
     fn browser_refusal_mcp_error_carries_only_closed_safe_code() {
         let error = hub_error_to_mcp(HubCommandError::Remote(
             crate::v2_m0::DeviceErrorCode::BrowserInputTrustUnavailable,
@@ -6674,41 +6752,44 @@ mod tests {
 
     #[test]
     fn screenshot_failure_is_read_only_but_type_text_is_mutating_for_accounting() {
-        assert!(command_is_read_only(&DeviceCommand::Screenshot));
-        assert!(command_is_read_only(&DeviceCommand::ListWindows {
-            process_id: None,
-            on_screen_only: true,
-        }));
-        assert!(command_is_read_only(&DeviceCommand::InspectWindow {
-            process_id: 1,
-            window_id: 1,
-            query: None,
-            max_elements: 10,
-            max_depth: 5,
-            include_screenshot: false,
-        }));
-        assert!(!command_is_read_only(&DeviceCommand::LaunchApplication {
-            identifier: Some("app".into()),
-            name: None,
-            targets: vec![],
-            new_instance: false,
-        }));
-        assert!(!command_is_read_only(&DeviceCommand::TypeText {
-            text: "x".into(),
-        }));
+        assert!(DeviceCommand::Screenshot.is_read_only());
+        assert!(
+            DeviceCommand::ListWindows {
+                process_id: None,
+                on_screen_only: true,
+            }
+            .is_read_only()
+        );
+        assert!(
+            DeviceCommand::InspectWindow {
+                process_id: 1,
+                window_id: 1,
+                query: None,
+                max_elements: 10,
+                max_depth: 5,
+                include_screenshot: false,
+            }
+            .is_read_only()
+        );
+        assert!(
+            !DeviceCommand::LaunchApplication {
+                identifier: Some("app".into()),
+                name: None,
+                targets: vec![],
+                new_instance: false,
+            }
+            .is_read_only()
+        );
+        assert!(!DeviceCommand::TypeText { text: "x".into() }.is_read_only());
         let remote = HubCommandError::Remote(crate::v2_m0::DeviceErrorCode::InternalFailure);
         assert_eq!(
-            usage_settlement_for_error(
-                true,
-                command_is_read_only(&DeviceCommand::Screenshot),
-                &remote
-            ),
+            usage_settlement_for_error(true, DeviceCommand::Screenshot.is_read_only(), &remote),
             (UsageSettlement::Zero, "proven_no_effect")
         );
         assert_eq!(
             usage_settlement_for_error(
                 true,
-                command_is_read_only(&DeviceCommand::TypeText { text: "x".into() }),
+                DeviceCommand::TypeText { text: "x".into() }.is_read_only(),
                 &remote,
             ),
             (UsageSettlement::Full, "dispatched_conservative")

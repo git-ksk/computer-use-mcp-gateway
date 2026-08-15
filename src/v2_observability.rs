@@ -272,6 +272,7 @@ pub const fn indeterminate_reason_name(reason: IndeterminateReason) -> &'static 
     match reason {
         IndeterminateReason::CancellationUnproven => "cancellation_unproven",
         IndeterminateReason::BackendTimedOut => "backend_timed_out",
+        IndeterminateReason::BackendOutcomeUnproven => "backend_outcome_unproven",
         IndeterminateReason::ConnectionLost => "connection_lost",
         IndeterminateReason::HubRestartAfterDispatch => "hub_restart_after_dispatch",
         IndeterminateReason::AgentRestartAfterDispatch => "agent_restart_after_dispatch",

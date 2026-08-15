@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 6;
+pub const CONTROL_SCHEMA_VERSION: u16 = 7;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
@@ -643,6 +643,38 @@ impl DeviceCommand {
 
     pub fn class(&self) -> CapabilityClass {
         self.capability().class()
+    }
+
+    /// True only when the semantic operation cannot intentionally mutate user or
+    /// desktop state. This classification is shared by the Agent execution-safety
+    /// boundary and northbound accounting so post-dispatch failures cannot be
+    /// interpreted differently at different layers.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::ListApplications
+                | Self::ScreenGeometry
+                | Self::Screenshot
+                | Self::ScreenshotContextual { .. }
+                | Self::ReadFile { .. }
+                | Self::ListDirectory { .. }
+                | Self::ListWindows { .. }
+                | Self::InspectWindow { .. }
+                | Self::InspectWindowContextual { .. }
+                | Self::VerifyUiState { .. }
+                | Self::VerifyUiStateContextual { .. }
+                | Self::ClipboardRead { .. }
+                | Self::PointerPosition { .. }
+                | Self::CaptureRegion { .. }
+                | Self::Browser {
+                    command: BrowserBackendCommand::Bind { .. }
+                        | BrowserBackendCommand::Inspect { .. }
+                        | BrowserBackendCommand::Dialog {
+                            action: crate::v2_browser::BrowserDialogAction::Inspect,
+                            ..
+                        },
+                }
+        )
     }
 }
 
@@ -1371,6 +1403,7 @@ pub enum DeviceErrorCode {
     NotFound,
     IoFailure,
     InternalFailure,
+    BackendOutcomeIndeterminate,
     BrowserRouteUnavailable,
     BrowserRequiresSetup,
     BrowserBindingAmbiguous,
@@ -1398,6 +1431,7 @@ impl DeviceErrorCode {
             Self::NotFound => "not_found",
             Self::IoFailure => "io_failure",
             Self::InternalFailure => "internal_failure",
+            Self::BackendOutcomeIndeterminate => "backend_outcome_indeterminate",
             Self::BrowserRouteUnavailable => "browser_route_unavailable",
             Self::BrowserRequiresSetup => "browser_requires_setup",
             Self::BrowserBindingAmbiguous => "browser_binding_ambiguous",
