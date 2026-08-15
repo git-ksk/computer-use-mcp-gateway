@@ -84,6 +84,21 @@ second real Computer Use backend または native GUI adapter は、具体的な
 
 real desktop side effect を起こせる backend では、compile-time interface compatibility だけを acceptance evidence としません。
 
+### Pluggable external capability providers
+
+CUMG 自身を agent 化したり upstream implementation を重複実装したりせず、有用な execution surface を追加できる場合、optional な external capability provider を candidate として検討できます。代表例は developer-workspace provider です。たとえば Serena のような maintained project-aware MCP が semantic code navigation、workspace search/editing、その他 developer primitive を提供し、それを reviewed CUMG adapter の背後に配置する構成を検討できます。
+
+integration boundary は generic MCP proxy ではなく capability-oriented のまま維持します。
+
+- planning、tool selection、project reasoning、multi-step agent loop は upstream chat/agent harness の責務のままとする;
+- provider が higher-level tool を提供していても、CUMG 内部に second autonomous coding/operations agent loop を持ち込まない;
+- provider tool は bounded input/result と read-only / state-changing classification を持つ explicit CUMG semantic capability に map する;
+- provider-specific tool name、opaque authority、arbitrary passthrough を permanent northbound contract にしない;
+- state-changing provider work は native capability と同じ authenticated principal、exact-capability grant、operation ownership、fencing、ambiguity、quarantine、cancellation、no-auto-replay rule の下に置く;
+- external provider は CUMG core product boundary を再定義せず、置換または省略可能でなければならない。
+
+これは extensibility direction であり、特定 provider の bundle を約束するものではありません。採用には具体的な workflow benefit と、adapter が CUMG execution-safety invariant を維持する evidence が必要です。
+
 ### Higher-risk capability surfaces
 
 explicit filesystem mutation、richer clipboard data、application launch argument、その他 consequential surface は、それぞれ separate exact capability として検討できます。既存 shell、GUI、browser、backend integration から暗黙に authority を継承しません。

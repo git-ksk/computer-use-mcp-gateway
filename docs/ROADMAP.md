@@ -84,6 +84,21 @@ Any adapter must remain below the same CUMG authority boundary:
 
 Compile-time interface compatibility alone is not acceptance evidence for a backend that can cause real desktop side effects.
 
+### Pluggable external capability providers
+
+CUMG may support optional external capability providers when they add a useful execution surface without turning CUMG itself into an agent or duplicating an upstream implementation. A developer-workspace provider is a representative candidate: for example, a maintained project-aware MCP such as Serena could supply semantic code navigation, workspace search/editing, or related developer primitives behind a reviewed CUMG adapter.
+
+The integration boundary must remain capability-oriented rather than becoming a generic MCP proxy:
+
+- the upstream chat/agent harness remains responsible for planning, tool selection, project reasoning, and multi-step agent loops;
+- CUMG must not acquire a second autonomous coding/operations agent loop merely because a provider offers higher-level tools;
+- provider tools are mapped to explicit CUMG semantic capabilities with bounded inputs/results and read-only versus state-changing classification;
+- provider-specific tool names, opaque authority, and arbitrary passthrough do not become the permanent northbound contract;
+- state-changing provider work remains under the same authenticated principal, exact-capability grant, operation ownership, fencing, ambiguity, quarantine, cancellation, and no-auto-replay rules as native capabilities;
+- an external provider may be replaced or omitted without redefining the CUMG core product boundary.
+
+This is an extensibility direction, not a commitment to bundle a particular provider. Admission requires a concrete workflow benefit and evidence that the adapter preserves CUMG's execution-safety invariant.
+
 ### Higher-risk capability surfaces
 
 Explicit filesystem mutation, richer clipboard data, application launch arguments, or other consequential surfaces may be considered as separate exact capabilities. They are not implicitly inherited from an existing shell, GUI, browser, or backend integration.
