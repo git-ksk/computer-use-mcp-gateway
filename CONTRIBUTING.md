@@ -51,3 +51,8 @@ The docs link checker validates repository-local Markdown targets without fetchi
 Changes to MCP lifecycle handling, cancellation, Cua integration, policy filtering/classification, Host/Origin validation, reconnect behavior, health telemetry, or CI supply-chain pins should include or update the relevant deterministic or real-Cua coverage. See [`docs/TESTING.md`](docs/TESTING.md).
 
 Do not run untrusted pull-request code on a TCC-granted self-hosted desktop runner. The desktop E2E workflow is manual and `main`-only by design.
+
+
+## Project and release policy
+
+All normal changes enter `main` through a pull request and follow the change-class gates in [`docs/PROJECT_GOVERNANCE.md`](docs/PROJECT_GOVERNANCE.md). Version impact is classified using [`docs/VERSIONING.md`](docs/VERSIONING.md); docs-only changes normally do not bump the crate version, compatible shipped fixes are PATCH, and public-contract expansion or deliberate pre-1.0 incompatibility is MINOR.
