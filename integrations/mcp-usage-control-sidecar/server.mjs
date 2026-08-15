@@ -141,6 +141,7 @@ export async function createUsageSidecar(options = {}) {
         return json(res, 200, {
           allowed: true,
           reservationId: admission.lease.reservation.id,
+          renewAfterMs: Math.max(1, Math.floor(reservationTtlMs / 3)),
         });
       }
 
@@ -149,6 +150,14 @@ export async function createUsageSidecar(options = {}) {
           return json(res, 400, { error: 'invalid_request' });
         }
         await store.markLiable({ reservationId: body.reservationId });
+        return json(res, 200, { ok: true });
+      }
+
+      if (req.url === '/v1/renew') {
+        if (!exactKeys(body, ['reservationId']) || !nonEmptyString(body.reservationId, 512)) {
+          return json(res, 400, { error: 'invalid_request' });
+        }
+        await store.renew({ reservationId: body.reservationId, ttlMs: reservationTtlMs });
         return json(res, 200, { ok: true });
       }
 

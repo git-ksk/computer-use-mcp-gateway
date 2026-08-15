@@ -16,7 +16,9 @@ MCP client
   -> MCPUsage markLiable()
   -> persist CUMG Dispatched
   -> gRPC/TLS Agent dispatch
+  -> [while active] MCPUsage renew() heartbeat
   -> Agent -> MCP stdio -> Cua
+  -> MCPUsage settle(0|1)
 ```
 
 `reserve()` cannot safely precede northbound authentication because usage identity is derived from the verified issuer and subject. Authentication credentials remain at the northbound boundary and are never sent to the usage sidecar. The current RFC 7662 adapter strips its bearer token before Hub execution.
@@ -74,6 +76,7 @@ Current post-dispatch zero settlement is intentionally narrow: an observation/re
 | reserve timeout / ambiguous ACK | fail the northbound call; do not dispatch and do not create an unrelated second reservation automatically |
 | quota deny / duplicate operationId | fail before CUMG execution admission |
 | `markLiable()` failure / ambiguous ACK | fail closed before Agent-visible dispatch; cancel the already-admitted CUMG operation through the existing pre-dispatch cancellation transition |
+| renewal timeout / ambiguous ACK | keep CUMG execution state authoritative; do not assume renewal succeeded and do not create a replacement reservation or replay the operation |
 | settlement timeout / ambiguous ACK | preserve the authoritative CUMG result/quarantine; log a bounded accounting failure and do not replay the business operation |
 | sidecar crash before dispatch | fail closed; no Agent dispatch |
 | sidecar crash after dispatch | CUMG execution state remains authoritative; accounting may be lost because MemoryUsageStore is non-durable |
@@ -96,6 +99,7 @@ Only these fields cross the bridge:
 - CUMG operation ID;
 - bounded tool name;
 - opaque reservation ID;
+- bounded renewal timing metadata;
 - bounded settlement outcome;
 - `actualUnits` of 0 or 1.
 
@@ -112,4 +116,4 @@ CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/
 CUMG_V2_USAGE_TIMEOUT_SECS=2
 ```
 
-The sidecar requires a positive `CUMG_USAGE_LIMIT_PER_PRINCIPAL`. See its README and the systemd examples under `packaging/systemd/`.
+The sidecar requires a positive `CUMG_USAGE_LIMIT_PER_PRINCIPAL`. Active operations are renewable: reserve returns a `renewAfterMs` cadence derived from the configured reservation TTL, and the Hub calls the private `/v1/renew` bridge while the tool remains active. A renewal failure never clears or changes CUMG execution state. See the sidecar README and the systemd examples under `packaging/systemd/`.
