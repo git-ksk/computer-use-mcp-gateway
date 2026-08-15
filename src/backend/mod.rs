@@ -51,6 +51,20 @@ impl std::fmt::Display for BackendCallTimedOut {
 
 impl std::error::Error for BackendCallTimedOut {}
 
+/// The backend request was successfully dispatched, but its response channel
+/// failed before CUMG could prove completion. Mutating callers must treat this
+/// as an ambiguous post-dispatch outcome and must not replay automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCallResponseLost;
+
+impl std::fmt::Display for BackendCallResponseLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("computer-use backend response was lost after request dispatch")
+    }
+}
+
+impl std::error::Error for BackendCallResponseLost {}
+
 #[async_trait]
 pub trait ComputerUseBackend: Send + Sync {
     async fn connect(&self) -> Result<()>;

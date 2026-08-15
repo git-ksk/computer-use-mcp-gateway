@@ -908,6 +908,70 @@ impl SingleDeviceHub {
         validate_command_result(command, &result.result)?;
         let owner = operation.owner.clone();
         let device_result = result.result.result.clone();
+        let capability = operation.command.capability();
+
+        if matches!(
+            device_result,
+            DeviceResult::Error {
+                code: crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate
+            }
+        ) {
+            let cancelled_queued = {
+                let mut persistent = self.inner.persistent.lock().await;
+                persistent.execution.mark_indeterminate(
+                    &operation_id,
+                    &owner,
+                    generation,
+                    IndeterminateReason::BackendOutcomeUnproven,
+                    unix_time_ms()?,
+                )?;
+                let cancelled: Vec<_> = pending
+                    .keys()
+                    .filter(|pending_id| {
+                        pending_id.as_str() != operation_id
+                            && persistent.execution.state(pending_id)
+                                == Some(HubOperationState::Cancelled)
+                    })
+                    .cloned()
+                    .collect();
+                persist_locked(&self.inner, &persistent)?;
+                cancelled
+            };
+            for cancelled_id in cancelled_queued {
+                queue_order.retain(|queued| queued != &cancelled_id);
+                if let Some(operation) = pending.remove(&cancelled_id) {
+                    let _ = operation
+                        .reply
+                        .send(Err(HubCommandError::CancelledBeforeDispatch));
+                }
+            }
+            if let Some(operation) = pending.remove(&operation_id) {
+                let _ = operation
+                    .reply
+                    .send(Err(HubCommandError::DeviceIndeterminate {
+                        operation_id: operation_id.clone(),
+                    }));
+            }
+            crate::v2_observability::operation_indeterminate(
+                IndeterminateReason::BackendOutcomeUnproven,
+            );
+            crate::v2_observability::quarantine_created();
+            tracing::warn!(
+                event = "v2_operation_indeterminate",
+                operation_id = %operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                capability = crate::v2_observability::capability_name(capability),
+                outcome = "quarantined",
+                indeterminate_reason = crate::v2_observability::indeterminate_reason_name(
+                    IndeterminateReason::BackendOutcomeUnproven
+                ),
+                error_code = "backend_outcome_unproven",
+                "backend returned no proof of completion after a mutating dispatch; device quarantined"
+            );
+            return Ok(());
+        }
+
         let (terminal_state, evidence) = match &device_result {
             DeviceResult::Error { .. } => (
                 HubOperationState::Failed,
@@ -934,7 +998,6 @@ impl SingleDeviceHub {
                 ExecutionEvidence::VerifiedAgentResult,
             ),
         };
-        let capability = operation.command.capability();
         let (next, receipt) = {
             let mut persistent = self.inner.persistent.lock().await;
             let settled = persistent.execution.finalize(

@@ -5,7 +5,8 @@
 //! remain fail-closed until their separate staging/transfer boundary is wired.
 
 use crate::backend::{
-    BackendCallCancelled, BackendCallTimedOut, ComputerUseBackend, cua::CuaBackend,
+    BackendCallCancelled, BackendCallResponseLost, BackendCallTimedOut, ComputerUseBackend,
+    cua::CuaBackend,
 };
 use crate::v2_browser::{
     BrowserDialogAction, BrowserDialogDelivery, BrowserInputRoute, BrowserPointerAction,
@@ -35,6 +36,7 @@ pub(crate) enum BrowserExecutionOutcome {
     Completed(BrowserBackendResult),
     CancellationPropagatedIndeterminate,
     TimedOutIndeterminate,
+    BackendOutcomeIndeterminate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,15 +148,42 @@ pub(crate) async fn execute_cua_browser(
         Err(error) if error.downcast_ref::<BackendCallTimedOut>().is_some() => {
             return Ok(BrowserExecutionOutcome::TimedOutIndeterminate);
         }
+        Err(error) if error.downcast_ref::<BackendCallResponseLost>().is_some() => {
+            if browser_command_is_read_only(command) {
+                return Err(BrowserExecutionError::Backend(error));
+            }
+            return Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate);
+        }
         Err(error) => return Err(BrowserExecutionError::Backend(error)),
     };
     if let Some(reason) = refusal_reason(&raw) {
         return Err(BrowserExecutionError::BackendRefused(reason));
     }
     if raw.is_error == Some(true) {
-        return Err(BrowserExecutionError::BackendToolError);
+        if browser_command_is_read_only(command) {
+            return Err(BrowserExecutionError::BackendToolError);
+        }
+        return Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate);
     }
-    normalize_completed(command, &raw).map(BrowserExecutionOutcome::Completed)
+    match normalize_completed(command, &raw) {
+        Ok(result) => Ok(BrowserExecutionOutcome::Completed(result)),
+        Err(_error) if !browser_command_is_read_only(command) => {
+            Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn browser_command_is_read_only(command: &BrowserBackendCommand) -> bool {
+    matches!(
+        command,
+        BrowserBackendCommand::Bind { .. }
+            | BrowserBackendCommand::Inspect { .. }
+            | BrowserBackendCommand::Dialog {
+                action: BrowserDialogAction::Inspect,
+                ..
+            }
+    )
 }
 
 const CUA_BROWSER_DOWNLOAD_APPROVAL_ARG: &str = "_cua_browser_download_mcp_host_approved";
@@ -204,36 +233,43 @@ pub(crate) async fn execute_cua_browser_upload(
         Err(error) if error.downcast_ref::<BackendCallTimedOut>().is_some() => {
             return Ok(BrowserExecutionOutcome::TimedOutIndeterminate);
         }
+        Err(error) if error.downcast_ref::<BackendCallResponseLost>().is_some() => {
+            return Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate);
+        }
         Err(error) => return Err(BrowserExecutionError::Backend(error)),
     };
     if let Some(reason) = refusal_reason(&raw) {
         return Err(BrowserExecutionError::BackendRefused(reason));
     }
     if raw.is_error == Some(true) {
-        return Err(BrowserExecutionError::BackendToolError);
+        return Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate);
     }
-    let structured = structured_value(&raw)?;
-    require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
-    if structured.get("ref").and_then(Value::as_str) != Some(backend_element_ref.as_str()) {
-        return Err(BrowserExecutionError::InvalidResult(
-            "browser upload result ref mismatch",
-        ));
+    let completion = (|| -> Result<BrowserBackendResult, BrowserExecutionError> {
+        let structured = structured_value(&raw)?;
+        require_exact_target_tab_ok(&structured, backend_target_id, backend_tab_id)?;
+        if structured.get("ref").and_then(Value::as_str) != Some(backend_element_ref.as_str()) {
+            return Err(BrowserExecutionError::InvalidResult(
+                "browser upload result ref mismatch",
+            ));
+        }
+        let file_count = structured
+            .get("file_count")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(BrowserExecutionError::InvalidResult(
+                "browser upload result omitted file_count",
+            ))?;
+        if usize::try_from(file_count).ok() != Some(files.len()) {
+            return Err(BrowserExecutionError::InvalidResult(
+                "browser upload file_count mismatch",
+            ));
+        }
+        Ok(BrowserBackendResult::UploadAssigned { file_count })
+    })();
+    match completion {
+        Ok(result) => Ok(BrowserExecutionOutcome::Completed(result)),
+        Err(_) => Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate),
     }
-    let file_count = structured
-        .get("file_count")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(BrowserExecutionError::InvalidResult(
-            "browser upload result omitted file_count",
-        ))?;
-    if usize::try_from(file_count).ok() != Some(files.len()) {
-        return Err(BrowserExecutionError::InvalidResult(
-            "browser upload file_count mismatch",
-        ));
-    }
-    Ok(BrowserExecutionOutcome::Completed(
-        BrowserBackendResult::UploadAssigned { file_count },
-    ))
 }
 
 pub(crate) async fn execute_cua_browser_download(
@@ -278,42 +314,51 @@ pub(crate) async fn execute_cua_browser_download(
         Err(error) if error.downcast_ref::<BackendCallTimedOut>().is_some() => {
             return Ok(BrowserExecutionOutcome::TimedOutIndeterminate);
         }
+        Err(error) if error.downcast_ref::<BackendCallResponseLost>().is_some() => {
+            return Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate);
+        }
         Err(error) => return Err(BrowserExecutionError::Backend(error)),
     };
     if let Some(reason) = refusal_reason(&raw) {
         return Err(BrowserExecutionError::BackendRefused(reason));
     }
     if raw.is_error == Some(true) {
-        return Err(BrowserExecutionError::BackendToolError);
+        return Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate);
     }
-    let structured = structured_value(&raw)?;
-    if structured.get("status").and_then(Value::as_str) != Some("completed") {
-        return Err(BrowserExecutionError::InvalidResult(
-            "browser download did not prove completion",
-        ));
-    }
-    let backend_download_id = structured
-        .get("download_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 512 && !value.contains('\0'))
-        .ok_or(BrowserExecutionError::InvalidResult(
-            "browser download omitted a bounded opaque id",
-        ))?
-        .to_owned();
-    let bytes_written = structured.get("bytes").and_then(Value::as_u64).ok_or(
-        BrowserExecutionError::InvalidResult("browser download omitted byte count"),
-    )?;
-    if bytes_written > *max_bytes || bytes_written > crate::v2_browser::MAX_BROWSER_DOWNLOAD_BYTES {
-        return Err(BrowserExecutionError::InvalidResult(
-            "browser download exceeded the CUMG byte bound",
-        ));
-    }
-    Ok(BrowserExecutionOutcome::Completed(
-        BrowserBackendResult::DownloadStaged {
+    let completion = (|| -> Result<BrowserBackendResult, BrowserExecutionError> {
+        let structured = structured_value(&raw)?;
+        if structured.get("status").and_then(Value::as_str) != Some("completed") {
+            return Err(BrowserExecutionError::InvalidResult(
+                "browser download did not prove completion",
+            ));
+        }
+        let backend_download_id = structured
+            .get("download_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 512 && !value.contains('\0'))
+            .ok_or(BrowserExecutionError::InvalidResult(
+                "browser download omitted a bounded opaque id",
+            ))?
+            .to_owned();
+        let bytes_written = structured.get("bytes").and_then(Value::as_u64).ok_or(
+            BrowserExecutionError::InvalidResult("browser download omitted byte count"),
+        )?;
+        if bytes_written > *max_bytes
+            || bytes_written > crate::v2_browser::MAX_BROWSER_DOWNLOAD_BYTES
+        {
+            return Err(BrowserExecutionError::InvalidResult(
+                "browser download exceeded the CUMG byte bound",
+            ));
+        }
+        Ok(BrowserBackendResult::DownloadStaged {
             backend_download_id,
             bytes_written,
-        },
-    ))
+        })
+    })();
+    match completion {
+        Ok(result) => Ok(BrowserExecutionOutcome::Completed(result)),
+        Err(_) => Ok(BrowserExecutionOutcome::BackendOutcomeIndeterminate),
+    }
 }
 
 fn validate_command(command: &BrowserBackendCommand) -> Result<(), BrowserExecutionError> {

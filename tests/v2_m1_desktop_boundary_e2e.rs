@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use computer_use_mcp_gateway::{
-    v2_execution_safety::{ExecutionEvidence, OperationOwner},
+    v2_execution_safety::{ExecutionEvidence, IndeterminateReason, OperationOwner},
     v2_m0::{DeviceCommand, DeviceIdentity, DeviceResult, GrantAuthority, ShellRequest},
     v2_m0_execution::{HubOperationState, IndeterminateResolution},
     v2_m0_transport::{CancellationDisposition, HubIdentity},
@@ -63,6 +63,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
     std::fs::set_permissions(&hub_state, std::fs::Permissions::from_mode(0o700))?;
     std::fs::set_permissions(&agent_state, std::fs::Permissions::from_mode(0o700))?;
     let app_marker = state_root.join("app-launched");
+    let ambiguous_click_marker = state_root.join("ambiguous-click");
     let drag_marker = state_root.join("drag-calls");
     let cancel_marker = state_root.join("drag-cancels");
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/mock_cua_mcp_backend.py");
@@ -123,6 +124,8 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
                 command: "python3".into(),
                 args: vec![
                     fixture.to_string_lossy().into_owned(),
+                    "--ambiguous-click-marker".into(),
+                    ambiguous_click_marker.to_string_lossy().into_owned(),
                     "--drag-marker".into(),
                     drag_marker.to_string_lossy().into_owned(),
                     "--cancel-marker".into(),
@@ -183,6 +186,59 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
         shell.receipt.evidence,
         ExecutionEvidence::VerifiedAgentResult
     );
+
+    // A provider-level error after an effectful request was dispatched is not
+    // proof of non-execution. The Agent sends a closed signed indeterminate
+    // signal; the Hub quarantines durably without tearing down this generation.
+    let ambiguous_click = handle
+        .start_command_as(
+            alice.clone(),
+            DeviceCommand::PointerClick {
+                x: 11,
+                y: 22,
+                button: computer_use_mcp_gateway::v2_m0::PointerButton::Left,
+            },
+        )
+        .await
+        .context("ambiguous click admission lost the Agent session")?;
+    let ambiguous_click_operation = ambiguous_click.operation_id.clone();
+    let click_result = tokio::time::timeout(Duration::from_secs(3), ambiguous_click.wait())
+        .await
+        .context("post-effect backend error did not settle at Hub")?;
+    assert!(matches!(
+        click_result,
+        Err(HubCommandError::DeviceIndeterminate { operation_id })
+            if operation_id == ambiguous_click_operation
+    ));
+    assert!(ambiguous_click_marker.is_file());
+    assert_eq!(handle.current_generation().await, Some(initial_generation));
+    let quarantine = handle
+        .desktop_quarantine()
+        .await
+        .ok_or_else(|| anyhow!("post-effect backend error did not quarantine desktop"))?;
+    assert_eq!(quarantine.operation_id, ambiguous_click_operation);
+    assert_eq!(
+        quarantine.reason,
+        IndeterminateReason::BackendOutcomeUnproven
+    );
+    assert!(matches!(
+        handle
+            .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+            .await?
+            .wait()
+            .await,
+        Err(HubCommandError::DeviceIndeterminate { operation_id })
+            if operation_id == ambiguous_click_operation
+    ));
+    handle
+        .resolve_indeterminate(
+            &ambiguous_click_operation,
+            alice.clone(),
+            IndeterminateResolution::ConfirmedCompleted,
+            "fixture recorded dispatch before returning a generic backend error",
+        )
+        .await?;
+    assert!(handle.desktop_quarantine().await.is_none());
 
     let pending = handle
         .start_command_as(
@@ -272,7 +328,12 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
             .map(|quarantine| quarantine.operation_id),
         Some(ambiguous_operation.clone())
     );
-    assert!(handle.resolution_records().await.is_empty());
+    let records_after_failed_resolution = handle.resolution_records().await;
+    assert_eq!(records_after_failed_resolution.len(), 1);
+    assert_eq!(
+        records_after_failed_resolution[0].operation_id,
+        ambiguous_click_operation
+    );
     std::fs::set_permissions(&hub_state, std::fs::Permissions::from_mode(0o700))?;
 
     let receipt = handle

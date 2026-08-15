@@ -1268,6 +1268,11 @@ async fn execute_computer_use_operation(
                 Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
                     AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
                 }
+                Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate) => {
+                    AgentOperationOutcome::Result(Ok(DeviceResult::Error {
+                        code: DeviceErrorCode::BackendOutcomeIndeterminate,
+                    }))
+                }
                 Err(error) => {
                     let _ = upload_staging.consume_handles(
                         &handles,
@@ -1358,6 +1363,11 @@ async fn execute_computer_use_operation(
                 Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
                     AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
                 }
+                Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate) => {
+                    AgentOperationOutcome::Result(Ok(DeviceResult::Error {
+                        code: DeviceErrorCode::BackendOutcomeIndeterminate,
+                    }))
+                }
                 Err(error) => {
                     let _ = download_staging.abort(
                         prepared.operation_handle(),
@@ -1380,6 +1390,11 @@ async fn execute_computer_use_operation(
             }
             Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
                 AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
+            }
+            Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate) => {
+                AgentOperationOutcome::Result(Ok(DeviceResult::Error {
+                    code: DeviceErrorCode::BackendOutcomeIndeterminate,
+                }))
             }
             Err(error) => AgentOperationOutcome::Result(Err(AgentOperationError::Backend(error))),
         },

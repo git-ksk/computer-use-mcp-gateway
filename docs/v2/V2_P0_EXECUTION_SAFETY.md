@@ -173,6 +173,8 @@ This pass deliberately does **not** add another generic admin-auth protocol. `Hu
 
 A race discovered by the mixed shell+Cua E2E was fixed during this pass: the Agent previously reconnected immediately when a Cua cancellation worker returned indeterminate, which could close the gRPC stream before the already-queued signed `IndeterminateAfterPropagation` acknowledgement was flushed. Cancellation-propagated ambiguity now keeps that session alive after the signed quarantine acknowledgement; autonomous provider timeout still reconnects to force unknown-result handling.
 
+Northbound MCP also distinguishes **protocol/input errors** from **runtime operation outcomes**. Authentication, malformed arguments, invalid context/ref use, and schema violations remain MCP/JSON-RPC errors. Once an operation has entered the execution path, a refusal, backend failure, or indeterminate result is returned as a bounded `CallToolResult` with `isError=true`, a closed CUMG code, and `retry_safe=false`. Provider exception text (including task-group/`ExceptionGroup` details) is not part of the northbound contract.
+
 ## 8. One desktop boundary for shell/process and Cua
 
 The P0 model intentionally does not create `ShellOwner` and `GuiOwner` concepts. All state-changing commands enter the same `start_command_as(owner, DeviceCommand)` path and therefore share:
@@ -221,7 +223,8 @@ There is intentionally no automatic v4 -> v5 migration in this pass. Loading an 
 | duplicate/late ambiguity signal | invariant test plus Hub late-ack guard |
 | network partition/result-loss + Hub/Agent restart race | `tests/v2_m1_partition_recovery.rs` aborts Agent after dispatch while the local side effect can still complete, restarts `SingleDeviceHub` from the durable quarantine checkpoint, then reconnects a newer Agent generation |
 | shell + GUI same ownership boundary | `tests/v2_m1_desktop_boundary_e2e.rs` full Hub-Agent TLS/gRPC path |
-| real Cua regression | `tests/v2_m1_cua_cancellation_e2e.rs` on operator-controlled macOS with Cua Driver |
+| real Cua cancellation regression | `tests/v2_m1_cua_cancellation_e2e.rs` on operator-controlled macOS with Cua Driver |
+| real Cua post-effect backend-error regression | `scripts/v2_issue47_browser_alert_acceptance.sh`: isolated Chrome alert side effect followed by provider error must classify as `BackendOutcomeIndeterminate` |
 
 Final acceptance on the P0 tree passed:
 
