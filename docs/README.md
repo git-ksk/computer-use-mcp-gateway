@@ -12,6 +12,7 @@ The documentation is grouped by purpose so current contracts are easy to disting
 - [`CLIENTS.md`](CLIENTS.md) and [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — client setup and diagnostics.
 - [`PROJECT_GOVERNANCE.md`](PROJECT_GOVERNANCE.md) — maintainer model, change classes, merge rules, localization, and feature admission.
 - [`VERSIONING.md`](VERSIONING.md) — SemVer, pre-1.0 compatibility, support/deprecation, and release procedure.
+- [`ROADMAP.md`](ROADMAP.md) — current maintenance priorities, future-minor admission, and the path to 1.0.
 
 ## Active V2 specification
 

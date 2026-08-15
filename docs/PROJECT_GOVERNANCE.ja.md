@@ -78,7 +78,7 @@ repository を安全に復旧するため通常 flow が使えない emergency r
 
 proposed feature は、何の問題を解決するか、public/security contract を変えるか、どの failure state が新たに生じるか、それをどう represent するか、どの evidence で change を close するか、なぜ external maintained component ではなく CUMG に属するかを説明できる必要があります。
 
-現在の GO / NO-GO boundary は [`ROADMAP.md`](ROADMAP.md) と [`v2/V2_POSITIONING.ja.md`](v2/V2_POSITIONING.ja.md) にあります。
+現在の GO / NO-GO boundary は [`ROADMAP.ja.md`](ROADMAP.ja.md) と [`v2/V2_POSITIONING.ja.md`](v2/V2_POSITIONING.ja.md) にあります。
 
 ## Release
 

@@ -1,236 +1,150 @@
 # Roadmap
 
-This file is the implementation roadmap snapshot. Historical acceptance detail lives in the milestone acceptance/progress documents.
+> English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Canonical V2 product boundary: [`V2_POSITIONING.md`](v2/V2_POSITIONING.md).
-Standard/OSS boundary: [`V2_STANDARDIZATION.md`](v2/V2_STANDARDIZATION.md).
-P2 replacement-seam review: [`V2_P2_REPLACEMENT_SEAMS.md`](v2/V2_P2_REPLACEMENT_SEAMS.md).
+Status as of 2026-08-15: **V1 closed, V2 execution-safety baseline complete, current released version `v0.2.0`.**
 
-## Positioning rule
+This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
-V1 is a hardened MCP-to-computer-use gateway.
+Version selection follows [`VERSIONING.md`](VERSIONING.md). Project/change governance follows [`PROJECT_GOVERNANCE.md`](PROJECT_GOVERNANCE.md). The canonical V2 product boundary remains [`v2/V2_POSITIONING.md`](v2/V2_POSITIONING.md).
 
-V2 is **not** a generic multi-machine MCP bridge, remote-desktop product, delegated-authorization protocol, or broad vendor-neutral physical-device control plane.
+## Product boundary
 
-The final competitor review on 2026-08-12 found material overlap in the broader category, including SINT Protocol, Arm Device Connect, OpenClaw, OAHL, QuickDesk, Obot, and delegated-authorization systems.
-
-The project-specific V2 boundary is therefore narrower:
+CUMG's project-specific core is:
 
 > **uncertainty-aware execution safety for delegated control of stateful interactive desktops**
 
-The core invariant is:
+The invariant that future work must preserve is:
 
 ```text
-external principal
-      |
+specific authenticated principal
+        |
 specific desktop + exact capability
-      |
-operation ID + exclusive ownership + fencing
-      |
-state-changing desktop action
-      |
-cancel / timeout / disconnect / lost response
-      |
-can non-execution or termination be proven?
-      |
-  yes -> terminal
-  no  -> indeterminate -> quarantine -> explicit resolution
+        |
+operation ID + exclusive ownership + generation/capability fencing
+        |
+state-changing action dispatched
+        |
+completion provable?
+   yes -> terminal
+   no  -> indeterminate -> durable quarantine -> explicit resolution
 ```
 
-An ambiguous state-changing operation is never automatically replayed because a client, Hub, Agent, transport, backend, or device reconnects.
+An ambiguous state-changing operation is never automatically retried or replayed because a client, Hub, Agent, transport, backend, or device reconnects.
 
-## V1 — Remote MCP Gateway
+The completed V1/V2 implementation history and acceptance evidence remain available through [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), [`v2/STATUS.md`](v2/STATUS.md), [`v2/acceptance/`](v2/acceptance/), and [`archive/`](archive/). This file intentionally focuses on work that is still relevant after the V2 closeout.
 
-**Status: closed 2026-08-11.**
+## Current maintenance line: `0.2.x`
 
-V1 established the hardened local/remote MCP boundary around Cua:
+`0.2.x` preserves the released V2 public direction. Work that remains compatible with that contract should stay on the patch line rather than inventing a new milestone number.
 
-- localhost-first Streamable HTTP MCP;
-- Host/Origin protection;
-- deny-by-default exact tool policy;
-- conservative semantic classification;
-- backend timeouts/reconnect without automatic replay of failed state-changing calls;
-- serialized physical desktop operations;
-- downstream cancellation propagation;
-- privacy-preserving audit metadata;
-- real-Cua Linux/macOS/Windows smoke coverage;
-- trusted macOS desktop E2E;
-- Cloudflare Access/Tunnel + ChatGPT remote MCP dogfood;
-- conformance, soak, and resource regression gates.
+Current priorities:
 
-See [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md) for acceptance evidence.
+- preserve the authoritative operation/quarantine/resolution/no-auto-replay state machine;
+- keep control schema v7 and capability-advertisement schema v4 behavior explicit until a reviewed change requires otherwise;
+- keep Cua Driver upgrades as reviewed compatibility changes with pinned/repeatable evidence;
+- maintain security, dependency, documentation, packaging, CI, conformance, soak, and resource-regression quality;
+- investigate and close or explicitly document the remaining V1 compatibility/quality issues:
+  - issue #14 — read-only `get_screen_size` session/escalation semantics;
+  - issue #15 — inconsistent Cua Driver application/process discovery identity;
+  - issue #20 — portable behavior for the V1 idle resource quality gate without weakening Linux enforcement;
+- fix compatible runtime/security/reliability defects as PATCH candidates;
+- keep docs-only/editorial work version-neutral unless an immutable corrected release snapshot is operationally necessary.
 
-Do not add V1 features solely to duplicate maintained backend functionality.
+A compatible fix merged after `v0.2.0` may contribute to a future `0.2.1`; the roadmap does not require a release merely because maintenance commits exist.
 
-## V2-M0 — competitor-gap PoC + trust model
+## Next minor: admission-driven, not number-driven
 
-**Status: GO, 2026-08-11.**
+The next minor release is created only when accepted work changes or meaningfully expands the public contract, or when a deliberate pre-1.0 incompatibility is justified. Today that would normally be `0.3.0`, but the roadmap does not pre-commit a feature bundle to that number.
 
-M0 proved the initial single-device delegated-capability control semantics:
+Candidate areas are evaluated independently.
 
-- cryptographic device identity;
-- outbound authenticated Agent connectivity;
-- principal -> device -> exact capability authorization;
-- short-lived grants and replay rejection;
-- explicit operation IDs;
-- per-device lease/serialization ownership;
-- generation/capability revision checks;
-- bounded admission and backpressure;
-- signed cancellation/result semantics;
-- reconnect rules that cannot silently transfer in-flight ownership;
-- backend-neutral adapter contract;
-- threat model for compromised Hub, Agent, backend, and client.
+### Remaining semantic parity decisions
 
-See [`V2_M0_POC.md`](archive/v2/V2_M0_POC.md) and [`V2_THREAT_MODEL.md`](v2/V2_THREAT_MODEL.md).
+The current Cua parity matrix deliberately leaves these legitimate gaps explicit:
 
-## V2-M1 — single secure remote Agent
+- `ClipboardWrite` supports plain text only; image/file clipboard write parity is not implemented;
+- `LaunchApplication` does not expose Cua `additional_arguments` or `webkit_inspector_port`.
 
-**Status: PASS, 2026-08-12.**
+A gap should be implemented only when there is a concrete workflow need and a bounded backend-neutral contract can be defined without exposing a generic backend passthrough. It is also valid to keep a gap explicitly unsupported.
 
-M1 established the production-candidate single-device foundation:
+See [`v2/V2_CUA_PARITY_MATRIX.md`](v2/V2_CUA_PARITY_MATRIX.md).
 
-- gRPC bidirectional streaming over TLS while preserving transport-neutral application semantics;
-- standard MCP Authorization/OAuth northbound boundary;
-- OAuth bearer token non-forwarding;
-- separate Hub/device/grant/TLS identity lifecycles;
-- restart-safe replay/trust checkpoints;
-- bounded queueing, rate/connection shedding, and per-device ownership;
-- OpenTelemetry/OTLP observability;
-- launchd/systemd packaging;
-- Agent-native process/shell/read-only-filesystem capabilities;
-- Cua behind a backend adapter contract;
-- real Cua Driver 0.19.3 cancellation E2E where cancellation propagation does **not** imply non-execution;
-- `indeterminate` outcome + device quarantine when the backend cannot prove a safe terminal result.
+### Additional backend or native GUI adapter
 
-See [`V2_M1_ACCEPTANCE.md`](v2/acceptance/V2_M1_ACCEPTANCE.md).
+A second real Computer Use backend or a native GUI adapter is a candidate only if it provides a concrete operational, portability, support, or security benefit.
 
-### Post-M1 correction
+Any adapter must remain below the same CUMG authority boundary:
 
-M1 proved useful semantics, but the final competitor review showed that broader claims such as these are not sufficient differentiation by themselves:
+- no second operation lifecycle or settlement authority;
+- no backend-specific IDs as permanent northbound capability identifiers;
+- unsupported or unprovable post-dispatch outcomes remain indeterminate;
+- no weakening of principal/device/capability/generation fencing;
+- no automatic replay.
 
-- vendor-neutral physical-device control plane;
-- scoped/expiring capability grants;
-- action IDs and replay defense;
-- device identity/registry/fleet state;
-- device reservation/lease;
-- generic physical-AI governance;
-- multi-machine routing.
+Compile-time interface compatibility alone is not acceptance evidence for a backend that can cause real desktop side effects.
 
-Accordingly, subsequent work must prioritize the narrower uncertainty-aware desktop execution core rather than broadening the control-plane surface.
+### Higher-risk capability surfaces
 
-## V2-M2 — uncertainty-aware core hardening
+Explicit filesystem mutation, richer clipboard data, application launch arguments, or other consequential surfaces may be considered as separate exact capabilities. They are not implicitly inherited from an existing shell, GUI, browser, or backend integration.
 
-**Primary tracking issue: #24.**
+Admission requires a reviewed threat boundary, bounded inputs/results, fail-closed authorization, ambiguity handling, tests, and physical acceptance when behavior depends on a real desktop/provider.
 
-M2 is no longer “build a multi-machine Hub” as a feature milestone. The first objective is to make the M1 operation-safety semantics explicit, durable, and difficult to violate.
+### Replaceable infrastructure
 
-### P0: authoritative operation state machine
+Transport, identity, policy, device-fabric, and backend implementations may be replaced or integrated with maintained standards/OSS when doing so provides a concrete benefit and preserves the CUMG safety invariant.
 
-- [x] define one reviewed operation-state model for dispatch, running, cancellation, terminal outcomes, and `indeterminate`;
-- [x] define evidence required to prove non-execution or clean termination;
-- [x] ensure timeout/cancel/disconnect/lost-result paths cannot collapse uncertainty into ordinary failure;
-- [x] reject late/stale results after session/device/ownership generation changes;
-- [x] prevent duplicate terminal finalization;
-- [x] add invariant/property coverage for illegal transitions;
-- [x] keep replay/tombstone state bounded without forgetting unresolved ambiguity.
+Do not adopt infrastructure merely for architectural fashion. Existing reviewed implementations remain valid until replacement evidence is stronger than the migration cost and risk. See [`v2/V2_STANDARDIZATION.md`](v2/V2_STANDARDIZATION.md).
 
-### P0: first-class quarantine and explicit resolution
+## Minor-release acceptance gate
 
-- [x] persist quarantine independently of connection/session lifetime;
-- [x] bind quarantine to the exact ambiguous operation and device generation;
-- [x] expose an explicit, auditable resolution path;
-- [x] record resolver principal, operation ID, decision, and relevant evidence metadata;
-- [x] ensure resolution can never replay the old operation;
-- [x] crash/restart test while quarantined;
-- [x] crash/restart test during resolution;
-- [x] deny normal work until the exact ambiguous state is resolved.
+Before a future minor release is cut, its public-contract scope must be explicit and all applicable gates must pass:
 
-### P0: ownership and fencing under failure
+1. the feature/compatibility boundary is documented before or with implementation;
+2. change class from [`PROJECT_GOVERNANCE.md`](PROJECT_GOVERNANCE.md) is identified;
+3. security/execution-safety changes include threat-model and targeted regression updates;
+4. control/capability schema changes are explicit, fail closed, and include upgrade/mismatch behavior;
+5. backend parity/status documentation states implemented, unsupported, and intentionally excluded behavior precisely;
+6. English canonical and paired Japanese normative docs are synchronized where semantics change;
+7. deterministic CI passes, plus trusted physical acceptance for Class D changes;
+8. migration/deprecation notes are present for incompatible pre-1.0 changes;
+9. the final release is prepared from merged `main` through the release process in [`VERSIONING.md`](VERSIONING.md).
 
-- [x] competing principals cannot steal or inherit in-flight ownership;
-- [x] reconnect cannot silently transfer old ownership;
-- [x] Hub restart preserves quarantine/ownership decisions;
-- [x] Agent restart preserves enough state to reject replay/stale finalization;
-- [x] stale Agent generations cannot finalize old operations;
-- [x] duplicate/late cancellation acknowledgements cannot clear quarantine incorrectly;
-- [x] network partition/reconnect races are covered around dispatch and result delivery.
+A successful prototype is not sufficient release evidence when it bypasses these boundaries.
 
-P0 execution-safety hardening is accepted on 2026-08-12. The detailed gap analysis, invariants, security review, and residual work are recorded in [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXECUTION_SAFETY.md).
+## Path to `1.0.0`
 
-## V2-M2 acceptance — multi-device invariant proof
+There is no target date or required feature count for `1.0.0`.
 
-Only after the P0 core is strong should multi-device work advance beyond the minimum routing needed to prove invariants.
+The 1.0 decision is a compatibility commitment. Readiness is reached when the criteria in [`VERSIONING.md`](VERSIONING.md) are true in practice, especially:
 
-M2 acceptance requires:
+- the supported northbound semantic surface and execution-safety invariants are explicitly stable;
+- control/capability schema upgrade and mismatch behavior is documented;
+- supported backend/deployment compatibility is documented and repeatably accepted;
+- governance, release, security, support, and deprecation rules have been exercised rather than only written down;
+- maintainers are prepared to preserve backward compatibility within 1.x.
 
-1. [x] Device A enters `indeterminate` after an ambiguous state-changing action and remains quarantined.
-2. [x] Device B remains independently usable by another authorized principal.
-3. [x] Another principal cannot acquire, inherit, or replace Device A's unresolved ownership.
-4. [x] Hub restart preserves independent A/B state.
-5. [x] reconnect/failover does not replay Device A's ambiguous operation.
-6. [x] stale device/Agent/capability generations cannot route or finalize old work.
-7. [x] queues/load shedding do not bypass per-device ownership invariants.
+Remaining parity gaps do **not** automatically block 1.0. Each gap must instead be classified as supported, intentionally unsupported, deferred, or deprecated so users know the stable boundary.
 
-A machine registry, device list, or successful routing to two machines is **not** sufficient M2 acceptance evidence.
-
-P1 fixed-set proof accepted boundary: the implementation composes existing per-device P0 Hubs with independent checkpoints and no shared fleet scheduler. Final release-closeout physical acceptance passed on 2026-08-13 against `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` in Desktop E2E run `31675515516`, including durable quarantine across Hub/Agent restart, newer-generation reconnect without replay, explicit resolution, and reuse.
-
-## V2-M3 — backend portability and OSS integration
-
-After the uncertainty-aware core and multi-device invariant proof pass:
-
-### Backend portability
-
-- [x] integrate a second backend or deterministic reference executor with materially different cancellation/result behavior;
-- [x] require adapters to provide evidence for terminal versus ambiguous classification;
-- [x] prove the operation-state machine remains unchanged across backends;
-- [x] map unsupported evidence conservatively to `indeterminate` rather than backend-specific guesses.
-
-### Replace/reuse generic infrastructure
-
-Review maintained standards/OSS before expanding custom implementations:
-
-- [x] delegated authorization candidates reviewed; add the exact `DeviceCapabilityAuthorizer` seam, keep existing OAuth/introspection and in-process policy as defaults, and defer SINT/Grantex/Open Agent Auth dependencies;
-- [x] device registry/fabric candidates reviewed; defer Arm Device Connect and keep immutable fixed-set composition because a generic discovery/failover plane is not yet safer or necessary;
-- [x] Computer Use runtime candidates reviewed; add `ComputerUseBackendAdapter`, keep direct Cua as the default, and defer OpenClaw integration until it provides a concrete operational advantage;
-- [x] ROSClaw reviewed for compatibility/invariant reuse only; do not fork or import its broader robotics runtime/state machine;
-- [x] SPIFFE reviewed and deferred until dynamic workload/trust-domain scale justifies its operational cost;
-- [x] OPA/Cedar-class generic policy engines reviewed and deferred while authorization remains an exact principal/device/capability tuple.
-
-The P2 review is accepted when these decisions and narrow seams pass regression. A checked review item does **not** mean the external system was adopted. Replacement remains conditional on evidence that the uncertainty-aware execution invariant is preserved or improved. See [`V2_P2_REPLACEMENT_SEAMS.md`](v2/V2_P2_REPLACEMENT_SEAMS.md).
-
-Final P2 integration acceptance is **accepted / closed on 2026-08-13**. Trusted merged `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` passed Desktop E2E run `31675515516`, supplementing the deterministic replacement-seam, multi-device, backend-portability, observability, and resource-regression gates.
-
-## Later product/fleet work
-
-Only after M2/M3 core acceptance should the project prioritize convenience/product surface such as:
-
-- fleet dashboard/UX;
-- broad device discovery;
-- routing convenience;
-- orchestration/workflows;
-- richer approval UX;
-- additional native GUI adapters.
-
-These features are optional consumers of the core, not the core itself.
+`0.9.x` is not a countdown. The project may use `0.10.0`, `0.11.0`, and later pre-1.0 minors until the compatibility commitment is justified.
 
 ## Explicit non-goals
 
+The following remain NO-GO by default unless the product boundary is deliberately reconsidered with evidence:
+
 - building a new screenshot/input computer-use engine;
-- building screen streaming or a general remote desktop UI;
-- building another generic agent authorization protocol;
-- building another generic physical-device fabric/registry when maintained OSS can serve the role;
-- claiming differentiation merely because multiple machines can be routed;
-- claiming differentiation merely because grants are scoped/short-lived or devices have leases;
-- exposing a Cua-specific protocol as the permanent Hub-Agent contract;
+- screen streaming or a general remote-desktop product;
+- another generic delegated-authorization protocol;
+- another generic physical-device fabric/registry when maintained infrastructure already serves the need;
+- fleet dashboards, broad discovery, failover, or orchestration merely because multiple machines are technically possible;
+- arbitrary backend-tool passthrough or raw backend identifiers as a public API;
+- arbitrary browser JavaScript execution as a parity shortcut;
 - blanket long-lived device-control credentials;
 - automatic replay of ambiguous state-changing work;
-- treating reconnect, heartbeat, backend restart, or device liveness as proof that an old ambiguous operation is safe to forget.
+- treating reconnect, heartbeat, backend restart, or device liveness as proof that an unresolved operation is safe to forget.
 
-## GO / NO-GO rule
+## Re-evaluation rule
 
-**GO:** strengthen and prove operation ownership, stale-result fencing, ambiguity handling, quarantine, explicit resolution, and no-auto-replay for delegated interactive-desktop control.
+Roadmap candidates are reviewed against current standards, maintained OSS, backend capabilities, user workflows, and the accepted CUMG invariants before implementation.
 
-**NO-GO by default:** broaden into generic auth, physical-device fabric, fleet management, remote desktop, or orchestration merely because those features are technically possible.
-
-If maintained OSS later provides equivalent per-desktop ownership, durable `indeterminate` quarantine, explicit resolution, stale-result fencing, and no-auto-replay semantics, reevaluate integration or retirement rather than defending sunk cost.
+If maintained OSS later provides equivalent or stronger per-desktop operation ownership, fencing, durable indeterminate quarantine, explicit resolution, and no-auto-replay semantics, reevaluate integration or retirement instead of defending sunk cost.
