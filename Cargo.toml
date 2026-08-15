@@ -14,7 +14,7 @@ categories = ["network-programming"]
 anyhow = "1"
 base64 = "0.22"
 async-trait = "0.1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand = "0.8"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
