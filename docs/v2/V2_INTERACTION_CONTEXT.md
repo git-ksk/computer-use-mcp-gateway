@@ -103,9 +103,10 @@ Resolution checks every field. Unknown, stale, cross-context, wrong-generation, 
 wrong-kind refs fail closed. Generation/revision/context invalidation drops all associated mappings.
 Backend-ref payloads are not persisted in the durable execution checkpoint and are not logged.
 
-`set_ui_value` is the first current action that consumes a scoped CUMG element ref. It accepts a
-`ref_...` minted by `inspect_window` in the same live context; the backend element token itself is not
-a northbound action argument. Browser actions will use the same pattern in the next phase.
+`set_ui_value`, native `click`, `type_text`, and `keyboard_input` consume scoped CUMG element refs
+minted by `inspect_window` in the same live context. The backend element token itself is never a
+northbound action argument. Each element action also supplies the exact process/window target; a
+provider rejection of a stale or mismatched window/token pair remains authoritative.
 
 A newer provider snapshot may invalidate an older backend token even inside an otherwise live CUMG
 context. That provider stale-ref refusal is preserved; CUMG does not auto-refresh and replay a
@@ -118,7 +119,7 @@ Current desktop forms include:
 
 - `DesktopPhysical`: physical desktop screenshot pixels;
 - `WindowPhysical`: physical pixels relative to the exact window image;
-- `InputTarget`: desktop, exact window, or exact window point;
+- `InputTarget`: desktop, exact window, exact window point, or same-context scoped element;
 - `ScrollTarget`: exact window, exact window point, or desktop point.
 
 Backends may use other internal coordinate systems, but CUMG does not depend on hidden provider state

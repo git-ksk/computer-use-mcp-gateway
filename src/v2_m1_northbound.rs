@@ -39,7 +39,7 @@ use crate::{
         MAX_KEYBOARD_MODIFIERS, MAX_MENU_PATH_SEGMENTS, MAX_MENU_SEGMENT_BYTES,
         MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
         PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
-        ScrollTarget, ShellRequest, UiPredicate, UiRect, UiRole,
+        ScrollTarget, ShellRequest, UiElementAction, UiPredicate, UiRect, UiRole,
     },
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
@@ -1373,7 +1373,7 @@ impl V2NorthboundMcp {
                 None,
             ));
         }
-        if let DeviceCommand::SetUiValue { element_ref, .. } = &mut command {
+        if let Some(element_ref) = command_scoped_ui_element_ref_mut(&mut command) {
             let backend_ref = {
                 let state = self.interactions.lock().await;
                 state
@@ -2595,31 +2595,46 @@ impl ServerHandler for V2NorthboundMcp {
             TOOL_CLICK => {
                 let args: ClickArgs = parse_arguments(request.arguments)?;
                 let button = parse_pointer_button(args.button.as_deref())?;
+                let action = args
+                    .action
+                    .as_deref()
+                    .map(parse_ui_element_action)
+                    .transpose()?;
                 let advanced = args.context_id.is_some()
                     || args.coordinate_space.is_some()
                     || args.process_id.is_some()
                     || args.window_id.is_some()
+                    || args.element_ref.is_some()
+                    || action.is_some()
                     || args.click_count.unwrap_or(1) != 1
                     || !args.modifiers.is_empty()
                     || args.delivery.is_some();
                 if !advanced {
-                    return Ok(DeviceCommand::PointerClick {
-                        x: args.x,
-                        y: args.y,
-                        button,
-                    });
+                    let (x, y) = require_coordinate_pair(args.x, args.y)?;
+                    return Ok(DeviceCommand::PointerClick { x, y, button });
                 }
+                let target = parse_click_target(
+                    args.context_id.as_deref(),
+                    args.coordinate_space.as_deref(),
+                    args.process_id,
+                    args.window_id,
+                    args.x,
+                    args.y,
+                    args.element_ref,
+                )?;
+                validate_element_click_options(
+                    &target,
+                    button,
+                    args.click_count.unwrap_or(1),
+                    action,
+                    &args.modifiers,
+                )?;
                 Ok(DeviceCommand::PointerClickAdvanced {
                     context_id: args.context_id,
-                    target: parse_pointer_target(
-                        args.coordinate_space.as_deref(),
-                        args.process_id,
-                        args.window_id,
-                        args.x,
-                        args.y,
-                    )?,
+                    target,
                     button,
                     click_count: args.click_count.unwrap_or(1),
+                    action,
                     modifiers: parse_keyboard_modifiers(&args.modifiers)?,
                     delivery: parse_delivery_mode(args.delivery.as_deref())?,
                 })
@@ -2694,10 +2709,17 @@ impl ServerHandler for V2NorthboundMcp {
                     || args.window_id.is_some()
                     || args.x.is_some()
                     || args.y.is_some()
+                    || args.element_ref.is_some()
                     || args.delivery.is_some()
                     || args.delay_ms.is_some();
                 if !advanced {
                     return Ok(DeviceCommand::TypeText { text: args.text });
+                }
+                if args.element_ref.is_some() && args.context_id.is_none() {
+                    return Err(McpError::invalid_params(
+                        "element_ref input requires context_id",
+                        None,
+                    ));
                 }
                 Ok(DeviceCommand::TypeTextAdvanced {
                     context_id: args.context_id,
@@ -2708,6 +2730,7 @@ impl ServerHandler for V2NorthboundMcp {
                         args.window_id,
                         args.x,
                         args.y,
+                        args.element_ref,
                     )?,
                     delivery: parse_delivery_mode(args.delivery.as_deref())?,
                     delay_ms: args.delay_ms.unwrap_or(30),
@@ -2883,6 +2906,12 @@ impl ServerHandler for V2NorthboundMcp {
             TOOL_KEYBOARD_INPUT => {
                 let args: KeyboardInputArgs = parse_arguments(request.arguments)?;
                 validate_keyboard_key_input(&args.key)?;
+                if args.element_ref.is_some() && args.context_id.is_none() {
+                    return Err(McpError::invalid_params(
+                        "element_ref input requires context_id",
+                        None,
+                    ));
+                }
                 Ok(DeviceCommand::KeyboardInput {
                     context_id: args.context_id,
                     key: args.key,
@@ -2893,6 +2922,7 @@ impl ServerHandler for V2NorthboundMcp {
                         args.window_id,
                         args.x,
                         args.y,
+                        args.element_ref,
                     )?,
                     delivery: parse_delivery_mode(args.delivery.as_deref())?,
                 })
@@ -3176,6 +3206,25 @@ fn capability_is_live(
     advertisement.is_some_and(|advertisement| advertisement.supports(capability))
 }
 
+fn command_scoped_ui_element_ref_mut(command: &mut DeviceCommand) -> Option<&mut String> {
+    match command {
+        DeviceCommand::PointerClickAdvanced {
+            target: PointerTarget::Element { element_ref, .. },
+            ..
+        }
+        | DeviceCommand::TypeTextAdvanced {
+            target: InputTarget::Element { element_ref, .. },
+            ..
+        }
+        | DeviceCommand::KeyboardInput {
+            target: InputTarget::Element { element_ref, .. },
+            ..
+        }
+        | DeviceCommand::SetUiValue { element_ref, .. } => Some(element_ref),
+        _ => None,
+    }
+}
+
 fn command_interaction_context_id(command: &DeviceCommand) -> Option<&str> {
     match command {
         DeviceCommand::ScreenshotContextual { context_id }
@@ -3233,7 +3282,7 @@ fn command_requires_window_scope(command: &DeviceCommand) -> bool {
         } => true,
         DeviceCommand::PointerClickAdvanced {
             context_id: Some(_),
-            target: PointerTarget::WindowPhysical { .. },
+            target: PointerTarget::WindowPhysical { .. } | PointerTarget::Element { .. },
             ..
         } => true,
         DeviceCommand::PointerDragAdvanced {
@@ -3707,6 +3756,8 @@ fn all_tools() -> Vec<Tool> {
                     ("context_id", interaction_context_id_schema()),
                     ("x", signed_integer_schema()),
                     ("y", signed_integer_schema()),
+                    ("element_ref", scoped_ref_schema()),
+                    ("action", ui_element_action_schema()),
                     ("button", pointer_button_schema()),
                     ("coordinate_space", pointer_coordinate_space_schema()),
                     ("process_id", positive_integer_schema()),
@@ -3715,7 +3766,7 @@ fn all_tools() -> Vec<Tool> {
                     ("modifiers", keyboard_modifiers_schema()),
                     ("delivery", delivery_mode_schema()),
                 ],
-                &["x", "y"],
+                &[],
             ),
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
@@ -3754,6 +3805,7 @@ fn all_tools() -> Vec<Tool> {
                     ("window_id", positive_integer_schema()),
                     ("x", signed_integer_schema()),
                     ("y", signed_integer_schema()),
+                    ("element_ref", scoped_ref_schema()),
                     ("delivery", delivery_mode_schema()),
                     ("delay_ms", bounded_nonnegative_integer_schema(200)),
                 ],
@@ -3924,6 +3976,7 @@ fn all_tools() -> Vec<Tool> {
                     ("window_id", positive_integer_schema()),
                     ("x", signed_integer_schema()),
                     ("y", signed_integer_schema()),
+                    ("element_ref", scoped_ref_schema()),
                     ("delivery", delivery_mode_schema()),
                 ],
                 &["key"],
@@ -4180,12 +4233,16 @@ fn pointer_coordinate_space_schema() -> Value {
     enum_string_schema(&["desktop_physical", "window_physical"])
 }
 
+fn ui_element_action_schema() -> Value {
+    enum_string_schema(&["press", "open", "show_menu", "pick", "confirm", "cancel"])
+}
+
 fn delivery_mode_schema() -> Value {
     enum_string_schema(&["background", "foreground"])
 }
 
 fn input_target_kind_schema() -> Value {
-    enum_string_schema(&["desktop", "window", "window_point"])
+    enum_string_schema(&["desktop", "window", "window_point", "element"])
 }
 
 fn scroll_target_kind_schema() -> Value {
@@ -4562,6 +4619,7 @@ struct TypeTextArgs {
     window_id: Option<u64>,
     x: Option<i32>,
     y: Option<i32>,
+    element_ref: Option<String>,
     delivery: Option<String>,
     delay_ms: Option<u16>,
 }
@@ -4570,8 +4628,10 @@ struct TypeTextArgs {
 #[serde(deny_unknown_fields)]
 struct ClickArgs {
     context_id: Option<String>,
-    x: i32,
-    y: i32,
+    x: Option<i32>,
+    y: Option<i32>,
+    element_ref: Option<String>,
+    action: Option<String>,
     button: Option<String>,
     coordinate_space: Option<String>,
     process_id: Option<u32>,
@@ -4665,6 +4725,108 @@ fn validate_keyboard_key_input(key: &str) -> Result<(), McpError> {
     }
 }
 
+fn require_coordinate_pair(x: Option<i32>, y: Option<i32>) -> Result<(i32, i32), McpError> {
+    match (x, y) {
+        (Some(x), Some(y)) => Ok((x, y)),
+        _ => Err(McpError::invalid_params(
+            "coordinate click requires both x and y",
+            None,
+        )),
+    }
+}
+
+fn parse_ui_element_action(value: &str) -> Result<UiElementAction, McpError> {
+    match value {
+        "press" => Ok(UiElementAction::Press),
+        "open" => Ok(UiElementAction::Open),
+        "show_menu" => Ok(UiElementAction::ShowMenu),
+        "pick" => Ok(UiElementAction::Pick),
+        "confirm" => Ok(UiElementAction::Confirm),
+        "cancel" => Ok(UiElementAction::Cancel),
+        _ => Err(McpError::invalid_params("invalid UI element action", None)),
+    }
+}
+
+fn parse_click_target(
+    context_id: Option<&str>,
+    coordinate_space: Option<&str>,
+    process_id: Option<u32>,
+    window_id: Option<u64>,
+    x: Option<i32>,
+    y: Option<i32>,
+    element_ref: Option<String>,
+) -> Result<PointerTarget, McpError> {
+    if let Some(element_ref) = element_ref {
+        if context_id.is_none() {
+            return Err(McpError::invalid_params(
+                "element_ref click requires context_id",
+                None,
+            ));
+        }
+        if coordinate_space.is_some() || x.is_some() || y.is_some() {
+            return Err(McpError::invalid_params(
+                "element_ref click cannot include coordinate fields",
+                None,
+            ));
+        }
+        let process_id = process_id.ok_or_else(|| {
+            McpError::invalid_params("element_ref click requires process_id", None)
+        })?;
+        let window_id = window_id.ok_or_else(|| {
+            McpError::invalid_params("element_ref click requires window_id", None)
+        })?;
+        validate_window_args(process_id, window_id)?;
+        return Ok(PointerTarget::Element {
+            process_id,
+            window_id,
+            element_ref,
+        });
+    }
+    let (x, y) = require_coordinate_pair(x, y)?;
+    parse_pointer_target(coordinate_space, process_id, window_id, x, y)
+}
+
+fn validate_element_click_options(
+    target: &PointerTarget,
+    button: PointerButton,
+    click_count: u8,
+    action: Option<UiElementAction>,
+    modifiers: &[String],
+) -> Result<(), McpError> {
+    if !matches!(target, PointerTarget::Element { .. }) {
+        if action.is_some() {
+            return Err(McpError::invalid_params(
+                "action is valid only for element_ref clicks",
+                None,
+            ));
+        }
+        return Ok(());
+    }
+    if !(1..=2).contains(&click_count) {
+        return Err(McpError::invalid_params(
+            "element_ref click_count must be 1 or 2",
+            None,
+        ));
+    }
+    if click_count == 2
+        && (button != PointerButton::Left || action.is_some() || !modifiers.is_empty())
+    {
+        return Err(McpError::invalid_params(
+            "element_ref double click supports only an unmodified left press",
+            None,
+        ));
+    }
+    if action.is_some_and(|action| action != UiElementAction::Press)
+        && (button != PointerButton::Left || !modifiers.is_empty())
+    {
+        return Err(McpError::invalid_params(
+            "non-press element actions cannot combine with button overrides or modifiers",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_pointer_target(
     coordinate_space: Option<&str>,
     process_id: Option<u32>,
@@ -4716,9 +4878,12 @@ fn parse_input_target(
     window_id: Option<u64>,
     x: Option<i32>,
     y: Option<i32>,
+    element_ref: Option<String>,
 ) -> Result<InputTarget, McpError> {
     let inferred = target_kind.unwrap_or_else(|| {
-        if x.is_some() || y.is_some() {
+        if element_ref.is_some() {
+            "element"
+        } else if x.is_some() || y.is_some() {
             "window_point"
         } else if process_id.is_some() || window_id.is_some() {
             "window"
@@ -4728,7 +4893,12 @@ fn parse_input_target(
     });
     match inferred {
         "desktop" => {
-            if process_id.is_some() || window_id.is_some() || x.is_some() || y.is_some() {
+            if process_id.is_some()
+                || window_id.is_some()
+                || x.is_some()
+                || y.is_some()
+                || element_ref.is_some()
+            {
                 return Err(McpError::invalid_params(
                     "desktop target cannot include process/window/point fields",
                     None,
@@ -4741,7 +4911,7 @@ fn parse_input_target(
                 McpError::invalid_params("window target requires process_id", None)
             })?;
             require_positive_process_id(process_id)?;
-            if window_id == Some(0) || x.is_some() || y.is_some() {
+            if window_id == Some(0) || x.is_some() || y.is_some() || element_ref.is_some() {
                 return Err(McpError::invalid_params("invalid window target", None));
             }
             Ok(InputTarget::Window {
@@ -4757,6 +4927,12 @@ fn parse_input_target(
                 .ok_or_else(|| McpError::invalid_params("window_point requires window_id", None))?;
             let x = x.ok_or_else(|| McpError::invalid_params("window_point requires x", None))?;
             let y = y.ok_or_else(|| McpError::invalid_params("window_point requires y", None))?;
+            if element_ref.is_some() {
+                return Err(McpError::invalid_params(
+                    "window_point cannot include element_ref",
+                    None,
+                ));
+            }
             validate_window_args(process_id, window_id)?;
             Ok(InputTarget::WindowPoint {
                 process_id,
@@ -4765,8 +4941,31 @@ fn parse_input_target(
                 y,
             })
         }
+        "element" => {
+            let process_id = process_id.ok_or_else(|| {
+                McpError::invalid_params("element target requires process_id", None)
+            })?;
+            let window_id = window_id.ok_or_else(|| {
+                McpError::invalid_params("element target requires window_id", None)
+            })?;
+            let element_ref = element_ref.ok_or_else(|| {
+                McpError::invalid_params("element target requires element_ref", None)
+            })?;
+            if x.is_some() || y.is_some() {
+                return Err(McpError::invalid_params(
+                    "element target cannot include coordinates",
+                    None,
+                ));
+            }
+            validate_window_args(process_id, window_id)?;
+            Ok(InputTarget::Element {
+                process_id,
+                window_id,
+                element_ref,
+            })
+        }
         _ => Err(McpError::invalid_params(
-            "target_kind must be desktop, window, or window_point",
+            "target_kind must be desktop, window, window_point, or element",
             None,
         )),
     }
@@ -4937,6 +5136,7 @@ struct KeyboardInputArgs {
     window_id: Option<u64>,
     x: Option<i32>,
     y: Option<i32>,
+    element_ref: Option<String>,
     delivery: Option<String>,
 }
 
@@ -6183,6 +6383,212 @@ mod tests {
     }
 
     #[test]
+    fn native_element_tool_schemas_expose_only_scoped_element_refs() {
+        let tools = all_tools();
+        let click = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == TOOL_CLICK)
+            .expect("click tool");
+        let click_schema = serde_json::to_value(&click.input_schema).unwrap();
+        let click_properties = click_schema["properties"].as_object().unwrap();
+        assert!(click_properties.contains_key("element_ref"));
+        assert!(click_properties.contains_key("action"));
+        let click_required = click_schema["required"].as_array().unwrap();
+        assert!(!click_required.iter().any(|field| field == "x"));
+        assert!(!click_required.iter().any(|field| field == "y"));
+        let serialized = serde_json::to_string(&click_schema).unwrap();
+        assert!(!serialized.contains("element_token"));
+        assert!(!serialized.contains("element_index"));
+        assert!(!serialized.contains("snapshot_id"));
+
+        for name in [TOOL_TYPE_TEXT, TOOL_KEYBOARD_INPUT] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(schema.contains("element_ref"));
+            assert!(schema.contains("\"element\""));
+            assert!(!schema.contains("element_token"));
+            assert!(!schema.contains("snapshot_id"));
+        }
+    }
+
+    #[test]
+    fn scoped_native_element_ref_extraction_covers_all_element_consumers() {
+        let public_ref = "ref_0123456789abcdef0123456789abcdef".to_owned();
+        let context = Some("ctx_0123456789abcdef0123456789abcdef".to_owned());
+        let mut commands = [
+            DeviceCommand::PointerClickAdvanced {
+                context_id: context.clone(),
+                target: PointerTarget::Element {
+                    process_id: 42,
+                    window_id: 7,
+                    element_ref: public_ref.clone(),
+                },
+                button: PointerButton::Left,
+                click_count: 1,
+                action: Some(UiElementAction::Press),
+                modifiers: vec![],
+                delivery: InputDeliveryMode::Background,
+            },
+            DeviceCommand::TypeTextAdvanced {
+                context_id: context.clone(),
+                text: "hello".into(),
+                target: InputTarget::Element {
+                    process_id: 42,
+                    window_id: 7,
+                    element_ref: public_ref.clone(),
+                },
+                delivery: InputDeliveryMode::Background,
+                delay_ms: 30,
+            },
+            DeviceCommand::KeyboardInput {
+                context_id: context,
+                key: "return".into(),
+                modifiers: vec![],
+                target: InputTarget::Element {
+                    process_id: 42,
+                    window_id: 7,
+                    element_ref: public_ref.clone(),
+                },
+                delivery: InputDeliveryMode::Background,
+            },
+            DeviceCommand::SetUiValue {
+                context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+                process_id: 42,
+                window_id: 7,
+                element_ref: public_ref.clone(),
+                value: "value".into(),
+            },
+        ];
+        for command in &mut commands {
+            assert_eq!(
+                command_scoped_ui_element_ref_mut(command).map(|value| value.as_str()),
+                Some(public_ref.as_str())
+            );
+        }
+
+        let mut coordinate = DeviceCommand::PointerClickAdvanced {
+            context_id: Some("ctx_0123456789abcdef0123456789abcdef".into()),
+            target: PointerTarget::WindowPhysical {
+                process_id: 42,
+                window_id: 7,
+                x: 1,
+                y: 2,
+            },
+            button: PointerButton::Left,
+            click_count: 1,
+            action: None,
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Background,
+        };
+        assert!(command_scoped_ui_element_ref_mut(&mut coordinate).is_none());
+    }
+
+    #[test]
+    fn native_element_targets_are_context_bound_and_coordinate_exclusive() {
+        let public_ref = "ref_0123456789abcdef0123456789abcdef";
+        let context = "ctx_0123456789abcdef0123456789abcdef";
+        let target = parse_click_target(
+            Some(context),
+            None,
+            Some(42),
+            Some(7),
+            None,
+            None,
+            Some(public_ref.into()),
+        )
+        .unwrap();
+        assert_eq!(
+            target,
+            PointerTarget::Element {
+                process_id: 42,
+                window_id: 7,
+                element_ref: public_ref.into(),
+            }
+        );
+        assert!(
+            parse_click_target(
+                None,
+                None,
+                Some(42),
+                Some(7),
+                None,
+                None,
+                Some(public_ref.into()),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_click_target(
+                Some(context),
+                None,
+                Some(42),
+                Some(7),
+                Some(1),
+                Some(2),
+                Some(public_ref.into()),
+            )
+            .is_err()
+        );
+
+        let input = parse_input_target(
+            Some("element"),
+            Some(42),
+            Some(7),
+            None,
+            None,
+            Some(public_ref.into()),
+        )
+        .unwrap();
+        assert_eq!(
+            input,
+            InputTarget::Element {
+                process_id: 42,
+                window_id: 7,
+                element_ref: public_ref.into(),
+            }
+        );
+        assert!(
+            parse_input_target(
+                Some("element"),
+                Some(42),
+                Some(7),
+                Some(1),
+                Some(2),
+                Some(public_ref.into()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_element_action_options_fail_closed() {
+        let target = PointerTarget::Element {
+            process_id: 42,
+            window_id: 7,
+            element_ref: "ref_0123456789abcdef0123456789abcdef".into(),
+        };
+        assert!(
+            validate_element_click_options(
+                &target,
+                PointerButton::Left,
+                1,
+                Some(UiElementAction::Open),
+                &[],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_element_click_options(&target, PointerButton::Right, 2, None, &[],).is_err()
+        );
+        assert!(
+            validate_element_click_options(&target, PointerButton::Left, 3, None, &[],).is_err()
+        );
+    }
+
+    #[test]
     fn type_text_arguments_fail_closed_before_dispatch() {
         assert!(
             parse_arguments::<TypeTextArgs>(Some(
@@ -6209,17 +6615,35 @@ mod tests {
             },
             button: PointerButton::Left,
             click_count: 1,
+            action: None,
             modifiers: vec![],
             delivery: InputDeliveryMode::Background,
         };
         assert!(command_requires_window_scope(&window_click));
         assert!(!command_requires_desktop_scope(&window_click));
 
+        let element_click = DeviceCommand::PointerClickAdvanced {
+            context_id: context_id.clone(),
+            target: PointerTarget::Element {
+                process_id: 1,
+                window_id: 2,
+                element_ref: "ref_0123456789abcdef0123456789abcdef".into(),
+            },
+            button: PointerButton::Left,
+            click_count: 1,
+            action: Some(UiElementAction::Press),
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Background,
+        };
+        assert!(command_requires_window_scope(&element_click));
+        assert!(!command_requires_desktop_scope(&element_click));
+
         let desktop_click = DeviceCommand::PointerClickAdvanced {
             context_id,
             target: PointerTarget::DesktopPhysical { x: 3, y: 4 },
             button: PointerButton::Left,
             click_count: 1,
+            action: None,
             modifiers: vec![],
             delivery: InputDeliveryMode::Foreground,
         };

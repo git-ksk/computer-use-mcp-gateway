@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 5;
+pub const CONTROL_SCHEMA_VERSION: u16 = 6;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
@@ -151,6 +151,17 @@ pub enum KeyboardModifier {
     Function,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiElementAction {
+    Press,
+    Open,
+    ShowMenu,
+    Pick,
+    Confirm,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "space", rename_all = "snake_case")]
 pub enum PointerTarget {
@@ -163,6 +174,11 @@ pub enum PointerTarget {
         window_id: u64,
         x: i32,
         y: i32,
+    },
+    Element {
+        process_id: u32,
+        window_id: u64,
+        element_ref: String,
     },
 }
 
@@ -179,6 +195,11 @@ pub enum InputTarget {
         window_id: u64,
         x: i32,
         y: i32,
+    },
+    Element {
+        process_id: u32,
+        window_id: u64,
+        element_ref: String,
     },
 }
 
@@ -412,6 +433,7 @@ pub enum DeviceCommand {
         target: PointerTarget,
         button: PointerButton,
         click_count: u8,
+        action: Option<UiElementAction>,
         modifiers: Vec<KeyboardModifier>,
         delivery: InputDeliveryMode,
     },
@@ -2278,18 +2300,22 @@ mod tests {
     }
 
     #[test]
-    fn pre_v4_control_and_capability_schemas_fail_closed_during_rolling_upgrade() {
+    fn older_control_and_capability_schemas_fail_closed_during_rolling_upgrade() {
         let (mut registry, _identity, device_id) = enrolled();
+        let old_capability_schema = CAPABILITY_SCHEMA_VERSION - 1;
         let mut old_capabilities = capabilities(8);
-        old_capabilities.capability_schema_version = 3;
+        old_capabilities.capability_schema_version = old_capability_schema;
         assert_eq!(
             registry.connect(&device_id, old_capabilities),
-            Err(ControlError::UnsupportedCapabilitySchema { got: 3 })
+            Err(ControlError::UnsupportedCapabilitySchema {
+                got: old_capability_schema
+            })
         );
 
         let session = registry.connect(&device_id, capabilities(9)).unwrap();
+        let old_control_schema = CONTROL_SCHEMA_VERSION - 1;
         let old_command = CommandEnvelope {
-            schema_version: 3,
+            schema_version: old_control_schema,
             device_id,
             device_generation: session.generation,
             capability_revision: session.capabilities.revision,
@@ -2298,7 +2324,9 @@ mod tests {
         };
         assert_eq!(
             validate_command_session(&old_command, &session),
-            Err(ControlError::UnsupportedControlSchema { got: 3 })
+            Err(ControlError::UnsupportedControlSchema {
+                got: old_control_schema
+            })
         );
     }
 
