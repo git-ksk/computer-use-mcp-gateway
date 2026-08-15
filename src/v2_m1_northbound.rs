@@ -82,7 +82,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex as TokioMutex;
+use tokio::{sync::Mutex as TokioMutex, time::MissedTickBehavior};
 use tracing::warn;
 
 const DEFAULT_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2452,44 +2452,66 @@ impl V2NorthboundMcp {
             }
         };
         let mut wait = Box::pin(pending.wait());
-        tokio::select! {
-            result = &mut wait => {
-                match result {
-                    Ok(result) => {
-                        let settlement = if usage.was_dispatched() {
-                            UsageSettlement::Full
-                        } else {
-                            UsageSettlement::Zero
-                        };
-                        let outcome = if usage.was_dispatched() { "completed" } else { "pre_dispatch_no_effect" };
-                        settle_usage_best_effort(&usage, settlement, outcome).await;
-                        Ok(result.result)
+        let renew_after = usage.renew_after();
+        let renew_enabled = renew_after.is_some();
+        let renew_period = renew_after.unwrap_or(Duration::from_secs(60));
+        let mut renew_tick = tokio::time::interval(renew_period);
+        renew_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // `interval()` ticks immediately once; consume that tick so the first
+        // renewal occurs only after the sidecar-provided heartbeat period.
+        renew_tick.tick().await;
+
+        loop {
+            tokio::select! {
+                result = &mut wait => {
+                    return match result {
+                        Ok(result) => {
+                            let settlement = if usage.was_dispatched() {
+                                UsageSettlement::Full
+                            } else {
+                                UsageSettlement::Zero
+                            };
+                            let outcome = if usage.was_dispatched() { "completed" } else { "pre_dispatch_no_effect" };
+                            settle_usage_best_effort(&usage, settlement, outcome).await;
+                            Ok(result.result)
+                        }
+                        Err(error) => {
+                            let (settlement, outcome) =
+                                usage_settlement_for_error(usage.was_dispatched(), read_only, &error);
+                            settle_usage_best_effort(&usage, settlement, outcome).await;
+                            Err(hub_error_to_mcp(error))
+                        }
+                    };
+                },
+                _ = renew_tick.tick(), if renew_enabled => {
+                    if let Err(error) = usage.renew().await {
+                        warn!(
+                            event = "v2_usage_renew_failed",
+                            operation_id,
+                            outcome = "execution_state_unchanged",
+                            error_code = error.safe_error_code(),
+                            "usage lease renewal failed; CUMG execution remains authoritative"
+                        );
                     }
-                    Err(error) => {
-                        let (settlement, outcome) =
-                            usage_settlement_for_error(usage.was_dispatched(), read_only, &error);
-                        settle_usage_best_effort(&usage, settlement, outcome).await;
-                        Err(hub_error_to_mcp(error))
+                },
+                _ = context.ct.cancelled() => {
+                    let cancellation = self.hub.cancel_as(owner, operation_id).await;
+                    let (settlement, outcome) = if usage.was_dispatched() {
+                        (UsageSettlement::Full, "cancelled_after_dispatch")
+                    } else {
+                        (UsageSettlement::Zero, "cancelled_before_dispatch")
+                    };
+                    settle_usage_best_effort(&usage, settlement, outcome).await;
+                    if let Err(error) = cancellation {
+                        warn!(
+                            event = "v2_northbound_cancel_failed",
+                            outcome = "original_call_cancelled",
+                            error_code = error.safe_error_code(),
+                            "CUMG cancellation request failed; execution safety state remains authoritative"
+                        );
                     }
+                    return Err(McpError::invalid_request("Tool call was cancelled", None));
                 }
-            },
-            _ = context.ct.cancelled() => {
-                let cancellation = self.hub.cancel_as(owner, operation_id).await;
-                let (settlement, outcome) = if usage.was_dispatched() {
-                    (UsageSettlement::Full, "cancelled_after_dispatch")
-                } else {
-                    (UsageSettlement::Zero, "cancelled_before_dispatch")
-                };
-                settle_usage_best_effort(&usage, settlement, outcome).await;
-                if let Err(error) = cancellation {
-                    warn!(
-                        event = "v2_northbound_cancel_failed",
-                        outcome = "original_call_cancelled",
-                        error_code = error.safe_error_code(),
-                        "CUMG cancellation request failed; execution safety state remains authoritative"
-                    );
-                }
-                Err(McpError::invalid_request("Tool call was cancelled", None))
             }
         }
     }

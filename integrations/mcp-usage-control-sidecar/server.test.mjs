@@ -131,6 +131,60 @@ test('MemoryUsageStore state is lost when the sidecar process/store is recreated
   await new Promise(resolve => second.server.close(resolve));
 });
 
+test('renew extends a liable reservation beyond its original TTL', async () => {
+  const instance = await createUsageSidecar({
+    moduleSpecifier,
+    limit: 1,
+    reservationTtlMs: 120,
+    maxRetainedOperations: 100,
+    maxRetainedBudgetKeys: 100,
+  });
+  await new Promise((resolve, reject) => {
+    instance.server.once('error', reject);
+    instance.server.listen(0, '127.0.0.1', resolve);
+  });
+  const isolatedBase = `http://127.0.0.1:${instance.server.address().port}`;
+  const isolatedPost = async (path, body) => {
+    const response = await fetch(`${isolatedBase}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+
+  try {
+    const admitted = await isolatedPost('/v1/reserve', {
+      operationId: 'renew-long-1', principal: { issuer: 'https://issuer.example', subject: 'renew-user' }, tool: 'shell',
+    });
+    assert.equal(admitted.status, 200);
+    assert.equal(admitted.body.allowed, true);
+    assert.equal(admitted.body.renewAfterMs, 40);
+    assert.deepEqual(await isolatedPost('/v1/mark-liable', { reservationId: admitted.body.reservationId }), {
+      status: 200, body: { ok: true },
+    });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.deepEqual(await isolatedPost('/v1/renew', { reservationId: admitted.body.reservationId }), {
+      status: 200, body: { ok: true },
+    });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.deepEqual(await isolatedPost('/v1/settle', {
+      reservationId: admitted.body.reservationId, actualUnits: 1, outcome: 'completed',
+    }), { status: 200, body: { ok: true } });
+  } finally {
+    await new Promise(resolve => instance.server.close(resolve));
+  }
+});
+
+test('renew rejects unexpected fields instead of widening the bridge', async () => {
+  const response = await post('/v1/renew', {
+    reservationId: 'opaque-reservation',
+    bearer: 'must-not-cross',
+  });
+  assert.equal(response.status, 400);
+  assert.equal(response.body.error, 'invalid_request');
+});
+
 test('bridge rejects accidental payload or bearer-like extra fields', async () => {
   const response = await post('/v1/reserve', {
     operationId: 'payload-leak-1',

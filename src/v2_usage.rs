@@ -1,8 +1,8 @@
 //! Optional usage-accounting seam for the V2 northbound runtime.
 //!
 //! CUMG remains the sole execution/replay/quarantine authority. Usage controllers
-//! only admit accounting reservations, mark the cost-liability boundary, and
-//! settle usage. No bearer token, tool payload, or CUMG safety state crosses this
+//! only admit accounting reservations, mark the cost-liability boundary, renew
+//! active leases, and settle usage. No bearer token, tool payload, or CUMG safety state crosses this
 //! boundary.
 
 use async_trait::async_trait;
@@ -36,6 +36,9 @@ pub struct UsageReservation {
     /// Opaque sidecar-owned reservation identity. It is never used as CUMG
     /// execution authority.
     pub reservation_id: String,
+    /// Sidecar-provided heartbeat cadence for renewable accounting leases.
+    /// This is accounting metadata only and never grants execution authority.
+    pub renew_after: Option<Duration>,
 }
 
 impl fmt::Debug for UsageOperation {
@@ -84,6 +87,8 @@ pub trait UsageController: Send + Sync {
 
     async fn mark_liable(&self, reservation: &UsageReservation) -> Result<(), UsageError>;
 
+    async fn renew(&self, reservation: &UsageReservation) -> Result<(), UsageError>;
+
     async fn settle(
         &self,
         reservation: &UsageReservation,
@@ -101,10 +106,15 @@ impl UsageController for NoopUsageController {
         Ok(UsageAdmission::Allowed(UsageReservation {
             operation: operation.clone(),
             reservation_id: operation.operation_id.clone(),
+            renew_after: None,
         }))
     }
 
     async fn mark_liable(&self, _reservation: &UsageReservation) -> Result<(), UsageError> {
+        Ok(())
+    }
+
+    async fn renew(&self, _reservation: &UsageReservation) -> Result<(), UsageError> {
         Ok(())
     }
 
@@ -205,6 +215,17 @@ impl UsageLease {
 
     pub fn was_dispatched(&self) -> bool {
         self.inner.phase.load(Ordering::Acquire) >= DISPATCHED
+    }
+
+    pub fn renew_after(&self) -> Option<Duration> {
+        self.inner.reservation.renew_after
+    }
+
+    pub async fn renew(&self) -> Result<(), UsageError> {
+        if self.inner.settled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.inner.controller.renew(&self.inner.reservation).await
     }
 
     pub async fn settle(
@@ -310,6 +331,8 @@ struct ReserveResponse {
     allowed: bool,
     #[serde(rename = "reservationId")]
     reservation_id: Option<String>,
+    #[serde(rename = "renewAfterMs")]
+    renew_after_ms: Option<u64>,
     reason: Option<String>,
 }
 
@@ -354,9 +377,15 @@ impl UsageController for McpUsageController {
                 .reservation_id
                 .filter(|value| !value.is_empty())
                 .ok_or(UsageError::InvalidResponse)?;
+            let renew_after = response
+                .renew_after_ms
+                .filter(|value| *value > 0)
+                .map(Duration::from_millis)
+                .ok_or(UsageError::InvalidResponse)?;
             Ok(UsageAdmission::Allowed(UsageReservation {
                 operation: operation.clone(),
                 reservation_id,
+                renew_after: Some(renew_after),
             }))
         } else {
             Ok(UsageAdmission::Denied {
@@ -369,6 +398,22 @@ impl UsageController for McpUsageController {
         let response: OkResponse = self
             .post(
                 "v1/mark-liable",
+                &ReservationRequest {
+                    reservation_id: &reservation.reservation_id,
+                },
+            )
+            .await?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(UsageError::InvalidResponse)
+        }
+    }
+
+    async fn renew(&self, reservation: &UsageReservation) -> Result<(), UsageError> {
+        let response: OkResponse = self
+            .post(
+                "v1/renew",
                 &ReservationRequest {
                     reservation_id: &reservation.reservation_id,
                 },
@@ -473,6 +518,7 @@ mod tests {
             Ok(UsageAdmission::Allowed(UsageReservation {
                 operation: operation.clone(),
                 reservation_id: format!("reservation:{}", operation.operation_id),
+                renew_after: Some(Duration::from_millis(10)),
             }))
         }
 
@@ -484,6 +530,14 @@ mod tests {
             if self.fail_mark.load(Ordering::Acquire) {
                 return Err(UsageError::Unavailable);
             }
+            Ok(())
+        }
+
+        async fn renew(&self, reservation: &UsageReservation) -> Result<(), UsageError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("renew:{}", reservation.operation.operation_id));
             Ok(())
         }
 
@@ -525,6 +579,26 @@ mod tests {
             .settle(UsageSettlement::Full, "completed")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewable_lease_delegates_heartbeat_without_changing_execution_phase() {
+        let controller = Arc::new(RecordingController::default());
+        let lease = UsageManager::new(controller.clone())
+            .reserve(operation("renew-1"))
+            .await
+            .unwrap();
+        assert_eq!(lease.renew_after(), Some(Duration::from_millis(10)));
+        lease.mark_liable().await.unwrap();
+        assert!(!lease.was_dispatched());
+        lease.renew().await.unwrap();
+        assert!(!lease.was_dispatched());
+        lease.mark_dispatched();
+        assert!(lease.was_dispatched());
+        assert_eq!(
+            controller.events.lock().unwrap().as_slice(),
+            ["reserve:renew-1", "liable:renew-1", "renew:renew-1"]
+        );
     }
 
     #[tokio::test]
