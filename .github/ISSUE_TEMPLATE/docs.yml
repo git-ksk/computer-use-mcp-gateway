@@ -1,0 +1,31 @@
+name: Documentation issue
+description: Report incorrect, stale, missing, or confusing CUMG documentation.
+title: "docs: "
+labels: ["documentation"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Document / section
+      placeholder: docs/GETTING_STARTED.md — V2 Agent setup
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing?
+      description: If the problem changes security, schema, capability, compatibility, or release meaning, call that out explicitly.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected correction
+      description: A proposed wording is welcome but not required.
+  - type: checkboxes
+    id: localization
+    attributes:
+      label: Localization
+      options:
+        - label: I checked whether the corresponding English/Japanese document also needs a normative update.
+          required: true

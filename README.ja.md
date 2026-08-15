@@ -129,7 +129,7 @@ python3 scripts/v1_conformance.py
 - acceptance evidence
 - historical PoC / decision record
 
-project の運営方針は [`docs/PROJECT_GOVERNANCE.ja.md`](docs/PROJECT_GOVERNANCE.ja.md)、version selection / release は [`docs/VERSIONING.ja.md`](docs/VERSIONING.ja.md) に定義しています。
+project の運営方針は [`docs/PROJECT_GOVERNANCE.ja.md`](docs/PROJECT_GOVERNANCE.ja.md)、version selection / release は [`docs/VERSIONING.ja.md`](docs/VERSIONING.ja.md) に定義しています。community participation は [`CODE_OF_CONDUCT.ja.md`](CODE_OF_CONDUCT.ja.md)、support routing は [`SUPPORT.ja.md`](SUPPORT.ja.md)、脆弱性報告は [`SECURITY.ja.md`](SECURITY.ja.md) に従います。
 
 repository-local documentation link checker はこれらの directory を再帰的に検証し、archive や nested document に壊れた local link が蓄積しないようにします。
 

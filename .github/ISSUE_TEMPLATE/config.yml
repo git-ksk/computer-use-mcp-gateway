@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/git-ksk/computer-use-mcp-gateway/security/advisories
+    about: Do not open a public issue. Use Security → Advisories → Report a vulnerability.
+  - name: Support policy
+    url: https://github.com/git-ksk/computer-use-mcp-gateway/blob/main/SUPPORT.md
+    about: Read the support scope and routing guidance before opening an issue.

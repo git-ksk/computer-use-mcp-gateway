@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-DOC_GLOBS = ("README.md", "CONTRIBUTING.md", "docs/**/*.md")
+DOC_GLOBS = ("*.md", ".github/**/*.md", "docs/**/*.md")
 LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
 
 

@@ -56,3 +56,8 @@ TCC 権限を付与した self-hosted desktop runner 上で、信頼されてい
 ## Project / release policy
 
 通常の change はすべて pull request 経由で `main` に入り、[`docs/PROJECT_GOVERNANCE.ja.md`](docs/PROJECT_GOVERNANCE.ja.md) の change-class gate に従います。version impact は [`docs/VERSIONING.ja.md`](docs/VERSIONING.ja.md) で分類します。docs-only change は通常 crate version を上げず、compatible な shipped fix は PATCH、public-contract expansion または deliberate pre-1.0 incompatibility は MINOR です。
+
+
+## Community と security report
+
+participation は [`CODE_OF_CONDUCT.ja.md`](CODE_OF_CONDUCT.ja.md) に従います。通常の bug、documentation issue、scoped feature proposal、setup question は repository issue form を使用してください。**脆弱性の疑いがある内容を public issue に投稿してはいけません。** [`SECURITY.ja.md`](SECURITY.ja.md) に従い、GitHub Private Vulnerability Reporting を使用してください。support scope と routing は [`SUPPORT.ja.md`](SUPPORT.ja.md) にあります。
