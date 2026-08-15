@@ -1,5 +1,7 @@
 # V2 GUI semantic capabilities
 
+> English is the canonical documentation. [日本語版 / Japanese translation](V2_GUI_SEMANTIC_CAPABILITIES.ja.md)
+
 ## Purpose
 
 V2 does not make a configured Computer Use backend's MCP tool names part of the CUMG product
@@ -143,7 +145,7 @@ refusals remain authoritative. For example, Cua may reject a process-scoped back
 PID owns multiple eligible windows and exact delivery cannot be proven; CUMG does not silently turn
 that into a foreground action.
 
-For execution-safety classification, the semantic command itself defines whether it is read-only. A generic backend error, response loss, or malformed/unprovable completion after dispatch of a mutating command is not accepted as terminal failure evidence; it becomes `BackendOutcomeUnproven` quarantine. The corresponding event on an explicitly read-only command remains a definite backend error. Reviewed semantic refusals keep their typed refusal codes.
+For execution-safety classification, the semantic command itself defines whether it is read-only. After dispatch of a mutating command, a generic backend error, response loss, or malformed/unprovable completion is not terminal failure evidence. The adapter/Agent classifies that uncertainty as `BackendOutcomeIndeterminate`; the Hub persists durable `Indeterminate` with reason `BackendOutcomeUnproven`, cancels queued work for the affected desktop, and quarantines the device until explicit persistence-gated resolution. The corresponding event on an explicitly read-only command may remain a definite backend error. Reviewed semantic refusals keep their typed refusal codes. No ambiguous mutating operation is automatically retried or replayed.
 
 ## Bounded carrier and privacy
 
