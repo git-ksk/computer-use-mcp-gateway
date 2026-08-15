@@ -124,10 +124,12 @@ See [`docs/TESTING.md`](docs/TESTING.md) for exact guarantees and limits. Deploy
 
 Start at [`docs/README.md`](docs/README.md). It separates:
 
-- operator/contributor guides;
+- operator/contributor guides and project governance/versioning;
 - active V2 specifications;
 - acceptance evidence;
 - historical PoC and decision records.
+
+Project operation is governed by [`docs/PROJECT_GOVERNANCE.md`](docs/PROJECT_GOVERNANCE.md); version selection and releases follow [`docs/VERSIONING.md`](docs/VERSIONING.md).
 
 The repository-local documentation link checker recursively validates these directories so archived or nested documents cannot silently accumulate broken local links.
 

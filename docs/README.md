@@ -10,6 +10,8 @@ The documentation is grouped by purpose so current contracts are easy to disting
 - [`TESTING.md`](TESTING.md) — automated, conformance, regression, and physical-desktop validation.
 - [`DEPLOYMENT.md`](DEPLOYMENT.md) — service, network-edge, TLS, and production deployment guidance.
 - [`CLIENTS.md`](CLIENTS.md) and [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — client setup and diagnostics.
+- [`PROJECT_GOVERNANCE.md`](PROJECT_GOVERNANCE.md) — maintainer model, change classes, merge rules, localization, and feature admission.
+- [`VERSIONING.md`](VERSIONING.md) — SemVer, pre-1.0 compatibility, support/deprecation, and release procedure.
 
 ## Active V2 specification
 

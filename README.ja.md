@@ -124,10 +124,12 @@ python3 scripts/v1_conformance.py
 
 入口は [`docs/README.md`](docs/README.md) です。文書は次の区分に整理されています:
 
-- operator/contributor guide
+- operator/contributor guide と project governance/versioning
 - active V2 specification
 - acceptance evidence
 - historical PoC / decision record
+
+project の運営方針は [`docs/PROJECT_GOVERNANCE.ja.md`](docs/PROJECT_GOVERNANCE.ja.md)、version selection / release は [`docs/VERSIONING.ja.md`](docs/VERSIONING.ja.md) に定義しています。
 
 repository-local documentation link checker はこれらの directory を再帰的に検証し、archive や nested document に壊れた local link が蓄積しないようにします。
 

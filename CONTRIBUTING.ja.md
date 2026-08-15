@@ -51,3 +51,8 @@ docs link checker は external website を取得せず、repository-local Markdo
 MCP lifecycle handling、cancellation、Cua integration、policy filtering/classification、Host/Origin validation、reconnect behavior、health telemetry、CI supply-chain pin を変更する場合は、該当する deterministic または real-Cua coverage を追加・更新してください。詳細は [`docs/TESTING.md`](docs/TESTING.md) を参照してください。
 
 TCC 権限を付与した self-hosted desktop runner 上で、信頼されていない pull-request code を実行しないでください。desktop E2E workflow は意図的に manual かつ `main`-only です。
+
+
+## Project / release policy
+
+通常の change はすべて pull request 経由で `main` に入り、[`docs/PROJECT_GOVERNANCE.ja.md`](docs/PROJECT_GOVERNANCE.ja.md) の change-class gate に従います。version impact は [`docs/VERSIONING.ja.md`](docs/VERSIONING.ja.md) で分類します。docs-only change は通常 crate version を上げず、compatible な shipped fix は PATCH、public-contract expansion または deliberate pre-1.0 incompatibility は MINOR です。
