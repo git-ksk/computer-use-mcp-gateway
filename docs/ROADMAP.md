@@ -86,7 +86,7 @@ Compile-time interface compatibility alone is not acceptance evidence for a back
 
 ### Pluggable external capability providers
 
-CUMG may support optional external capability providers when they add a useful execution surface without turning CUMG itself into an agent or duplicating an upstream implementation. A developer-workspace provider is a representative candidate: for example, a maintained project-aware MCP such as Serena could supply semantic code navigation, workspace search/editing, or related developer primitives behind a reviewed CUMG adapter.
+CUMG may support optional external capability providers when they add a useful execution surface without turning CUMG itself into an agent or duplicating an upstream implementation. Developer-workspace providers are a representative candidate class. A DevSpace-class provider can supply Codex-like workspace primitives such as project/worktree context, repository instructions, file editing, patching, shell execution, and Git-aware state, while a Serena-class provider can supply semantic code navigation and symbol-aware workspace intelligence. Either may sit behind a reviewed CUMG adapter without becoming part of the CUMG core.
 
 The integration boundary must remain capability-oriented rather than becoming a generic MCP proxy:
 

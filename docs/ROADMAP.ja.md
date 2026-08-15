@@ -86,7 +86,7 @@ real desktop side effect を起こせる backend では、compile-time interface
 
 ### Pluggable external capability providers
 
-CUMG 自身を agent 化したり upstream implementation を重複実装したりせず、有用な execution surface を追加できる場合、optional な external capability provider を candidate として検討できます。代表例は developer-workspace provider です。たとえば Serena のような maintained project-aware MCP が semantic code navigation、workspace search/editing、その他 developer primitive を提供し、それを reviewed CUMG adapter の背後に配置する構成を検討できます。
+CUMG 自身を agent 化したり upstream implementation を重複実装したりせず、有用な execution surface を追加できる場合、optional な external capability provider を candidate として検討できます。代表例は developer-workspace provider です。DevSpace-class provider は project/worktree context、repository instruction、file editing、patch、shell execution、Git-aware state などの Codex-like workspace primitive を提供でき、Serena-class provider は semantic code navigation や symbol-aware workspace intelligence を提供できます。どちらも reviewed CUMG adapter の背後に配置でき、CUMG core 自体へ取り込む必要はありません。
 
 integration boundary は generic MCP proxy ではなく capability-oriented のまま維持します。
 
