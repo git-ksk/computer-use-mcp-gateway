@@ -1,5 +1,7 @@
 # Contributing
 
+> English is the canonical documentation. [日本語版 / Japanese translation](CONTRIBUTING.ja.md)
+
 ## Principles
 
 1. Keep the public MCP boundary backend-agnostic.

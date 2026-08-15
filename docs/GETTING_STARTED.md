@@ -1,5 +1,7 @@
 # Getting started
 
+> English is the canonical documentation. [日本語版 / Japanese translation](GETTING_STARTED.ja.md)
+
 This guide takes a new user from a clean machine to the recommended **V2 Hub + V2 Agent** runtime. V1 remains available as `v1_gateway` for regression/reference, but `cargo run` now starts the V2 Hub and intentionally requires explicit trust/TLS material.
 
 ## What you need
@@ -235,7 +237,7 @@ cargo run --locked --bin v2_hub -- --help
 
 Configure the required Hub/grant/device-public/TLS/state paths plus the Agent-facing gRPC bind. To expose northbound MCP, configure the loopback `CUMG_V2_MCP_BIND`, canonical public HTTPS resource, and exact principal -> device -> `DeviceCapability` policy from [`DEPLOYMENT.md`](DEPLOYMENT.md). Choose either OAuth RFC 7662 introspection or the packaged trusted-proxy fixed-principal mode for an explicitly single-principal authenticated tunnel. Both reduce identity to the same `AuthenticatedClientPrincipal` before CUMG authorization; the modes are mutually exclusive.
 
-The northbound MCP is not a raw Cua proxy. The current typed V2 contract exposes `list_apps`, `get_screen_size`, `screenshot`, `click`, `drag`, `type_text`, `execute_process`, `shell`, `read_file`, `list_directory`, plus the GUI semantic capabilities `list_windows`, `launch_application`, `inspect_window`, and `verify_ui_state`. Discovery is filtered by exact authorization and, while the Agent is online, its live `CapabilityAdvertisement`. See [`V2_GUI_SEMANTIC_CAPABILITIES.md`](v2/V2_GUI_SEMANTIC_CAPABILITIES.md).
+The northbound MCP is not a raw Cua proxy. The current typed V2 contract is grouped into Agent-native process/shell execution plus bounded filesystem observation, Desktop semantic capabilities including same-context native element targeting/actions, and Browser semantic capabilities plus bounded upload/download transfer when exact policy and the live `CapabilityAdvertisement` permit them. Discovery is filtered by exact authorization and the Agent's live advertisement; an offline Agent exposes no semantic device tools. See [`V2_GUI_SEMANTIC_CAPABILITIES.md`](v2/V2_GUI_SEMANTIC_CAPABILITIES.md), [`V2_BROWSER_SEMANTIC_CAPABILITIES.md`](v2/V2_BROWSER_SEMANTIC_CAPABILITIES.md), and [`V2_CUA_PARITY_MATRIX.md`](v2/V2_CUA_PARITY_MATRIX.md).
 
 ## 8. Start the V2 Agent on the controlled desktop
 

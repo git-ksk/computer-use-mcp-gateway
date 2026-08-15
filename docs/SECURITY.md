@@ -1,5 +1,7 @@
 # Security
 
+> English is the canonical documentation. [日本語版 / Japanese translation](SECURITY.ja.md)
+
 Computer-use grants a client access to sensitive desktop capabilities. Treat this gateway as a security boundary, not merely a transport adapter.
 
 ## V1 defaults
@@ -91,7 +93,6 @@ Gateway audit logs record coarse metadata such as tool name, semantic class, pol
 
 For security-sensitive reports, do not include credentials or unrelated private desktop data in public issues. Prefer GitHub private vulnerability reporting when available.
 
-
 ## V2 trust model
 
 V2 separates northbound authenticated client principals, Hub transport identity, grant-signing authority, and Agent device identity. Key rotation requires continuity proof; bounded admission and signed cancellation/reconnect semantics fail closed around ambiguous operations. The complete compromised-component analysis and non-claims are documented in [`V2_THREAT_MODEL.md`](v2/V2_THREAT_MODEL.md).
@@ -136,7 +137,7 @@ P2 does not delegate the execution-safety authority to an external authorization
 The two new seams are intentionally one-way and narrow:
 
 - `DeviceCapabilityAuthorizer` may answer only whether one authenticated principal may use one exact `DeviceCapability` on one stable device ID. It cannot create/settle an operation, change ownership/generation, clear quarantine, or forward a northbound bearer token to the Agent.
-- `ComputerUseBackendAdapter` may advertise typed capabilities, normalize backend-specific GUI observations into the bounded CUMG model, and return the existing `BackendExecutionOutcome`. It cannot own the Hub ledger or resolution path. Backend tool/session names are not themselves authorization capabilities. A cancellation, timeout, disconnect, or other post-side-effect uncertainty without sufficient backend evidence must remain `indeterminate` and flow into the unchanged Hub quarantine path. GUI snapshots may contain sensitive window titles, labels, values, and screenshots; they remain request results and must not be copied into default telemetry.
+- `ComputerUseBackendAdapter` may advertise typed capabilities, normalize backend-specific GUI observations into the bounded CUMG model, and return the existing `BackendExecutionOutcome`. It cannot own the Hub ledger or resolution path. Backend tool/session names are not themselves authorization capabilities. For a mutating command after provider dispatch, cancellation, timeout, disconnect, generic backend error, response loss, or malformed/unprovable completion without sufficient evidence of non-execution is classified at the adapter/Agent boundary as `BackendOutcomeIndeterminate`; the Hub persists durable `Indeterminate` with reason `BackendOutcomeUnproven` and follows the unchanged quarantine/explicit-resolution/no-auto-replay path. Read-only backend failures may remain definite. GUI snapshots may contain sensitive window titles, labels, values, and screenshots; they remain request results and must not be copied into default telemetry.
 
 A future SINT/Grantex/Open Agent Auth/OPA/Cedar adapter must fail closed when its authorization state is unavailable or ambiguous. A future Arm Device Connect or other fabric integration must treat discovery and liveness as routing inputs only: they are never proof of ownership, safe settlement, or safe reuse. A future OpenClaw or other Computer Use adapter must remain an executor under the CUMG operation ID and fences rather than introducing a second authoritative action lifecycle.
 

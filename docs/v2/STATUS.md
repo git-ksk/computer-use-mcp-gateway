@@ -1,11 +1,13 @@
 # V2 status
 
+> English is the canonical documentation. [日本語版 / Japanese translation](STATUS.ja.md)
+
 Status as of 2026-08-15:
 
 - **Desktop semantic path:** complete and accepted, including same-context native element click/type/key targeting and real-Cua background AX element-action evidence.
 - **Browser core semantic path:** complete and accepted for prepare, bind, inspect, navigate, click, type, dialog, and pointer semantics.
 - **Browser transfer:** complete and accepted. Upload/download use scoped CUMG refs plus Agent-private bounded staging; no arbitrary host path is exposed northbound.
-- **Post-dispatch ambiguity hardening:** mutating backend errors, malformed/unprovable completions, and response loss are quarantined as `BackendOutcomeUnproven`; runtime failures are returned as stable MCP tool-error results rather than leaking transport/exception shapes. Real-Cua browser-alert acceptance covers the observable-side-effect case from issue #47.
+- **Post-dispatch ambiguity hardening:** after dispatch of a mutating command, a generic backend error, malformed/unprovable completion, or response loss is classified at the adapter/Agent boundary as `BackendOutcomeIndeterminate`, persisted by the Hub as durable `Indeterminate` with reason `BackendOutcomeUnproven`, cancels queued work for that desktop, and keeps the device quarantined until explicit persistence-gated resolution. It is never automatically retried or replayed. Read-only backend failures may remain definite. Northbound operational failures use bounded MCP `CallToolResult` errors with `isError=true` and closed CUMG codes rather than leaking transport/provider/`ExceptionGroup` shapes. Real-Cua browser-alert acceptance covers the observable-side-effect case from issue #47.
 - **V1 production:** unchanged by the V2 development branch. V1 regression and conformance coverage remains required during V2 work.
 
 ## Active contracts
