@@ -129,7 +129,7 @@ Start at [`docs/README.md`](docs/README.md). It separates:
 - acceptance evidence;
 - historical PoC and decision records.
 
-Project operation is governed by [`docs/PROJECT_GOVERNANCE.md`](docs/PROJECT_GOVERNANCE.md); version selection and releases follow [`docs/VERSIONING.md`](docs/VERSIONING.md).
+Project operation is governed by [`docs/PROJECT_GOVERNANCE.md`](docs/PROJECT_GOVERNANCE.md); version selection and releases follow [`docs/VERSIONING.md`](docs/VERSIONING.md). Community participation uses [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), support routing is in [`SUPPORT.md`](SUPPORT.md), and vulnerability reports follow [`SECURITY.md`](SECURITY.md).
 
 The repository-local documentation link checker recursively validates these directories so archived or nested documents cannot silently accumulate broken local links.
 

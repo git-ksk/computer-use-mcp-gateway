@@ -14,6 +14,8 @@ The documentation is grouped by purpose so current contracts are easy to disting
 - [`VERSIONING.md`](VERSIONING.md) — SemVer, pre-1.0 compatibility, support/deprecation, and release procedure.
 - [`ROADMAP.md`](ROADMAP.md) — current maintenance priorities, future-minor admission, and the path to 1.0.
 
+Repository-level community health files live at the repository root: [`../SECURITY.md`](../SECURITY.md) for private vulnerability reporting, [`../SUPPORT.md`](../SUPPORT.md) for support routing, [`../CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) for participation expectations, and [`../GOVERNANCE.md`](../GOVERNANCE.md) as the standard governance entry point.
+
 ## Active V2 specification
 
 Current V2 contracts and status live under [`v2/`](v2/). Start with [`v2/STATUS.md`](v2/STATUS.md).

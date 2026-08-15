@@ -123,7 +123,7 @@ This test demonstrates MemoryUsageStore semantics only; it is not a durable bill
 python3 scripts/check_docs.py
 ```
 
-The checker scans `README.md`, `CONTRIBUTING.md`, and `docs/*.md` and fails when a repository-local Markdown link points to a missing target or escapes the repository root. It deliberately does not fetch external URLs.
+The checker scans repository-root Markdown, `.github/**/*.md`, and `docs/**/*.md` and fails when a repository-local Markdown link points to a missing target or escapes the repository root. This includes community health files such as the security, support, conduct, governance, and pull-request documents. It deliberately does not fetch external URLs.
 
 ## What normal CI proves
 

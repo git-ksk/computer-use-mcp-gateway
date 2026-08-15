@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a reproducible CUMG defect that is not a security vulnerability.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. **Do not report security vulnerabilities here.** Use the repository Security → Advisories → Report a vulnerability flow instead.
+  - type: input
+    id: version
+    attributes:
+      label: CUMG version or commit
+      description: Use a released version/tag or exact commit SHA when possible.
+      placeholder: v0.2.0 or abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Cua Driver version if relevant, local/remote deployment shape, and client.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Area
+      options:
+        - V2 Hub / northbound MCP
+        - V2 Agent / transport
+        - Cua backend adapter / GUI semantics
+        - Browser semantics / transfer
+        - V1 compatibility
+        - Packaging / deployment
+        - Testing / CI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reliable reproduction. Redact credentials, private endpoints, and unrelated desktop content.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized logs or evidence
+      description: Optional. Do not include secrets, raw sensitive desktop payloads, access tokens, or private vulnerability details.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I checked the current documentation and existing issues for the same problem.
+          required: true
+        - label: This report does not contain a security vulnerability or sensitive disclosure that belongs in Private Vulnerability Reporting.
+          required: true

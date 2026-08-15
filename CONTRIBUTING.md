@@ -56,3 +56,8 @@ Do not run untrusted pull-request code on a TCC-granted self-hosted desktop runn
 ## Project and release policy
 
 All normal changes enter `main` through a pull request and follow the change-class gates in [`docs/PROJECT_GOVERNANCE.md`](docs/PROJECT_GOVERNANCE.md). Version impact is classified using [`docs/VERSIONING.md`](docs/VERSIONING.md); docs-only changes normally do not bump the crate version, compatible shipped fixes are PATCH, and public-contract expansion or deliberate pre-1.0 incompatibility is MINOR.
+
+
+## Community and security reports
+
+Participation is subject to [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Use the repository issue forms for normal bugs, documentation issues, scoped feature proposals, and setup questions. **Do not open a public issue for a suspected vulnerability**; follow [`SECURITY.md`](SECURITY.md) and use GitHub Private Vulnerability Reporting. Support scope and routing are documented in [`SUPPORT.md`](SUPPORT.md).

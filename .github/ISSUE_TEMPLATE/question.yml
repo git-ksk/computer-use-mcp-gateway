@@ -1,0 +1,38 @@
+name: Usage / setup question
+description: Ask a CUMG usage or setup question after checking the getting-started and troubleshooting docs.
+title: "question: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project is maintained on a best-effort basis. Security vulnerabilities must use Private Vulnerability Reporting, not this form.
+  - type: input
+    id: version
+    attributes:
+      label: CUMG version or commit
+      placeholder: v0.2.0 or abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and deployment shape
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Explain what you are trying to do and where the documented path stopped being sufficient.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked docs/GETTING_STARTED.md and docs/TROUBLESHOOTING.md.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

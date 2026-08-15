@@ -1,0 +1,55 @@
+name: Feature proposal
+description: Propose a bounded capability or project change that fits CUMG's product boundary.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        CUMG deliberately avoids becoming a generic fleet platform, remote desktop, device fabric, or arbitrary backend passthrough. Read `docs/ROADMAP.md` and `docs/v2/V2_POSITIONING.md` before proposing scope expansion.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the concrete user/operator problem, not only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed capability or change
+      description: State the smallest public-contract change that would solve the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Existing backend / OSS alternatives considered
+      description: Explain whether Cua Driver, another maintained OSS project, or composition outside CUMG can already solve this.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Security and execution-safety impact
+      description: Address authorization scope, state mutation, ambiguity, quarantine/no-auto-replay, sensitive data, and fail-closed behavior where relevant.
+    validations:
+      required: true
+  - type: dropdown
+    id: release
+    attributes:
+      label: Expected roadmap / release impact
+      options:
+        - 0.2.x-compatible maintenance only
+        - Future minor candidate / public-contract expansion
+        - Potential pre-1.0 incompatibility
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: What deterministic, compatibility, security, or physical acceptance would prove this change safe and useful?
+    validations:
+      required: true
