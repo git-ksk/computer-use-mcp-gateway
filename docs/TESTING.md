@@ -29,6 +29,8 @@ V2 observability hardening also has deterministic regressions for payload-safe p
 
 V2 usage integration adds deterministic tests for Noop compatibility, 0/1-unit lease state, denied reservation, the `markLiable -> persisted Dispatched -> Agent send` ordering, and the architectural rule that the execution-safety module has no usage dependency. The CUMG-owned Node sidecar has a separate source-level test against the real `mcp-usage-control` `MemoryUsageStore` covering allow, zero settlement/release, full settlement, quota exhaustion, duplicate `operationId`, restart state loss, and rejection of accidental payload fields.
 
+V2 checkpoint compatibility has deterministic issue-#60 regressions for both the v0.2.0-era persisted lineage (registry/control tag 2 + capability schema 2; Agent grant-ledger tag 2) and the post-v0.2.0 tag-5 state observed in dogfood. The tests require device identity/generation preservation, no promotion of historical capability advertisements, Agent grant replay/revocation preservation, durable `Indeterminate` quarantine, receipt/resolution audit preservation, rejection of impossible schema pairings, and a non-destructive migration path that leaves the original append-only checkpoint unchanged until a later normal checkpoint append succeeds.
+
 For an observability/operations change, run the stricter local gate before spending CI capacity:
 
 ```bash

@@ -50,12 +50,17 @@ compatibility を維持すること自体が vulnerability を残す security em
 
 ## Schema version は独立管理
 
-project/crate version と protocol schema version は目的が異なります。
+project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。
 
-- `CONTROL_SCHEMA_VERSION` は control-schema compatibility boundary が変わるときに変更;
-- capability-advertisement schema version はその compatibility boundary が変わるときに変更;
+- `CONTROL_SCHEMA_VERSION` は live control-schema compatibility boundary が変わるときに変更;
+- capability-advertisement schema version は live advertisement boundary が変わるときに変更;
+- `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION` と `GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION` は persisted structure を独立に versioning し、future `CONTROL_SCHEMA_VERSION` bump だけを理由に変更しない。persisted structure 自体が変わる場合だけ bump する;
+- historical v0.2.x checkpoint は当時の control schema number を persisted registry / grant-ledger tag に流用していた。runtime restore が support するのは review 済みの v0.2.0 以降の lineage のみで、registry は `2/capability 2`、`3/capability 3`、`4..=7/capability 4`、grant-ledger は `2..=7`。prototype tag `1`、unknown/future tag、不可能な control/capability pairing は fail closed;
+- migration 時に historical capability advertisement を live authority へ昇格させない。Hub は historical pairing を検証し、device identity / generation を restore した上で device を offline にし、dispatch 前に current live schema の fresh Agent advertisement を要求する;
 - crate release だけを理由に schema version を自動 increment しない;
 - schema change から算術的に crate version を決めず、public compatibility impact に応じて PATCH/MINOR rule を使う。
+
+既に supported な release line の checkpoint を、wire/configuration behavior を変えず backward-compatible に restore する persisted-state migration は PATCH で扱えます。documented persisted-state version の support removal、新しい incompatible persisted-state shape、operator に state transformation を要求する変更は新しい compatibility boundary なので、pre-1.0 では通常 MINOR が必要です。したがって、この backward-compatible checkpoint migration 自体は **MINOR version bump を要求しません**。
 
 ## `1.0.0` の条件
 
