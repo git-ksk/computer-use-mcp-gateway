@@ -44,12 +44,12 @@ method escape hatch.
 | 7 | `bring_to_front` | semantic, current | `ActivateWindow` with exact-window verification evidence |
 | 8 | `set_window_frame` | semantic, current | `SetWindowFrame` |
 | 9 | `invoke_menu` | semantic, current | exact bounded `InvokeMenu` |
-| 10 | `click` | semantic, current | `PointerClick`; typed count/button/modifiers and coordinate target |
-| 11 | `double_click` | integrated | `PointerClick { click_count: 2 }` |
-| 12 | `right_click` | integrated | `PointerClick { button: right }` |
+| 10 | `click` | semantic, current | `PointerClick`; typed coordinates or scoped native element ref with semantic AX action |
+| 11 | `double_click` | integrated | `PointerClick { click_count: 2 }`, including scoped native element targets |
+| 12 | `right_click` | integrated | `PointerClick { button: right }`, including scoped native element targets |
 | 13 | `drag` | semantic, current | `PointerDrag`; typed endpoints, modifiers, duration, and steps |
-| 14 | `type_text` | semantic, current | `TypeText`; bounded contextual target/delivery semantics |
-| 15 | `press_key` | semantic, current | `KeyboardInput` |
+| 14 | `type_text` | semantic, current | `TypeText`; bounded contextual coordinate/window/element target semantics |
+| 15 | `press_key` | semantic, current | `KeyboardInput`, including scoped native element targeting |
 | 16 | `hotkey` | integrated | `KeyboardInput` chord |
 | 17 | `set_value` | semantic, current | `SetUiValue` using scoped CUMG element refs |
 | 18 | `scroll` | semantic, current | `Scroll` with explicit coordinate space/target |
@@ -102,8 +102,10 @@ Current desktop runtime acceptance covers:
 
 - context open bound atomically to device generation and capability revision;
 - contextual window inspection and CUMG snapshot/element ref minting;
-- `set_ui_value` through a same-context CUMG ref with read-back verification;
-- stale, unknown, cross-context, wrong-generation, and closed-context ref rejection;
+- `set_ui_value`, native click, text input, and keyboard input through same-context CUMG element refs;
+- native element `press/open/show_menu/pick/confirm/cancel` mapping without raw backend handles;
+- stale, unknown, cross-context, wrong-generation, wrong-revision, wrong-kind, and provider-stale ref rejection;
+- trusted-Mac Calculator acceptance proving a background AX element press changes the exact window;
 - verified exact-window activation;
 - representative background keyboard/scroll on an unambiguous target;
 - privacy-safe clipboard type-only observation;
@@ -116,8 +118,8 @@ Cua safety refusals remain authoritative. A background key/scroll may be refused
 cannot prove which sibling window of one PID would receive process-scoped input; CUMG never turns
 that refusal into an automatic foreground or desktop escalation.
 
-`CONTROL_SCHEMA_VERSION` and `CAPABILITY_SCHEMA_VERSION` are both version 4. Pre-v4 mixing fails
-closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded
+`CONTROL_SCHEMA_VERSION` is version 6 and `CAPABILITY_SCHEMA_VERSION` remains version 4. Control
+schema mismatches and capability-advertisement schema mismatches fail closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded
 image/UI/clipboard/region observations use the reviewed large-result allowance. Clipboard plain text
 is capped at 1 MiB.
 

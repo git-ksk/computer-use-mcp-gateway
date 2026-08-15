@@ -75,7 +75,7 @@ Keep the gateway on loopback. Do not commit real tunnel credentials, Access toke
 
 A Mac with Accessibility and Screen Recording grants is a high-trust machine. Physical desktop acceptance is therefore operator-controlled and local-only; normal GitHub Actions use GitHub-hosted runners and do not receive those desktop grants.
 
-Run `scripts/v2_desktop_acceptance.sh` only from a reviewed checkout on a trusted logged-in Mac, with both physical-action ACK variables explicitly set to `1`. Prefer a dedicated test Mac rather than a daily-use workstation. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](v2/acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md) and [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
+Run `scripts/v2_desktop_acceptance.sh` only from a reviewed checkout on a trusted logged-in Mac, with all required physical-action ACK variables explicitly set to `1`. Prefer a dedicated test Mac rather than a daily-use workstation. See [`V2_LOCAL_DESKTOP_ACCEPTANCE.md`](v2/acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md) and [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md).
 
 P1 final physical acceptance ran on 2026-08-13 against trusted `main` commit `bb39390f3587902a7df918fe1ff4a8b28c328d50` as Desktop E2E run `31675515516`. The runner was registered ephemerally with the dedicated label, executed only the trusted `main` checkout, and automatically unregistered after the job. The V2 P1 step required exact quarantine to survive Hub/Agent restart and generation advance with no replay before explicit resolution and reuse.
 

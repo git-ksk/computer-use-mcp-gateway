@@ -32,9 +32,9 @@ extension:
 | `list_apps` | `ListApplications` | bounded application observation |
 | `get_screen_size` | `ScreenGeometry` | physical/logical display geometry |
 | `screenshot` | `Screenshot` | bounded desktop PNG; contextual desktop use requires explicit scope expansion |
-| `click` | `PointerClick` | typed button/count/modifiers, explicit window or desktop coordinates |
+| `click` | `PointerClick` | typed coordinate clicks or same-context element refs with bounded semantic actions |
 | `drag` | `PointerDrag` | typed endpoints, button/modifiers, bounded duration/steps |
-| `type_text` | `TypeText` | bounded text, explicit target and delivery when contextual |
+| `type_text` | `TypeText` | bounded text, including same-context element-ref targeting, with explicit delivery |
 | `list_windows` | `ListWindows` | bounded backend-neutral top-level window records |
 | `launch_application` | `LaunchApplication` | launch by opaque identifier/name with bounded targets |
 | `inspect_window` | `InspectWindow` | bounded normalized UI snapshot; mints CUMG scoped refs |
@@ -43,7 +43,7 @@ extension:
 | `activate_window` | `ActivateWindow` | activate a process or exact window with verification evidence |
 | `set_window_frame` | `SetWindowFrame` | set and verify exact top-level window geometry |
 | `invoke_menu` | `InvokeMenu` | invoke a bounded semantic menu path without raw backend selectors |
-| `keyboard_input` | `KeyboardInput` | bounded semantic key/modifiers with explicit delivery mode |
+| `keyboard_input` | `KeyboardInput` | bounded semantic key/modifiers, including same-context element-ref targeting |
 | `scroll` | `Scroll` | bounded direction/granularity/amount against an explicit target |
 | `clipboard_read` | `ClipboardRead` | bounded types and optional privacy-sensitive text |
 | `clipboard_write` | `ClipboardWrite` | bounded plain-text replacement |
@@ -75,8 +75,9 @@ If the Agent is offline, there is no live advertisement and no semantic device t
 reconnect may produce a new device generation or capability revision; stateful requests are fenced
 against both, so a discovery/dispatch race fails closed.
 
-The control and capability schemas are version 3 for this desktop contract. Pre-v3 Agent/Hub mixing
-is rejected rather than interpreted as an ambiguous rolling-upgrade compatibility mode.
+The control schema is version 6 and the capability-advertisement schema remains version 4. Hub and
+Agent control-schema mismatches fail closed; capability advertisements with another schema version are
+also rejected rather than interpreted as an ambiguous rolling-upgrade compatibility mode.
 
 ## Interaction context and backend lifecycle
 
@@ -111,10 +112,12 @@ capability revision
 ref kind
 ```
 
-`set_ui_value` accepts only a CUMG element ref from the same live context. Unknown, stale,
-cross-context, wrong-generation, wrong-revision, or wrong-kind refs fail closed. Newer backend
-snapshots may also make older backend handles stale; CUMG does not replay or guess around that
-provider refusal.
+`set_ui_value`, `click`, `type_text`, and `keyboard_input` can consume a CUMG element ref from the
+same live context. The Hub resolves that opaque ref only after context/device/generation/revision/kind
+checks; the command still carries the exact process/window target to the backend, whose element token
+must agree with that window. Unknown, stale, cross-context, wrong-generation, wrong-revision,
+wrong-kind, or provider-rejected window/token combinations fail closed. CUMG does not auto-refresh
+and replay a mutation.
 
 The context and scoped ref registries do not replace `OperationOwner`. Quarantine ownership and
 indeterminate resolution remain bound to the authenticated principal.
@@ -128,8 +131,10 @@ Unknown provider-specific roles normalize to `other` rather than escaping backen
 cannot be targeted by the V2 window contract. Exact window targets and snapshots continue to require
 strictly positive geometry; malformed non-geometry fields still fail closed.
 
-Desktop actions use typed coordinates/targets such as `DesktopPhysical`, `WindowPhysical`,
-`InputTarget`, and `ScrollTarget`. CUMG does not expose Cua's hidden `from_zoom` coordinate state.
+Desktop actions use typed coordinates/targets such as `DesktopPhysical`, `WindowPhysical`, scoped
+native element targets, `InputTarget`, and `ScrollTarget`. Element targets never expose Cua
+`element_token`, `element_index`, or `snapshot_id` northbound. CUMG also does not expose Cua's hidden
+`from_zoom` coordinate state.
 `CaptureRegion` is window-local; desktop observation after explicit expansion is performed through the
 contextual desktop screenshot path.
 
@@ -150,9 +155,8 @@ should prefer type-only observation when the text itself is unnecessary.
 
 ## Browser and data-transfer boundary
 
-Browser semantic parity is the next phase. It will define backend-neutral browser inspect/bind,
-navigate, click, type, dialog, upload, download, and pointer contracts without exposing raw Cua/CDP
-methods.
+Browser semantic parity is implemented separately through backend-neutral inspect/bind, navigate,
+click, type, dialog, upload, download, and pointer contracts without exposing raw Cua/CDP methods.
 
 Upload is a local-data exfiltration boundary and must use a CUMG-issued file ref rather than an
 arbitrary local path. Download is a local-write boundary and must independently bind destination,

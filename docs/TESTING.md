@@ -213,11 +213,12 @@ real Cua state-changing operation
     → safe reuse with a new operation ID
 ```
 
-Run it only after reviewing the checkout and explicitly acknowledging both real-desktop actions:
+Run it only after reviewing the checkout and explicitly acknowledging the real-desktop acceptance actions:
 
 ```bash
 CUMG_DESKTOP_E2E_ACK=1 \
 CUMG_V2_CUA_CANCEL_E2E_ACK=1 \
+CUMG_V2_NATIVE_ELEMENT_E2E_ACK=1 \
 CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" \
 ./scripts/v2_desktop_acceptance.sh
 ```

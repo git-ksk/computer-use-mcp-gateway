@@ -18,8 +18,9 @@ use crate::v2_m0::{
     MAX_CLIPBOARD_TYPE_BYTES, MAX_CLIPBOARD_TYPES, MAX_KEYBOARD_MODIFIERS, MAX_MENU_PATH_SEGMENTS,
     MAX_MENU_SEGMENT_BYTES, MAX_SCREENSHOT_BYTES, MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS,
     MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, MAX_UI_REF_BYTES, MAX_UI_TEXT_BYTES, MAX_WINDOW_RESULTS,
-    PointerTarget, ScrollDirection, ScrollGranularity, ScrollTarget, UiElement, UiElementSelector,
-    UiImage, UiPredicate, UiPredicateResult, UiRect, UiRole, VerificationStatus, WindowInfo,
+    PointerTarget, ScrollDirection, ScrollGranularity, ScrollTarget, UiElement, UiElementAction,
+    UiElementSelector, UiImage, UiPredicate, UiPredicateResult, UiRect, UiRole, VerificationStatus,
+    WindowInfo,
 };
 use crate::v2_m0_transport::CancellationDisposition;
 use crate::v2_observability::SafeErrorCode;
@@ -589,6 +590,7 @@ fn map_command(
             target,
             button,
             click_count,
+            action,
             modifiers,
             delivery,
         } => {
@@ -605,16 +607,44 @@ fn map_command(
             }
             let mut args = pointer_target_arguments(target, *delivery)?;
             args.insert(
+                "delivery_mode".into(),
+                serde_json::json!(delivery_mode_name(*delivery)),
+            );
+            insert_context_session(&mut args, context_id.as_deref())?;
+            if matches!(target, PointerTarget::Element { .. }) && *click_count == 2 {
+                if *button != crate::v2_m0::PointerButton::Left
+                    || action.is_some()
+                    || !modifiers.is_empty()
+                {
+                    return Err(M1BackendError::InvalidRequest(
+                        "invalid element double click options",
+                    ));
+                }
+                return Ok(("double_click", Some(args)));
+            }
+            if matches!(target, PointerTarget::Element { .. }) {
+                if *click_count != 1 {
+                    return Err(M1BackendError::InvalidRequest(
+                        "element click count must be 1 or 2",
+                    ));
+                }
+                if let Some(action) = action {
+                    args.insert(
+                        "action".into(),
+                        serde_json::json!(ui_element_action_name(*action)),
+                    );
+                }
+            } else if action.is_some() {
+                return Err(M1BackendError::InvalidRequest(
+                    "UI element action requires an element target",
+                ));
+            }
+            args.insert(
                 "button".into(),
                 serde_json::json!(pointer_button_name(*button)),
             );
             args.insert("count".into(), serde_json::json!(click_count));
             args.insert("modifier".into(), serde_json::json!(modifiers));
-            args.insert(
-                "delivery_mode".into(),
-                serde_json::json!(delivery_mode_name(*delivery)),
-            );
-            insert_context_session(&mut args, context_id.as_deref())?;
             Ok(("click", Some(args)))
         }
         DeviceCommand::PointerDrag {
@@ -2189,6 +2219,20 @@ fn pointer_target_arguments(
             args.insert("y".into(), serde_json::json!(y));
             args.insert("scope".into(), serde_json::json!("window"));
         }
+        PointerTarget::Element {
+            process_id,
+            window_id,
+            element_ref,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if element_ref.is_empty() || element_ref.len() > MAX_UI_REF_BYTES {
+                return Err(M1BackendError::InvalidRequest("invalid UI element ref"));
+            }
+            args.insert("pid".into(), serde_json::json!(process_id));
+            args.insert("window_id".into(), serde_json::json!(window_id));
+            args.insert("element_token".into(), serde_json::json!(element_ref));
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
     }
     Ok(args)
 }
@@ -2295,6 +2339,20 @@ fn input_target_arguments(
             args.insert("window_id".into(), serde_json::json!(window_id));
             args.insert("x".into(), serde_json::json!(x));
             args.insert("y".into(), serde_json::json!(y));
+            args.insert("scope".into(), serde_json::json!("window"));
+        }
+        InputTarget::Element {
+            process_id,
+            window_id,
+            element_ref,
+        } => {
+            validate_window_target(*process_id, *window_id)?;
+            if element_ref.is_empty() || element_ref.len() > MAX_UI_REF_BYTES {
+                return Err(M1BackendError::InvalidRequest("invalid UI element ref"));
+            }
+            args.insert("pid".into(), serde_json::json!(process_id));
+            args.insert("window_id".into(), serde_json::json!(window_id));
+            args.insert("element_token".into(), serde_json::json!(element_ref));
             args.insert("scope".into(), serde_json::json!("window"));
         }
     }
@@ -2493,6 +2551,17 @@ fn normalize_screenshot_result(result: &CallToolResult) -> Result<DeviceResult, 
         width_pixels,
         height_pixels,
     })
+}
+
+fn ui_element_action_name(action: UiElementAction) -> &'static str {
+    match action {
+        UiElementAction::Press => "press",
+        UiElementAction::Open => "open",
+        UiElementAction::ShowMenu => "show_menu",
+        UiElementAction::Pick => "pick",
+        UiElementAction::Confirm => "confirm",
+        UiElementAction::Cancel => "cancel",
+    }
 }
 
 fn pointer_button_name(button: crate::v2_m0::PointerButton) -> &'static str {
@@ -3108,6 +3177,203 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "trusted-mac real-Cua native element action acceptance"]
+    async fn real_cua_native_element_action_acceptance() {
+        assert_eq!(
+            std::env::var("CUMG_V2_NATIVE_ELEMENT_E2E_ACK").as_deref(),
+            Ok("1"),
+            "explicit trusted-Mac acknowledgement required"
+        );
+        let command = std::env::var("CUMG_V2_CUA_COMMAND")
+            .unwrap_or_else(|_| "/Users/sawadakousuke/.local/bin/cua-driver".into());
+        let context = format!("ctx_{:032x}", rand::random::<u128>());
+        let adapter = CuaMcpAdapter::new(
+            command,
+            vec!["mcp".into()],
+            "0.19.3",
+            "macos",
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            1,
+            Duration::from_millis(50),
+        );
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let launch = adapter
+            .execute(
+                &DeviceCommand::LaunchApplication {
+                    identifier: Some("com.apple.calculator".into()),
+                    name: None,
+                    targets: vec![],
+                    new_instance: true,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let process_id = match launch {
+            BackendExecutionOutcome::Completed(DeviceResult::ApplicationLaunched {
+                process_id,
+                ..
+            }) => process_id,
+            other => panic!("unexpected Calculator launch result: {other:?}"),
+        };
+
+        let mut window_id = None;
+        for _ in 0..20 {
+            let windows = adapter
+                .execute(
+                    &DeviceCommand::ListWindows {
+                        process_id: Some(process_id),
+                        on_screen_only: false,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap();
+            if let BackendExecutionOutcome::Completed(DeviceResult::Windows { windows, .. }) =
+                windows
+            {
+                if let Some(window) = windows.into_iter().find(|window| {
+                    window.window_id != 0
+                        && window.is_on_screen
+                        && window.bounds.width >= 150
+                        && window.bounds.height >= 150
+                }) {
+                    window_id = Some(window.window_id);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let window_id = window_id.expect("Calculator window did not become observable");
+
+        let inspected = adapter
+            .execute(
+                &DeviceCommand::InspectWindowContextual {
+                    context_id: context.clone(),
+                    process_id,
+                    window_id,
+                    query: Some("7".into()),
+                    max_elements: 128,
+                    max_depth: 32,
+                    include_screenshot: true,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let (element_ref, before_screenshot) = match inspected {
+            BackendExecutionOutcome::Completed(DeviceResult::WindowSnapshot {
+                elements,
+                screenshot: Some(screenshot),
+                ..
+            }) => {
+                let element_ref = elements
+                    .into_iter()
+                    .find(|element| {
+                        element.role == UiRole::Button
+                            && element
+                                .label
+                                .as_deref()
+                                .is_some_and(|label| label.trim() == "7")
+                    })
+                    .map(|element| element.element_ref)
+                    .expect("Calculator 7 button was not exposed as an actionable element");
+                (element_ref, screenshot.data_base64)
+            }
+            other => panic!("unexpected Calculator inspect result: {other:?}"),
+        };
+
+        let wrong_window_id = window_id.checked_add(1).expect("window id overflow");
+        assert!(
+            adapter
+                .execute(
+                    &DeviceCommand::PointerClickAdvanced {
+                        context_id: Some(context.clone()),
+                        target: PointerTarget::Element {
+                            process_id,
+                            window_id: wrong_window_id,
+                            element_ref: element_ref.clone(),
+                        },
+                        button: crate::v2_m0::PointerButton::Left,
+                        click_count: 1,
+                        action: Some(UiElementAction::Press),
+                        modifiers: vec![],
+                        delivery: InputDeliveryMode::Background,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .is_err(),
+            "an element ref must not be usable with a different native window"
+        );
+
+        assert_eq!(
+            adapter
+                .execute(
+                    &DeviceCommand::PointerClickAdvanced {
+                        context_id: Some(context.clone()),
+                        target: PointerTarget::Element {
+                            process_id,
+                            window_id,
+                            element_ref,
+                        },
+                        button: crate::v2_m0::PointerButton::Left,
+                        click_count: 1,
+                        action: Some(UiElementAction::Press),
+                        modifiers: vec![],
+                        delivery: InputDeliveryMode::Background,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap(),
+            BackendExecutionOutcome::Completed(DeviceResult::PointerClickCompleted)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let after = adapter
+            .execute(
+                &DeviceCommand::InspectWindowContextual {
+                    context_id: context.clone(),
+                    process_id,
+                    window_id,
+                    query: Some("7".into()),
+                    max_elements: 128,
+                    max_depth: 32,
+                    include_screenshot: true,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        match after {
+            BackendExecutionOutcome::Completed(DeviceResult::WindowSnapshot {
+                screenshot: Some(screenshot),
+                ..
+            }) => {
+                assert_ne!(
+                    screenshot.data_base64, before_screenshot,
+                    "Calculator window did not visually change after the background AX element press"
+                );
+            }
+            other => panic!("unexpected Calculator post-click inspect result: {other:?}"),
+        }
+
+        let _ = adapter
+            .execute(
+                &DeviceCommand::TerminateApplication { process_id },
+                cancel_rx,
+            )
+            .await;
+        adapter.end_interaction_session(&context).await.unwrap();
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn normalizes_fixture_results_to_backend_neutral_types() {
         let adapter = fixture(vec!["scripts/mock_mcp_backend.py".into()]);
         adapter.connect().await.unwrap();
@@ -3410,6 +3676,7 @@ mod tests {
             },
             button: crate::v2_m0::PointerButton::Left,
             click_count: 2,
+            action: None,
             modifiers: vec![KeyboardModifier::Meta],
             delivery: InputDeliveryMode::Foreground,
         })
@@ -3435,6 +3702,7 @@ mod tests {
                 },
                 button: crate::v2_m0::PointerButton::Left,
                 click_count: 1,
+                action: None,
                 modifiers: vec![KeyboardModifier::Meta],
                 delivery: InputDeliveryMode::Background,
             }),
@@ -3460,6 +3728,118 @@ mod tests {
                 delivery: InputDeliveryMode::Background,
                 duration_ms: 100,
                 steps: 10,
+            }),
+            Err(M1BackendError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn native_element_actions_map_to_exact_cua_element_tokens() {
+        let context = "ctx_0123456789abcdef0123456789abcdef".to_owned();
+        let target = PointerTarget::Element {
+            process_id: 42,
+            window_id: 7,
+            element_ref: "backend-element-token".into(),
+        };
+
+        let (tool, args) = map_command(&DeviceCommand::PointerClickAdvanced {
+            context_id: Some(context.clone()),
+            target: target.clone(),
+            button: crate::v2_m0::PointerButton::Left,
+            click_count: 1,
+            action: Some(UiElementAction::Open),
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Background,
+        })
+        .unwrap();
+        assert_eq!(tool, "click");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["session"], context);
+        assert_eq!(args["pid"], 42);
+        assert_eq!(args["window_id"], 7);
+        assert_eq!(args["element_token"], "backend-element-token");
+        assert_eq!(args["action"], "open");
+        assert!(args.get("x").is_none());
+        assert!(args.get("y").is_none());
+
+        let (tool, args) = map_command(&DeviceCommand::PointerClickAdvanced {
+            context_id: Some(context.clone()),
+            target: target.clone(),
+            button: crate::v2_m0::PointerButton::Left,
+            click_count: 2,
+            action: None,
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Background,
+        })
+        .unwrap();
+        assert_eq!(tool, "double_click");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["element_token"], "backend-element-token");
+        assert_eq!(args["session"], context);
+
+        let (tool, args) = map_command(&DeviceCommand::TypeTextAdvanced {
+            context_id: Some(context.clone()),
+            text: "hello".into(),
+            target: InputTarget::Element {
+                process_id: 42,
+                window_id: 7,
+                element_ref: "backend-element-token".into(),
+            },
+            delivery: InputDeliveryMode::Background,
+            delay_ms: 30,
+        })
+        .unwrap();
+        assert_eq!(tool, "type_text");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["element_token"], "backend-element-token");
+        assert_eq!(args["pid"], 42);
+        assert_eq!(args["window_id"], 7);
+
+        let (tool, args) = map_command(&DeviceCommand::KeyboardInput {
+            context_id: Some(context),
+            key: "return".into(),
+            modifiers: vec![],
+            target: InputTarget::Element {
+                process_id: 42,
+                window_id: 7,
+                element_ref: "backend-element-token".into(),
+            },
+            delivery: InputDeliveryMode::Background,
+        })
+        .unwrap();
+        assert_eq!(tool, "press_key");
+        let args = Value::Object(args.unwrap());
+        assert_eq!(args["element_token"], "backend-element-token");
+    }
+
+    #[test]
+    fn native_element_click_options_fail_closed() {
+        let target = PointerTarget::Element {
+            process_id: 42,
+            window_id: 7,
+            element_ref: "backend-element-token".into(),
+        };
+        assert!(matches!(
+            map_command(&DeviceCommand::PointerClickAdvanced {
+                context_id: Some("ctx_0123456789abcdef0123456789abcdef".into()),
+                target: target.clone(),
+                button: crate::v2_m0::PointerButton::Left,
+                click_count: 3,
+                action: None,
+                modifiers: vec![],
+                delivery: InputDeliveryMode::Background,
+            }),
+            Err(M1BackendError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            map_command(&DeviceCommand::PointerClickAdvanced {
+                context_id: Some("ctx_0123456789abcdef0123456789abcdef".into()),
+                target,
+                button: crate::v2_m0::PointerButton::Right,
+                click_count: 2,
+                action: None,
+                modifiers: vec![],
+                delivery: InputDeliveryMode::Background,
             }),
             Err(M1BackendError::InvalidRequest(_))
         ));

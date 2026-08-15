@@ -17,13 +17,18 @@ Run:
 ```bash
 CUMG_DESKTOP_E2E_ACK=1 \
 CUMG_V2_CUA_CANCEL_E2E_ACK=1 \
+CUMG_V2_NATIVE_ELEMENT_E2E_ACK=1 \
 CUMG_V2_CUA_COMMAND="$(command -v cua-driver)" \
 bash scripts/v2_desktop_acceptance.sh
 ```
 
-Both ACK variables are mandatory. The wrapper fails closed before any desktop action if either acknowledgement is missing.
+All three ACK variables are mandatory. The wrapper fails closed before any desktop action if an acknowledgement is missing.
 
-The wrapper verifies Cua permissions, runs the real TextEdit screenshot/click/type/readback fixture, then runs the V2 real-Cua ambiguity/restart/reconnect/no-auto-replay/explicit-resolution regression.
+The wrapper verifies Cua permissions, runs the real TextEdit screenshot/click/type/readback fixture,
+then runs `real_cua_native_element_action_acceptance`: a fresh Calculator instance is inspected for the
+exact `7` button, the resulting backend element token is exercised through the V2 background element
+press path, and before/after exact-window screenshots prove the visual effect. The wrapper then runs
+the V2 real-Cua ambiguity/restart/reconnect/no-auto-replay/explicit-resolution regression.
 
 The historical V1 gateway binary is built only for the mature TextEdit physical fixture. The recommended runtime remains V2 Hub + V2 Agent.
 
