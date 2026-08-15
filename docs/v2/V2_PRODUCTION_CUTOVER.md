@@ -20,7 +20,26 @@ Do not change the public route unless all of the following are true:
 
 ## 2. Persistent-state compatibility
 
-Current V2 fails closed when an older control/capability checkpoint cannot be safely mixed with the current schema. Never delete or reset V2 state merely to make a new binary boot.
+Never delete or reset V2 state merely to make a new binary boot. Durable checkpoints contain replay barriers, device generations, operation ownership, `Indeterminate` quarantine, receipts, and resolution audit.
+
+Current restore separates persisted-state schema from the live `CONTROL_SCHEMA_VERSION`. It supports only the explicitly reviewed v0.2.0-and-later historical lineage:
+
+- Hub registry tag 2 with capability schema 2;
+- Hub registry tag 3 with capability schema 3;
+- Hub registry tags 4 through 7 with capability schema 4;
+- Agent grant-ledger tags 2 through 7.
+
+Prototype tag 1, unknown/future tags, malformed state, and impossible registry/capability pairings still fail closed. This compatibility path applies only to trusted local durable checkpoints; it does **not** make old live control messages, grants, commands, or capability advertisements valid on the current wire boundary.
+
+Migration is in-memory and non-destructive. Restore validates the old checkpoint without rewriting it. For historical registry snapshots, persisted capability advertisements are discarded after their historical schema pairing is validated because a Hub restart already invalidates transport liveness; the Agent must reconnect and advertise the current capability schema before dispatch. Exact device identity/generation and all execution-safety state are preserved. The next successful normal checkpoint append uses the dedicated persisted-state schema, while the historical checkpoint remains an older append-only rollback/evidence file until normal bounded retention eventually prunes it.
+
+Before an in-place upgrade:
+
+1. archive the current Hub/Agent state directories, exact binaries/hashes, policy, and service configuration;
+2. run the candidate against a copy of the durable state when practical and require successful restore before touching the supervised service;
+3. stop/restart through the normal supervisor path without editing the checkpoint JSON;
+4. verify Hub/Agent startup, fresh Agent capability advertisement, unchanged unresolved quarantine, and no automatic replay;
+5. only then continue with public-route validation.
 
 A state reset is permitted only after all three conditions are proved:
 

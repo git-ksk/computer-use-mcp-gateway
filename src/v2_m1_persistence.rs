@@ -67,8 +67,8 @@ impl AgentPersistentState {
             .map_err(|_| PersistenceError::InvalidState)?;
         let trusted_hub =
             TrustedHubIdentity::from_verifier_and_epoch(hub_key, self.trusted_hub_epoch);
-        let grant_ledger =
-            GrantLedger::from_snapshot(self.grant_ledger).map_err(PersistenceError::Control)?;
+        let grant_ledger = GrantLedger::from_persisted_snapshot(self.grant_ledger)
+            .map_err(PersistenceError::Control)?;
         let execution = AgentExecutionGate::restore_after_restart(self.execution)
             .map_err(PersistenceError::Execution)?;
         Ok((self.device_id, trusted_hub, grant_ledger, execution))
@@ -99,8 +99,8 @@ impl HubPersistentState {
         limits: AdmissionLimits,
     ) -> Result<(DeviceRegistry, AuthoritativeOperationController), PersistenceError> {
         validate_state_schema(self.schema_version)?;
-        let mut registry =
-            DeviceRegistry::from_snapshot(self.registry).map_err(PersistenceError::Control)?;
+        let mut registry = DeviceRegistry::from_persisted_snapshot(self.registry)
+            .map_err(PersistenceError::Control)?;
         // A Hub process restart destroys every live transport session. Persisted
         // capability advertisements remain useful as history, but must not make
         // the device appear online until a fresh authenticated Agent reconnects.
@@ -366,9 +366,11 @@ impl std::error::Error for PersistenceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_execution_safety::OperationOwner;
-    use crate::v2_m0::{CapabilityClass, DeviceCapability, DeviceIdentity, GrantAuthority};
-    use crate::v2_m0_execution::{AdmissionDecision, OperationRef};
+    use crate::v2_execution_safety::{ExecutionEvidence, IndeterminateReason, OperationOwner};
+    use crate::v2_m0::{
+        CapabilityAdvertisement, CapabilityClass, DeviceCapability, DeviceIdentity, GrantAuthority,
+    };
+    use crate::v2_m0_execution::{AdmissionDecision, IndeterminateResolution, OperationRef};
     use crate::v2_m0_transport::HubIdentity;
     use rand::{RngCore, rngs::OsRng};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -476,6 +478,159 @@ mod tests {
     }
 
     #[test]
+    fn historical_agent_checkpoint_preserves_grant_and_operation_replay_barriers() {
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let mut grants = GrantLedger::new(authority.verifier());
+        let consumed = authority
+            .issue("dev-a", CapabilityClass::Observe, 1_000, 30_000)
+            .unwrap();
+        grants
+            .authorize_once(&consumed, "dev-a", CapabilityClass::Observe, 1_001)
+            .unwrap();
+        let mut execution = AgentExecutionGate::default();
+        execution
+            .begin(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 2,
+                operation_id: "op-v020-active".into(),
+            })
+            .unwrap();
+        let mut state =
+            AgentPersistentState::capture("dev-a", &trusted_hub, &grants, &execution).unwrap();
+        state.grant_ledger.schema_version = 2;
+
+        let (_, _, mut restored_grants, mut restored_execution) = state.restore().unwrap();
+        assert_eq!(
+            restored_grants.authorize_once(&consumed, "dev-a", CapabilityClass::Observe, 1_002),
+            Err(crate::v2_m0::ControlError::GrantReplay)
+        );
+        assert_eq!(
+            restored_execution.begin(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 2,
+                operation_id: "op-v020-active".into(),
+            }),
+            Err(crate::v2_m0_execution::ExecutionError::OperationReplay)
+        );
+    }
+
+    #[test]
+    fn historical_hub_checkpoints_preserve_ambiguity_receipts_and_resolution_audit() {
+        let (mut registry, _identity, device_id) = enrolled_registry();
+        registry
+            .connect(
+                &device_id,
+                CapabilityAdvertisement {
+                    backend: "cua".into(),
+                    backend_version: "0.19.3".into(),
+                    platform: "darwin-arm64".into(),
+                    capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+                    revision: 1,
+                    supported: vec![DeviceCapability::PointerClick],
+                },
+            )
+            .unwrap();
+
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        };
+        let mut execution = AuthoritativeOperationController::new(limits).unwrap();
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+
+        let resolved_op = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: "op-resolved-audit".into(),
+        };
+        execution
+            .prepare(
+                resolved_op,
+                owner.clone(),
+                DeviceCapability::PointerClick,
+                10,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched("op-resolved-audit", &owner, 1, 11)
+            .unwrap();
+        execution
+            .mark_indeterminate(
+                "op-resolved-audit",
+                &owner,
+                1,
+                IndeterminateReason::ConnectionLost,
+                12,
+            )
+            .unwrap();
+        execution
+            .resolve_indeterminate(
+                "op-resolved-audit",
+                owner.clone(),
+                IndeterminateResolution::ConfirmedCompleted,
+                "operator reconciled external state",
+                13,
+            )
+            .unwrap();
+
+        let ambiguous_op = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: "op-still-ambiguous".into(),
+        };
+        execution
+            .prepare(
+                ambiguous_op,
+                owner.clone(),
+                DeviceCapability::PointerClick,
+                14,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched("op-still-ambiguous", &owner, 1, 15)
+            .unwrap();
+        execution
+            .mark_indeterminate(
+                "op-still-ambiguous",
+                &owner,
+                1,
+                IndeterminateReason::ConnectionLost,
+                16,
+            )
+            .unwrap();
+
+        let current = HubPersistentState::capture(&registry, &execution);
+        for (legacy_registry_schema, legacy_capability_schema) in [(2, 2), (5, 4)] {
+            let mut fixture = current.clone();
+            fixture.registry.schema_version = legacy_registry_schema;
+            fixture.registry.devices[0]
+                .capabilities
+                .as_mut()
+                .unwrap()
+                .capability_schema_version = legacy_capability_schema;
+
+            let (restored_registry, restored) = fixture.restore(limits).unwrap();
+            let migrated_registry = restored_registry.snapshot();
+            assert_eq!(migrated_registry.devices[0].generation, 1);
+            assert_eq!(migrated_registry.devices[0].capabilities, None);
+            assert_eq!(
+                restored.state("op-still-ambiguous"),
+                Some(crate::v2_m0_execution::HubOperationState::Indeterminate)
+            );
+            let quarantine = restored.quarantine(&device_id).unwrap();
+            assert_eq!(quarantine.operation_id, "op-still-ambiguous");
+            assert_eq!(quarantine.owner, owner);
+            assert_eq!(restored.resolutions().len(), 1);
+            assert_eq!(restored.resolutions()[0].operation_id, "op-resolved-audit");
+            let receipt = restored.receipt("op-resolved-audit").unwrap();
+            assert_eq!(receipt.owner, owner);
+            assert_eq!(receipt.evidence, ExecutionEvidence::OperatorResolution);
+        }
+    }
+
+    #[test]
     fn hub_state_restore_marks_dispatched_work_indeterminate() {
         let (registry, _identity, device_id) = enrolled_registry();
         let limits = AdmissionLimits {
@@ -505,6 +660,85 @@ mod tests {
         let quarantine = restored.quarantine(&device_id).unwrap();
         assert_eq!(quarantine.operation_id, "op-1");
         assert_eq!(quarantine.device_generation, 1);
+    }
+
+    #[test]
+    fn historical_checkpoint_migration_is_read_only_until_a_new_append() {
+        let directory = temp_directory("checkpoint-migration-append");
+        let store = CheckpointStore::new(&directory, "hub").unwrap();
+        let (registry, _identity, _device_id) = enrolled_registry();
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 1,
+        };
+        let execution = AuthoritativeOperationController::new(limits).unwrap();
+        let mut legacy = HubPersistentState::capture(&registry, &execution);
+        legacy.registry.schema_version = 5;
+        let old_path = store.save(&legacy).unwrap();
+        let old_bytes = fs::read(&old_path).unwrap();
+
+        let loaded: HubPersistentState = store.load_latest().unwrap();
+        let (restored_registry, restored_execution) = loaded.restore(limits).unwrap();
+        assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        let migrated = HubPersistentState::capture(&restored_registry, &restored_execution);
+        assert_eq!(
+            migrated.registry.schema_version,
+            crate::v2_m0::DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION
+        );
+        let new_path = store.save(&migrated).unwrap();
+        assert_ne!(new_path, old_path);
+        assert!(old_path.exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        let latest: HubPersistentState = store.load_latest().unwrap();
+        assert_eq!(
+            latest.registry.schema_version,
+            crate::v2_m0::DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejected_historical_checkpoint_is_not_rewritten() {
+        let directory = temp_directory("checkpoint-migration-reject");
+        let store = CheckpointStore::new(&directory, "hub").unwrap();
+        let (mut registry, _identity, device_id) = enrolled_registry();
+        registry
+            .connect(
+                &device_id,
+                CapabilityAdvertisement {
+                    backend: "cua".into(),
+                    backend_version: "0.19.3".into(),
+                    platform: "darwin-arm64".into(),
+                    capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+                    revision: 1,
+                    supported: vec![DeviceCapability::PointerClick],
+                },
+            )
+            .unwrap();
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 1,
+        };
+        let execution = AuthoritativeOperationController::new(limits).unwrap();
+        let mut invalid = HubPersistentState::capture(&registry, &execution);
+        // control schema 2 historically paired with capability schema 2, so
+        // schema 2 + capability schema 4 must never be silently reinterpreted.
+        invalid.registry.schema_version = 2;
+        let path = store.save(&invalid).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let loaded: HubPersistentState = store.load_latest().unwrap();
+        assert!(matches!(
+            loaded.restore(limits),
+            Err(PersistenceError::Control(
+                crate::v2_m0::ControlError::InvalidRegistrySnapshot
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

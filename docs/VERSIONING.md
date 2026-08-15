@@ -50,12 +50,17 @@ Security emergency changes may break compatibility when preserving compatibility
 
 ## Schema versions are independent
 
-Project/crate versions and protocol schema versions serve different purposes.
+Project/crate versions, wire protocol schemas, capability-advertisement schemas, and durable-state schemas serve different purposes.
 
-- `CONTROL_SCHEMA_VERSION` changes when the control-schema compatibility boundary changes.
-- capability-advertisement schema version changes when that compatibility boundary changes.
-- a crate release does not automatically increment either schema.
+- `CONTROL_SCHEMA_VERSION` changes when the live control-schema compatibility boundary changes.
+- capability-advertisement schema version changes when that live advertisement boundary changes.
+- `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION` and `GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION` version their persisted structures independently; a future `CONTROL_SCHEMA_VERSION` bump must not change them unless the persisted structure itself changes.
+- historical v0.2.x checkpoints used the then-current control schema number as the persisted registry/grant-ledger tag. Runtime restore supports only the explicitly reviewed v0.2.0-and-later lineage: registry `2/capability 2`, `3/capability 3`, `4..=7/capability 4`, and grant-ledger tags `2..=7`. Prototype tag `1`, unknown/future tags, and impossible control/capability pairings fail closed.
+- historical capability advertisements are not promoted into live authority during migration. The Hub validates the historical pairing, restores device identity/generation, marks the device offline, and requires a fresh Agent advertisement using the current live schema before dispatch.
+- a crate release does not automatically increment any schema.
 - a schema change does not determine the crate version arithmetically; use PATCH/MINOR based on public compatibility impact.
+
+A backward-compatible persisted-state migration that restores an already-supported release line without changing wire/configuration behavior is PATCH-eligible. Introducing a new incompatible persisted-state shape, removing support for a previously documented persisted-state version, or requiring operator state transformation is a new compatibility boundary and normally requires a MINOR release before 1.0. This backward-compatible checkpoint migration therefore does **not** by itself require a MINOR version bump.
 
 ## `1.0.0` criteria
 

@@ -14,6 +14,12 @@ use std::fmt;
 
 pub const CONTROL_SCHEMA_VERSION: u16 = 7;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
+/// First dedicated persisted registry schema. The numeric value intentionally
+/// matches the last historical control schema that was written into this field,
+/// so current rollback binaries can still read newly persisted checkpoints.
+pub const DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+/// First dedicated persisted grant-ledger schema; see the registry note above.
+pub const GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TYPE_TEXT_BYTES: usize = 32 * 1024;
 pub const MAX_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -798,14 +804,14 @@ impl DeviceRegistry {
         let mut revoked_device_ids: Vec<_> = self.revoked.iter().cloned().collect();
         revoked_device_ids.sort();
         DeviceRegistrySnapshot {
-            schema_version: CONTROL_SCHEMA_VERSION,
+            schema_version: DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION,
             devices,
             revoked_device_ids,
         }
     }
 
     pub fn from_snapshot(snapshot: DeviceRegistrySnapshot) -> Result<Self, ControlError> {
-        if snapshot.schema_version != CONTROL_SCHEMA_VERSION {
+        if snapshot.schema_version != DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION {
             return Err(ControlError::UnsupportedControlSchema {
                 got: snapshot.schema_version,
             });
@@ -835,6 +841,40 @@ impl DeviceRegistry {
         }
         let revoked = snapshot.revoked_device_ids.into_iter().collect();
         Ok(Self { devices, revoked })
+    }
+
+    /// Restore only known historical persisted registry formats. Historical
+    /// capability advertisements are validated against the exact schema pairing
+    /// that existed at that checkpoint version, then discarded: a process restart
+    /// already invalidates transport liveness and a fresh Agent must advertise the
+    /// current capability schema before becoming online. This is deliberately
+    /// narrower than accepting old wire/control messages.
+    pub(crate) fn from_persisted_snapshot(
+        mut snapshot: DeviceRegistrySnapshot,
+    ) -> Result<Self, ControlError> {
+        if snapshot.schema_version == DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION {
+            return Self::from_snapshot(snapshot);
+        }
+
+        let expected_capability_schema = match snapshot.schema_version {
+            2 => 2,
+            3 => 3,
+            4..=6 => 4,
+            got => return Err(ControlError::UnsupportedControlSchema { got }),
+        };
+        for device in &snapshot.devices {
+            if let Some(capabilities) = &device.capabilities
+                && capabilities.capability_schema_version != expected_capability_schema
+            {
+                return Err(ControlError::InvalidRegistrySnapshot);
+            }
+        }
+
+        snapshot.schema_version = DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION;
+        for device in &mut snapshot.devices {
+            device.capabilities = None;
+        }
+        Self::from_snapshot(snapshot)
     }
 
     /// Offline administrative provisioning for a device public key that was
@@ -1185,7 +1225,7 @@ impl GrantLedger {
         let mut revoked_grant_ids: Vec<_> = self.revoked.iter().cloned().collect();
         revoked_grant_ids.sort();
         GrantLedgerSnapshot {
-            schema_version: CONTROL_SCHEMA_VERSION,
+            schema_version: GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION,
             verifier_keys,
             consumed_grants,
             revoked_grant_ids,
@@ -1193,7 +1233,7 @@ impl GrantLedger {
     }
 
     pub fn from_snapshot(snapshot: GrantLedgerSnapshot) -> Result<Self, ControlError> {
-        if snapshot.schema_version != CONTROL_SCHEMA_VERSION {
+        if snapshot.schema_version != GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION {
             return Err(ControlError::UnsupportedControlSchema {
                 got: snapshot.schema_version,
             });
@@ -1223,6 +1263,24 @@ impl GrantLedger {
             consumed,
             revoked: snapshot.revoked_grant_ids.into_iter().collect(),
         })
+    }
+
+    /// Restore the exact historical persisted ledger shapes that shipped from
+    /// v0.2.0 onward. The ledger fields did not change across control schemas
+    /// 2..=7; only the mistakenly coupled schema tag changed. Replay/revocation
+    /// entries are preserved exactly and unknown/prototype/future formats fail
+    /// closed.
+    pub(crate) fn from_persisted_snapshot(
+        mut snapshot: GrantLedgerSnapshot,
+    ) -> Result<Self, ControlError> {
+        match snapshot.schema_version {
+            GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION => Self::from_snapshot(snapshot),
+            2..=6 => {
+                snapshot.schema_version = GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION;
+                Self::from_snapshot(snapshot)
+            }
+            got => Err(ControlError::UnsupportedControlSchema { got }),
+        }
     }
 
     pub fn trust_verifier(&mut self, verifier: VerifyingKey) -> String {
@@ -2556,6 +2614,59 @@ mod tests {
     }
 
     #[test]
+    fn persisted_registry_migrates_v0_2_and_post_release_snapshots_without_widening() {
+        let (mut registry, _identity, device_id) = enrolled();
+        registry.connect(&device_id, capabilities(5)).unwrap();
+        let current = registry.snapshot();
+
+        for (legacy_schema, legacy_capability_schema) in [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4)] {
+            let mut legacy = current.clone();
+            legacy.schema_version = legacy_schema;
+            legacy.devices[0]
+                .capabilities
+                .as_mut()
+                .unwrap()
+                .capability_schema_version = legacy_capability_schema;
+
+            let restored = DeviceRegistry::from_persisted_snapshot(legacy).unwrap();
+            let migrated = restored.snapshot();
+            assert_eq!(
+                migrated.schema_version,
+                DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION
+            );
+            assert_eq!(migrated.devices[0].device_id, current.devices[0].device_id);
+            assert_eq!(
+                migrated.devices[0].verifying_key,
+                current.devices[0].verifying_key
+            );
+            assert_eq!(
+                migrated.devices[0].generation,
+                current.devices[0].generation
+            );
+            assert_eq!(migrated.devices[0].capabilities, None);
+        }
+
+        let mut mismatched = current.clone();
+        mismatched.schema_version = 2;
+        assert_eq!(
+            DeviceRegistry::from_persisted_snapshot(mismatched).unwrap_err(),
+            ControlError::InvalidRegistrySnapshot
+        );
+
+        let mut unsupported = current;
+        unsupported.schema_version = 1;
+        unsupported.devices[0]
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .capability_schema_version = 1;
+        assert_eq!(
+            DeviceRegistry::from_persisted_snapshot(unsupported).unwrap_err(),
+            ControlError::UnsupportedControlSchema { got: 1 }
+        );
+    }
+
+    #[test]
     fn grant_ledger_snapshot_preserves_consumed_and_revoked_replay_state() {
         let authority = GrantAuthority::generate();
         let mut ledger = GrantLedger::new(authority.verifier());
@@ -2577,6 +2688,48 @@ mod tests {
         assert_eq!(
             restored.authorize_once(&revoked, "dev", CapabilityClass::Observe, 12),
             Err(ControlError::GrantRevoked)
+        );
+    }
+
+    #[test]
+    fn persisted_grant_ledger_migrates_v0_2_and_post_release_replay_state() {
+        let authority = GrantAuthority::generate();
+        let mut ledger = GrantLedger::new(authority.verifier());
+        let consumed = authority
+            .issue("dev", CapabilityClass::Observe, 10, 100)
+            .unwrap();
+        ledger
+            .authorize_once(&consumed, "dev", CapabilityClass::Observe, 11)
+            .unwrap();
+        let revoked = authority
+            .issue("dev", CapabilityClass::Observe, 10, 100)
+            .unwrap();
+        ledger.revoke(&revoked.payload.grant_id);
+        let current = ledger.snapshot();
+
+        for legacy_schema in [2, 3, 4, 5, 6] {
+            let mut legacy = current.clone();
+            legacy.schema_version = legacy_schema;
+            let mut restored = GrantLedger::from_persisted_snapshot(legacy).unwrap();
+            assert_eq!(
+                restored.snapshot().schema_version,
+                GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                restored.authorize_once(&consumed, "dev", CapabilityClass::Observe, 12),
+                Err(ControlError::GrantReplay)
+            );
+            assert_eq!(
+                restored.authorize_once(&revoked, "dev", CapabilityClass::Observe, 12),
+                Err(ControlError::GrantRevoked)
+            );
+        }
+
+        let mut unsupported = current;
+        unsupported.schema_version = 1;
+        assert_eq!(
+            GrantLedger::from_persisted_snapshot(unsupported).unwrap_err(),
+            ControlError::UnsupportedControlSchema { got: 1 }
         );
     }
 
