@@ -20,7 +20,7 @@ Repository-level community health files live at the repository root: [`../SECURI
 
 Current V2 contracts and status live under [`v2/`](v2/). Start with [`v2/STATUS.md`](v2/STATUS.md).
 
-The active specification covers the product boundary, execution safety, interaction context, Desktop and Browser semantic capabilities, backend parity, threat model, standardization seams, and optional usage accounting.
+The active specification covers the product boundary, execution safety, process/shell operation recovery, interaction context, Desktop and Browser semantic capabilities, backend parity, threat model, standardization seams, and optional usage accounting. See [`v2/V2_OPERATION_RECOVERY.md`](v2/V2_OPERATION_RECOVERY.md) for the durable no-replay recovery contract.
 
 ## Acceptance evidence
 

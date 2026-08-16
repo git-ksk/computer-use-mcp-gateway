@@ -4,10 +4,11 @@
 //! work. The older M0 admission controller still owns bounded queueing, while
 //! this ledger adds the semantics that must survive transport/session churn:
 //! exact principal ownership, generation fencing, durable pending-effect intent,
-//! guarded finalization, desktop quarantine, explicit resolution, and compact
-//! execution receipts that never contain raw command/result payloads.
+//! guarded finalization, desktop quarantine, explicit resolution, compact execution
+//! receipts, and bounded recoverable process/shell results. Recovery state never
+//! stores raw command, argv, cwd, or environment payloads.
 
-use crate::v2_m0::DeviceCapability;
+use crate::v2_m0::{DeviceCapability, DeviceErrorCode, ProcessOutput};
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision, ExecutionError,
     HubAdmissionController, HubAdmissionSnapshot, HubOperationState, IndeterminateResolution,
@@ -17,8 +18,11 @@ use crate::v2_m0_trust::AuthenticatedClientPrincipal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 1;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 2;
+const PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 1;
 pub const MAX_RESOLUTION_EVIDENCE_BYTES: usize = 1024;
+pub const MAX_RECOVERY_ARCHIVE_ENTRIES: usize = 8;
+pub const MAX_RECOVERY_ARCHIVE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OperationOwner {
@@ -115,6 +119,85 @@ pub struct ResolutionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecoverableOperationResult {
+    Process { output: ProcessOutput },
+    Shell { output: ProcessOutput },
+    Error { code: DeviceErrorCode },
+}
+
+impl RecoverableOperationResult {
+    fn is_valid_for(&self, capability: DeviceCapability, state: HubOperationState) -> bool {
+        match self {
+            Self::Process { output } if capability == DeviceCapability::ExecuteProcess => {
+                process_output_matches_state(output, state)
+            }
+            Self::Shell { output } if capability == DeviceCapability::Shell => {
+                process_output_matches_state(output, state)
+            }
+            Self::Error { .. }
+                if matches!(
+                    capability,
+                    DeviceCapability::ExecuteProcess | DeviceCapability::Shell
+                ) =>
+            {
+                state == HubOperationState::Failed
+            }
+            _ => false,
+        }
+    }
+}
+
+fn process_output_matches_state(output: &ProcessOutput, state: HubOperationState) -> bool {
+    if output.cancelled && output.timed_out {
+        false
+    } else if output.cancelled {
+        state == HubOperationState::Cancelled
+    } else if output.timed_out {
+        state == HubOperationState::Failed
+    } else {
+        state == HubOperationState::Completed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRecoverySnapshot {
+    pub operation: OperationRef,
+    pub capability: DeviceCapability,
+    pub state: HubOperationState,
+    pub indeterminate_reason: Option<IndeterminateReason>,
+    pub receipt: Option<ExecutionReceipt>,
+    pub result: Option<RecoverableOperationResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedOperationRecovery {
+    pub operation: OperationRef,
+    pub owner: OperationOwner,
+    pub capability: DeviceCapability,
+    pub state: HubOperationState,
+    pub receipt: ExecutionReceipt,
+    pub result: RecoverableOperationResult,
+}
+
+impl ArchivedOperationRecovery {
+    fn encoded_len(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len())
+    }
+
+    fn is_valid(&self) -> bool {
+        matches!(
+            self.state,
+            HubOperationState::Completed | HubOperationState::Failed | HubOperationState::Cancelled
+        ) && self.result.is_valid_for(self.capability, self.state)
+            && self.receipt.operation == self.operation
+            && self.receipt.owner == self.owner
+            && self.receipt.capability == self.capability
+            && self.receipt.terminal_state == self.state
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyOperationSnapshot {
     pub operation: OperationRef,
     pub owner: OperationOwner,
@@ -124,6 +207,8 @@ pub struct SafetyOperationSnapshot {
     pub dispatched_at_ms: Option<u64>,
     pub indeterminate_reason: Option<IndeterminateReason>,
     pub receipt: Option<ExecutionReceipt>,
+    #[serde(default)]
+    pub recoverable_result: Option<RecoverableOperationResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +216,8 @@ pub struct AuthoritativeSafetySnapshot {
     pub schema_version: u16,
     pub admission: HubAdmissionSnapshot,
     pub operations: Vec<SafetyOperationSnapshot>,
+    #[serde(default)]
+    pub recoveries: Vec<ArchivedOperationRecovery>,
     pub quarantines: Vec<DesktopQuarantine>,
     pub resolutions: Vec<ResolutionRecord>,
 }
@@ -145,6 +232,7 @@ struct SafetyOperation {
     dispatched_at_ms: Option<u64>,
     indeterminate_reason: Option<IndeterminateReason>,
     receipt: Option<ExecutionReceipt>,
+    recoverable_result: Option<RecoverableOperationResult>,
 }
 
 /// Single authoritative state machine for Hub-side desktop execution safety.
@@ -156,6 +244,7 @@ struct SafetyOperation {
 pub struct AuthoritativeOperationController {
     admission: HubAdmissionController,
     operations: HashMap<String, SafetyOperation>,
+    recovery_archive: HashMap<String, ArchivedOperationRecovery>,
     quarantines: HashMap<String, DesktopQuarantine>,
     resolutions: Vec<ResolutionRecord>,
 }
@@ -165,6 +254,7 @@ impl AuthoritativeOperationController {
         Ok(Self {
             admission: HubAdmissionController::new(limits)?,
             operations: HashMap::new(),
+            recovery_archive: HashMap::new(),
             quarantines: HashMap::new(),
             resolutions: Vec::new(),
         })
@@ -177,7 +267,9 @@ impl AuthoritativeOperationController {
         capability: DeviceCapability,
         now_ms: u64,
     ) -> Result<AdmissionDecision, ExecutionError> {
-        if self.operations.contains_key(&operation.operation_id) {
+        if self.operations.contains_key(&operation.operation_id)
+            || self.recovery_archive.contains_key(&operation.operation_id)
+        {
             return Err(ExecutionError::OperationReplay);
         }
         let decision = self.admission.admit(operation.clone())?;
@@ -196,6 +288,7 @@ impl AuthoritativeOperationController {
                 dispatched_at_ms: None,
                 indeterminate_reason: None,
                 receipt: None,
+                recoverable_result: None,
             },
         );
         Ok(decision)
@@ -394,6 +487,7 @@ impl AuthoritativeOperationController {
         record.state = HubOperationState::Indeterminate;
         record.indeterminate_reason = Some(reason);
         record.receipt = None;
+        record.recoverable_result = None;
         let quarantine = DesktopQuarantine {
             device_id: record.operation.device_id.clone(),
             operation_id: record.operation.operation_id.clone(),
@@ -502,6 +596,67 @@ impl AuthoritativeOperationController {
             .and_then(|record| record.receipt.as_ref())
     }
 
+    /// Attach bounded caller-visible output to an already finalized process/shell operation.
+    /// Raw request material is never accepted here.
+    pub fn attach_recoverable_result(
+        &mut self,
+        operation_id: &str,
+        owner: &OperationOwner,
+        device_generation: u64,
+        result: RecoverableOperationResult,
+    ) -> Result<(), ExecutionError> {
+        let record = self.checked(operation_id, owner, device_generation)?;
+        if record.receipt.is_none()
+            || !result.is_valid_for(record.capability, record.state)
+            || serde_json::to_vec(&result)
+                .map_or(true, |bytes| bytes.len() > MAX_RECOVERY_ARCHIVE_BYTES)
+            || record.recoverable_result.is_some()
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        self.operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?
+            .recoverable_result = Some(result);
+        Ok(())
+    }
+
+    /// Exact-owner read-only recovery lookup. Wrong-owner and unknown IDs are
+    /// intentionally indistinguishable.
+    pub fn recovery_for_owner(
+        &self,
+        operation_id: &str,
+        owner: &OperationOwner,
+    ) -> Result<OperationRecoverySnapshot, ExecutionError> {
+        if let Some(record) = self
+            .operations
+            .get(operation_id)
+            .filter(|record| &record.owner == owner)
+        {
+            return Ok(OperationRecoverySnapshot {
+                operation: record.operation.clone(),
+                capability: record.capability,
+                state: record.state,
+                indeterminate_reason: record.indeterminate_reason,
+                receipt: record.receipt.clone(),
+                result: record.recoverable_result.clone(),
+            });
+        }
+        let archived = self
+            .recovery_archive
+            .get(operation_id)
+            .filter(|record| &record.owner == owner)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        Ok(OperationRecoverySnapshot {
+            operation: archived.operation.clone(),
+            capability: archived.capability,
+            state: archived.state,
+            indeterminate_reason: None,
+            receipt: Some(archived.receipt.clone()),
+            result: Some(archived.result.clone()),
+        })
+    }
+
     pub fn quarantine(&self, device_id: &str) -> Option<&DesktopQuarantine> {
         self.quarantines.get(device_id)
     }
@@ -515,6 +670,54 @@ impl AuthoritativeOperationController {
         device_id: &str,
         current_generation: u64,
     ) -> Result<usize, ExecutionError> {
+        // Mirror the admission-controller precondition before mutating the
+        // recovery archive, so the later admission prune cannot leave a
+        // half-applied archive transition.
+        if device_id.trim().is_empty() || current_generation == 0 {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        let to_archive: Vec<_> = self
+            .operations
+            .values()
+            .filter(|record| {
+                record.operation.device_id == device_id
+                    && record.operation.device_generation < current_generation
+                    && matches!(
+                        record.state,
+                        HubOperationState::Completed
+                            | HubOperationState::Failed
+                            | HubOperationState::Cancelled
+                    )
+                    && record.recoverable_result.is_some()
+            })
+            .map(|record| {
+                let receipt = record
+                    .receipt
+                    .clone()
+                    .ok_or(ExecutionError::InvalidTransition)?;
+                let result = record
+                    .recoverable_result
+                    .clone()
+                    .ok_or(ExecutionError::InvalidTransition)?;
+                Ok(ArchivedOperationRecovery {
+                    operation: record.operation.clone(),
+                    owner: record.owner.clone(),
+                    capability: record.capability,
+                    state: record.state,
+                    receipt,
+                    result,
+                })
+            })
+            .collect::<Result<_, ExecutionError>>()?;
+        for archived in to_archive {
+            if !archived.is_valid() {
+                return Err(ExecutionError::InvalidTransition);
+            }
+            self.recovery_archive
+                .insert(archived.operation.operation_id.clone(), archived);
+        }
+        self.bound_recovery_archive();
+
         let removed = self
             .admission
             .prune_terminal_before_generation(device_id, current_generation)?;
@@ -533,6 +736,38 @@ impl AuthoritativeOperationController {
         Ok(removed)
     }
 
+    fn recovery_archive_encoded_bytes(&self) -> usize {
+        self.recovery_archive
+            .values()
+            .map(ArchivedOperationRecovery::encoded_len)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn bound_recovery_archive(&mut self) {
+        while self.recovery_archive.len() > MAX_RECOVERY_ARCHIVE_ENTRIES
+            || self.recovery_archive_encoded_bytes() > MAX_RECOVERY_ARCHIVE_BYTES
+        {
+            let oldest = self
+                .recovery_archive
+                .values()
+                .min_by(|left, right| {
+                    left.receipt
+                        .finalized_at_ms
+                        .cmp(&right.receipt.finalized_at_ms)
+                        .then_with(|| {
+                            left.operation
+                                .operation_id
+                                .cmp(&right.operation.operation_id)
+                        })
+                })
+                .map(|record| record.operation.operation_id.clone());
+            let Some(operation_id) = oldest else {
+                break;
+            };
+            self.recovery_archive.remove(&operation_id);
+        }
+    }
+
     pub fn snapshot_for_restart(&self) -> AuthoritativeSafetySnapshot {
         let admission = self.admission.snapshot_for_restart();
         let mut operations = Vec::with_capacity(self.operations.len());
@@ -541,6 +776,7 @@ impl AuthoritativeOperationController {
             let mut state = record.state;
             let mut reason = record.indeterminate_reason;
             let mut receipt = record.receipt.clone();
+            let mut recoverable_result = record.recoverable_result.clone();
             match record.state {
                 HubOperationState::Queued | HubOperationState::ActiveNotDispatched => {
                     state = HubOperationState::Cancelled;
@@ -550,11 +786,13 @@ impl AuthoritativeOperationController {
                         ExecutionEvidence::CancelledBeforeDispatch,
                         record.prepared_at_ms,
                     ));
+                    recoverable_result = None;
                 }
                 HubOperationState::Dispatched | HubOperationState::CancelRequested => {
                     state = HubOperationState::Indeterminate;
                     reason = Some(IndeterminateReason::HubRestartAfterDispatch);
                     receipt = None;
+                    recoverable_result = None;
                     quarantines.insert(
                         record.operation.device_id.clone(),
                         DesktopQuarantine {
@@ -578,15 +816,19 @@ impl AuthoritativeOperationController {
                 dispatched_at_ms: record.dispatched_at_ms,
                 indeterminate_reason: reason,
                 receipt,
+                recoverable_result,
             });
         }
         operations.sort_by(|a, b| a.operation.operation_id.cmp(&b.operation.operation_id));
+        let mut recoveries: Vec<_> = self.recovery_archive.values().cloned().collect();
+        recoveries.sort_by(|a, b| a.operation.operation_id.cmp(&b.operation.operation_id));
         let mut quarantines: Vec<_> = quarantines.into_values().collect();
         quarantines.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         AuthoritativeSafetySnapshot {
             schema_version: EXECUTION_SAFETY_SCHEMA_VERSION,
             admission,
             operations,
+            recoveries,
             quarantines,
             resolutions: self.resolutions.clone(),
         }
@@ -596,7 +838,19 @@ impl AuthoritativeOperationController {
         limits: AdmissionLimits,
         snapshot: AuthoritativeSafetySnapshot,
     ) -> Result<Self, ExecutionError> {
-        if snapshot.schema_version != EXECUTION_SAFETY_SCHEMA_VERSION {
+        if !matches!(
+            snapshot.schema_version,
+            PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION | EXECUTION_SAFETY_SCHEMA_VERSION
+        ) {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version == PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION
+            && (!snapshot.recoveries.is_empty()
+                || snapshot
+                    .operations
+                    .iter()
+                    .any(|record| record.recoverable_result.is_some()))
+        {
             return Err(ExecutionError::InvalidSnapshot);
         }
         let admission = HubAdmissionController::restore_after_restart(limits, snapshot.admission)?;
@@ -609,6 +863,12 @@ impl AuthoritativeOperationController {
                     | HubOperationState::Cancelled
                     | HubOperationState::Indeterminate
             ) || operations.contains_key(&record.operation.operation_id)
+                || record.recoverable_result.as_ref().is_some_and(|result| {
+                    record.receipt.is_none()
+                        || !result.is_valid_for(record.capability, record.state)
+                })
+                || (record.state == HubOperationState::Indeterminate
+                    && record.recoverable_result.is_some())
             {
                 return Err(ExecutionError::InvalidSnapshot);
             }
@@ -623,6 +883,7 @@ impl AuthoritativeOperationController {
                     dispatched_at_ms: record.dispatched_at_ms,
                     indeterminate_reason: record.indeterminate_reason,
                     receipt: record.receipt,
+                    recoverable_result: record.recoverable_result,
                 },
             );
         }
@@ -635,6 +896,27 @@ impl AuthoritativeOperationController {
                         safe.operation != admitted.operation || safe.state != admitted.state
                     })
             })
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+
+        let mut recovery_archive = HashMap::new();
+        for archived in snapshot.recoveries {
+            if !archived.is_valid()
+                || operations.contains_key(&archived.operation.operation_id)
+                || recovery_archive
+                    .insert(archived.operation.operation_id.clone(), archived)
+                    .is_some()
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+        }
+        let recovery_archive_bytes = recovery_archive
+            .values()
+            .map(ArchivedOperationRecovery::encoded_len)
+            .fold(0usize, usize::saturating_add);
+        if recovery_archive.len() > MAX_RECOVERY_ARCHIVE_ENTRIES
+            || recovery_archive_bytes > MAX_RECOVERY_ARCHIVE_BYTES
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -665,6 +947,7 @@ impl AuthoritativeOperationController {
         Ok(Self {
             admission,
             operations,
+            recovery_archive,
             quarantines,
             resolutions: snapshot.resolutions,
         })
@@ -775,6 +1058,340 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.owner, alice());
         assert_eq!(receipt.operation.operation_id, "op-1");
+    }
+
+    #[test]
+    fn bounded_process_result_is_owner_scoped_and_survives_restart() {
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-recover", 7),
+                alice(),
+                DeviceCapability::ExecuteProcess,
+                10,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-recover", &alice(), 7, 11)
+            .unwrap();
+        ledger
+            .finalize(
+                "op-recover",
+                &alice(),
+                7,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                12,
+            )
+            .unwrap();
+        let output = ProcessOutput {
+            exit_code: Some(0),
+            stdout: "done\n".into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            cancelled: false,
+            duration_ms: 2,
+        };
+        ledger
+            .attach_recoverable_result(
+                "op-recover",
+                &alice(),
+                7,
+                RecoverableOperationResult::Process {
+                    output: output.clone(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.recovery_for_owner("op-recover", &bob()),
+            Err(ExecutionError::UnknownOperation)
+        );
+        let recovered = ledger.recovery_for_owner("op-recover", &alice()).unwrap();
+        assert_eq!(recovered.state, HubOperationState::Completed);
+        assert_eq!(
+            recovered.result,
+            Some(RecoverableOperationResult::Process {
+                output: output.clone()
+            })
+        );
+
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.schema_version, EXECUTION_SAFETY_SCHEMA_VERSION);
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .recovery_for_owner("op-recover", &alice())
+                .unwrap()
+                .result,
+            Some(RecoverableOperationResult::Process { output })
+        );
+    }
+
+    #[test]
+    fn recoverable_result_survives_generation_pruning_and_remains_a_replay_tombstone() {
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-generation-recovery", 1),
+                alice(),
+                DeviceCapability::Shell,
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-generation-recovery", &alice(), 1, 2)
+            .unwrap();
+        ledger
+            .finalize(
+                "op-generation-recovery",
+                &alice(),
+                1,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                3,
+            )
+            .unwrap();
+        let output = ProcessOutput {
+            exit_code: Some(0),
+            stdout: "survives generation rollover\n".into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            cancelled: false,
+            duration_ms: 1,
+        };
+        ledger
+            .attach_recoverable_result(
+                "op-generation-recovery",
+                &alice(),
+                1,
+                RecoverableOperationResult::Shell {
+                    output: output.clone(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger
+                .prune_terminal_before_generation("desktop-a", 2)
+                .unwrap(),
+            1
+        );
+        assert_eq!(ledger.state("op-generation-recovery"), None);
+        assert_eq!(
+            ledger
+                .recovery_for_owner("op-generation-recovery", &alice())
+                .unwrap()
+                .result,
+            Some(RecoverableOperationResult::Shell {
+                output: output.clone()
+            })
+        );
+        assert_eq!(
+            ledger.prepare(
+                op("op-generation-recovery", 2),
+                alice(),
+                DeviceCapability::Shell,
+                4,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.recoveries.len(), 1);
+        assert!(snapshot.operations.is_empty());
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .recovery_for_owner("op-generation-recovery", &alice())
+                .unwrap()
+                .result,
+            Some(RecoverableOperationResult::Shell { output })
+        );
+        assert_eq!(
+            restored.recovery_for_owner("op-generation-recovery", &bob()),
+            Err(ExecutionError::UnknownOperation)
+        );
+    }
+
+    #[test]
+    fn recovery_archive_is_bounded_by_count_and_encoded_bytes() {
+        let mut ledger = controller();
+        let stdout = "x".repeat(16 * 1024);
+        let stderr = "y".repeat(16 * 1024);
+        for index in 0..10_u64 {
+            let operation_id = format!("op-bounded-{index:02}");
+            ledger
+                .prepare(
+                    op(&operation_id, 1),
+                    alice(),
+                    DeviceCapability::ExecuteProcess,
+                    index * 3 + 1,
+                )
+                .unwrap();
+            ledger
+                .mark_dispatched(&operation_id, &alice(), 1, index * 3 + 2)
+                .unwrap();
+            ledger
+                .finalize(
+                    &operation_id,
+                    &alice(),
+                    1,
+                    HubOperationState::Completed,
+                    ExecutionEvidence::VerifiedAgentResult,
+                    index * 3 + 3,
+                )
+                .unwrap();
+            ledger
+                .attach_recoverable_result(
+                    &operation_id,
+                    &alice(),
+                    1,
+                    RecoverableOperationResult::Process {
+                        output: ProcessOutput {
+                            exit_code: Some(0),
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
+                            stdout_truncated: true,
+                            stderr_truncated: true,
+                            timed_out: false,
+                            cancelled: false,
+                            duration_ms: 1,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            ledger
+                .prune_terminal_before_generation("desktop-a", 2)
+                .unwrap(),
+            10
+        );
+        assert!(ledger.recovery_archive.len() <= MAX_RECOVERY_ARCHIVE_ENTRIES);
+        assert!(ledger.recovery_archive_encoded_bytes() <= MAX_RECOVERY_ARCHIVE_BYTES);
+        assert!(ledger.recovery_for_owner("op-bounded-09", &alice()).is_ok());
+        assert_eq!(
+            ledger.recovery_for_owner("op-bounded-00", &alice()),
+            Err(ExecutionError::UnknownOperation)
+        );
+        let snapshot = ledger.snapshot_for_restart();
+        assert!(snapshot.recoveries.len() <= MAX_RECOVERY_ARCHIVE_ENTRIES);
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert!(restored.recovery_archive_encoded_bytes() <= MAX_RECOVERY_ARCHIVE_BYTES);
+    }
+
+    #[test]
+    fn previous_safety_snapshot_without_result_remains_readable_but_cannot_smuggle_result() {
+        let mut ledger = controller();
+        ledger
+            .prepare(op("op-old", 7), alice(), DeviceCapability::Shell, 10)
+            .unwrap();
+        ledger.mark_dispatched("op-old", &alice(), 7, 11).unwrap();
+        ledger
+            .finalize(
+                "op-old",
+                &alice(),
+                7,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                12,
+            )
+            .unwrap();
+        let mut legacy = ledger.snapshot_for_restart();
+        legacy.schema_version = PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION;
+        assert!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                legacy.clone(),
+            )
+            .is_ok()
+        );
+
+        let mut legacy_with_archive = legacy.clone();
+        let receipt = legacy_with_archive.operations[0].receipt.clone().unwrap();
+        legacy_with_archive
+            .recoveries
+            .push(ArchivedOperationRecovery {
+                operation: receipt.operation.clone(),
+                owner: receipt.owner.clone(),
+                capability: receipt.capability,
+                state: receipt.terminal_state,
+                receipt,
+                result: RecoverableOperationResult::Shell {
+                    output: ProcessOutput {
+                        exit_code: Some(0),
+                        stdout: "smuggled archive".into(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        timed_out: false,
+                        cancelled: false,
+                        duration_ms: 1,
+                    },
+                },
+            });
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                legacy_with_archive,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+
+        legacy.operations[0].recoverable_result = Some(RecoverableOperationResult::Shell {
+            output: ProcessOutput {
+                exit_code: Some(0),
+                stdout: "smuggled".into(),
+                stderr: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                timed_out: false,
+                cancelled: false,
+                duration_ms: 1,
+            },
+        });
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                legacy,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
     }
 
     #[test]
