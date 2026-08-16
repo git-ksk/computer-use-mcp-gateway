@@ -1973,6 +1973,25 @@ fn canonical_grant_bytes(payload: &GrantPayload) -> Result<Vec<u8>, ControlError
     serde_json::to_vec(payload).map_err(|_| ControlError::Serialization)
 }
 
+pub fn verify_grant_token_with_verifier(
+    token: &GrantToken,
+    verifier: &VerifyingKey,
+) -> Result<(), ControlError> {
+    if token.payload.issuer_key_id != verifying_key_id(verifier) {
+        return Err(ControlError::UnknownGrantSigningKey);
+    }
+    let sig_bytes: [u8; 64] = token
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| ControlError::InvalidGrantSignature)?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    let bytes = canonical_grant_bytes(&token.payload)?;
+    verifier
+        .verify(&bytes, &signature)
+        .map_err(|_| ControlError::InvalidGrantSignature)
+}
+
 pub fn verifying_key_id(verifier: &VerifyingKey) -> String {
     format!("key_{}", hex(&verifier.to_bytes()))
 }

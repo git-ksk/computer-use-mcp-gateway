@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use computer_use_mcp_gateway::{
+    v2_grant_signer::HubGrantSigner,
     v2_m0_trust::DeviceKeyRotation,
     v2_m1_grpc::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
@@ -37,8 +38,18 @@ struct Args {
     bind: SocketAddr,
     #[arg(long, env = "CUMG_V2_HUB_SECRET_FILE")]
     hub_secret_file: PathBuf,
+    /// Legacy/single-host in-process grant signer. Mutually exclusive with the
+    /// external signer socket/public-key pair.
     #[arg(long, env = "CUMG_V2_GRANT_SECRET_FILE")]
-    grant_secret_file: PathBuf,
+    grant_secret_file: Option<PathBuf>,
+    /// Production external grant-signing service Unix socket.
+    #[arg(long, env = "CUMG_V2_GRANT_SIGNER_SOCKET")]
+    grant_signer_socket: Option<PathBuf>,
+    /// Public verifier pinned by the Hub for responses from the external signer.
+    #[arg(long, env = "CUMG_V2_GRANT_PUBLIC_KEY_FILE")]
+    grant_public_key_file: Option<PathBuf>,
+    #[arg(long, env = "CUMG_V2_GRANT_SIGNER_TIMEOUT_SECS", default_value_t = 2)]
+    grant_signer_timeout_secs: u64,
     #[arg(long, env = "CUMG_V2_DEVICE_PUBLIC_KEY_FILE")]
     device_public_key_file: PathBuf,
     /// Signed device-key continuity document used only when enrolled key changes.
@@ -173,6 +184,23 @@ async fn main() -> Result<()> {
         "CUMG_V2_HEARTBEAT_TIMEOUT_SECS must be greater than zero"
     );
     ensure!(
+        args.grant_signer_timeout_secs > 0,
+        "CUMG_V2_GRANT_SIGNER_TIMEOUT_SECS must be greater than zero"
+    );
+    let in_process_grant_signer = args.grant_secret_file.is_some();
+    let external_grant_signer =
+        args.grant_signer_socket.is_some() || args.grant_public_key_file.is_some();
+    ensure!(
+        (in_process_grant_signer
+            && !external_grant_signer
+            && args.grant_signer_socket.is_none()
+            && args.grant_public_key_file.is_none())
+            || (!in_process_grant_signer
+                && args.grant_signer_socket.is_some()
+                && args.grant_public_key_file.is_some()),
+        "configure exactly one grant signer: CUMG_V2_GRANT_SECRET_FILE, or both CUMG_V2_GRANT_SIGNER_SOCKET and CUMG_V2_GRANT_PUBLIC_KEY_FILE"
+    );
+    ensure!(
         args.max_agent_session_lifetime_secs > 0
             && args.agent_session_reauth_drain_secs > 0
             && args.agent_session_reauth_drain_secs < args.max_agent_session_lifetime_secs,
@@ -211,11 +239,48 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let grant_signer = if let Some(path) = &args.grant_secret_file {
+        HubGrantSigner::in_process(
+            load_grant_authority(path)
+                .context("failed to load in-process grant-signing identity")?,
+        )
+    } else {
+        #[cfg(unix)]
+        {
+            HubGrantSigner::external_unix(
+                args.grant_signer_socket
+                    .clone()
+                    .expect("validated external signer socket"),
+                load_verifying_key(
+                    args.grant_public_key_file
+                        .as_ref()
+                        .expect("validated external signer public key"),
+                )
+                .context("failed to load external grant signer verifier")?,
+                Duration::from_secs(args.grant_signer_timeout_secs),
+            )
+            .context("invalid external grant signer configuration")?
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("external Unix grant signer mode is unavailable on this platform")
+        }
+    };
+    let grant_signer_mode = match &grant_signer {
+        HubGrantSigner::InProcess(_) => "in_process",
+        #[cfg(unix)]
+        HubGrantSigner::ExternalUnix(_) => "external_unix",
+    };
+    info!(
+        event = "v2_grant_signer_configured",
+        mode = grant_signer_mode,
+        signer_key_id = %computer_use_mcp_gateway::v2_m0::verifying_key_id(&grant_signer.verifier()),
+        "grant-signing backend configured"
+    );
     let material = HubProvisionedMaterial {
         hub_identity: load_hub_identity(&args.hub_secret_file)
             .context("failed to load Hub Ed25519 identity")?,
-        grant_authority: load_grant_authority(&args.grant_secret_file)
-            .context("failed to load grant-signing identity")?,
+        grant_signer,
         device_verifier: load_verifying_key(&args.device_public_key_file)
             .context("failed to load enrolled Agent public key")?,
         device_rotation,

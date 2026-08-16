@@ -1,7 +1,8 @@
 [Unit]
 Description=computer-use-mcp-gateway V2 Hub
-After=network-online.target
+After=network-online.target cumg-v2-grant-signer.service
 Wants=network-online.target
+Requires=cumg-v2-grant-signer.service
 
 [Service]
 Type=exec
@@ -9,10 +10,9 @@ User=cumg-v2
 Group=cumg-v2
 EnvironmentFile=-/etc/cumg-v2/hub.env
 LoadCredentialEncrypted=hub-secret
-LoadCredentialEncrypted=grant-secret
 LoadCredential=tls-key:/etc/cumg-v2/tls/server.key
 Environment=CUMG_V2_HUB_SECRET_FILE=%d/hub-secret
-Environment=CUMG_V2_GRANT_SECRET_FILE=%d/grant-secret
+Environment=CUMG_V2_GRANT_SIGNER_SOCKET=/run/cumg-v2-grant-signer/grant-signer.sock
 Environment=CUMG_V2_TLS_KEY_PEM_FILE=%d/tls-key
 Environment=CUMG_V2_HUB_STATE_DIR=%S/cumg-v2-hub
 ExecStart=/usr/local/bin/v2_hub

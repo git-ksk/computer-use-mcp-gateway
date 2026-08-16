@@ -59,7 +59,7 @@ fn hub_material(
 ) -> HubProvisionedMaterial {
     HubProvisionedMaterial {
         hub_identity: hub_identity.clone(),
-        grant_authority: grant_authority.clone(),
+        grant_signer: grant_authority.clone().into(),
         device_verifier: device_identity.verifying_key(),
         device_rotation: None,
     }

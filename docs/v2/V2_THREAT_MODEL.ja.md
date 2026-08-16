@@ -30,11 +30,19 @@ authenticated MCP client principal
         v
 +---------------- Hub ----------------+
 | client policy                        |
-| grant-signing authority              |
+| grant signer client + public verifier|
 | transport identity                   |
 | admission / lease / audit state      |
-+--------------------------------------+
-        |
++----------------+---------------------+
+                 | typed exact-capability signing request
+                 v
+        +-------- external signer --------+
+        | independent capability ceiling  |
+        | grant-signing private key       |
+        +----------------+----------------+
+                         | signed GrantToken
+                         v
++---------------- Hub ----------------+
         | signed, versioned Hub-Agent messages
         | + production confidentiality required
         v
@@ -61,7 +69,7 @@ high-value asset には次が含まれます。
 - desktop session と、そこから見える / 操作できる data。
 - Agent device private key。
 - Hub transport private key。
-- Hub grant-signing private key。
+- capability-grant signing private key（packaged production では `v2_hub` ではなく external signer が保持）。
 - northbound client authentication state と authorization mapping。
 - conflicting / replayed action を防ぐための operation/lease state。
 - capability advertisement と generation/revision state。
@@ -86,22 +94,24 @@ Controls:
 
 M1 northbound boundary は新しい OAuth server を作るのではなく、MCP Authorization protected-resource side を実装します。`v2_hub` は RFC 9728 metadata を公開し、header bearer presentation を要求し、設定済み RFC 7662 introspection endpoint で token を検証し、accepted token を設定済み MCP resource audience に bind し、verified subject と configured authorization-server issuer から `AuthenticatedClientPrincipal` を構築します。required OAuth scope は MCP resource への entry を gate しますが、delegated device access については別の local principal -> device -> exact `DeviceCapability` policy が authoritative のままです。bearer header は rmcp handler dispatch 前に除去され、typed Hub-to-Agent command/grant path には bearer field がありません。
 
-Residual risk: authorization-server/introspection availability と credential compromise は deployment trust dependency のままです。public HTTPS termination と transport-edge rate limiting は loopback northbound listener の外側にある deployment responsibility です。compromised Hub は自身の grant authority を使って valid Agent grant を mint できるため、OAuth は既に文書化された fully-compromised-Hub trust failure を軽減しません。
+Residual risk: authorization-server/introspection availability と credential compromise は deployment trust dependency のままです。public HTTPS termination と transport-edge rate limiting は loopback northbound listener の外側にある deployment responsibility です。packaged production では compromised `v2_hub` は grant-signing private key を保持せず、external signer が unavailable / reject の間は新しい grant を mint できません。ただし live signer は independent signer policy に明示的に allow された exact capability の request を受理できるため、OAuth + key isolation だけで fully compromised Hub が無害になるわけではありません。
 
 ### Compromised Hub
 
-fully compromised Hub は **high-severity trust failure** です。通常 Hub は authorization、admission、transport signing、grant issuance を制御します。attacker が active Hub transport key と grant-signing authority の両方を取得した場合、Agent はその command と authorized Hub command を区別できません。
+fully compromised Hub は引き続き **high-severity trust failure** です。Hub は northbound authorization/admission と active Hub transport identity を制御するためです。ただし packaged production では grant-signing private key を Hub process から除去します。`v2_hub` が送れるのは bounded typed signing request だけで、別 Unix-socket service が stable device / exact capability、TTL、issue-time skew の独立 ceiling を検証し、grant ID と canonical payload を自身で生成して sign します。Hub は返却tokenを pinned grant public key で再検証します。signer unavailable / deny 時は Agent dispatch 前に operation を cancel し、in-process fallback はありません。
 
 それでも blast radius を抑える / recovery を助ける control:
 
-- transport identity と grant-signing key は分離され、独立して rotate できる。
+- packaged production では transport identity と grant-signing private key custody を別 process / service identity に分離する。
+- signer は arbitrary bytes を sign せず、grant ID / canonical payload を自身で生成し、policy にない capability を独立に reject する。
+- signer は TTL を bounded にし、自身の clock-skew window 外の issue time を reject する。
 - Agent trust change は signed key-rotation continuity を要求する。
 - grant は scoped / short-lived のまま。
 - Agent は grant signature、device generation、capability revision、single-operation execution を独立して検証する。
-- backend/Agent policy ceiling は Hub grant より厳しくできる。
+- backend/Agent policy ceiling は Hub / signer grant より厳しくできる。
 - content-minimizing audit evidence により raw desktop data を保存せず investigation を支援できる。
 
-Non-claim: cryptography で fully compromised authorized Hub を無害にはできません。M1/M3 deployment では grant-signing key を Hub process から分離する、または dangerous capability に separate approval authority を要求することを検討すべきです。
+Non-claim: external key custody は per-operation user approval ではありません。malicious Hub が Hub transport key を保持し、healthy signer に到達できるなら、independently administered signer policy が意図的に allow した capability は request できます。Hub と signer の両方が compromise されれば強い trust failure に戻ります。dangerous capability に human/hardware approval が必要な deployment は key isolation だけで実現したとみなさず signer boundary に別 approval authority を追加すべきです。[`V2_GRANT_SIGNING.md`](V2_GRANT_SIGNING.md) を参照してください。
 
 ### Compromised Agent
 

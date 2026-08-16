@@ -9,10 +9,11 @@ use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionEvidence, ExecutionReceipt,
     IndeterminateReason, OperationOwner, ResolutionRecord,
 };
+use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
     CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CommandEnvelope, DeviceCapability,
-    DeviceCommand, DeviceErrorCode, DeviceRegistry, DeviceResult, DirectoryEntry, GrantAuthority,
-    ProcessOutput, ProcessRequest, ShellRequest, validate_command_result,
+    DeviceCommand, DeviceErrorCode, DeviceRegistry, DeviceResult, DirectoryEntry, ProcessOutput,
+    ProcessRequest, ShellRequest, validate_command_result,
 };
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision,
@@ -67,7 +68,7 @@ const GRANT_ISSUED_AT_SAFETY_MS: u64 = 5_000;
 #[derive(Clone)]
 pub struct HubProvisionedMaterial {
     pub hub_identity: HubIdentity,
-    pub grant_authority: GrantAuthority,
+    pub grant_signer: HubGrantSigner,
     pub device_verifier: VerifyingKey,
     pub device_rotation: Option<DeviceKeyRotation>,
 }
@@ -944,10 +945,10 @@ impl SingleDeviceHub {
             operation_id: operation_id.to_owned(),
             command: device_command,
         };
-        let grant = self
+        let grant = match self
             .inner
             .material
-            .grant_authority
+            .grant_signer
             .issue_for_device_capability(
                 &self.inner.device_id,
                 command.command.capability(),
@@ -955,7 +956,16 @@ impl SingleDeviceHub {
                     .now_ms()
                     .saturating_sub(GRANT_ISSUED_AT_SAFETY_MS),
                 DEFAULT_GRANT_TTL_MS,
-            )?;
+            )
+            .await
+        {
+            Ok(grant) => grant,
+            Err(error) => {
+                return self
+                    .reject_for_grant_signer(operation_id, &owner, generation, pending, &error)
+                    .await;
+            }
+        };
         let remote = self.inner.material.hub_identity.remote_command(
             hello,
             challenge,
@@ -1040,6 +1050,49 @@ impl SingleDeviceHub {
             "operation dispatched to Agent"
         );
         Ok(DispatchOutcome::Sent)
+    }
+
+    async fn reject_for_grant_signer(
+        &self,
+        operation_id: &str,
+        owner: &OperationOwner,
+        generation: u64,
+        pending: &mut HashMap<String, PendingOperation>,
+        error: &GrantSignerError,
+    ) -> Result<DispatchOutcome, HubServiceError> {
+        let next = {
+            let mut persistent = self.inner.persistent.lock().await;
+            let decision = persistent.execution.request_cancel(
+                operation_id,
+                owner,
+                generation,
+                unix_time_ms()?,
+            )?;
+            persist_locked(&self.inner, &persistent)?;
+            match decision {
+                CancellationDecision::CancelledBeforeDispatch { next } => next,
+                CancellationDecision::AlreadyTerminal(_) => CompletionDecision::Idle,
+                CancellationDecision::SendCancellation(_) => {
+                    return Err(HubServiceError::StateBusy);
+                }
+            }
+        };
+        if let Some(operation) = pending.remove(operation_id) {
+            let _ = operation
+                .reply
+                .send(Err(HubCommandError::GrantSigningUnavailable));
+        }
+        crate::v2_observability::grant_signing_failed();
+        tracing::error!(
+            event = "v2_grant_signing_failed",
+            operation_id,
+            device_id = %self.inner.device_id,
+            generation,
+            outcome = "cancelled_before_dispatch",
+            error_code = error.safe_error_code(),
+            "grant signer did not authorize a token; operation cancelled before Agent dispatch"
+        );
+        Ok(DispatchOutcome::Rejected(next))
     }
 
     async fn cancel_for_shutdown_drain(
@@ -2077,6 +2130,7 @@ pub enum HubCommandError {
     DeviceIndeterminate { operation_id: String },
     Rejected,
     UsageUnavailable,
+    GrantSigningUnavailable,
     Remote(DeviceErrorCode),
     UnexpectedResult,
     Indeterminate,
@@ -2095,6 +2149,7 @@ impl SafeErrorCode for HubCommandError {
             Self::DeviceIndeterminate { .. } | Self::Indeterminate => "device_indeterminate",
             Self::Rejected => "rejected",
             Self::UsageUnavailable => "usage_unavailable",
+            Self::GrantSigningUnavailable => "grant_signing_unavailable",
             Self::Remote(_) => "remote_error",
             Self::UnexpectedResult => "unexpected_result",
         }
@@ -2227,6 +2282,7 @@ impl std::error::Error for HubServiceError {}
 mod tests {
     use super::*;
     use crate::v2_m0::DeviceIdentity;
+    use crate::v2_m0::GrantAuthority;
     use crate::v2_m0_trust::build_device_key_rotation;
 
     fn test_state_dir(name: &str) -> std::path::PathBuf {
@@ -2290,7 +2346,7 @@ mod tests {
         };
         let material = HubProvisionedMaterial {
             hub_identity: HubIdentity::generate(),
-            grant_authority: GrantAuthority::generate(),
+            grant_signer: GrantAuthority::generate().into(),
             device_verifier: DeviceIdentity::generate().verifying_key(),
             device_rotation: None,
         };
@@ -2335,7 +2391,7 @@ mod tests {
             config.clone(),
             HubProvisionedMaterial {
                 hub_identity: hub_identity.clone(),
-                grant_authority: grants.clone(),
+                grant_signer: grants.clone().into(),
                 device_verifier: old_device.verifying_key(),
                 device_rotation: None,
             },
@@ -2351,7 +2407,7 @@ mod tests {
             config.clone(),
             HubProvisionedMaterial {
                 hub_identity: hub_identity.clone(),
-                grant_authority: grants.clone(),
+                grant_signer: grants.clone().into(),
                 device_verifier: new_device.verifying_key(),
                 device_rotation: Some(rotation),
             },
@@ -2364,7 +2420,7 @@ mod tests {
             config,
             HubProvisionedMaterial {
                 hub_identity,
-                grant_authority: grants,
+                grant_signer: grants.into(),
                 device_verifier: new_device.verifying_key(),
                 device_rotation: None,
             },
@@ -2391,7 +2447,7 @@ mod tests {
             },
             HubProvisionedMaterial {
                 hub_identity: HubIdentity::generate(),
-                grant_authority: GrantAuthority::generate(),
+                grant_signer: GrantAuthority::generate().into(),
                 device_verifier: device.verifying_key(),
                 device_rotation: None,
             },
@@ -2425,7 +2481,7 @@ mod tests {
             },
             HubProvisionedMaterial {
                 hub_identity: HubIdentity::generate(),
-                grant_authority: GrantAuthority::generate(),
+                grant_signer: GrantAuthority::generate().into(),
                 device_verifier: device.verifying_key(),
                 device_rotation: None,
             },

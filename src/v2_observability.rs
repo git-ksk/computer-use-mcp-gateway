@@ -156,6 +156,18 @@ pub fn agent_session_lifetime_exceeded() {
     increment_counter("cumg.v2.agent_session_lifetime_exceeded", &[]);
 }
 
+pub fn grant_signing_failed() {
+    increment_counter("cumg.v2.grant_signing_failed", &[]);
+}
+
+pub fn external_grant_signed() {
+    increment_counter("cumg.v2.external_grant_signed", &[]);
+}
+
+pub fn external_grant_rejected() {
+    increment_counter("cumg.v2.external_grant_rejected", &[]);
+}
+
 pub fn agent_session_rejected(reason: SessionRejectReason) {
     increment_counter(
         "cumg.v2.agent_session_rejected",

@@ -93,14 +93,18 @@ Transfer `agent/` over an authenticated operator channel and preserve the device
 
 ### Linux Hub
 
-Use `packaging/systemd/cumg-v2-hub.service` plus `packaging/systemd/hub.env.example` as templates. The unit uses systemd encrypted credentials for the Hub and grant-signing application keys and a systemd credential path for the ACME-managed TLS private key. Provision long-lived application keys into the encrypted credential store outside the repository, for example:
+Use `packaging/systemd/cumg-v2-hub.service`, `packaging/systemd/cumg-v2-grant-signer.service`, and `packaging/systemd/hub.env.example` as templates. Production packaging deliberately separates grant-key custody from the Hub process: the Hub unit receives the Hub Ed25519 key and ACME TLS key, while the dedicated signer unit receives the grant Ed25519 key. Provision them independently outside the repository:
 
 ```bash
-sudo systemd-creds encrypt --name=hub-secret /secure/admin/hub.key   /etc/credstore.encrypted/hub-secret
-sudo systemd-creds encrypt --name=grant-secret /secure/admin/grant.key   /etc/credstore.encrypted/grant-secret
+sudo systemd-creds encrypt --name=hub-secret \
+  /secure/admin/hub.key /etc/credstore.encrypted/hub-secret
+sudo systemd-creds encrypt --name=grant-secret \
+  /secure/admin/grant.key /etc/credstore.encrypted/grant-secret
 ```
 
-Keep the recovery/rotation copy in the operator's normal secret manager. Do not retain plaintext administrative copies in the checkout. The service receives `%d/hub-secret`, `%d/grant-secret`, and `%d/tls-key` paths; private bytes are not environment-variable values.
+Create the signer service account (example `cumg-v2-signer`) with primary group `cumg-v2`, install `packaging/systemd/grant-signer-policy.example.json` as `/etc/cumg-v2/policy/grant-signer.json`, replace its device ID/capability allowlist, and keep the policy non-group/other-writable. The signer owns its runtime directory and exposes a mode-0660 Unix socket to the Hub group. The Hub unit itself contains neither `LoadCredentialEncrypted=grant-secret` nor `CUMG_V2_GRANT_SECRET_FILE`; it pins `/etc/cumg-v2/trust/grant.pub` and talks to the signer socket. Keep recovery/rotation copies in the operator's normal secret manager, not the checkout.
+
+The signer is not a raw signing oracle: requests are bounded typed grant fields; the signer generates the grant ID/canonical payload itself and independently checks exact device capability, short TTL, and bounded issue-time skew. External mode has no local fallback. See [`v2/V2_GRANT_SIGNING.md`](v2/V2_GRANT_SIGNING.md) for the protocol, failure semantics, and residual risk. A consciously single-host/development deployment may instead configure only `CUMG_V2_GRANT_SECRET_FILE`; do not combine it with external signer variables.
 
 For northbound OAuth introspection, use the optional encrypted-credential drop-in in `packaging/systemd/cumg-v2-hub-oauth-credential.conf.example` rather than putting the client secret in `hub.env`. For trusted-proxy mode, use `packaging/systemd/cumg-v2-hub-trusted-proxy-credential.conf.example`; provision the same random secret separately to the proxy/tunnel and never place the value itself in `hub.env`.
 
