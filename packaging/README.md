@@ -6,7 +6,7 @@ V2-M1 uses the operating system service manager instead of implementing a daemon
 
 Use an existing ACME client (Certbot, Caddy, lego, etc.) as the certificate authority/renewal mechanism. `v2_hub` intentionally rejects symlinked secret-key inputs, so do not point it directly at an ACME client's `live/` symlink tree. Run `scripts/v2-install-renewed-tls.sh` from the ACME deploy hook to validate the certificate/key pair and atomically copy regular files into `/etc/cumg-v2/tls/`, then `systemctl try-restart cumg-v2-hub.service`. Renewal logic remains owned by ACME, not this project.
 
-The systemd Hub unit uses `LoadCredentialEncrypted=` for the long-lived Hub Ed25519 and grant-signing keys and `LoadCredential=` for the ACME-managed TLS private key. Provision the application keys into the systemd encrypted credential store with `systemd-creds encrypt --name=hub-secret ... /etc/credstore.encrypted/hub-secret` and the equivalent `grant-secret` command; keep the rotation/recovery copy in the operator's normal secret manager rather than in the repository. The service receives only `%d/...` credential file paths. Private key bytes are never placed in environment variables, checkpoints, logs, or OTLP attributes.
+The packaged production split keeps the Hub Ed25519 transport key in `cumg-v2-hub.service` but moves the capability-grant Ed25519 private key into the separate `cumg-v2-grant-signer.service`. Provision `hub-secret` for the Hub unit and `grant-secret` for the signer unit with `systemd-creds encrypt`; the Hub receives only the grant **public** key plus the Unix signer socket path. The ACME-managed TLS private key remains a separate `LoadCredential=` input to the Hub. Private key bytes are never placed in environment variables, checkpoints, logs, or OTLP attributes. See [`../docs/v2/V2_GRANT_SIGNING.md`](../docs/v2/V2_GRANT_SIGNING.md).
 
 `v2_tls_check` provides the common certificate/trust-anchor expiry probe. It accepts PEM server certificates and DER trust roots, rejects symlinks or group/world-writable trust material, prints `CUMG_TLS_EXPIRY_OK` while healthy, and exits non-zero with `CUMG_TLS_EXPIRY_ALERT` when the certificate is inside the warning window, expired/not-yet-valid, or malformed. The packaged Linux Hub timer checks `/etc/cumg-v2/tls/server.pem` daily with a 30-day warning window. The Linux Agent user timer and macOS LaunchAgent template perform the same daily check on the configured pinned `tls-root.der`. A non-zero oneshot/LaunchAgent result is intentionally an operational alert signal; wire failed-unit/log monitoring to the deployment's pager or notification system instead of treating it as an automatic trust change.
 
@@ -32,6 +32,19 @@ Ordinary ACME renewal is not the compromise procedure. If a private pinned hiera
 
 The regression `v2_m1_tls::tests::private_root_compromise_cutover_requires_agent_trust_reprovisioning` proves the boundary: the old root accepts the old chain, rejects the replacement chain, and the replacement root accepts it.
 
+## External grant signer
+
+For the packaged production layout, create a dedicated signer account whose primary group is the Hub group (example: user `cumg-v2-signer`, group `cumg-v2`). Install `cumg-v2-grant-signer.service`, copy `grant-signer-policy.example.json` to `/etc/cumg-v2/policy/grant-signer.json`, replace the device ID and exact capability allowlist, and keep that file root/operator-owned and non-group/other-writable. Encrypt the signing key specifically for the signer unit:
+
+```bash
+sudo systemd-creds encrypt --name=grant-secret \
+  /secure/admin/grant.key /etc/credstore.encrypted/grant-secret
+```
+
+The signer creates `/run/cumg-v2-grant-signer/grant-signer.sock`; the packaged Hub requires the signer unit and uses `CUMG_V2_GRANT_PUBLIC_KEY_FILE` to pin responses. The signer independently enforces exact capability, TTL, and clock-skew bounds. If it is unavailable or denies the request, there is **no** in-process fallback in external mode and the operation is cancelled before Agent dispatch.
+
+The legacy in-process mode remains available only by configuring `CUMG_V2_GRANT_SECRET_FILE` directly and omitting both external-signer variables. Do not configure both modes; `v2_hub` rejects mixed/incomplete signer configuration.
+
 ## Application-key lifecycle
 
 `v2_keyctl` creates secrets with create-new semantics and never prints private key material.
@@ -40,7 +53,7 @@ On Linux Hub rotation, decrypt or retrieve the active old Hub key only in a prot
 
 - Hub identity rotation: `v2_keyctl rotate-hub --old-secret OLD --new-secret NEW --new-public NEW_PUB --rotation hub-rotation.json --epoch NEXT_EPOCH`. Stop the Agent during the cutover, deploy `NEW` to the Hub and `NEW_PUB` plus the signed rotation document to the Agent (`CUMG_V2_HUB_ROTATION_FILE`), then restart Hub and Agent. The Agent accepts the changed Hub key only if the persisted old key verifies the continuity document and the next epoch is exact.
 - Device identity rotation: stop the Agent first, then run `v2_keyctl rotate-device --device-id STABLE_ID --old-secret OLD --new-secret NEW --new-public NEW_PUB --rotation device-rotation.json --epoch EPOCH` in a protected admin context. The command creates the replacement secret with create-new semantics and produces a continuity document signed by both the old and new device keys. Stage `NEW_PUB` plus `CUMG_V2_DEVICE_ROTATION_FILE` on the Hub and restart the Hub **before** starting the Agent with `NEW`; Hub startup verifies and persists the rotation while retaining the stable device id and existing replay/admission checkpoint. Start the Agent with `NEW`, confirm a fresh authenticated generation, then remove the one-shot rotation-file setting; a later Hub restart must load the already-persisted new verifier without that document. Do not fall back to the old device secret after the rotation is persisted: returning to an older key requires a new continuity rotation signed by the currently trusted key and the intended replacement.
-- Grant-signing rotation: generate a new grant key, first add its public key to the Agent with `CUMG_V2_ADDITIONAL_GRANT_PUBLIC_KEY_FILES`, then switch the Hub signer. Keep both verifiers trusted for at least the maximum grant lifetime (5 minutes). After that, make the new verifier primary and remove the old verifier. The Agent's configured verifier set is authoritative on restart, so retired keys are removed from its persisted grant ledger.
+- Grant-signing rotation: generate a new grant key, first add its public key to the Agent with `CUMG_V2_ADDITIONAL_GRANT_PUBLIC_KEY_FILES`, then replace the **external signer** credential and the Hub's pinned `CUMG_V2_GRANT_PUBLIC_KEY_FILE` together during a controlled signer/Hub restart. Keep both Agent verifiers trusted for at least the maximum grant lifetime (5 minutes). After that, make the new verifier primary and remove the old verifier. The Agent's configured verifier set is authoritative on restart, so retired keys are removed from its persisted grant ledger. In-process fallback deployments perform the same verifier-overlap sequence but replace their local `CUMG_V2_GRANT_SECRET_FILE` instead.
 
 TLS identity, Hub application identity, device identity, and capability-grant signing identity are deliberately separate lifecycles.
 

@@ -30,11 +30,19 @@ authenticated MCP client principal
         v
 +---------------- Hub ----------------+
 | client policy                        |
-| grant-signing authority              |
+| grant signer client + public verifier|
 | transport identity                   |
 | admission / lease / audit state      |
-+--------------------------------------+
-        |
++----------------+---------------------+
+                 | typed exact-capability signing request
+                 v
+        +-------- external signer --------+
+        | independent capability ceiling  |
+        | grant-signing private key       |
+        +----------------+----------------+
+                         | signed GrantToken
+                         v
++---------------- Hub ----------------+
         | signed, versioned Hub-Agent messages
         | + production confidentiality required
         v
@@ -61,7 +69,7 @@ High-value assets include:
 - the desktop session and any data visible or controllable through it;
 - Agent device private keys;
 - Hub transport private keys;
-- Hub grant-signing private keys;
+- capability-grant signing private keys (held by the external signer in packaged production, not by `v2_hub`);
 - northbound client authentication state and authorization mappings;
 - operation/lease state used to prevent conflicting or replayed actions;
 - capability advertisements and generation/revision state;
@@ -86,22 +94,24 @@ Controls:
 
 The M1 northbound boundary implements the MCP Authorization protected-resource side rather than a new OAuth server. `v2_hub` publishes RFC 9728 metadata, requires header bearer presentation, validates tokens through a configured RFC 7662 introspection endpoint, binds accepted tokens to the configured MCP resource audience, and constructs `AuthenticatedClientPrincipal` from the verified subject plus the configured authorization-server issuer. Required OAuth scopes gate entry to the MCP resource, while the separate local principal -> device -> exact `DeviceCapability` policy remains authoritative for delegated device access. The bearer header is removed before rmcp handler dispatch and no bearer field exists in the typed Hub-to-Agent command/grant path.
 
-Residual risk: authorization-server/introspection availability and credential compromise remain deployment trust dependencies; public HTTPS termination and transport-edge rate limiting remain deployment responsibilities outside the loopback northbound listener. A compromised Hub can still mint valid Agent grants using its own grant authority, so OAuth does not reduce the already-documented fully-compromised-Hub trust failure.
+Residual risk: authorization-server/introspection availability and credential compromise remain deployment trust dependencies; public HTTPS termination and transport-edge rate limiting remain deployment responsibilities outside the loopback northbound listener. In packaged production a compromised `v2_hub` no longer possesses the grant-signing private key and cannot mint a grant while the external signer is absent or rejecting the request. A live signer may still authorize any exact capability intentionally present in its independent signer policy, so OAuth plus key isolation does not make a fully compromised Hub harmless.
 
 ### Compromised Hub
 
-A fully compromised Hub is a **high-severity trust failure**. The Hub normally controls authorization, admission, transport signing, and grant issuance. If an attacker obtains both the active Hub transport key and grant-signing authority, the Agent cannot distinguish those commands from authorized Hub commands.
+A fully compromised Hub is still a **high-severity trust failure** because it controls northbound authorization/admission and the active Hub transport identity. Packaged production now removes the grant-signing private key from that process: `v2_hub` can submit only bounded typed signing requests to a separate Unix-socket service, and that service applies its own stable-device/exact-capability, TTL, and issue-time-skew ceiling before constructing and signing the canonical grant. The Hub verifies every returned token against a pinned grant public key. If the signer is absent or rejects the request, the operation is cancelled before Agent dispatch and there is no in-process fallback.
 
 Controls that still reduce blast radius or aid recovery:
 
-- transport identity and grant-signing keys are separate and independently rotatable;
+- transport identity and grant-signing private key custody are split across separate processes/service identities in packaged production;
+- the signer receives no arbitrary bytes to sign, generates the grant ID/canonical payload itself, and independently denies capabilities omitted from its policy;
+- the signer bounds TTL and rejects issue times outside its own clock-skew window;
 - Agent trust changes require signed key-rotation continuity;
 - grants remain scoped and short-lived;
 - Agent independently validates grant signatures, device generation, capability revision, and single-operation execution;
-- a backend/Agent policy ceiling may be stricter than the Hub grant;
+- a backend/Agent policy ceiling may be stricter than both Hub and signer grants;
 - content-minimizing audit evidence can support investigation without storing raw desktop data.
 
-Non-claim: cryptography cannot make a fully compromised authorized Hub harmless. M1/M3 deployments should consider isolating the grant-signing key from the Hub process or requiring a separate approval authority for dangerous capabilities.
+Non-claim: external key custody is not per-operation user approval. A malicious Hub that still holds the Hub transport key and can reach a healthy signer can request any capability that the independently administered signer policy intentionally allows. Compromise of both Hub and signer restores the stronger trust failure. Deployments that require human/hardware approval for dangerous capabilities should add that authority at the signer boundary rather than assuming key isolation provides it. See [`V2_GRANT_SIGNING.md`](V2_GRANT_SIGNING.md).
 
 ### Compromised Agent
 

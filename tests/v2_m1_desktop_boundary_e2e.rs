@@ -89,7 +89,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },

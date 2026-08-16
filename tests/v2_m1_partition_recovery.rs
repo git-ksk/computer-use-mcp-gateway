@@ -127,7 +127,7 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },
@@ -260,7 +260,7 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },

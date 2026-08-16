@@ -2,7 +2,12 @@
 
 use anyhow::{Result, anyhow};
 use computer_use_mcp_gateway::{
-    v2_m0::{DeviceCommand, DeviceIdentity, GrantAuthority, ProcessRequest, ShellRequest},
+    v2_grant_signer::{
+        GRANT_SIGNER_POLICY_SCHEMA_VERSION, GrantSigningPolicyDocument, HubGrantSigner,
+    },
+    v2_m0::{
+        DeviceCommand, DeviceIdentity, DeviceRegistry, GrantAuthority, ProcessRequest, ShellRequest,
+    },
     v2_m0_transport::HubIdentity,
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig},
@@ -10,10 +15,13 @@ use computer_use_mcp_gateway::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
     },
     v2_m1_hub::{HubCommandError, HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
-    v2_m1_keys::AgentProvisionedMaterial,
+    v2_m1_keys::{
+        AgentProvisionedMaterial, create_new_grant_authority, load_verifying_key,
+        write_new_trusted_text, write_new_verifying_key,
+    },
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use std::{env, time::Duration};
+use std::{env, process::Stdio, time::Duration};
 use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
@@ -72,7 +80,7 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },
@@ -274,7 +282,7 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },
@@ -413,7 +421,7 @@ async fn checkpoint_high_water_rolls_generation_without_quarantine() -> Result<(
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },
@@ -578,7 +586,7 @@ async fn session_lifetime_reauthenticates_cleanly_without_quarantine() -> Result
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },
@@ -697,7 +705,7 @@ async fn hard_session_lifetime_cuts_off_unsettled_work_fail_closed() -> Result<(
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },
@@ -803,5 +811,181 @@ async fn hard_session_lifetime_cuts_off_unsettled_work_fail_closed() -> Result<(
     let _ = std::fs::remove_dir_all(hub_state);
     let _ = std::fs::remove_dir_all(agent_state);
     let _ = std::fs::remove_dir_all(fs_root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_grant_signer_executes_without_hub_key_custody_and_has_no_fallback() -> Result<()>
+{
+    let cwd = env::current_dir()?;
+    // Keep the Unix socket pathname short enough for macOS while remaining
+    // portable to Linux CI. The private child directory is mode 0700 below.
+    let root = std::path::PathBuf::from(format!(
+        "/tmp/cumg-gs-{}-{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir(&root)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let hub_state = temp_dir("external-grant-hub-state");
+    let agent_state = temp_dir("external-grant-agent-state");
+    let signer_socket = root.join("grant-signer.sock");
+    let signer_secret = root.join("grant.key");
+    let signer_public = root.join("grant.pub");
+    let signer_policy = root.join("grant-policy.json");
+
+    let grant_authority = create_new_grant_authority(&signer_secret)?;
+    write_new_verifying_key(&signer_public, &grant_authority.verifier())?;
+    let device_identity = DeviceIdentity::generate();
+    let mut registry = DeviceRegistry::default();
+    let device_id = registry.provision_trusted_device(device_identity.verifying_key());
+    write_new_trusted_text(
+        &signer_policy,
+        &serde_json::to_string_pretty(&GrantSigningPolicyDocument {
+            schema_version: GRANT_SIGNER_POLICY_SCHEMA_VERSION,
+            device_id: device_id.clone(),
+            allowed_device_capabilities: vec![
+                computer_use_mcp_gateway::v2_m0::DeviceCapability::Shell,
+            ],
+            max_grant_lifetime_ms: 30_000,
+            max_clock_skew_ms: 15_000,
+        })?,
+    )?;
+
+    let mut signer = std::process::Command::new(env!("CARGO_BIN_EXE_v2_grant_signer"))
+        .args([
+            "--socket",
+            signer_socket.to_str().unwrap(),
+            "--grant-secret-file",
+            signer_secret.to_str().unwrap(),
+            "--policy-file",
+            signer_policy.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !signer_socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("external grant signer did not create its socket"))?;
+
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_pem = signing_key.serialize_pem();
+    let hub_identity = HubIdentity::generate();
+    let external_signer = HubGrantSigner::external_unix(
+        signer_socket.clone(),
+        load_verifying_key(&signer_public)?,
+        Duration::from_secs(1),
+    )?;
+    let (hub, handle) = SingleDeviceHub::new(
+        HubServiceConfig {
+            state_dir: hub_state.clone(),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 2,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        },
+        HubProvisionedMaterial {
+            hub_identity: hub_identity.clone(),
+            grant_signer: external_signer,
+            device_verifier: device_identity.verifying_key(),
+            device_rotation: None,
+        },
+    )?;
+    assert_eq!(hub.device_id(), device_id);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
+            .add_service(
+                AgentControlServer::new(hub)
+                    .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+
+    let mut agent = AgentService::new(
+        AgentServiceConfig {
+            hub_endpoint: format!("https://localhost:{}", address.port()),
+            hub_domain: "localhost".into(),
+            device_id,
+            allowed_cwd_roots: vec![cwd.clone()],
+            state_dir: agent_state.clone(),
+            heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(50),
+                max_attempts: 5,
+            },
+            cua: None,
+        },
+        AgentProvisionedMaterial {
+            device_identity,
+            trusted_hub: hub_identity.verifier(),
+            grant_verifier: grant_authority.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: cert_der,
+        },
+    )?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let agent_task = tokio::spawn(async move { agent.run(shutdown_rx).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !handle.is_online().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Agent did not connect"))?;
+
+    let signed = handle
+        .execute_shell(ShellRequest {
+            command: "printf external-signer".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        })
+        .await?;
+    assert_eq!(signed.output.stdout, "external-signer");
+
+    signer.kill()?;
+    let _ = signer.wait()?;
+    let denied = handle
+        .execute_shell(ShellRequest {
+            command: "printf must-not-dispatch".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        })
+        .await;
+    assert_eq!(denied, Err(HubCommandError::GrantSigningUnavailable));
+    assert!(handle.desktop_quarantine().await.is_none());
+    assert!(handle.is_online().await);
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), agent_task)
+        .await
+        .map_err(|_| anyhow!("Agent did not shut down"))???;
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(hub_state);
+    let _ = std::fs::remove_dir_all(agent_state);
     Ok(())
 }

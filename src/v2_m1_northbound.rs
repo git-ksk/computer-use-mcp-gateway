@@ -3621,6 +3621,12 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
             "usage_unavailable",
             None,
         ),
+        HubCommandError::GrantSigningUnavailable => {
+            return McpError::internal_error(
+                "Grant signing is temporarily unavailable",
+                Some(json!({"code": "grant_signing_unavailable"})),
+            );
+        }
         HubCommandError::Remote(code) => {
             let message = if code.is_browser_refusal() {
                 "Browser operation was refused"
@@ -6012,7 +6018,7 @@ mod tests {
             },
             HubProvisionedMaterial {
                 hub_identity: HubIdentity::generate(),
-                grant_authority: GrantAuthority::generate(),
+                grant_signer: GrantAuthority::generate().into(),
                 device_verifier: device_identity.verifying_key(),
                 device_rotation: None,
             },
@@ -6172,7 +6178,7 @@ mod tests {
             },
             HubProvisionedMaterial {
                 hub_identity: HubIdentity::generate(),
-                grant_authority: GrantAuthority::generate(),
+                grant_signer: GrantAuthority::generate().into(),
                 device_verifier: device_identity.verifying_key(),
                 device_rotation: None,
             },
@@ -6302,7 +6308,7 @@ mod tests {
             },
             HubProvisionedMaterial {
                 hub_identity: HubIdentity::generate(),
-                grant_authority: GrantAuthority::generate(),
+                grant_signer: GrantAuthority::generate().into(),
                 device_verifier: device_identity.verifying_key(),
                 device_rotation: None,
             },

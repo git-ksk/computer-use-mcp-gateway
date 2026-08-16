@@ -79,7 +79,7 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
         },
         HubProvisionedMaterial {
             hub_identity: hub_identity.clone(),
-            grant_authority: grant_authority.clone(),
+            grant_signer: grant_authority.clone().into(),
             device_verifier: device_identity.verifying_key(),
             device_rotation: None,
         },
