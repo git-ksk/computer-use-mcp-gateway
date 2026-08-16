@@ -9,6 +9,7 @@ use crate::v2_m0::{
     CapabilityAdvertisement, CommandEnvelope, CommandResultEnvelope, ControlError, DeviceIdentity,
     DeviceRegistry, GrantToken,
 };
+use crate::v2_online_recovery::{RecoveryAuthorization, RecoveryChallenge, RecoveryResolved};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,7 +19,7 @@ use std::{
     time::Instant,
 };
 
-pub const HUB_AGENT_SCHEMA_VERSION: u16 = 1;
+pub const HUB_AGENT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
@@ -329,6 +330,7 @@ pub enum AgentToHub {
     Result(RemoteResult),
     CancellationAck(RemoteCancellationAck),
     BackendSessionEnded(RemoteBackendSessionEnded),
+    RecoveryAuthorization(RecoveryAuthorization),
     Heartbeat(AgentHeartbeat),
 }
 
@@ -343,6 +345,8 @@ pub enum HubToAgent {
     Command(RemoteCommand),
     Cancel(RemoteCancel),
     BackendSessionEnd(RemoteBackendSessionEnd),
+    RecoveryChallenge(RecoveryChallenge),
+    RecoveryResolved(RecoveryResolved),
     HeartbeatAck(HubHeartbeatAck),
 }
 
@@ -354,6 +358,7 @@ impl AgentToHub {
             Self::Result(_) => "result",
             Self::CancellationAck(_) => "cancellation_ack",
             Self::BackendSessionEnded(_) => "backend_session_ended",
+            Self::RecoveryAuthorization(_) => "recovery_authorization",
             Self::Heartbeat(_) => "heartbeat",
         }
     }
@@ -367,6 +372,8 @@ impl HubToAgent {
             Self::Command(_) => "command",
             Self::Cancel(_) => "cancel",
             Self::BackendSessionEnd(_) => "backend_session_end",
+            Self::RecoveryChallenge(_) => "recovery_challenge",
+            Self::RecoveryResolved(_) => "recovery_resolved",
             Self::HeartbeatAck(_) => "heartbeat_ack",
         }
     }

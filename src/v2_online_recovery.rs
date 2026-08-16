@@ -10,6 +10,7 @@
 use crate::v2_execution_safety::{DesktopQuarantine, IndeterminateReason};
 use crate::v2_m0_execution::IndeterminateResolution;
 use crate::v2_m0_transport::HubIdentity;
+use crate::v2_m1_keys::{KeyMaterialError, load_public_trust_bytes};
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier as _, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use ring::{digest, signature};
@@ -96,7 +97,9 @@ pub struct RecoveryVerifier {
 
 impl RecoveryVerifier {
     pub fn from_x963_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
-        let public_key: [u8; 65] = bytes.try_into().map_err(|_| RecoveryError::InvalidPublicKey)?;
+        let public_key: [u8; 65] = bytes
+            .try_into()
+            .map_err(|_| RecoveryError::InvalidPublicKey)?;
         if public_key[0] != 0x04 {
             return Err(RecoveryError::InvalidPublicKey);
         }
@@ -105,10 +108,12 @@ impl RecoveryVerifier {
 
     pub fn load_optional(state_dir: &Path) -> Result<Option<Self>, RecoveryError> {
         let path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
-        let bytes = match fs::read(path) {
+        let bytes = match load_public_trust_bytes(&path, 65) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(RecoveryError::Io),
+            Err(KeyMaterialError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(_) => return Err(RecoveryError::UnsafeTrustAnchor),
         };
         Self::from_x963_bytes(&bytes).map(Some)
     }
@@ -147,7 +152,10 @@ pub fn build_recovery_challenge(
     current_generation: u64,
     now_ms: u64,
 ) -> Result<RecoveryChallenge, RecoveryError> {
-    if current_generation == 0 || quarantine.device_id.trim().is_empty() || quarantine.operation_id.trim().is_empty() {
+    if current_generation == 0
+        || quarantine.device_id.trim().is_empty()
+        || quarantine.operation_id.trim().is_empty()
+    {
         return Err(RecoveryError::InvalidMessage);
     }
     let mut nonce = [0_u8; 32];
@@ -240,7 +248,9 @@ pub fn validate_authorization_against_challenge(
     validate_evidence(&authorization.evidence)?;
     if authorization.request_id.len() != 36
         || !authorization.request_id.starts_with("rec_")
-        || !authorization.request_id[4..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || !authorization.request_id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {
         return Err(RecoveryError::InvalidMessage);
     }
@@ -324,7 +334,10 @@ pub fn authorization_path(state_dir: &Path) -> PathBuf {
     state_dir.join(RECOVERY_AUTHORIZATION_FILENAME)
 }
 
-pub fn store_challenge(state_dir: &Path, challenge: &RecoveryChallenge) -> Result<(), RecoveryError> {
+pub fn store_challenge(
+    state_dir: &Path,
+    challenge: &RecoveryChallenge,
+) -> Result<(), RecoveryError> {
     atomic_write_json_private(&challenge_path(state_dir), challenge)
 }
 
@@ -336,7 +349,7 @@ pub fn store_authorization(
     state_dir: &Path,
     authorization: &RecoveryAuthorization,
 ) -> Result<(), RecoveryError> {
-    atomic_write_json_private(&authorization_path(state_dir), authorization)
+    atomic_write_json_private_no_replace(&authorization_path(state_dir), authorization)
 }
 
 pub fn load_authorization(
@@ -371,7 +384,10 @@ pub fn authorization_signing_bytes(
     bytes.extend_from_slice(&authorization.quarantine_fingerprint);
     bytes.extend_from_slice(&authorization.challenge_nonce);
     bytes.extend_from_slice(&authorization.challenge_expires_at_ms.to_be_bytes());
-    push_str(&mut bytes, audit_assessment_name(authorization.audit_assessment));
+    push_str(
+        &mut bytes,
+        audit_assessment_name(authorization.audit_assessment),
+    );
     push_str(&mut bytes, resolution_name(&authorization.decision));
     push_str(&mut bytes, &authorization.evidence);
     Ok(bytes)
@@ -465,7 +481,10 @@ fn atomic_write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<(),
         return Err(RecoveryError::InvalidMessage);
     }
     let parent = path.parent().ok_or(RecoveryError::InvalidPath)?;
-    let file_name = path.file_name().and_then(|name| name.to_str()).ok_or(RecoveryError::InvalidPath)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(RecoveryError::InvalidPath)?;
     let mut random = [0_u8; 8];
     OsRng.fill_bytes(&mut random);
     let mut suffix = String::new();
@@ -498,8 +517,63 @@ fn atomic_write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<(),
     write_result
 }
 
+fn atomic_write_json_private_no_replace<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), RecoveryError> {
+    if path.exists() {
+        return Err(RecoveryError::AuthorizationAlreadyPending);
+    }
+    let bytes = serde_json::to_vec(value).map_err(|_| RecoveryError::InvalidMessage)?;
+    if bytes.len() > MAX_RECOVERY_FILE_BYTES {
+        return Err(RecoveryError::InvalidMessage);
+    }
+    let parent = path.parent().ok_or(RecoveryError::InvalidPath)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(RecoveryError::InvalidPath)?;
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let mut suffix = String::new();
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    let pending = parent.join(format!(".{file_name}.pending-{suffix}.tmp"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&pending).map_err(|_| RecoveryError::Io)?;
+    let write_result = (|| {
+        file.write_all(&bytes).map_err(|_| RecoveryError::Io)?;
+        file.flush().map_err(|_| RecoveryError::Io)?;
+        file.sync_all().map_err(|_| RecoveryError::Io)?;
+        fs::hard_link(&pending, path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                RecoveryError::AuthorizationAlreadyPending
+            } else {
+                RecoveryError::Io
+            }
+        })?;
+        fs::remove_file(&pending).map_err(|_| RecoveryError::Io)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| RecoveryError::Io)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&pending);
+    }
+    write_result
+}
+
 fn read_json_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, RecoveryError> {
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(RecoveryError::Io),
@@ -536,8 +610,11 @@ pub enum RecoveryError {
     ExpiredChallenge,
     InvalidPath,
     Io,
+    UnsafeTrustAnchor,
     UnsupportedPlatform,
     KeyUnavailable,
+    KeyAlreadyExists,
+    AuthorizationAlreadyPending,
     UserPresenceDenied,
 }
 
@@ -554,8 +631,11 @@ impl RecoveryError {
             Self::ExpiredChallenge => "recovery_challenge_expired",
             Self::InvalidPath => "recovery_invalid_path",
             Self::Io => "recovery_io",
+            Self::UnsafeTrustAnchor => "recovery_unsafe_trust_anchor",
             Self::UnsupportedPlatform => "recovery_unsupported_platform",
             Self::KeyUnavailable => "recovery_key_unavailable",
+            Self::KeyAlreadyExists => "recovery_key_already_exists",
+            Self::AuthorizationAlreadyPending => "recovery_authorization_pending",
             Self::UserPresenceDenied => "recovery_user_presence_denied",
         }
     }
@@ -579,7 +659,9 @@ impl std::error::Error for RecoveryError {}
 pub mod macos {
     use super::*;
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
-    use security_framework::item::{ItemSearchOptions, KeyClass, Location, Reference, SearchResult};
+    use security_framework::item::{
+        ItemSearchOptions, KeyClass, Location, Reference, SearchResult,
+    };
     use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
     use security_framework_sys::access_control::{
         kSecAccessControlPrivateKeyUsage, kSecAccessControlUserPresence,
@@ -591,12 +673,15 @@ pub mod macos {
     }
 
     impl MacRecoveryKey {
-        pub fn load_or_create(label: &str) -> Result<Self, RecoveryError> {
+        pub fn create_new(label: &str) -> Result<Self, RecoveryError> {
             if label.trim().is_empty() {
                 return Err(RecoveryError::KeyUnavailable);
             }
-            if let Some(private_key) = load_private_key(label)? {
-                return Ok(Self { private_key });
+            // Initial provisioning never trusts a pre-existing label. This
+            // prevents a software key planted under the default label from
+            // being exported and pinned as recovery authority.
+            if load_private_key(label)?.is_some() {
+                return Err(RecoveryError::KeyAlreadyExists);
             }
             let flags = kSecAccessControlUserPresence | kSecAccessControlPrivateKeyUsage;
             let access_control = SecAccessControl::create_with_protection(
@@ -606,7 +691,7 @@ pub mod macos {
             .map_err(|_| RecoveryError::KeyUnavailable)?;
             let mut options = GenerateKeyOptions::default();
             options
-                .set_key_type(KeyType::ec_sec_prime_random())
+                .set_key_type(KeyType::ec())
                 .set_size_in_bits(256)
                 .set_token(Token::SecureEnclave)
                 .set_location(Location::DataProtectionKeychain)
@@ -623,7 +708,10 @@ pub mod macos {
         }
 
         pub fn public_key_bytes(&self) -> Result<[u8; 65], RecoveryError> {
-            let public = self.private_key.public_key().ok_or(RecoveryError::KeyUnavailable)?;
+            let public = self
+                .private_key
+                .public_key()
+                .ok_or(RecoveryError::KeyUnavailable)?;
             let bytes = public
                 .external_representation()
                 .ok_or(RecoveryError::KeyUnavailable)?
@@ -704,7 +792,8 @@ mod tests {
         let challenge = build_recovery_challenge(&hub, &quarantine(), 5, 100).unwrap();
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
         let verifier = RecoveryVerifier::from_x963_bytes(key.public_key().as_ref()).unwrap();
         let mut authorization = new_authorization(
             &challenge,
@@ -715,7 +804,9 @@ mod tests {
         .unwrap();
         let bytes = authorization_signing_bytes(&authorization).unwrap();
         authorization.signature = key.sign(&rng, &bytes).unwrap().as_ref().to_vec();
-        verifier.verify_authorization(&challenge, &authorization, 101).unwrap();
+        verifier
+            .verify_authorization(&challenge, &authorization, 101)
+            .unwrap();
 
         let mut tampered = authorization.clone();
         tampered.decision = IndeterminateResolution::ConfirmedNotExecuted;

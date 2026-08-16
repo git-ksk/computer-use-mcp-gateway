@@ -1,4 +1,6 @@
-use anyhow::{Context, Result, bail};
+#[cfg(not(target_os = "macos"))]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
@@ -10,7 +12,7 @@ use computer_use_mcp_gateway::{
 };
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
@@ -78,12 +80,15 @@ fn now_ms() -> Result<u64> {
     .unwrap_or(u64::MAX))
 }
 
-fn verified_challenge(state_dir: &PathBuf, hub_public_key_file: &PathBuf) -> Result<computer_use_mcp_gateway::v2_online_recovery::RecoveryChallenge> {
+fn verified_challenge(
+    state_dir: &Path,
+    hub_public_key_file: &Path,
+) -> Result<computer_use_mcp_gateway::v2_online_recovery::RecoveryChallenge> {
     let challenge = load_challenge(state_dir)
         .context("failed to read recovery challenge")?
         .context("no active recovery challenge")?;
-    let trusted_hub = load_verifying_key(hub_public_key_file)
-        .context("failed to load pinned Hub public key")?;
+    let trusted_hub =
+        load_verifying_key(hub_public_key_file).context("failed to load pinned Hub public key")?;
     verify_recovery_challenge(
         &challenge,
         &trusted_hub,
@@ -134,9 +139,11 @@ fn main() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn init_key(key_label: String, public_key_out: PathBuf) -> Result<()> {
     use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
-    let key = MacRecoveryKey::load_or_create(&key_label)
+    let key = MacRecoveryKey::create_new(&key_label)
         .context("failed to create/load Secure Enclave recovery key")?;
-    let public_key = key.public_key_bytes().context("failed to export recovery public key")?;
+    let public_key = key
+        .public_key_bytes()
+        .context("failed to export recovery public key")?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
