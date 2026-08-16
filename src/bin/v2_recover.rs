@@ -6,11 +6,16 @@ use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_verifying_key,
     v2_online_recovery::{
-        DEFAULT_MACOS_RECOVERY_KEY_LABEL, RecoveryAuditAssessment, load_challenge,
-        new_authorization, store_authorization, verify_recovery_challenge,
+        DEFAULT_MACOS_RECOVERY_KEY_LABEL, load_challenge, verify_recovery_challenge,
     },
 };
+#[cfg(target_os = "macos")]
+use computer_use_mcp_gateway::v2_online_recovery::{
+    RecoveryAuditAssessment, new_authorization, store_authorization,
+};
+#[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
+#[cfg(target_os = "macos")]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
