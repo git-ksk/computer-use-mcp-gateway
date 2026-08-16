@@ -1,9 +1,12 @@
 //! V2-M1 crash-safe replay/trust checkpoint persistence.
 //!
-//! Checkpoints are append-only files. A new checkpoint is written with
-//! `create_new`, flushed, and fsynced before it can become the highest sequence.
-//! Loading rejects symlinks, oversized files, weak Unix permissions, malformed
-//! state, and unsupported schema versions instead of silently falling back.
+//! Checkpoints are append-only committed files. A new checkpoint is first written
+//! to a private same-directory pending file, flushed, and fsynced. It is then
+//! published under the sequenced final name with a no-clobber atomic hard link,
+//! followed by a directory fsync. Pending/incomplete names are never considered
+//! committed checkpoints. Loading rejects symlinks, oversized files, weak Unix
+//! permissions, malformed state, and unsupported schema versions instead of
+//! silently falling back from a malformed committed checkpoint.
 
 use crate::v2_execution_safety::{AuthoritativeOperationController, AuthoritativeSafetySnapshot};
 use crate::v2_m0::{DeviceRegistry, DeviceRegistrySnapshot, GrantLedger, GrantLedgerSnapshot};
@@ -11,6 +14,7 @@ use crate::v2_m0_execution::{AdmissionLimits, AgentExecutionGate, AgentExecution
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_observability::SafeErrorCode;
 use ed25519_dalek::VerifyingKey;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -148,6 +152,18 @@ impl CheckpointStore {
         &self,
         value: &T,
     ) -> Result<(PathBuf, usize), PersistenceError> {
+        self.save_with_size_inner(value, |_| Ok(()))
+    }
+
+    fn save_with_size_inner<T, F>(
+        &self,
+        value: &T,
+        after_pending_create: F,
+    ) -> Result<(PathBuf, usize), PersistenceError>
+    where
+        T: Serialize,
+        F: FnOnce(&Path) -> std::io::Result<()>,
+    {
         self.ensure_directory()?;
         let payload = serde_json::to_vec(value).map_err(PersistenceError::Serialization)?;
         if u64::try_from(payload.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_BYTES {
@@ -155,21 +171,71 @@ impl CheckpointStore {
         }
         let payload_len = payload.len();
 
-        let mut sequence = self.next_sequence()?;
+        let (pending_path, mut file) = self.create_pending_checkpoint()?;
+        let pending_write = (|| -> std::io::Result<()> {
+            after_pending_create(&pending_path)?;
+            file.write_all(&payload)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(error) = pending_write {
+            let _ = fs::remove_file(&pending_path);
+            return Err(PersistenceError::Io(error));
+        }
+
+        let mut sequence = match self.next_sequence() {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                let _ = fs::remove_file(&pending_path);
+                return Err(error);
+            }
+        };
         for _ in 0..8 {
             let path = self.checkpoint_path(sequence);
-            match secure_create_new(&path) {
-                Ok(mut file) => {
-                    file.write_all(&payload).map_err(PersistenceError::Io)?;
-                    file.flush().map_err(PersistenceError::Io)?;
-                    file.sync_all().map_err(PersistenceError::Io)?;
+            match fs::hard_link(&pending_path, &path) {
+                Ok(()) => {
+                    // The final name now refers to the already-complete, fsynced
+                    // inode. Persist publication before any cleanup can happen.
                     sync_directory(&self.directory)?;
+
+                    // The final link is already committed. Pending-file cleanup is
+                    // best-effort because reporting a failure after commit would
+                    // falsely tell the caller that the durable checkpoint failed.
+                    if fs::remove_file(&pending_path).is_ok() {
+                        let _ = sync_directory(&self.directory);
+                    }
                     self.prune_old_checkpoints(MAX_RETAINED_CHECKPOINTS)?;
                     return Ok((path, payload_len));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     sequence = sequence.saturating_add(1);
                 }
+                Err(error) => {
+                    let _ = fs::remove_file(&pending_path);
+                    return Err(PersistenceError::Io(error));
+                }
+            }
+        }
+        let _ = fs::remove_file(&pending_path);
+        Err(PersistenceError::SequenceContention)
+    }
+
+    fn create_pending_checkpoint(&self) -> Result<(PathBuf, File), PersistenceError> {
+        let mut random = [0_u8; 16];
+        for _ in 0..8 {
+            OsRng.fill_bytes(&mut random);
+            let nonce = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let path = self
+                .directory
+                .join(format!(".{}.pending-{nonce}.tmp", self.prefix));
+            match secure_create_new(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(PersistenceError::Io(error)),
             }
         }
@@ -386,7 +452,11 @@ mod tests {
     use crate::v2_m0_execution::{AdmissionDecision, IndeterminateResolution, OperationRef};
     use crate::v2_m0_transport::HubIdentity;
     use rand::{RngCore, rngs::OsRng};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn temp_directory(name: &str) -> PathBuf {
         let mut random = [0_u8; 8];
@@ -422,6 +492,135 @@ mod tests {
         assert_eq!(latest["version"], 2);
         let count = fs::read_dir(&directory).unwrap().count();
         assert_eq!(count, 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_pending_write_never_supersedes_last_committed_checkpoint() {
+        let directory = temp_directory("checkpoint-atomic-failure");
+        let store = CheckpointStore::new(&directory, "hub").unwrap();
+        store.save(&serde_json::json!({"version": 1})).unwrap();
+
+        let result =
+            store.save_with_size_inner(&serde_json::json!({"version": 2}), |pending_path| {
+                assert_eq!(
+                    parse_checkpoint_name(
+                        "hub",
+                        pending_path.file_name().unwrap().to_str().unwrap()
+                    ),
+                    None
+                );
+                #[cfg(unix)]
+                {
+                    let mode = fs::metadata(pending_path)?.permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600);
+                }
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            });
+        assert!(matches!(result, Err(PersistenceError::Io(_))));
+
+        // Reconstruct the store to model restart. The failed candidate never
+        // acquired a sequenced final name, so the prior committed state remains
+        // authoritative rather than falling back from a malformed latest file.
+        let restarted = CheckpointStore::new(&directory, "hub").unwrap();
+        let latest: serde_json::Value = restarted.load_latest().unwrap();
+        assert_eq!(latest["version"], 1);
+        assert_eq!(restarted.latest_sequence().unwrap(), Some(1));
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| parse_checkpoint_name("hub", name))
+                        .is_some()
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            1,
+            "failed save should remove its own pending file when cleanup is possible"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incomplete_pending_artifact_is_ignored_and_does_not_block_future_commit() {
+        let directory = temp_directory("checkpoint-stale-pending");
+        let store = CheckpointStore::new(&directory, "hub").unwrap();
+        store.save(&serde_json::json!({"version": 1})).unwrap();
+
+        let pending_path = directory.join(".hub.pending-crash-leftover.tmp");
+        let mut pending = secure_create_new(&pending_path).unwrap();
+        pending.write_all(br#"{"version":"#).unwrap();
+        pending.flush().unwrap();
+        drop(pending);
+        assert_eq!(
+            parse_checkpoint_name("hub", pending_path.file_name().unwrap().to_str().unwrap()),
+            None
+        );
+
+        let restarted = CheckpointStore::new(&directory, "hub").unwrap();
+        let latest: serde_json::Value = restarted.load_latest().unwrap();
+        assert_eq!(latest["version"], 1);
+        restarted.save(&serde_json::json!({"version": 2})).unwrap();
+        let latest: serde_json::Value = restarted.load_latest().unwrap();
+        assert_eq!(latest["version"], 2);
+        assert_eq!(restarted.latest_sequence().unwrap(), Some(2));
+        assert!(
+            pending_path.exists(),
+            "foreign crash-leftover pending file should be ignored, not raced by cleanup"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_atomic_publication_never_clobbers_an_existing_sequence() {
+        let directory = temp_directory("checkpoint-contention");
+        let store = CheckpointStore::new(&directory, "hub").unwrap();
+        let barrier = Arc::new(Barrier::new(4));
+        let mut threads = Vec::new();
+        for writer in 0..4_u64 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                store
+                    .save_with_size_inner(&serde_json::json!({"writer": writer}), |_| {
+                        barrier.wait();
+                        Ok(())
+                    })
+                    .map(|(path, _)| path)
+            }));
+        }
+        let paths: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap())
+            .collect();
+        let unique: HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), 4);
+        assert_eq!(store.latest_sequence().unwrap(), Some(4));
+
+        let final_count = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| parse_checkpoint_name("hub", name))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(final_count, 4);
+        for path in paths {
+            let value: serde_json::Value = read_secure_json(&path).unwrap();
+            assert!(value["writer"].as_u64().is_some());
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
