@@ -64,9 +64,10 @@ use reqwest::{Client, Url, redirect::Policy as RedirectPolicy};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
-        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
-        Tool, ToolAnnotations,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        InitializeRequestParams, InitializeResult, JsonObject, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+        ToolAnnotations,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -87,6 +88,9 @@ use tracing::warn;
 
 const DEFAULT_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BEARER_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_AUDIT_CLIENT_NAME_BYTES: usize = 128;
+const MAX_AUDIT_CLIENT_VERSION_BYTES: usize = 64;
+const MAX_AUDIT_CLIENT_DESCRIPTION_BYTES: usize = 256;
 const TOOL_LIST_APPS: &str = "list_apps";
 const TOOL_GET_SCREEN_SIZE: &str = "get_screen_size";
 const TOOL_SCREENSHOT: &str = "screenshot";
@@ -990,6 +994,88 @@ fn oauth_error_response(
         response.headers_mut().insert(WWW_AUTHENTICATE, value);
     }
     response
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NorthboundClientAudit {
+    name: String,
+    version: String,
+    description: Option<String>,
+}
+
+impl NorthboundClientAudit {
+    fn from_implementation(client: &Implementation) -> Self {
+        Self {
+            name: bounded_audit_text(&client.name, MAX_AUDIT_CLIENT_NAME_BYTES, "unknown"),
+            version: bounded_audit_text(&client.version, MAX_AUDIT_CLIENT_VERSION_BYTES, "unknown"),
+            description: client
+                .description
+                .as_deref()
+                .map(|value| bounded_audit_text(value, MAX_AUDIT_CLIENT_DESCRIPTION_BYTES, ""))
+                .filter(|value| !value.is_empty()),
+        }
+    }
+}
+
+fn bounded_audit_text(value: &str, max_bytes: usize, fallback: &str) -> String {
+    let mut output = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        fallback.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn log_northbound_client_initialized(client: &Implementation) {
+    let client = NorthboundClientAudit::from_implementation(client);
+    tracing::info!(
+        event = "v2_northbound_client_initialized",
+        client_name = %client.name,
+        client_version = %client.version,
+        client_description = client.description.as_deref().unwrap_or("none"),
+        identity_source = "mcp_client_info_untrusted",
+        "northbound MCP client metadata recorded for audit correlation"
+    );
+}
+
+fn log_northbound_operation_requested(
+    operation_id: &str,
+    device_id: &str,
+    capability: DeviceCapability,
+    client: Option<Implementation>,
+) {
+    let client = client
+        .as_ref()
+        .map(NorthboundClientAudit::from_implementation)
+        .unwrap_or_else(|| NorthboundClientAudit {
+            name: "unknown".into(),
+            version: "unknown".into(),
+            description: None,
+        });
+    tracing::info!(
+        event = "v2_northbound_operation_requested",
+        operation_id,
+        device_id,
+        capability = crate::v2_observability::capability_name(capability),
+        client_name = %client.name,
+        client_version = %client.version,
+        client_description = client.description.as_deref().unwrap_or("none"),
+        identity_source = "mcp_client_info_untrusted",
+        outcome = "authorized",
+        "authorized northbound operation correlated with caller-supplied MCP client metadata"
+    );
 }
 
 struct NorthboundInteractionState {
@@ -2532,6 +2618,29 @@ impl ServerHandler for V2NorthboundMcp {
         info
     }
 
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        log_northbound_client_initialized(&request.client_info);
+        context.peer.set_peer_info(request.clone());
+        let mut info = self.get_info();
+        if self
+            .supported_protocol_versions()
+            .contains(&request.protocol_version)
+        {
+            info.protocol_version = request.protocol_version;
+        } else {
+            tracing::warn!(
+                client_requested = %request.protocol_version,
+                server_fallback = %info.protocol_version,
+                "client requested unsupported protocol version; falling back to server default"
+            );
+        }
+        Ok(info)
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -2587,6 +2696,12 @@ impl ServerHandler for V2NorthboundMcp {
             settle_usage_best_effort(&usage, UsageSettlement::Zero, "authorization_denied").await;
             return Err(error);
         }
+        log_northbound_operation_requested(
+            &operation_id,
+            self.hub.device_id(),
+            capability,
+            context.client_info(),
+        );
 
         if request.name.as_ref() == TOOL_BROWSER_STAGE_UPLOAD_FILE {
             return self
@@ -5319,6 +5434,80 @@ impl std::error::Error for NorthboundConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct AuditCaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct AuditCaptureSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for AuditCaptureSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditCaptureWriter {
+        type Writer = AuditCaptureSink;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            AuditCaptureSink(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn caller_supplied_client_info_is_bounded_and_distinguishes_operations() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(AuditCaptureWriter(bytes.clone()))
+            .finish();
+        let alpha = Implementation::new("operator-cli", "1.2.3");
+        let beta = Implementation::new("automation-worker", "9.8.7");
+        tracing::subscriber::with_default(subscriber, || {
+            log_northbound_client_initialized(&alpha);
+            log_northbound_operation_requested(
+                "op-alpha",
+                "dev-audit",
+                DeviceCapability::Shell,
+                Some(alpha.clone()),
+            );
+            log_northbound_client_initialized(&beta);
+            log_northbound_operation_requested(
+                "op-beta",
+                "dev-audit",
+                DeviceCapability::Shell,
+                Some(beta.clone()),
+            );
+        });
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "v2_northbound_client_initialized",
+            "v2_northbound_operation_requested",
+            "operator-cli",
+            "1.2.3",
+            "automation-worker",
+            "9.8.7",
+            "op-alpha",
+            "op-beta",
+            "mcp_client_info_untrusted",
+        ] {
+            assert!(
+                log.contains(expected),
+                "missing client audit field {expected}"
+            );
+        }
+        let unsafe_client = Implementation::new(format!("{}\nforged", "x".repeat(256)), "\r\n");
+        let audit = NorthboundClientAudit::from_implementation(&unsafe_client);
+        assert!(audit.name.len() <= MAX_AUDIT_CLIENT_NAME_BYTES);
+        assert!(!audit.name.contains('\n'));
+        assert_eq!(audit.version, "unknown");
+    }
 
     #[test]
     fn protected_resource_metadata_uses_mcp_endpoint_path_insertion() {
