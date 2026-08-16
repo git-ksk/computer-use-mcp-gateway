@@ -75,6 +75,9 @@ impl ProcessPolicy {
             "RUSTUP_HOME",
             "NODE_ENV",
             "npm_config_cache",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
             "DEVELOPER_DIR",
             "FASTLANE_SKIP_UPDATE_CHECK",
         ]
@@ -709,6 +712,63 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(output.cancelled && !output.timed_out);
         assert_eq!(gate.begin(operation), Err(ExecutionError::OperationReplay));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_utf8_locale_is_available_without_inherited_locale() {
+        let root = temp_root("explicit-locale");
+        let defaults = ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap();
+        for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            assert!(defaults.explicit_env_keys.contains(key));
+        }
+
+        let inherited = HashSet::new();
+        let explicit = ["LANG", "LC_ALL", "LC_CTYPE"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let policy =
+            ProcessPolicy::new(vec![root.clone()], inherited, explicit, HashSet::new()).unwrap();
+        let executor = ProcessExecutor::new(policy);
+        let locale = "en_US.UTF-8";
+        let env = ["LANG", "LC_ALL", "LC_CTYPE"]
+            .into_iter()
+            .map(|key| ProcessEnvVar {
+                key: key.into(),
+                value: locale.into(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut process = request("/usr/bin/env", &root, &[]);
+        process.env = env.clone();
+        let process_output = executor
+            .execute(&process, &ProcessCancellation::default())
+            .unwrap();
+        for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            assert!(
+                process_output
+                    .stdout
+                    .lines()
+                    .any(|line| line == format!("{key}={locale}"))
+            );
+        }
+
+        let shell = ShellRequest {
+            command: r#"printf '%s\n' "$LANG" "$LC_ALL" "$LC_CTYPE""#.into(),
+            cwd: root.to_string_lossy().into_owned(),
+            env,
+            timeout_ms: 5_000,
+        };
+        let shell_output = executor
+            .execute_shell(&shell, &ProcessCancellation::default())
+            .unwrap();
+        assert_eq!(
+            shell_output.stdout.lines().collect::<Vec<_>>(),
+            vec![locale, locale, locale]
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
