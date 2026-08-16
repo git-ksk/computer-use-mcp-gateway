@@ -267,9 +267,13 @@ The detailed invariant is recorded in [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXE
 
 ```bash
 cargo test v2_execution_safety --lib
+cargo test v2_maintenance::tests --lib
+cargo test v2_state_lock::tests --lib
 cargo test --test v2_m1_desktop_boundary_e2e
 cargo test --test v2_m1_partition_recovery
 ```
+
+The issue-#64 maintenance regressions prove the offline resolver refuses a concurrently owned Hub state directory, writes resolution only through the append-only checkpoint store, restores the exact authoritative quarantine transition, and retains `ResolutionRecord` audit history after terminal operation pruning and another restart.
 
 `v2_m1_desktop_boundary_e2e` uses a deterministic Cua-shaped stdio fixture and a real Hub-Agent TLS/gRPC session. It proves native shell and GUI-adapter commands share one owner/fence/quarantine boundary, includes a forced checkpoint-write failure during resolution, and requires rollback to quarantine before a successful retry.
 

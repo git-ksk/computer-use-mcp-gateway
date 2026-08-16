@@ -44,6 +44,22 @@ A successful drain then shuts down the gRPC and northbound HTTP servers. If the 
 
 Configure the service manager's stop/kill timeout to be **longer** than `CUMG_V2_DRAIN_TIMEOUT_SECS`; otherwise the supervisor can kill the Hub before its own bounded drain completes. The packaged systemd unit uses `TimeoutStopSec=45s` for the default 30-second drain. Apply the same ordering to operator-maintained launchd or other service-manager definitions.
 
+### Offline quarantine resolution
+
+A durable `Indeterminate` quarantine is never cleared by reconnect or restart. After an operator establishes out-of-band evidence for the exact ambiguous operation, stop `v2_hub` completely and use the offline maintenance CLI instead of editing checkpoint JSON:
+
+```bash
+cargo run --locked --bin v2_maint -- resolve \
+  --state-dir /var/lib/cumg-v2/hub \
+  --operation-id op_... \
+  --decision confirmed_not_executed \
+  --evidence "ticket-1234: operator verified no side effect"
+```
+
+`confirmed_completed` is also available when the side effect is positively confirmed. Evidence is required and remains subject to `MAX_RESOLUTION_EVIDENCE_BYTES`; keep it to bounded audit metadata and never place commands, results, desktop content, credentials, tokens, or secrets in it.
+
+The Hub and maintenance CLI take the same exclusive state-directory lock. `v2_maint` therefore fails closed while any `SingleDeviceHub` instance still owns that state directory. A successful resolution restores the checkpoint through the normal schema-validation path, invokes the existing authoritative `resolve_indeterminate` transition, and appends a new checkpoint through the same create-new/fsync persistence path. The resulting `ResolutionRecord` remains durable even after terminal operation tombstones are pruned on later generations. Restart the Hub only after the CLI exits successfully.
+
 ### Linux Hub
 
 Use `packaging/systemd/cumg-v2-hub.service` plus `packaging/systemd/hub.env.example` as templates. The unit uses systemd encrypted credentials for the Hub and grant-signing application keys and a systemd credential path for the ACME-managed TLS private key. Provision long-lived application keys into the encrypted credential store outside the repository, for example:
