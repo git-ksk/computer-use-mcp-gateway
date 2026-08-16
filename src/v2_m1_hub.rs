@@ -76,6 +76,8 @@ pub struct HubProvisionedMaterial {
 pub struct HubServiceConfig {
     pub state_dir: std::path::PathBuf,
     pub heartbeat_timeout: Duration,
+    pub max_agent_session_lifetime: Duration,
+    pub agent_session_reauth_drain: Duration,
     pub checkpoint_generation_rollover_bytes: usize,
     pub max_queued_per_device: usize,
     pub max_agent_sessions: usize,
@@ -94,6 +96,14 @@ impl HubServiceConfig {
         if self.heartbeat_timeout.is_zero() {
             return Err(HubServiceError::InvalidConfig(
                 "heartbeat timeout must be non-zero",
+            ));
+        }
+        if self.max_agent_session_lifetime.is_zero()
+            || self.agent_session_reauth_drain.is_zero()
+            || self.agent_session_reauth_drain >= self.max_agent_session_lifetime
+        {
+            return Err(HubServiceError::InvalidConfig(
+                "Agent session lifetime must be non-zero and greater than its reauthentication drain window",
             ));
         }
         if self.checkpoint_generation_rollover_bytes == 0
@@ -494,6 +504,15 @@ impl SingleDeviceHub {
         > = HashMap::new();
         let heartbeat_deadline = tokio::time::sleep(self.inner.config.heartbeat_timeout);
         tokio::pin!(heartbeat_deadline);
+        let reauth_deadline = tokio::time::sleep(
+            self.inner.config.max_agent_session_lifetime
+                - self.inner.config.agent_session_reauth_drain,
+        );
+        tokio::pin!(reauth_deadline);
+        let session_hard_deadline =
+            tokio::time::sleep(self.inner.config.max_agent_session_lifetime);
+        tokio::pin!(session_hard_deadline);
+        let mut session_reauth_requested = false;
         let mut generation_rollover_requested = false;
 
         loop {
@@ -512,6 +531,21 @@ impl SingleDeviceHub {
                     "Hub checkpoint reached the generation rollover high-water mark; new operation admission is paused"
                 );
             }
+            if session_reauth_requested
+                && pending.is_empty()
+                && cancel_waiters.is_empty()
+                && backend_session_end_waiters.is_empty()
+            {
+                tracing::info!(
+                    event = "v2_agent_session_reauth",
+                    device_id = %self.inner.device_id,
+                    generation,
+                    max_session_lifetime_secs = self.inner.config.max_agent_session_lifetime.as_secs(),
+                    outcome = "reconnect",
+                    "Agent session reauthentication drain completed; closing transport for a fresh handshake"
+                );
+                return Ok(());
+            }
             if generation_rollover_requested && pending.is_empty() {
                 tracing::info!(
                     event = "v2_checkpoint_generation_rollover",
@@ -525,6 +559,33 @@ impl SingleDeviceHub {
             }
 
             tokio::select! {
+                _ = &mut reauth_deadline, if !session_reauth_requested => {
+                    session_reauth_requested = true;
+                    crate::v2_observability::agent_session_reauth_requested();
+                    tracing::warn!(
+                        event = "v2_agent_session_reauth_requested",
+                        device_id = %self.inner.device_id,
+                        generation,
+                        max_session_lifetime_secs = self.inner.config.max_agent_session_lifetime.as_secs(),
+                        drain_window_secs = self.inner.config.agent_session_reauth_drain.as_secs(),
+                        outcome = "drain_existing",
+                        "Agent session is approaching its maximum lifetime; new operation admission is paused until a fresh handshake"
+                    );
+                }
+                _ = &mut session_hard_deadline => {
+                    crate::v2_observability::agent_session_lifetime_exceeded();
+                    tracing::error!(
+                        event = "v2_agent_session_lifetime_exceeded",
+                        device_id = %self.inner.device_id,
+                        generation,
+                        max_session_lifetime_secs = self.inner.config.max_agent_session_lifetime.as_secs(),
+                        pending_operations = pending.len(),
+                        outcome = "terminated_fail_closed",
+                        error_code = "session_lifetime_exceeded",
+                        "Agent session reached its hard maximum lifetime; transport is being terminated"
+                    );
+                    return Ok(());
+                }
                 _ = &mut heartbeat_deadline => {
                     tracing::warn!(
                         event = "v2_hub_heartbeat_timeout",
@@ -557,6 +618,20 @@ impl SingleDeviceHub {
                                     outcome = "draining",
                                     error_code = "hub_draining",
                                     "operation rejected because Hub shutdown drain has started"
+                                );
+                                let _ = reply.send(Err(HubCommandError::Busy));
+                                continue;
+                            }
+                            if session_reauth_requested {
+                                tracing::info!(
+                                    event = "v2_operation_rejected",
+                                    operation_id = %operation_id,
+                                    device_id = %self.inner.device_id,
+                                    generation,
+                                    capability = crate::v2_observability::capability_name(command.capability()),
+                                    outcome = "session_reauthentication",
+                                    error_code = "state_busy",
+                                    "operation rejected while Hub drains the current Agent session for reauthentication"
                                 );
                                 let _ = reply.send(Err(HubCommandError::Busy));
                                 continue;
@@ -2170,11 +2245,44 @@ mod tests {
     }
 
     #[test]
+    fn session_lifetime_requires_a_strictly_smaller_nonzero_reauth_drain() {
+        let base = HubServiceConfig {
+            state_dir: test_state_dir("session-lifetime-config"),
+            heartbeat_timeout: Duration::from_secs(5),
+            max_agent_session_lifetime: Duration::from_secs(60),
+            agent_session_reauth_drain: Duration::from_secs(30),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 1,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        };
+        assert!(base.validate().is_ok());
+
+        let mut equal = base.clone();
+        equal.agent_session_reauth_drain = equal.max_agent_session_lifetime;
+        assert!(matches!(
+            equal.validate(),
+            Err(HubServiceError::InvalidConfig(_))
+        ));
+
+        let mut zero = base.clone();
+        zero.agent_session_reauth_drain = Duration::ZERO;
+        assert!(matches!(
+            zero.validate(),
+            Err(HubServiceError::InvalidConfig(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(base.state_dir);
+    }
+
+    #[test]
     fn startup_exclusively_owns_the_state_directory_until_all_handles_drop() {
         let state_dir = test_state_dir("state-lock");
         let config = HubServiceConfig {
             state_dir: state_dir.clone(),
             heartbeat_timeout: Duration::from_secs(5),
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
             checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 1,
             max_agent_sessions: 2,
@@ -2213,6 +2321,8 @@ mod tests {
         let config = HubServiceConfig {
             state_dir: state_dir.clone(),
             heartbeat_timeout: Duration::from_secs(5),
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
             checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 1,
             max_agent_sessions: 2,
@@ -2272,6 +2382,8 @@ mod tests {
             HubServiceConfig {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
                 checkpoint_generation_rollover_bytes: 512 * 1024,
                 max_queued_per_device: 1,
                 max_agent_sessions: 2,
@@ -2304,6 +2416,8 @@ mod tests {
             HubServiceConfig {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
                 checkpoint_generation_rollover_bytes: 512 * 1024,
                 max_queued_per_device: 1,
                 max_agent_sessions: 2,

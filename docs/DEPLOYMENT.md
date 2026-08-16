@@ -38,6 +38,14 @@ For a trusted authenticated proxy/tunnel, constrain the Hub listener to loopback
 
 After the local trust gate, trusted-proxy traffic has a separate peer ceiling: `CUMG_V2_TRUSTED_PROXY_MAX_PEER_CONCURRENCY` defaults to `4` and `CUMG_V2_TRUSTED_PROXY_MAX_PEER_REQUESTS_PER_MINUTE` defaults to `60`. Both must remain below the global defaults (`16` and `120`) so global headroom is preserved. Peer concurrency rejection is HTTP 503 and peer rate rejection is HTTP 429. The peer key is the verified loopback source IP; it is overload isolation, not user identity. The fixed CUMG principal still comes only from operator configuration, and caller `clientInfo` remains audit-only. The adapter strips common Authorization/Cloudflare identity headers before MCP dispatch. If the deployment needs per-user CUMG policy, use a signed-token/OIDC-style adapter that conveys a tamper-resistant authenticated identity. Never trust a caller-provided `X-User`/similar header merely because the listener is called a proxy mode.
 
+### Authenticated Agent session lifetime
+
+`v2_hub` bounds every authenticated Agent transport with `CUMG_V2_MAX_AGENT_SESSION_LIFETIME_SECS` (default `3600`). `CUMG_V2_AGENT_SESSION_REAUTH_DRAIN_SECS` (default `30`) reserves the final part of that lifetime for a controlled reauthentication drain. The drain value must be non-zero and strictly smaller than the hard lifetime.
+
+When the reauthentication window begins, the Hub emits `v2_agent_session_reauth_requested` / `cumg.v2.agent_session_reauth_requested`, pauses **new** operation admission for that session, and lets already-admitted work settle. If the pending set drains before the hard deadline, the Hub closes the stream normally; the Agent's existing reconnect lifecycle performs a fresh hello/challenge/proof/accepted handshake and advances to a new generation. This normal path does not create a quarantine.
+
+The hard lifetime is not advisory. If already-dispatched work is still unsettled when the deadline arrives, the Hub emits the high-visibility `v2_agent_session_lifetime_exceeded` event plus `cumg.v2.agent_session_lifetime_exceeded` and closes the transport. Existing execution-safety cleanup then fails closed: work whose side effect cannot be proven terminal may become `Indeterminate` and quarantine exactly as with any other connection loss. Increasing the lifetime or drain window must never be used to auto-replay or clear such ambiguity.
+
 ### Planned Hub shutdown and restart
 
 `v2_hub` treats `SIGINT`, `SIGTERM`, and `SIGHUP` as planned shutdown signals. On the first signal it closes the operation-admission gate, keeps the Agent transport alive, and waits up to `CUMG_V2_DRAIN_TIMEOUT_SECS` (default `30`) for work that was already admitted to reach a durable terminal or indeterminate state. Requests that have not crossed the dispatch boundary are rejected/cancelled rather than starting new side effects during the drain.

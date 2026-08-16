@@ -148,6 +148,14 @@ pub fn agent_session_started() {
     increment_counter("cumg.v2.agent_session_started", &[]);
 }
 
+pub fn agent_session_reauth_requested() {
+    increment_counter("cumg.v2.agent_session_reauth_requested", &[]);
+}
+
+pub fn agent_session_lifetime_exceeded() {
+    increment_counter("cumg.v2.agent_session_lifetime_exceeded", &[]);
+}
+
 pub fn agent_session_rejected(reason: SessionRejectReason) {
     increment_counter(
         "cumg.v2.agent_session_rejected",

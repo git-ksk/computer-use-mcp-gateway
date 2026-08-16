@@ -63,6 +63,8 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
             checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 2,
             max_agent_sessions: 2,
@@ -263,6 +265,8 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
             checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 2,
             max_agent_sessions: 2,
@@ -400,6 +404,8 @@ async fn checkpoint_high_water_rolls_generation_without_quarantine() -> Result<(
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
             checkpoint_generation_rollover_bytes: 8 * 1024,
             max_queued_per_device: 2,
             max_agent_sessions: 2,
@@ -532,6 +538,262 @@ async fn checkpoint_high_water_rolls_generation_without_quarantine() -> Result<(
         .map_err(|error| anyhow!("post-rollover shell failed: {error:?}"))?;
     assert_eq!(after.output.stdout, "after-rollover");
     assert!(after.receipt.operation.device_generation >= 2);
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), agent_task)
+        .await
+        .map_err(|_| anyhow!("Agent did not shut down"))???;
+    server.abort();
+    let _ = std::fs::remove_dir_all(hub_state);
+    let _ = std::fs::remove_dir_all(agent_state);
+    let _ = std::fs::remove_dir_all(fs_root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_lifetime_reauthenticates_cleanly_without_quarantine() -> Result<()> {
+    let cwd = env::current_dir()?;
+    let fs_root = temp_dir("hub-session-lifetime-fs");
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_pem = signing_key.serialize_pem();
+
+    let device_identity = DeviceIdentity::generate();
+    let hub_identity = HubIdentity::generate();
+    let grant_authority = GrantAuthority::generate();
+    let hub_state = temp_dir("hub-session-lifetime-state");
+    let agent_state = temp_dir("agent-session-lifetime-state");
+
+    let (hub, handle) = SingleDeviceHub::new(
+        HubServiceConfig {
+            state_dir: hub_state.clone(),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(2),
+            agent_session_reauth_drain: Duration::from_secs(1),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 2,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 120,
+        },
+        HubProvisionedMaterial {
+            hub_identity: hub_identity.clone(),
+            grant_authority: grant_authority.clone(),
+            device_verifier: device_identity.verifying_key(),
+            device_rotation: None,
+        },
+    )
+    .map_err(|error| anyhow!("Hub init failed: {error:?}"))?;
+    let device_id = hub.device_id().to_owned();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
+            .add_service(
+                AgentControlServer::new(hub)
+                    .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+
+    let mut agent = AgentService::new(
+        AgentServiceConfig {
+            hub_endpoint: format!("https://localhost:{}", address.port()),
+            hub_domain: "localhost".into(),
+            device_id,
+            allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
+            state_dir: agent_state.clone(),
+            heartbeat_interval: Duration::from_millis(200),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(50),
+                max_attempts: 20,
+            },
+            cua: None,
+        },
+        AgentProvisionedMaterial {
+            device_identity,
+            trusted_hub: hub_identity.verifier(),
+            grant_verifier: grant_authority.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: cert_der,
+        },
+    )
+    .map_err(|error| anyhow!("Agent init failed: {error:?}"))?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let agent_task = tokio::spawn(async move { agent.run(shutdown_rx).await });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while handle.current_generation().await != Some(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Agent did not establish generation 1"))?;
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while handle.current_generation().await.unwrap_or(0) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("session lifetime did not trigger a fresh authenticated generation"))?;
+
+    assert!(handle.desktop_quarantine().await.is_none());
+    let after = handle
+        .execute_shell(ShellRequest {
+            command: "printf after-reauth".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        })
+        .await
+        .map_err(|error| anyhow!("post-reauth shell failed: {error:?}"))?;
+    assert_eq!(after.output.stdout, "after-reauth");
+    assert!(after.receipt.operation.device_generation >= 2);
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), agent_task)
+        .await
+        .map_err(|_| anyhow!("Agent did not shut down"))???;
+    server.abort();
+    let _ = std::fs::remove_dir_all(hub_state);
+    let _ = std::fs::remove_dir_all(agent_state);
+    let _ = std::fs::remove_dir_all(fs_root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hard_session_lifetime_cuts_off_unsettled_work_fail_closed() -> Result<()> {
+    let cwd = env::current_dir()?;
+    let fs_root = temp_dir("hub-session-hard-limit-fs");
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_pem = signing_key.serialize_pem();
+
+    let device_identity = DeviceIdentity::generate();
+    let hub_identity = HubIdentity::generate();
+    let grant_authority = GrantAuthority::generate();
+    let hub_state = temp_dir("hub-session-hard-limit-state");
+    let agent_state = temp_dir("agent-session-hard-limit-state");
+
+    let (hub, handle) = SingleDeviceHub::new(
+        HubServiceConfig {
+            state_dir: hub_state.clone(),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(2),
+            agent_session_reauth_drain: Duration::from_secs(1),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 2,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 120,
+        },
+        HubProvisionedMaterial {
+            hub_identity: hub_identity.clone(),
+            grant_authority: grant_authority.clone(),
+            device_verifier: device_identity.verifying_key(),
+            device_rotation: None,
+        },
+    )
+    .map_err(|error| anyhow!("Hub init failed: {error:?}"))?;
+    let device_id = hub.device_id().to_owned();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
+            .add_service(
+                AgentControlServer::new(hub)
+                    .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+
+    let mut agent = AgentService::new(
+        AgentServiceConfig {
+            hub_endpoint: format!("https://localhost:{}", address.port()),
+            hub_domain: "localhost".into(),
+            device_id,
+            allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
+            state_dir: agent_state.clone(),
+            heartbeat_interval: Duration::from_millis(200),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(50),
+                max_attempts: 20,
+            },
+            cua: None,
+        },
+        AgentProvisionedMaterial {
+            device_identity,
+            trusted_hub: hub_identity.verifier(),
+            grant_verifier: grant_authority.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: cert_der,
+        },
+    )
+    .map_err(|error| anyhow!("Agent init failed: {error:?}"))?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let agent_task = tokio::spawn(async move { agent.run(shutdown_rx).await });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while handle.current_generation().await != Some(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Agent did not establish generation 1"))?;
+
+    let command_handle = handle.clone();
+    let cwd_string = cwd.to_string_lossy().into_owned();
+    let pending = tokio::spawn(async move {
+        command_handle
+            .execute_shell(ShellRequest {
+                command: "sleep 4; printf must-not-complete".into(),
+                cwd: cwd_string,
+                env: vec![],
+                timeout_ms: 10_000,
+            })
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while handle.desktop_quarantine().await.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("hard session lifetime did not fail closed on unsettled work"))?;
+
+    let quarantine = handle
+        .desktop_quarantine()
+        .await
+        .ok_or_else(|| anyhow!("expected quarantine after hard session cutoff"))?;
+    assert_eq!(
+        quarantine.reason,
+        computer_use_mcp_gateway::v2_execution_safety::IndeterminateReason::ConnectionLost
+    );
+    assert_eq!(quarantine.device_generation, 1);
+
+    let command_result = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .map_err(|_| anyhow!("unsettled command did not return after hard session cutoff"))??;
+    assert!(
+        command_result.is_err(),
+        "hard cutoff unexpectedly returned command success"
+    );
 
     let _ = shutdown_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), agent_task)

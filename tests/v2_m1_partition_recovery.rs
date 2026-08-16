@@ -118,6 +118,8 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
             checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 4,
             max_agent_sessions: 2,
@@ -249,6 +251,8 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
             checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 4,
             max_agent_sessions: 2,

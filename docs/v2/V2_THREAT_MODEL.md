@@ -149,6 +149,8 @@ Post-M1 P0 execution-safety details and residual recovery assumptions are record
 
 Current M1 evidence includes TLS-protected gRPC bidirectional streaming with pinned certificate trust/domain validation plus independent Ed25519 application authentication. The earlier raw-TLS transport remains a regression/reference implementation and is TLS 1.3-only with a dedicated ALPN. The operator-facing `v2_hub` daemon and `v2_agent` are covered by end-to-end TLS/gRPC tests. Public-edge firewall/reverse-proxy controls, raw transport handshake shedding, external authorization-service availability, and credential/certificate custody remain deployment responsibilities; they are not permission to weaken the accepted application-level safety model.
 
+Production hardening additionally bounds every authenticated Agent session. The Hub pauses new admission during a bounded pre-expiry drain and normally closes the stream only after already-admitted work settles, forcing a fresh nonce-bound handshake and generation. If the hard deadline arrives first, transport closure remains fail-closed and unresolved dispatched work may become `Indeterminate` plus quarantine rather than becoming replayable.
+
 ### Replay and stale-state attacker
 
 Controls:
@@ -203,6 +205,8 @@ Transfer refs and staging die with context/generation/revision lifecycle. Defini
 ### Agent credential rotation
 
 The logical device ID remains stable. Replacement requires a rotation statement signed by both the currently enrolled device key and the proposed new device key. Rotation invalidates the current capability session and advances generation state before reconnect.
+
+The packaged rotation runbook treats that continuity document as one-shot: stop the Agent, generate the dual-signed replacement offline, let the Hub verify and persist the new verifier, then start the Agent with the new secret. After a fresh authenticated generation succeeds, remove the rotation-file setting; a subsequent Hub restart must succeed from persisted trust without reusing the document. See [`../../packaging/README.md`](../../packaging/README.md).
 
 If the current Agent key is lost rather than available for continuity proof, recovery must be an explicit administrative re-enrollment flow; it must not be represented as ordinary in-band rotation.
 
