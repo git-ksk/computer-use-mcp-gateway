@@ -275,10 +275,12 @@ impl ProcessExecutor {
         }
 
         let started = Instant::now();
-        // Supervise the whole process tree, not just the direct child. On Unix
-        // the child becomes a process-group leader; on Windows it is assigned
-        // to a Job Object. Cancellation/timeout therefore terminates descendants
-        // spawned by build tools, package managers, shell pipelines, or tests.
+        // Supervise the operation's process-control domain, not just the direct
+        // child. On Unix the child becomes a process-group leader; on Windows
+        // it is assigned to a Job Object. Cancellation/timeout therefore
+        // terminates ordinary descendants that remain in that domain. Deliberate
+        // Unix session/process-group detachment is not an OS-wide containment
+        // guarantee; see the public process-lifetime contract.
         let mut command = CommandWrap::from(command);
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
@@ -638,6 +640,40 @@ mod tests {
         assert!(
             !still_alive,
             "background descendant survived operation completion"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_normal_exit_cleans_nohup_background_descendant_in_process_group() {
+        let root = temp_root("shell-nohup-background");
+        let pid_file = root.join("background.pid");
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+        let shell = ShellRequest {
+            command: format!(
+                "/usr/bin/nohup /bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {}",
+                pid_file.display()
+            ),
+            cwd: root.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        };
+        let output = executor
+            .execute_shell(&shell, &ProcessCancellation::default())
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        let child_pid = fs::read_to_string(&pid_file).unwrap().trim().to_owned();
+        thread::sleep(Duration::from_millis(30));
+        let still_alive = Command::new("/bin/kill")
+            .args(["-0", &child_pid])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(
+            !still_alive,
+            "nohup background descendant survived shell operation completion"
         );
         fs::remove_dir_all(root).unwrap();
     }

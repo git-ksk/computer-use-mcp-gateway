@@ -265,6 +265,9 @@ The current post-M1/P0 version of this acceptance is stronger than the original 
 
 The detailed invariant is recorded in [`V2_P0_EXECUTION_SAFETY.md`](v2/V2_P0_EXECUTION_SAFETY.md). In addition to the repository-wide gate above, the focused deterministic regressions are:
 
+- `v2_m1_process::tests::normal_parent_exit_does_not_leave_background_descendants` proves a structured process cannot leave an ordinary background child in the supervised Unix process group after the parent exits.
+- `v2_m1_process::tests::shell_normal_exit_cleans_nohup_background_descendant_in_process_group` proves the free-form shell path also cleans a `nohup ... &` descendant that remains in that group. Deliberate Unix session/process-group detachment is documented as outside the current containment guarantee and tracked in GitHub issue #96 rather than being misrepresented by this regression.
+
 ```bash
 cargo test v2_execution_safety --lib
 cargo test v2_maintenance::tests --lib

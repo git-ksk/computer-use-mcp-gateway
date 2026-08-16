@@ -4189,7 +4189,7 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().read_only(true)),
         Tool::new(
             TOOL_EXECUTE_PROCESS,
-            "Execute a bounded structured local process. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the process.",
+            "Execute a bounded structured local process. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; this is not a persistent service launcher. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the process.",
             object_schema(
                 vec![
                     ("operation_id", operation_id_schema()),
@@ -4205,7 +4205,7 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_SHELL,
-            "Execute a bounded free-form shell command. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the shell command.",
+            "Execute a bounded free-form shell command. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; nohup/backgrounding is not a supported persistence mechanism. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the shell command.",
             object_schema(
                 vec![
                     ("operation_id", operation_id_schema()),

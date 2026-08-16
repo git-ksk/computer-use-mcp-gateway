@@ -10,6 +10,14 @@ Status: **v0.3 production hardening の active V2 contract**。
 
 accepted operation ID は既存の authoritative replay identity そのものです。同じ ID で別 execution を試すと `operation_replay` として拒否され、status lookup が replay や resume に変換することはありません。
 
+## Process lifetime / background descendant
+
+`execute_process` / `shell` は bounded operation であり、service launcher ではありません。Unix では Agent が launched operation を専用 supervised process group に置き、Windows では Job Object を使います。cancellation、timeout、ordinary parent completion では、その supervision domain に残っている descendant を cleanup します。したがって plain shell background job（`nohup ... &` を含む）を persistence mechanism として使ってはいけません。supervised process group 内に残っている限り、operation が terminal state に到達すると terminate されます。
+
+これは lifecycle contract であり、すでに Dangerous process/shell capability を authorize された caller に対する OS-wide sandbox ではありません。特に現在の Unix process-group primitive は、descendant が意図的に別 session/process group を作る（例: `setsid()` を call する）、external service manager 経由で reparent する、その他 supervised group から離脱する場合まで cleanup を guarantee できません。このような detachment は unsupported であり、persistent work を作る方法として **依存してはいけません**。より強い Unix containment gap は GitHub issue #96 で追跡し、shell text filtering や heuristic PID killing でごまかしません。
+
+long-running build/release は bounded operation 内に残し、caller-retained `operation_id` + `get_operation` で lost northbound result を recovery します。将来 persistent managed job を追加する場合は、この process boundary を弱めるのではなく、explicit start/status/cancel lifecycle と authorization を持つ別 capability/API とします。
+
 ## `get_operation`
 
 `get_operation(operation_id)` は Hub-local の read-only MCP tool です。Agent online を必要とせず、device command を dispatch しません。lookup は original operation を作成した authenticated issuer+subject に scope され、返却前に original `ExecuteProcess` / `Shell` capability の current authorization も再確認します。wrong-owner と unknown ID は同じ not-found behavior にし、operation reference を cross-principal existence oracle にできないようにします。
