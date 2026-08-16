@@ -19,8 +19,8 @@ replace_once(
 
 replace_once(
     "src/v2_online_recovery.rs",
-    "use crate::v2_m0_transport::HubIdentity;\n",
-    "use crate::v2_m0_transport::HubIdentity;\nuse crate::v2_m1_keys::{KeyMaterialError, load_public_trust_bytes};\n",
+    "use crate::v2_m0_execution::IndeterminateResolution;\nuse crate::v2_m0_transport::HubIdentity;\n",
+    "use crate::v2_m0_execution::IndeterminateResolution;\nuse crate::v2_m0_transport::HubIdentity;\nuse crate::v2_m1_keys::{KeyMaterialError, load_public_trust_bytes};\n",
 )
 replace_once(
     "src/v2_online_recovery.rs",
@@ -115,20 +115,6 @@ replace_once(
 fn read_json_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, RecoveryError> {''',
 )
 replace_once(
-    "src/v2_online_recovery.rs",
-    '''    UnsafeTrustAnchor,
-    UnsupportedPlatform,
-    KeyUnavailable,
-    UserPresenceDenied,
-}''',
-    '''    UnsafeTrustAnchor,
-    UnsupportedPlatform,
-    KeyUnavailable,
-    KeyAlreadyExists,
-    AuthorizationAlreadyPending,
-    UserPresenceDenied,
-}''',
-) if "    UnsafeTrustAnchor,\n" in Path("src/v2_online_recovery.rs").read_text() else replace_once(
     "src/v2_online_recovery.rs",
     '''    InvalidPath,
     Io,
