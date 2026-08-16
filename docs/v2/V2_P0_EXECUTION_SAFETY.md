@@ -64,6 +64,7 @@ CUMG does not copy Agent libOS's process/object/resource OS abstraction. It adop
 - **Persist intent before effect.** The Hub records the operation before dispatch and records `Dispatched` before writing the command to the Agent transport.
 - **Consume authority before effect.** The Agent persists consumed one-shot grant state before local execution proceeds.
 - **Persist active local execution before provider/spawn.** Agent operation replay state is checkpointed before the local side-effect boundary.
+- **Publish checkpoints atomically.** A checkpoint becomes discoverable under its sequenced final name only after the complete private pending file has been flushed and fsynced. Publication is no-clobber and followed by a directory fsync; incomplete pending names are never execution authority.
 - **Guard finalization by causal identity.** Operation ID, owner, and generation must all match; only `Completed`, `Failed`, or proven `Cancelled` may finalize normally.
 - **Unknown remains unknown.** Transport/provider ambiguity cannot be rewritten as an ordinary failure merely to make the API convenient.
 - **No duplicate settlement.** A second finalization or stale/late ambiguity signal cannot replace a terminal receipt or clear quarantine.
@@ -222,6 +223,7 @@ There is intentionally no automatic outer Hub v4 -> v5 migration. Loading an inc
 | crash while dispatched | restart snapshot converts dispatch to indeterminate quarantine |
 | crash before/after resolution | restart tests on both sides of explicit resolution; old operation replay remains rejected |
 | durable resolution failure | mixed E2E makes Hub checkpoint directory unwritable; failed resolution rolls back to quarantine |
+| ENOSPC/mid-write checkpoint failure | persistence fault injection fails after pending-file creation; restart must load the last committed final checkpoint, while malformed pending artifacts remain undiscoverable |
 | duplicate/late ambiguity signal | invariant test plus Hub late-ack guard |
 | network partition/result-loss + Hub/Agent restart race | `tests/v2_m1_partition_recovery.rs` aborts Agent after dispatch while the local side effect can still complete, restarts `SingleDeviceHub` from the durable quarantine checkpoint, then reconnects a newer Agent generation |
 | shell + GUI same ownership boundary | `tests/v2_m1_desktop_boundary_e2e.rs` full Hub-Agent TLS/gRPC path |
