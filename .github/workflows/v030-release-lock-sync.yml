@@ -1,0 +1,44 @@
+name: V0.3 Release Lock Sync
+
+on:
+  push:
+    branches: [release/v0.3.0]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-lock:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: release/v0.3.0
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Refresh root package lock metadata
+        run: cargo check --all-targets
+
+      - name: Verify only Cargo.lock changed
+        shell: bash
+        run: |
+          changed="$(git diff --name-only)"
+          if [[ "$changed" != "Cargo.lock" ]]; then
+            echo "unexpected generated changes: $changed" >&2
+            exit 1
+          fi
+
+      - name: Commit synchronized Cargo.lock
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore(release): sync Cargo.lock for 0.3.0"
+          git push origin HEAD:release/v0.3.0
