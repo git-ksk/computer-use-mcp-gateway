@@ -19,5 +19,15 @@ replace_once(
     "use anyhow::{Context, Result, bail};\n",
     "use anyhow::{Context, Result};\n#[cfg(not(target_os = \"macos\"))]\nuse anyhow::bail;\n",
 )
+replace_once(
+    "src/bin/v2_recover.rs",
+    "use std::path::PathBuf;\n",
+    "use std::path::{Path, PathBuf};\n",
+)
+replace_once(
+    "src/bin/v2_recover.rs",
+    "    state_dir: &PathBuf,\n    hub_public_key_file: &PathBuf,\n",
+    "    state_dir: &Path,\n    hub_public_key_file: &Path,\n",
+)
 
 print("online recovery lint fixes applied")
