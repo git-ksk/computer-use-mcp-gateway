@@ -774,6 +774,67 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn environment_policy_rejections_distinguish_denied_malformed_duplicates_and_count() {
+        let root = temp_root("env-rejections");
+        let executor = ProcessExecutor::new(
+            ProcessPolicy::developer_defaults(vec![root.clone()])
+                .unwrap()
+                .with_limits(32, 1, 1024, 5_000)
+                .unwrap(),
+        );
+
+        let mut denied = request("/usr/bin/env", &root, &[]);
+        denied.env = vec![ProcessEnvVar {
+            key: "AWS_SECRET_ACCESS_KEY".into(),
+            value: "secret-value".into(),
+        }];
+        assert!(matches!(
+            executor.execute(&denied, &ProcessCancellation::default()),
+            Err(ProcessError::EnvironmentKeyDenied(key)) if key == "AWS_SECRET_ACCESS_KEY"
+        ));
+
+        let mut malformed = request("/usr/bin/env", &root, &[]);
+        malformed.env = vec![ProcessEnvVar {
+            key: "BAD=KEY".into(),
+            value: "secret-value".into(),
+        }];
+        assert!(matches!(
+            executor.execute(&malformed, &ProcessCancellation::default()),
+            Err(ProcessError::InvalidEnvironment)
+        ));
+
+        let mut duplicate = request("/usr/bin/env", &root, &[]);
+        duplicate.env = vec![
+            ProcessEnvVar {
+                key: "CI".into(),
+                value: "1".into(),
+            },
+            ProcessEnvVar {
+                key: "CI".into(),
+                value: "secret-value".into(),
+            },
+        ];
+        assert!(matches!(
+            executor.execute(&duplicate, &ProcessCancellation::default()),
+            Err(ProcessError::TooManyEnvironmentEntries)
+        ));
+
+        let duplicate_executor = ProcessExecutor::new(
+            ProcessPolicy::developer_defaults(vec![root.clone()])
+                .unwrap()
+                .with_limits(32, 2, 1024, 5_000)
+                .unwrap(),
+        );
+        assert!(matches!(
+            duplicate_executor.execute(&duplicate, &ProcessCancellation::default()),
+            Err(ProcessError::InvalidEnvironment)
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn explicit_environment_is_allowlisted_and_environment_is_cleared() {
         let root = temp_root("env");
         let mut inherited = HashSet::new();

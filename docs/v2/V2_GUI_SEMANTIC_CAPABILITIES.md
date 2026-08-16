@@ -62,6 +62,13 @@ not authorize any device operation.
 Process, shell, and bounded filesystem tools remain separate non-GUI V2 capabilities. Browser and
 file-transfer parity are deliberately excluded from this desktop phase.
 
+Process/shell environment policy failures cross the Hub/Agent boundary only as stable coarse codes.
+`environment_key_denied`, `invalid_environment`, and `too_many_environment_entries` are public
+northbound remediation reasons; environment values are never returned in these errors. Unknown or
+internal executor failures remain coarse and fail closed. This reviewed error-contract addition is why
+the live control schema is version 8; persisted registry and grant-ledger schemas remain independently
+versioned.
+
 ## Capability advertisement and discovery
 
 `CapabilityAdvertisement` is the backend portability boundary. `tools/list` is the exact intersection
@@ -77,7 +84,7 @@ If the Agent is offline, there is no live advertisement and no semantic device t
 reconnect may produce a new device generation or capability revision; stateful requests are fenced
 against both, so a discovery/dispatch race fails closed.
 
-The control schema is version 7 and the capability-advertisement schema remains version 4. Hub and
+The control schema is version 8 and the capability-advertisement schema remains version 4. Hub and
 Agent control-schema mismatches fail closed; capability advertisements with another schema version are
 also rejected rather than interpreted as an ambiguous rolling-upgrade compatibility mode.
 

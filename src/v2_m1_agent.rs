@@ -1139,6 +1139,18 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         | AgentOperationError::Shell(ShellError::Process(ProcessError::Spawn(_))) => {
             DeviceErrorCode::IoFailure
         }
+        AgentOperationError::Process(ProcessError::EnvironmentKeyDenied(_))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::EnvironmentKeyDenied(_))) => {
+            DeviceErrorCode::EnvironmentKeyDenied
+        }
+        AgentOperationError::Process(ProcessError::InvalidEnvironment)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidEnvironment)) => {
+            DeviceErrorCode::InvalidEnvironment
+        }
+        AgentOperationError::Process(ProcessError::TooManyEnvironmentEntries)
+        | AgentOperationError::Shell(ShellError::Process(
+            ProcessError::TooManyEnvironmentEntries,
+        )) => DeviceErrorCode::TooManyEnvironmentEntries,
         AgentOperationError::Filesystem(_)
         | AgentOperationError::Process(_)
         | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
@@ -1635,6 +1647,36 @@ impl std::error::Error for AgentServiceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_policy_errors_map_to_stable_device_codes_without_values() {
+        let denied = AgentOperationError::Process(ProcessError::EnvironmentKeyDenied(
+            "AWS_SECRET_ACCESS_KEY".into(),
+        ));
+        assert_eq!(
+            operation_error_code(&denied),
+            DeviceErrorCode::EnvironmentKeyDenied
+        );
+        assert_eq!(
+            operation_error_code(&AgentOperationError::Process(
+                ProcessError::InvalidEnvironment
+            )),
+            DeviceErrorCode::InvalidEnvironment
+        );
+        assert_eq!(
+            operation_error_code(&AgentOperationError::Shell(ShellError::Process(
+                ProcessError::TooManyEnvironmentEntries,
+            ))),
+            DeviceErrorCode::TooManyEnvironmentEntries
+        );
+        assert_eq!(
+            operation_error_code(&AgentOperationError::Process(ProcessError::InvalidRequest)),
+            DeviceErrorCode::InvalidRequest
+        );
+        let rendered = format!("{denied:?}");
+        assert!(!rendered.contains("AWS_SECRET_ACCESS_KEY"));
+        assert!(!rendered.contains("secret-value"));
+    }
 
     #[test]
     fn config_requires_https_and_bounded_liveness_settings() {
