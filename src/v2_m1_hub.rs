@@ -33,6 +33,7 @@ use crate::v2_m1_persistence::{
     CheckpointStore, HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError,
 };
 use crate::v2_observability::SafeErrorCode;
+use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use crate::v2_usage::UsageLease;
 use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
@@ -129,6 +130,7 @@ struct HubInner {
     material: HubProvisionedMaterial,
     device_id: String,
     checkpoint: CheckpointStore,
+    _state_lock: StateDirectoryLock,
     persistent: Mutex<PersistentHubState>,
     live: Mutex<Option<LiveSession>>,
     draining: AtomicBool,
@@ -260,6 +262,8 @@ impl SingleDeviceHub {
         material: HubProvisionedMaterial,
     ) -> Result<(Self, HubHandle), HubServiceError> {
         config.validate()?;
+        let state_lock = StateDirectoryLock::acquire(&config.state_dir)
+            .map_err(HubServiceError::StateDirectoryLock)?;
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "hub")
             .map_err(HubServiceError::Persistence)?;
 
@@ -320,6 +324,7 @@ impl SingleDeviceHub {
             material,
             device_id,
             checkpoint,
+            _state_lock: state_lock,
             persistent: Mutex::new(PersistentHubState {
                 registry,
                 execution,
@@ -1997,6 +2002,7 @@ impl std::error::Error for HubCommandError {}
 pub enum HubServiceError {
     InvalidConfig(&'static str),
     Persistence(PersistenceError),
+    StateDirectoryLock(StateDirectoryLockError),
     Control(crate::v2_m0::ControlError),
     Execution(crate::v2_m0_execution::ExecutionError),
     Transport(crate::v2_m0_transport::TransportError),
@@ -2057,6 +2063,8 @@ impl SafeErrorCode for HubServiceError {
         match self {
             Self::InvalidConfig(_) => "invalid_config",
             Self::Persistence(error) => error.safe_error_code(),
+            Self::StateDirectoryLock(StateDirectoryLockError::Busy) => "state_directory_busy",
+            Self::StateDirectoryLock(_) => "state_directory_lock_error",
             Self::Control(_) => "control_error",
             Self::Execution(_) => "execution_error",
             Self::Transport(_) => "protocol_error",
@@ -2118,6 +2126,44 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         path
+    }
+
+    #[test]
+    fn startup_exclusively_owns_the_state_directory_until_all_handles_drop() {
+        let state_dir = test_state_dir("state-lock");
+        let config = HubServiceConfig {
+            state_dir: state_dir.clone(),
+            heartbeat_timeout: Duration::from_secs(5),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 1,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        };
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_authority: GrantAuthority::generate(),
+            device_verifier: DeviceIdentity::generate().verifying_key(),
+            device_rotation: None,
+        };
+        let (first, first_handle) = SingleDeviceHub::new(config.clone(), material.clone()).unwrap();
+        assert!(matches!(
+            SingleDeviceHub::new(config.clone(), material.clone()),
+            Err(HubServiceError::StateDirectoryLock(
+                StateDirectoryLockError::Busy
+            ))
+        ));
+        drop(first);
+        assert!(matches!(
+            SingleDeviceHub::new(config.clone(), material.clone()),
+            Err(HubServiceError::StateDirectoryLock(
+                StateDirectoryLockError::Busy
+            ))
+        ));
+        drop(first_handle);
+        let (restarted, restarted_handle) = SingleDeviceHub::new(config, material).unwrap();
+        drop(restarted);
+        drop(restarted_handle);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]
