@@ -2,7 +2,7 @@
 
 use anyhow::{Result, anyhow};
 use computer_use_mcp_gateway::{
-    v2_m0::{DeviceIdentity, GrantAuthority, ProcessRequest, ShellRequest},
+    v2_m0::{DeviceCommand, DeviceIdentity, GrantAuthority, ProcessRequest, ShellRequest},
     v2_m0_transport::HubIdentity,
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig},
@@ -238,5 +238,143 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     let _ = std::fs::remove_dir_all(agent_state);
     let _ = std::fs::remove_dir_all(fs_root);
     let _ = std::fs::remove_dir_all(outside_root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admission() -> Result<()>
+{
+    let cwd = env::current_dir()?;
+    let fs_root = temp_dir("hub-drain-fs");
+    let sentinel = fs_root.join("dispatched.marker");
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_pem = signing_key.serialize_pem();
+
+    let device_identity = DeviceIdentity::generate();
+    let hub_identity = HubIdentity::generate();
+    let grant_authority = GrantAuthority::generate();
+    let hub_state = temp_dir("hub-drain-state");
+    let agent_state = temp_dir("agent-drain-state");
+
+    let (hub, handle) = SingleDeviceHub::new(
+        HubServiceConfig {
+            state_dir: hub_state.clone(),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            max_queued_per_device: 2,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        },
+        HubProvisionedMaterial {
+            hub_identity: hub_identity.clone(),
+            grant_authority: grant_authority.clone(),
+            device_verifier: device_identity.verifying_key(),
+            device_rotation: None,
+        },
+    )
+    .map_err(|error| anyhow!("Hub init failed: {error:?}"))?;
+    let device_id = hub.device_id().to_owned();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
+            .add_service(
+                AgentControlServer::new(hub)
+                    .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+
+    let mut agent = AgentService::new(
+        AgentServiceConfig {
+            hub_endpoint: format!("https://localhost:{}", address.port()),
+            hub_domain: "localhost".into(),
+            device_id,
+            allowed_cwd_roots: vec![cwd, fs_root.clone()],
+            state_dir: agent_state.clone(),
+            heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(50),
+                max_attempts: 5,
+            },
+            cua: None,
+        },
+        AgentProvisionedMaterial {
+            device_identity,
+            trusted_hub: hub_identity.verifier(),
+            grant_verifier: grant_authority.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: cert_der,
+        },
+    )
+    .map_err(|error| anyhow!("Agent init failed: {error:?}"))?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let agent_task = tokio::spawn(async move { agent.run(shutdown_rx).await });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !handle.is_online().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Agent did not connect to drain-test Hub"))?;
+
+    let pending = handle
+        .start_shell(ShellRequest {
+            command: format!(
+                "touch '{}'; sleep 0.3; printf done",
+                sentinel.to_string_lossy()
+            ),
+            cwd: fs_root.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        })
+        .await
+        .map_err(|error| anyhow!("drain fixture shell start failed: {error:?}"))?;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !sentinel.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("fixture never crossed the dispatch boundary"))?;
+
+    assert!(handle.begin_shutdown_drain());
+    assert!(matches!(
+        handle.start_command(DeviceCommand::ScreenGeometry).await,
+        Err(HubCommandError::Busy)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), handle.wait_for_shutdown_drain())
+            .await
+            .is_err(),
+        "drain completed before the already-dispatched command settled"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_for_shutdown_drain())
+        .await
+        .map_err(|_| anyhow!("drain did not finish after command settlement"))?;
+    let completed = pending.wait().await?;
+    assert_eq!(completed.output.exit_code, Some(0));
+    assert_eq!(completed.output.stdout, "done");
+    assert!(handle.desktop_quarantine().await.is_none());
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), agent_task)
+        .await
+        .map_err(|_| anyhow!("Agent did not shut down"))???;
+    server.abort();
+    let _ = std::fs::remove_dir_all(hub_state);
+    let _ = std::fs::remove_dir_all(agent_state);
+    let _ = std::fs::remove_dir_all(fs_root);
     Ok(())
 }

@@ -18,9 +18,9 @@ use computer_use_mcp_gateway::{
     v2_usage::{McpUsageController, UsageManager},
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tracing::info;
+use tracing::{info, warn};
 
 const MAX_OAUTH_SECRET_BYTES: u64 = 16 * 1024;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
@@ -48,6 +48,10 @@ struct Args {
     state_dir: PathBuf,
     #[arg(long, env = "CUMG_V2_HEARTBEAT_TIMEOUT_SECS", default_value_t = 45)]
     heartbeat_timeout_secs: u64,
+    /// Maximum time to keep Agent transport alive after a planned shutdown signal
+    /// so already-admitted operations can reach a durable terminal state.
+    #[arg(long, env = "CUMG_V2_DRAIN_TIMEOUT_SECS", default_value_t = 30)]
+    drain_timeout_secs: u64,
     #[arg(long, env = "CUMG_V2_MAX_QUEUED_PER_DEVICE", default_value_t = 8)]
     max_queued_per_device: usize,
     #[arg(long, env = "CUMG_V2_MAX_AGENT_SESSIONS", default_value_t = 2)]
@@ -128,6 +132,10 @@ async fn main() -> Result<()> {
         "CUMG_V2_HEARTBEAT_TIMEOUT_SECS must be greater than zero"
     );
     ensure!(
+        args.drain_timeout_secs > 0,
+        "CUMG_V2_DRAIN_TIMEOUT_SECS must be greater than zero"
+    );
+    ensure!(
         args.oauth_introspection_timeout_secs > 0,
         "CUMG_V2_OAUTH_INTROSPECTION_TIMEOUT_SECS must be greater than zero"
     );
@@ -135,6 +143,16 @@ async fn main() -> Result<()> {
         args.usage_timeout_secs > 0,
         "CUMG_V2_USAGE_TIMEOUT_SECS must be greater than zero"
     );
+
+    // Install the OS signal handlers before secret/checkpoint loading so an
+    // operator stop immediately after exec cannot hit the process-wide default
+    // SIGTERM action before the Hub reaches its serving loop. The received
+    // signal is retained until the runtime has a Hub handle to drain safely.
+    let (signal_tx, signal_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = signal_tx.send(shutdown_signal().await);
+    });
+    tokio::task::yield_now().await;
 
     let device_rotation = if let Some(path) = &args.device_rotation_file {
         let document = load_trusted_text(path, 64 * 1024)
@@ -170,6 +188,7 @@ async fn main() -> Result<()> {
     )
     .context("failed to initialize V2 Hub state")?;
     let device_id = hub.device_id().to_owned();
+    let shutdown_handle = handle.clone();
     let northbound = build_northbound_runtime(&args, handle, &device_id)?;
 
     info!(
@@ -182,8 +201,36 @@ async fn main() -> Result<()> {
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        let signal = signal_rx.await.unwrap_or("signal_listener_closed");
+        let first = shutdown_handle.begin_shutdown_drain();
+        info!(
+            event = "v2_hub_shutdown_drain_start",
+            signal,
+            drain_timeout_ms = drain_timeout.as_millis() as u64,
+            outcome = if first { "started" } else { "already_draining" },
+            "Hub shutdown signal received; admission closed while admitted operations drain"
+        );
+        match tokio::time::timeout(drain_timeout, shutdown_handle.wait_for_shutdown_drain()).await {
+            Ok(()) => {
+                info!(
+                    event = "v2_hub_shutdown_drain_complete",
+                    signal,
+                    outcome = "drained",
+                    "Hub shutdown drain completed"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    event = "v2_hub_shutdown_drain_timeout",
+                    signal,
+                    drain_timeout_ms = drain_timeout.as_millis() as u64,
+                    outcome = "timeout_fail_closed",
+                    "Hub shutdown drain timed out; remaining dispatched work will retain fail-closed restart semantics"
+                );
+            }
+        }
         let _ = shutdown_tx.send(true);
     });
 
@@ -375,6 +422,32 @@ fn required<'a>(value: &'a Option<String>, name: &'static str) -> Result<&'a str
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("{name} is required when northbound MCP is enabled"))
+}
+
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut hangup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if result.is_err() { "signal_error" } else { "SIGINT" }
+            }
+            _ = terminate.recv() => "SIGTERM",
+            _ = hangup.recv() => "SIGHUP",
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            "signal_error"
+        } else {
+            "CTRL_C"
+        }
+    }
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {

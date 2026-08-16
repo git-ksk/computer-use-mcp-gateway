@@ -18,7 +18,7 @@ Environment=CUMG_V2_HUB_STATE_DIR=%S/cumg-v2-hub
 ExecStart=/usr/local/bin/v2_hub
 Restart=on-failure
 RestartSec=2s
-TimeoutStopSec=20s
+TimeoutStopSec=45s
 StateDirectory=cumg-v2-hub
 StateDirectoryMode=0700
 RuntimeDirectory=cumg-v2-hub

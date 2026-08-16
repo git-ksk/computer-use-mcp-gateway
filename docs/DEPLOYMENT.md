@@ -36,6 +36,14 @@ OIDC/JWT validation does not require a CUMG user database merely to identify the
 
 For a trusted authenticated proxy/tunnel, constrain the Hub listener to loopback. An explicitly single-principal deployment may set `CUMG_V2_TRUSTED_PROXY_ISSUER` and `CUMG_V2_TRUSTED_PROXY_SUBJECT`; these are mutually exclusive with the OAuth introspection settings. The adapter derives identity only from those operator-controlled values and strips common Authorization/Cloudflare identity headers before MCP dispatch. If the deployment needs per-user CUMG policy, use a signed-token/OIDC-style adapter that conveys a tamper-resistant authenticated identity. Never trust a caller-provided `X-User`/similar header merely because the listener is called a proxy mode.
 
+### Planned Hub shutdown and restart
+
+`v2_hub` treats `SIGINT`, `SIGTERM`, and `SIGHUP` as planned shutdown signals. On the first signal it closes the operation-admission gate, keeps the Agent transport alive, and waits up to `CUMG_V2_DRAIN_TIMEOUT_SECS` (default `30`) for work that was already admitted to reach a durable terminal or indeterminate state. Requests that have not crossed the dispatch boundary are rejected/cancelled rather than starting new side effects during the drain.
+
+A successful drain then shuts down the gRPC and northbound HTTP servers. If the bounded drain timeout expires, shutdown continues with the existing fail-closed restart behavior: any work that had crossed the dispatch boundary without terminal proof remains eligible for `Indeterminate` + quarantine on restart. The timeout never authorizes replay or clears ambiguity.
+
+Configure the service manager's stop/kill timeout to be **longer** than `CUMG_V2_DRAIN_TIMEOUT_SECS`; otherwise the supervisor can kill the Hub before its own bounded drain completes. The packaged systemd unit uses `TimeoutStopSec=45s` for the default 30-second drain. Apply the same ordering to operator-maintained launchd or other service-manager definitions.
+
 ### Linux Hub
 
 Use `packaging/systemd/cumg-v2-hub.service` plus `packaging/systemd/hub.env.example` as templates. The unit uses systemd encrypted credentials for the Hub and grant-signing application keys and a systemd credential path for the ACME-managed TLS private key. Provision long-lived application keys into the encrypted credential store outside the repository, for example:
