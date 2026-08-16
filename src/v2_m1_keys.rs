@@ -54,7 +54,7 @@ pub fn load_agent_material(
         grant_verifier: load_verifying_key(grant_public_key_file)?,
         additional_grant_verifiers: Vec::new(),
         hub_rotation: None,
-        tls_root_der: read_public_file(tls_root_der_file, MAX_TLS_ROOT_BYTES)?,
+        tls_root_der: load_tls_root_der(tls_root_der_file)?,
     })
 }
 
@@ -103,6 +103,17 @@ pub fn load_trusted_text(path: &Path, max_bytes: u64) -> Result<String, KeyMater
     read_public_text(path, max_bytes)
 }
 
+pub fn load_tls_root_der(path: &Path) -> Result<Vec<u8>, KeyMaterialError> {
+    read_public_file(path, MAX_TLS_ROOT_BYTES)
+}
+
+pub fn write_new_tls_root_der(path: &Path, value: &[u8]) -> Result<(), KeyMaterialError> {
+    if value.is_empty() || u64::try_from(value.len()).unwrap_or(u64::MAX) > MAX_TLS_ROOT_BYTES {
+        return Err(KeyMaterialError::FileTooLarge);
+    }
+    write_new_public_bytes(path, value)
+}
+
 pub fn write_new_verifying_key(
     path: &Path,
     verifier: &VerifyingKey,
@@ -143,6 +154,21 @@ fn write_new_secret(path: &Path, secret: &[u8; 32]) -> Result<(), KeyMaterialErr
     file.flush().map_err(KeyMaterialError::Io)?;
     file.sync_all().map_err(KeyMaterialError::Io)?;
     validate_regular_file(path, FileSensitivity::Secret)?;
+    sync_parent(path)?;
+    Ok(())
+}
+
+fn write_new_public_bytes(path: &Path, value: &[u8]) -> Result<(), KeyMaterialError> {
+    ensure_parent_is_safe(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o644);
+    let mut file = options.open(path).map_err(KeyMaterialError::Io)?;
+    file.write_all(value).map_err(KeyMaterialError::Io)?;
+    file.flush().map_err(KeyMaterialError::Io)?;
+    file.sync_all().map_err(KeyMaterialError::Io)?;
+    validate_regular_file(path, FileSensitivity::PublicTrustAnchor)?;
     sync_parent(path)?;
     Ok(())
 }

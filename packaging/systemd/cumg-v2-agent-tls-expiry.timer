@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily computer-use-mcp-gateway V2 Agent TLS trust-root expiry check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+Unit=cumg-v2-agent-tls-expiry.service
+
+[Install]
+WantedBy=timers.target

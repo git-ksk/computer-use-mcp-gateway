@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.git-ksk.cumg-v2-tls-expiry</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BINARY@</string>
+    <string>--certificate</string>
+    <string>@HOME@/Library/Application Support/cumg-v2-agent/trust/tls-root.der</string>
+    <string>--format</string>
+    <string>der</string>
+    <string>--warn-before-secs</string>
+    <string>2592000</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>86400</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/cumg-v2-tls-expiry.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/cumg-v2-tls-expiry.err.log</string>
+</dict>
+</plist>

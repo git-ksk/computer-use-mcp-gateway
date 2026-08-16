@@ -8,6 +8,30 @@ Use an existing ACME client (Certbot, Caddy, lego, etc.) as the certificate auth
 
 The systemd Hub unit uses `LoadCredentialEncrypted=` for the long-lived Hub Ed25519 and grant-signing keys and `LoadCredential=` for the ACME-managed TLS private key. Provision the application keys into the systemd encrypted credential store with `systemd-creds encrypt --name=hub-secret ... /etc/credstore.encrypted/hub-secret` and the equivalent `grant-secret` command; keep the rotation/recovery copy in the operator's normal secret manager rather than in the repository. The service receives only `%d/...` credential file paths. Private key bytes are never placed in environment variables, checkpoints, logs, or OTLP attributes.
 
+`v2_tls_check` provides the common certificate/trust-anchor expiry probe. It accepts PEM server certificates and DER trust roots, rejects symlinks or group/world-writable trust material, prints `CUMG_TLS_EXPIRY_OK` while healthy, and exits non-zero with `CUMG_TLS_EXPIRY_ALERT` when the certificate is inside the warning window, expired/not-yet-valid, or malformed. The packaged Linux Hub timer checks `/etc/cumg-v2/tls/server.pem` daily with a 30-day warning window. The Linux Agent user timer and macOS LaunchAgent template perform the same daily check on the configured pinned `tls-root.der`. A non-zero oneshot/LaunchAgent result is intentionally an operational alert signal; wire failed-unit/log monitoring to the deployment's pager or notification system instead of treating it as an automatic trust change.
+
+### Initial Agent enrollment
+
+Enrollment remains an **offline operator-controlled trust action**, not a public enrollment endpoint. On a protected administrative host, place the already-reviewed Hub application public key, grant-verifier public key, and currently-valid TLS root in a private staging parent, then run:
+
+```bash
+v2_keyctl prepare-agent-enrollment \
+  --output-dir /secure/cumg-enroll/desktop-01 \
+  --hub-public /secure/cumg-trust/hub.pub \
+  --grant-public /secure/cumg-trust/grant.pub \
+  --tls-root-der /secure/cumg-trust/tls-root.der
+```
+
+The output directory must not already exist and its parent must not be a symlink or group/world-writable. The command validates the source trust material, generates a new device secret with create-new semantics, and writes a non-secret `enrollment.json`. Transfer only `agent/` to the target desktop over the operator's authenticated provisioning channel. Install `hub/device.pub` as that Hub instance's `CUMG_V2_DEVICE_PUBLIC_KEY_FILE`, and configure the Agent with the `device_id` printed by the command / recorded in the manifest. Private device bytes are never printed.
+
+This flow is for a **fresh fixed-device enrollment**. Do not replace the provisioned public key underneath an existing checkpoint for a different device: Hub startup intentionally detects that as a trust mismatch. Rotate the same logical device through the dual-signed device-rotation procedure below; provision unrelated additional devices as separate fixed entries/instances rather than turning this workflow into mutable runtime discovery.
+
+### TLS private-key/root compromise
+
+Ordinary ACME renewal is not the compromise procedure. If a private pinned hierarchy's server private key may have escaped, the old certificate remains cryptographically valid to an Agent that still trusts the old root because CUMG does not add CRL/OCSP processing. The independent Hub Ed25519 handshake still prevents the TLS key alone from becoming CUMG command authority, but TLS confidentiality must be considered lost. Use a maintenance cutover: stop affected Agents, create a replacement private root and server certificate/key with the deployment PKI, validate the new chain/key, stage the new regular-file server identity on the Hub and the new DER root on every Agent through the authenticated provisioning channel, restart the Hub, then restart Agents and verify a fresh authenticated generation. Do **not** rotate Hub/device/grant application identities merely because the TLS hierarchy changed.
+
+The regression `v2_m1_tls::tests::private_root_compromise_cutover_requires_agent_trust_reprovisioning` proves the boundary: the old root accepts the old chain, rejects the replacement chain, and the replacement root accepts it.
+
 ## Application-key lifecycle
 
 `v2_keyctl` creates secrets with create-new semantics and never prints private key material.

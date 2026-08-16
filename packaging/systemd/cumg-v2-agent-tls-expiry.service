@@ -1,0 +1,12 @@
+[Unit]
+Description=computer-use-mcp-gateway V2 Agent TLS trust-root expiry check
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/cumg-v2-agent/agent.env
+ExecStart=/usr/local/bin/v2_tls_check --certificate ${CUMG_V2_TLS_ROOT_DER_FILE} --format der --warn-before-secs 2592000
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX

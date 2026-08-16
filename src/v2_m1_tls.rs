@@ -131,7 +131,10 @@ impl std::error::Error for TlsTransportError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedKey, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, generate_simple_self_signed,
+    };
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -140,6 +143,47 @@ mod tests {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         (cert.der().to_vec(), signing_key.serialize_der())
+    }
+
+    fn ca_signed_server_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut leaf_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        (
+            ca_cert.der().to_vec(),
+            leaf_cert.der().to_vec(),
+            leaf_key.serialize_der(),
+        )
+    }
+
+    fn tls_handshake_succeeds(root: Vec<u8>, leaf: Vec<u8>, key: Vec<u8>) -> bool {
+        let server_config = server_config_from_der(vec![leaf], key).unwrap();
+        let client_config = client_config_with_pinned_root(root).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accept_hub_tls(stream, server_config).is_ok()
+        });
+        let client_result = TcpStream::connect(address)
+            .ok()
+            .and_then(|stream| connect_agent_tls(stream, "localhost", client_config).ok())
+            .is_some();
+        let _ = server.join().unwrap();
+        client_result
     }
 
     #[test]
@@ -176,6 +220,20 @@ mod tests {
             Some(rustls::ProtocolVersion::TLSv1_3)
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn private_root_compromise_cutover_requires_agent_trust_reprovisioning() {
+        let (old_root, old_leaf, old_key) = ca_signed_server_material();
+        let (new_root, new_leaf, new_key) = ca_signed_server_material();
+        assert_ne!(old_root, new_root);
+        assert!(tls_handshake_succeeds(old_root.clone(), old_leaf, old_key));
+        assert!(!tls_handshake_succeeds(
+            old_root,
+            new_leaf.clone(),
+            new_key.clone()
+        ));
+        assert!(tls_handshake_succeeds(new_root, new_leaf, new_key));
     }
 
     #[test]
