@@ -2,16 +2,16 @@
 use anyhow::bail;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(target_os = "macos")]
+use computer_use_mcp_gateway::v2_online_recovery::{
+    RecoveryAuditAssessment, new_authorization, store_authorization,
+};
 use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_verifying_key,
     v2_online_recovery::{
         DEFAULT_MACOS_RECOVERY_KEY_LABEL, load_challenge, verify_recovery_challenge,
     },
-};
-#[cfg(target_os = "macos")]
-use computer_use_mcp_gateway::v2_online_recovery::{
-    RecoveryAuditAssessment, new_authorization, store_authorization,
 };
 #[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
