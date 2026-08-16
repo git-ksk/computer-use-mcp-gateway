@@ -1,0 +1,29 @@
+name: V0.3 Systemd Verify Temp
+
+on:
+  pull_request:
+    paths:
+      - "packaging/systemd/**"
+      - ".github/workflows/v03-systemd-verify-temp.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Show systemd version
+        run: systemd-analyze --version
+      - name: Verify packaged systemd units
+        run: |
+          sudo systemd-analyze verify \
+            packaging/systemd/cumg-v2-agent.service \
+            packaging/systemd/cumg-v2-agent-tls-expiry.service \
+            packaging/systemd/cumg-v2-agent-tls-expiry.timer \
+            packaging/systemd/cumg-v2-grant-signer.service \
+            packaging/systemd/cumg-v2-hub.service \
+            packaging/systemd/cumg-v2-tls-expiry.service \
+            packaging/systemd/cumg-v2-tls-expiry.timer \
+            packaging/systemd/cumg-v2-usage-sidecar.service
