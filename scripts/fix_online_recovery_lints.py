@@ -26,8 +26,8 @@ replace_once(
 )
 replace_once(
     "src/bin/v2_recover.rs",
-    "    state_dir: &PathBuf,\n    hub_public_key_file: &PathBuf,\n",
-    "    state_dir: &Path,\n    hub_public_key_file: &Path,\n",
+    "fn verified_challenge(state_dir: &PathBuf, hub_public_key_file: &PathBuf) -> Result<computer_use_mcp_gateway::v2_online_recovery::RecoveryChallenge> {\n",
+    "fn verified_challenge(state_dir: &Path, hub_public_key_file: &Path) -> Result<computer_use_mcp_gateway::v2_online_recovery::RecoveryChallenge> {\n",
 )
 
 print("online recovery lint fixes applied")
