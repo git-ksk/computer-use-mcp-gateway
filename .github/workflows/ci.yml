@@ -40,6 +40,13 @@ jobs:
       - name: Temporary v0.3 systemd semantic verification
         run: |
           systemd-analyze --version
+          # systemd-analyze also validates absolute ExecStart paths. Provide
+          # harmless runner-local executable fixtures so this temporary gate
+          # measures unit semantics rather than release installation layout.
+          for binary in v2_agent v2_hub v2_grant_signer v2_tls_check; do
+            sudo install -m 0755 /bin/true "/usr/local/bin/$binary"
+          done
+          sudo ln -sf "$(command -v node)" /usr/bin/node
           sudo systemd-analyze verify \
             packaging/systemd/cumg-v2-agent.service \
             packaging/systemd/cumg-v2-agent-tls-expiry.service \
