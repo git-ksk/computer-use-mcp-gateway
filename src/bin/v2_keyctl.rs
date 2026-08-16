@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use computer_use_mcp_gateway::{
+    v2_enrollment::prepare_agent_enrollment,
     v2_m0_trust::{build_device_key_rotation, build_hub_key_rotation},
     v2_m1_keys::{
         create_new_device_identity, create_new_grant_authority, create_new_hub_identity,
@@ -19,6 +20,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    PrepareAgentEnrollment {
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        hub_public: PathBuf,
+        #[arg(long)]
+        grant_public: PathBuf,
+        #[arg(long)]
+        tls_root_der: PathBuf,
+    },
     GenerateDevice {
         secret: PathBuf,
         public: PathBuf,
@@ -61,6 +72,24 @@ enum Command {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::PrepareAgentEnrollment {
+            output_dir,
+            hub_public,
+            grant_public,
+            tls_root_der,
+        } => {
+            let manifest =
+                prepare_agent_enrollment(&output_dir, &hub_public, &grant_public, &tls_root_der)
+                    .context("prepare Agent enrollment bundle")?;
+            println!("device_id={}", manifest.device_id);
+            println!("agent_bundle={}", output_dir.join("agent").display());
+            println!(
+                "hub_device_public_key={}",
+                output_dir
+                    .join(&manifest.hub_device_public_key_file)
+                    .display()
+            );
+        }
         Command::GenerateDevice { secret, public } => {
             let identity = create_new_device_identity(&secret).context("create device secret")?;
             write_new_verifying_key(&public, &identity.verifying_key())

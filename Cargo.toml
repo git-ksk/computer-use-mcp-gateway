@@ -33,6 +33,7 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+x509-parser = "0.18.1"
 tonic = { version = "0.14.6", features = ["transport", "tls-ring"] }
 prost = "0.14"
 tonic-prost = "0.14.6"

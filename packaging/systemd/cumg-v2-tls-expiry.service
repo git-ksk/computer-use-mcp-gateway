@@ -1,0 +1,24 @@
+[Unit]
+Description=computer-use-mcp-gateway V2 TLS expiry check
+
+[Service]
+Type=oneshot
+User=cumg-v2
+Group=cumg-v2
+ExecStart=/usr/local/bin/v2_tls_check --certificate /etc/cumg-v2/tls/server.pem --format pem --warn-before-secs 2592000
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=

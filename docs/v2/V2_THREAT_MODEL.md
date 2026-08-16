@@ -202,6 +202,12 @@ Transfer refs and staging die with context/generation/revision lifecycle. Defini
 
 ## Key rotation
 
+### Enrollment and TLS trust-anchor lifecycle
+
+Fresh fixed-device enrollment is deliberately offline. `v2_keyctl prepare-agent-enrollment` generates a create-new device secret plus the exact Hub/grant/TLS trust inputs under a private staging directory and emits only a non-secret manifest/device ID. The Agent portion must cross an operator-authenticated provisioning channel; the Hub receives only the device public key. This does not create mutable runtime discovery or a network enrollment oracle.
+
+TLS trust is also independent of the Hub Ed25519 application identity. Possession of a compromised TLS server key does not by itself satisfy the signed Hub handshake, but it invalidates the confidentiality assumption. In the private pinned-root model CUMG intentionally does not implement CRL/OCSP. Therefore an old compromised leaf is removed from the Agent trust boundary by an explicit root/server-identity maintenance cutover and Agent root reprovisioning. The old root rejects the replacement chain and the replacement root accepts it in the dedicated TLS regression. Expiry checks emit a stable operational alert and never modify trust automatically.
+
 ### Agent credential rotation
 
 The logical device ID remains stable. Replacement requires a rotation statement signed by both the currently enrolled device key and the proposed new device key. Rotation invalidates the current capability session and advances generation state before reconnect.

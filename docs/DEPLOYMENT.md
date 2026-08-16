@@ -70,6 +70,27 @@ cargo run --locked --bin v2_maint -- resolve \
 
 The Hub and maintenance CLI take the same exclusive state-directory lock. `v2_maint` therefore fails closed while any `SingleDeviceHub` instance still owns that state directory. A successful resolution restores the checkpoint through the normal schema-validation path, invokes the existing authoritative `resolve_indeterminate` transition, and appends a new checkpoint through the same create-new/fsync persistence path. The resulting `ResolutionRecord` remains durable even after terminal operation tombstones are pruned on later generations. Restart the Hub only after the CLI exits successfully.
 
+### Initial Agent enrollment
+
+The production runtime does not expose unauthenticated or mutable network enrollment. Prepare each fresh fixed Agent offline with `v2_keyctl prepare-agent-enrollment` from a protected directory:
+
+```bash
+v2_keyctl prepare-agent-enrollment \
+  --output-dir /secure/cumg-enroll/desktop-01 \
+  --hub-public /secure/cumg-trust/hub.pub \
+  --grant-public /secure/cumg-trust/grant.pub \
+  --tls-root-der /secure/cumg-trust/tls-root.der
+```
+
+The command refuses an existing output directory, requires a non-group/world-writable parent on Unix, validates that the TLS root is a currently-valid X.509 DER certificate, and creates:
+
+- `agent/secrets/device.key` — new private device identity;
+- `agent/trust/hub.pub`, `agent/trust/grant.pub`, `agent/trust/tls-root.der` — normalized Agent trust inputs;
+- `hub/device.pub` — the public key to register as `CUMG_V2_DEVICE_PUBLIC_KEY_FILE`;
+- `enrollment.json` — non-secret relative paths plus the stable `device_id`.
+
+Transfer `agent/` over an authenticated operator channel and preserve the device-secret permissions. Register `hub/device.pub` on the intended Hub and copy the manifest `device_id` into the Agent configuration before starting either side. The CLI never prints private key bytes. An existing Hub checkpoint for a different device intentionally fails trust matching; this command is not a hot-swap/discovery mechanism. Use signed device-key rotation for the same logical device or a separate fixed Hub/device entry for another device.
+
 ### Linux Hub
 
 Use `packaging/systemd/cumg-v2-hub.service` plus `packaging/systemd/hub.env.example` as templates. The unit uses systemd encrypted credentials for the Hub and grant-signing application keys and a systemd credential path for the ACME-managed TLS private key. Provision long-lived application keys into the encrypted credential store outside the repository, for example:
@@ -100,13 +121,31 @@ sudo systemctl try-restart cumg-v2-hub.service
 
 The hook validates that the certificate and private key parse and match before same-directory atomic replacement. The deployed key is mode 0600. Application Hub/device/grant identity rotation is independent; follow `packaging/README.md` and use `v2_keyctl` for continuity documents.
 
+Install `v2_tls_check` beside the Hub and enable `packaging/systemd/cumg-v2-tls-expiry.service` plus `.timer`. The timer runs daily and uses a 30-day warning window. Healthy checks emit `CUMG_TLS_EXPIRY_OK`; an expiring, expired, not-yet-valid, malformed, unsafe-path, or writable certificate emits `CUMG_TLS_EXPIRY_ALERT` and fails the oneshot service. Alert on either the failed unit or that marker in the journal. The checker does not renew or replace trust automatically.
+
+#### Private pinned-root compromise
+
+A suspected TLS server-private-key leak is not an ordinary renewal event. Without CRL/OCSP enforcement, an Agent that retains the old private root can still validate the old leaf until its validity ends. The independent Ed25519 Hub authentication means possession of the TLS key alone is **not** CUMG command authority, but the TLS confidentiality boundary is compromised. For the private pinned-root model, perform a maintenance cutover:
+
+1. Stop affected Agents so no operation straddles the trust change.
+2. Create a replacement private root and server certificate/key using the deployment's protected PKI process; validate the chain and key before staging.
+3. Install the replacement regular-file server certificate/key on the Hub and transfer the replacement DER root to every Agent over the authenticated provisioning channel. Keep the existing Hub/device/grant Ed25519 identities unchanged.
+4. Start the Hub, then start the Agents. Verify a fresh authenticated Agent generation and normal command execution.
+5. Remove/archive the compromised TLS material according to the operator's incident procedure and confirm `v2_tls_check` is healthy on both server certificate and Agent root.
+
+The TLS regression `v2_m1_tls::tests::private_root_compromise_cutover_requires_agent_trust_reprovisioning` proves that an Agent pinned to the old root rejects the replacement chain until its trust root is explicitly reprovisioned, and accepts the replacement afterward. CUMG intentionally does not invent CRL/OCSP or silently broaden trust to make this cutover seamless.
+
 ### Linux Agent
 
 Install `packaging/systemd/cumg-v2-agent.service` as a **user service** and customize `packaging/systemd/agent.env.example` outside the repository. The template intentionally avoids a filesystem namespace that would silently change the explicitly configured process/filesystem capability semantics. Store the device secret as a regular 0600 file and keep Hub/grant/TLS trust anchors non-group/other-writable.
 
+Install `packaging/systemd/cumg-v2-agent-tls-expiry.service` and `.timer` in the same user systemd scope. It reads `CUMG_V2_TLS_ROOT_DER_FILE` from the Agent environment file and checks that pinned root daily. Treat a failed oneshot / `CUMG_TLS_EXPIRY_ALERT` journal entry as operator-action-required; it is never permission to replace the trust anchor automatically.
+
 ### macOS Agent
 
 Customize `packaging/launchd/com.github.git-ksk.cumg-v2-agent.plist`, replacing `@BINARY@` and `@HOME@`, then install it as a user LaunchAgent. Cua-backed GUI automation must run in the logged-in user session so Accessibility/Screen Recording TCC attribution remains explicit. Secret/trust files live outside the repository under the user's Application Support tree with restrictive permissions. Keep `CUMG_V2_CUA_BACKEND_VERSION` pinned to the exact reviewed Cua version; a concrete value is checked against the MCP handshake on initial connection and reconnect.
+
+Install `packaging/launchd/com.github.git-ksk.cumg-v2-tls-expiry.plist` alongside it after replacing `@BINARY@` with `v2_tls_check` and `@HOME@`. It checks the DER trust root at load and every 24 hours, writing the same `CUMG_TLS_EXPIRY_OK` / `CUMG_TLS_EXPIRY_ALERT` markers to the configured log files. Route the alert log/non-zero job status into the operator monitoring used on that Mac.
 
 For an existing V1 production endpoint moving to V2, follow the guarded [`V2 production cutover runbook`](v2/V2_PRODUCTION_CUTOVER.md). Do not treat a successful local V2 start as permission to stop V1.
 

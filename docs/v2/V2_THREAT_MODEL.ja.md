@@ -204,6 +204,12 @@ transfer ref と staging は context/generation/revision lifecycle とともに�
 
 ## Key rotation
 
+### Enrollment と TLS trust-anchor lifecycle
+
+fresh fixed-device enrollment は意図的に offline です。`v2_keyctl prepare-agent-enrollment` は private staging directory 配下に create-new device secret と exact Hub/grant/TLS trust input を生成し、non-secret manifest / device ID だけを出力します。Agent 側 artifact は operator-authenticated provisioning channel で転送し、Hub には device public key だけを登録します。mutable runtime discovery や network enrollment oracle は追加しません。
+
+TLS trust は Hub Ed25519 application identity とも独立です。compromised TLS server key の所持だけでは signed Hub handshake を満たせませんが、confidentiality assumption は無効になります。private pinned-root model では CUMG は意図的に CRL/OCSP を実装しません。そのため old compromised leaf は explicit な root/server-identity maintenance cutover と Agent root reprovisioning によって trust boundary から外します。dedicated TLS regression は old root が replacement chain を拒否し、replacement root が受理することを確認します。expiry check は stable operational alert を出しますが trust を自動変更しません。
+
 ### Agent credential rotation
 
 logical device ID は stable のままです。replacement には currently enrolled device key と proposed new device key の両方で sign された rotation statement が必要です。rotation は current capability session を無効化し、reconnect より前に generation state を進めます。
