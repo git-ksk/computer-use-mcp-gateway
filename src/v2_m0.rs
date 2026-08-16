@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 7;
+pub const CONTROL_SCHEMA_VERSION: u16 = 8;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
 /// First dedicated persisted registry schema. The numeric value intentionally
 /// matches the last historical control schema that was written into this field,
@@ -1462,6 +1462,9 @@ pub enum DeviceErrorCode {
     IoFailure,
     InternalFailure,
     BackendOutcomeIndeterminate,
+    EnvironmentKeyDenied,
+    InvalidEnvironment,
+    TooManyEnvironmentEntries,
     BrowserRouteUnavailable,
     BrowserRequiresSetup,
     BrowserBindingAmbiguous,
@@ -1490,6 +1493,9 @@ impl DeviceErrorCode {
             Self::IoFailure => "io_failure",
             Self::InternalFailure => "internal_failure",
             Self::BackendOutcomeIndeterminate => "backend_outcome_indeterminate",
+            Self::EnvironmentKeyDenied => "environment_key_denied",
+            Self::InvalidEnvironment => "invalid_environment",
+            Self::TooManyEnvironmentEntries => "too_many_environment_entries",
             Self::BrowserRouteUnavailable => "browser_route_unavailable",
             Self::BrowserRequiresSetup => "browser_requires_setup",
             Self::BrowserBindingAmbiguous => "browser_binding_ambiguous",

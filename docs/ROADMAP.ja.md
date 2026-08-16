@@ -41,7 +41,7 @@ completion provable?
 現在の priority:
 
 - authoritative operation / quarantine / resolution / no-auto-replay state machine を維持する;
-- reviewed change が必要になるまで control schema v7 と capability-advertisement schema v4 の behavior を明示した状態で維持する;
+- reviewed change が必要になるまで control schema v8 と capability-advertisement schema v4 の behavior を明示した状態で維持する;
 - Cua Driver upgrade を pinned / repeatable evidence を伴う reviewed compatibility change として扱う;
 - security、dependency、documentation、packaging、CI、conformance、soak、resource-regression quality を維持する;
 - 残っている V1 compatibility / quality issue を調査し、close または明示的に document する:

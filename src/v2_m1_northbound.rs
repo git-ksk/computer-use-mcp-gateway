@@ -6665,6 +6665,45 @@ mod tests {
     }
 
     #[test]
+    fn environment_policy_failures_are_stable_northbound_codes() {
+        for (code, expected) in [
+            (
+                crate::v2_m0::DeviceErrorCode::EnvironmentKeyDenied,
+                "environment_key_denied",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::InvalidEnvironment,
+                "invalid_environment",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::TooManyEnvironmentEntries,
+                "too_many_environment_entries",
+            ),
+        ] {
+            let response =
+                execution_error_response(hub_error_to_mcp(HubCommandError::Remote(code)));
+            let serialized = match response {
+                CallToolResponse::Complete(result) => {
+                    assert_eq!(result.is_error, Some(true));
+                    serde_json::to_string(&result).unwrap()
+                }
+                other => panic!("unexpected tool response: {other:?}"),
+            };
+            assert!(serialized.contains(expected));
+            assert!(serialized.contains("retry_safe"));
+            assert!(!serialized.contains("AWS_SECRET_ACCESS_KEY"));
+            assert!(!serialized.contains("secret-value"));
+        }
+
+        let generic = serde_json::to_string(&hub_error_to_mcp(HubCommandError::Remote(
+            crate::v2_m0::DeviceErrorCode::InternalFailure,
+        )))
+        .unwrap();
+        assert!(generic.contains("internal_failure"));
+        assert!(!generic.contains("process_"));
+    }
+
+    #[test]
     fn browser_refusal_mcp_error_carries_only_closed_safe_code() {
         let error = hub_error_to_mcp(HubCommandError::Remote(
             crate::v2_m0::DeviceErrorCode::BrowserInputTrustUnavailable,
