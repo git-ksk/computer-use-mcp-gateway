@@ -473,6 +473,23 @@ impl AuthoritativeOperationController {
         self.operations.get(operation_id).map(|record| record.state)
     }
 
+    /// Returns true while this device still has work that has not reached a
+    /// durable terminal or indeterminate state. Shutdown draining uses this to
+    /// keep the Agent transport alive until already-admitted work either settles
+    /// or the caller's bounded drain timeout expires.
+    pub fn has_unsettled_work(&self, device_id: &str) -> bool {
+        self.operations.values().any(|record| {
+            record.operation.device_id == device_id
+                && matches!(
+                    record.state,
+                    HubOperationState::Queued
+                        | HubOperationState::ActiveNotDispatched
+                        | HubOperationState::Dispatched
+                        | HubOperationState::CancelRequested
+                )
+        })
+    }
+
     pub fn owner(&self, operation_id: &str) -> Option<&OperationOwner> {
         self.operations
             .get(operation_id)

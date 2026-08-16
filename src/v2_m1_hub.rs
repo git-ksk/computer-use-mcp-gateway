@@ -37,7 +37,10 @@ use rand::{RngCore, rngs::OsRng};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
@@ -111,6 +114,7 @@ struct HubInner {
     checkpoint: CheckpointStore,
     persistent: Mutex<PersistentHubState>,
     live: Mutex<Option<LiveSession>>,
+    draining: AtomicBool,
     session_slots: Arc<Semaphore>,
     session_rate: crate::v2_limits::SlidingWindowRateLimit,
 }
@@ -303,6 +307,7 @@ impl SingleDeviceHub {
                 execution,
             }),
             live: Mutex::new(None),
+            draining: AtomicBool::new(false),
             session_slots,
             session_rate,
         });
@@ -490,6 +495,20 @@ impl SingleDeviceHub {
                     };
                     match request {
                         HubRequest::Execute { operation_id, owner, command, usage, reply } => {
+                            if self.inner.draining.load(Ordering::Acquire) {
+                                tracing::info!(
+                                    event = "v2_operation_rejected",
+                                    operation_id = %operation_id,
+                                    device_id = %self.inner.device_id,
+                                    generation,
+                                    capability = crate::v2_observability::capability_name(command.capability()),
+                                    outcome = "draining",
+                                    error_code = "hub_draining",
+                                    "operation rejected because Hub shutdown drain has started"
+                                );
+                                let _ = reply.send(Err(HubCommandError::Busy));
+                                continue;
+                            }
                             if pending.contains_key(&operation_id) {
                                 let _ = reply.send(Err(HubCommandError::OperationReplay));
                                 continue;
@@ -770,6 +789,12 @@ impl SingleDeviceHub {
                 operation.usage.clone(),
             )
         };
+        if self.inner.draining.load(Ordering::Acquire) {
+            return self
+                .cancel_for_shutdown_drain(operation_id, &owner, generation, pending)
+                .await;
+        }
+
         let command = CommandEnvelope {
             schema_version: CONTROL_SCHEMA_VERSION,
             device_id: self.inner.device_id.clone(),
@@ -833,6 +858,15 @@ impl SingleDeviceHub {
             return Ok(DispatchOutcome::Rejected(next));
         }
 
+        // A shutdown signal may arrive while usage accounting is awaiting its
+        // pre-dispatch liability transition. Re-check the drain gate before the
+        // durable side-effect boundary so such work remains provably unexecuted.
+        if self.inner.draining.load(Ordering::Acquire) {
+            return self
+                .cancel_for_shutdown_drain(operation_id, &owner, generation, pending)
+                .await;
+        }
+
         // Persist `Dispatched` before putting bytes on the network. A crash after
         // this point can conservatively restore as indeterminate, but can never
         // restore a command that may have executed as runnable.
@@ -865,6 +899,47 @@ impl SingleDeviceHub {
             "operation dispatched to Agent"
         );
         Ok(DispatchOutcome::Sent)
+    }
+
+    async fn cancel_for_shutdown_drain(
+        &self,
+        operation_id: &str,
+        owner: &OperationOwner,
+        generation: u64,
+        pending: &mut HashMap<String, PendingOperation>,
+    ) -> Result<DispatchOutcome, HubServiceError> {
+        let next = {
+            let mut persistent = self.inner.persistent.lock().await;
+            let decision = persistent.execution.request_cancel(
+                operation_id,
+                owner,
+                generation,
+                unix_time_ms()?,
+            )?;
+            persist_locked(&self.inner, &persistent)?;
+            match decision {
+                CancellationDecision::CancelledBeforeDispatch { next } => next,
+                CancellationDecision::AlreadyTerminal(_) => CompletionDecision::Idle,
+                CancellationDecision::SendCancellation(_) => {
+                    return Err(HubServiceError::StateBusy);
+                }
+            }
+        };
+        if let Some(operation) = pending.remove(operation_id) {
+            let _ = operation
+                .reply
+                .send(Err(HubCommandError::CancelledBeforeDispatch));
+        }
+        tracing::info!(
+            event = "v2_operation_rejected",
+            operation_id,
+            device_id = %self.inner.device_id,
+            generation,
+            outcome = "draining",
+            error_code = "hub_draining",
+            "undispatched operation cancelled during Hub shutdown drain"
+        );
+        Ok(DispatchOutcome::Rejected(next))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1334,6 +1409,35 @@ impl HubHandle {
         &self.inner.device_id
     }
 
+    /// Close the Hub admission gate before a planned shutdown. Existing work
+    /// that has already crossed the dispatch boundary remains connected so the
+    /// Agent can provide terminal evidence during the bounded drain window.
+    pub fn begin_shutdown_drain(&self) -> bool {
+        !self.inner.draining.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn is_shutdown_draining(&self) -> bool {
+        self.inner.draining.load(Ordering::Acquire)
+    }
+
+    /// Wait until all already-admitted work reaches a durable terminal or
+    /// indeterminate state. The binary wraps this in an operator-configured
+    /// timeout; timeout never changes the fail-closed restart semantics.
+    pub async fn wait_for_shutdown_drain(&self) {
+        loop {
+            let unsettled = {
+                let persistent = self.inner.persistent.lock().await;
+                persistent
+                    .execution
+                    .has_unsettled_work(&self.inner.device_id)
+            };
+            if !unsettled {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     pub async fn is_online(&self) -> bool {
         self.inner.live.lock().await.is_some()
     }
@@ -1403,6 +1507,9 @@ impl HubHandle {
         command: DeviceCommand,
         usage: Option<UsageLease>,
     ) -> Result<HubPendingCommand, HubCommandError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(HubCommandError::Busy);
+        }
         if operation_id.is_empty()
             || usage
                 .as_ref()
@@ -1999,6 +2106,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restarted.device_id(), stable_device_id);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_closes_new_admission_gate() {
+        let state_dir = test_state_dir("shutdown-drain-admission");
+        let device = DeviceIdentity::generate();
+        let (_hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_authority: GrantAuthority::generate(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+
+        assert!(handle.begin_shutdown_drain());
+        assert!(handle.is_shutdown_draining());
+        assert!(!handle.begin_shutdown_drain());
+        assert!(matches!(
+            handle.start_command(DeviceCommand::ScreenGeometry).await,
+            Err(HubCommandError::Busy)
+        ));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_waits_for_already_admitted_work_to_settle() {
+        let state_dir = test_state_dir("shutdown-drain-wait");
+        let device = DeviceIdentity::generate();
+        let (_hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_authority: GrantAuthority::generate(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let owner = OperationOwner::local_hub();
+        let operation_id = "op-shutdown-drain".to_owned();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    crate::v2_m0::DeviceCapability::ScreenGeometry,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+
+        handle.begin_shutdown_drain();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), handle.wait_for_shutdown_drain())
+                .await
+                .is_err(),
+            "drain must wait while admitted work is non-terminal"
+        );
+
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            let decision = persistent
+                .execution
+                .request_cancel(&operation_id, &owner, 1, 2)
+                .unwrap();
+            assert!(matches!(
+                decision,
+                CancellationDecision::CancelledBeforeDispatch { .. }
+            ));
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+        tokio::time::timeout(Duration::from_millis(200), handle.wait_for_shutdown_drain())
+            .await
+            .expect("drain should finish after durable settlement");
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
