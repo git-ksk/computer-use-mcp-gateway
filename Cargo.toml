@@ -17,6 +17,7 @@ async-trait = "0.1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 fs2 = "0.4"
 rand = "0.8"
+ring = "0.17"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 rmcp = { version = "=3.1.2", features = [
@@ -44,6 +45,10 @@ opentelemetry = { version = "0.32.0", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace", "metrics"] }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.1", features = ["OSX_10_15"] }
+security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
