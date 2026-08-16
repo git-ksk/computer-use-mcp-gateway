@@ -126,3 +126,9 @@ recovery private key紛失、Agent接続不能、Secure Enclave利用不能、on
 7. 承認後のみHubがdurable resolveして署名ACKを返す
 8. 新しいoperationが成功する
 9. 旧operationは一度もreplayされない
+
+## Protocol互換性とchallenge更新
+
+Online recoveryではHub-Agent message variantを追加し、`HUB_AGENT_SCHEMA_VERSION` を1から2へ進めます。schema validationはfail-closedのままなので、このreleaseを有効にする際はHubとAgentを協調して更新し、mixed-version rolling compatibilityには依存しません。V1 gatewayの動作は変わりません。
+
+Recovery challengeは120秒で期限切れになります。desktopがquarantineのままなら、通常のauthenticated Agent heartbeatを契機にHubがpending challengeを再確認し、期限切れ後はfresh nonceを持つchallengeを再発行します。承認時間切れだけを理由にHub/Agentを再起動する必要はありません。fresh challenge受信時は以前のlocal authorization handoffを無効化します。

@@ -173,3 +173,9 @@ Before enabling the macOS online path in a release, a trusted physical Mac must 
 7. approving the exact decision causes a durable Hub resolution and signed acknowledgement;
 8. a new operation succeeds afterward;
 9. the old ambiguous operation is never replayed.
+
+## Protocol compatibility and challenge renewal
+
+Online recovery adds Hub-Agent message variants and advances `HUB_AGENT_SCHEMA_VERSION` from 1 to 2. Schema validation remains fail-closed, so a deployment enabling this release must upgrade Hub and Agent as a coordinated pair rather than relying on mixed-version rolling compatibility. V1 gateway behavior is unchanged.
+
+A recovery challenge expires after 120 seconds. While the desktop remains quarantined, normal authenticated Agent heartbeats cause the Hub to re-check the pending challenge and issue a fresh nonce-bound challenge after expiry. An operator therefore does not need to restart the Hub or Agent merely because a local approval window elapsed. Receiving a fresh challenge invalidates the prior local authorization handoff.

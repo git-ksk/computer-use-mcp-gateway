@@ -145,7 +145,7 @@ struct LiveSession {
 #[derive(Default)]
 struct RecoveryRuntimeState {
     pending: Option<RecoveryChallenge>,
-    last_resolved: Option<RecoveryResolved>,
+    last_resolved: Option<(RecoveryAuthorization, RecoveryResolved)>,
 }
 
 struct HubInner {
@@ -877,6 +877,12 @@ impl SingleDeviceHub {
                             )?;
                             send_hub(&outbound, HubToAgent::HeartbeatAck(ack)).await?;
                             heartbeat_deadline.as_mut().reset(tokio::time::Instant::now() + self.inner.config.heartbeat_timeout);
+                            self.maybe_send_recovery_challenge(
+                                &outbound,
+                                generation,
+                                session_clock,
+                            )
+                            .await?;
                         }
                         AgentToHub::Result(result) => {
                             self.handle_result(
@@ -1628,16 +1634,12 @@ impl SingleDeviceHub {
             let duplicate = runtime
                 .last_resolved
                 .as_ref()
-                .filter(|resolved| resolved.request_id == authorization.request_id)
+                .filter(|(accepted, _)| accepted.request_id == authorization.request_id)
                 .cloned();
             (runtime.pending.clone(), duplicate)
         };
-        if let Some(ack) = duplicate_ack {
-            if ack.device_id != authorization.device_id
-                || ack.operation_id != authorization.operation_id
-                || ack.current_generation != authorization.current_generation
-                || ack.decision != authorization.decision
-            {
+        if let Some((accepted, ack)) = duplicate_ack {
+            if accepted != authorization {
                 return Err(HubServiceError::OnlineRecovery(
                     RecoveryError::ChallengeMismatch,
                 ));
@@ -1700,7 +1702,7 @@ impl SingleDeviceHub {
         {
             let mut runtime = self.inner.recovery_runtime.lock().await;
             runtime.pending = None;
-            runtime.last_resolved = Some(ack.clone());
+            runtime.last_resolved = Some((authorization.clone(), ack.clone()));
         }
         crate::v2_observability::quarantine_resolved();
         tracing::info!(

@@ -189,6 +189,17 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     ));
     assert_eq!(handle.resolution_records().await.len(), 1);
 
+    let mut changed_evidence = authorization.clone();
+    changed_evidence.evidence = "different local evidence".into();
+    assert!(matches!(
+        hub.handle_recovery_authorization(changed_evidence, &outbound, current_generation, &clock,)
+            .await,
+        Err(HubServiceError::OnlineRecovery(
+            RecoveryError::ChallengeMismatch
+        ))
+    ));
+    assert_eq!(handle.resolution_records().await.len(), 1);
+
     // The durable resolved operation remains a replay tombstone after restart.
     drop(handle);
     drop(hub);
