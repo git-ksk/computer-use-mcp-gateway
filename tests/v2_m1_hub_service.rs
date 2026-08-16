@@ -2,13 +2,17 @@
 
 use anyhow::{Result, anyhow};
 use computer_use_mcp_gateway::{
+    v2_execution_safety::{OperationOwner, RecoverableOperationResult},
     v2_grant_signer::{
         GRANT_SIGNER_POLICY_SCHEMA_VERSION, GrantSigningPolicyDocument, HubGrantSigner,
     },
     v2_m0::{
-        DeviceCommand, DeviceIdentity, DeviceRegistry, GrantAuthority, ProcessRequest, ShellRequest,
+        DeviceCapability, DeviceCommand, DeviceIdentity, DeviceRegistry, GrantAuthority,
+        ProcessRequest, ShellRequest,
     },
+    v2_m0_execution::HubOperationState,
     v2_m0_transport::HubIdentity,
+    v2_m0_trust::ClientAuthorizationPolicy,
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig},
     v2_m1_grpc::{
@@ -19,6 +23,7 @@ use computer_use_mcp_gateway::{
         AgentProvisionedMaterial, create_new_grant_authority, load_verifying_key,
         write_new_trusted_text, write_new_verifying_key,
     },
+    v2_m1_northbound::{TrustedProxyConfig, V2NorthboundMcp, build_trusted_proxy_router},
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use std::{env, process::Stdio, time::Duration};
@@ -32,6 +37,18 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 // deadline. Keep the fixture comfortably outside that sub-second timing regime.
 const E2E_AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn delay_marked_mcp_response(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let delay = request.headers().contains_key("x-cumg-test-delay-response");
+    let response = next.run(request).await;
+    if delay {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    response
+}
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -140,6 +157,29 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     .await
     .map_err(|_| anyhow!("Agent did not connect to deployable Hub"))?;
 
+    let proxy_config = TrustedProxyConfig::new(
+        "https://hub.example/mcp",
+        "https://access.example",
+        "recovery-user",
+    )
+    .unwrap();
+    let recovery_owner = OperationOwner::from_principal(proxy_config.principal());
+    let mut northbound_policy = ClientAuthorizationPolicy::default();
+    northbound_policy.allow_device_capability(
+        proxy_config.principal(),
+        handle.device_id(),
+        DeviceCapability::Shell,
+    );
+    let northbound_router = build_trusted_proxy_router(
+        V2NorthboundMcp::new(handle.clone(), northbound_policy),
+        proxy_config,
+    )
+    .layer(axum::middleware::from_fn(delay_marked_mcp_response));
+    let northbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let northbound_address = northbound_listener.local_addr()?;
+    let northbound_server =
+        tokio::spawn(async move { axum::serve(northbound_listener, northbound_router).await });
+
     let git = handle
         .execute_process(ProcessRequest {
             program: "git".into(),
@@ -240,10 +280,174 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
         .map_err(|_| anyhow!("cancelled shell did not complete"))??;
     assert!(cancelled_shell.output.cancelled && !cancelled_shell.output.timed_out);
 
+    // Deliberately hold the HTTP response after the MCP handler has already
+    // finalized the shell operation. Dropping the client request then models a
+    // northbound response loss without cancelling or replaying the device work.
+    let recovery_operation_id = "op_11111111111111111111111111111111";
+    let client = reqwest::Client::new();
+    let first_request = client
+        .post(format!("http://{northbound_address}/mcp"))
+        .header("Origin", "https://hub.example")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "shell")
+        .header("Accept", "application/json, text/event-stream")
+        .header("x-cumg-test-delay-response", "1")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "name": "shell",
+                "arguments": {
+                    "operation_id": recovery_operation_id,
+                    "command": "sleep 0.05; printf 'RECOVERED\n' # RAW_COMMAND_MUST_NOT_PERSIST",
+                    "cwd": cwd.to_string_lossy(),
+                    "env": {"CI": "RECOVERY_ENV_SECRET"},
+                    "timeout_ms": 5000
+                }
+            }
+        }))
+        .send();
+    let first_request = tokio::spawn(first_request);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    if first_request.is_finished() {
+        let response = first_request
+            .await
+            .map_err(|error| anyhow!("northbound shell request task failed: {error}"))??;
+        let status = response.status();
+        let body = response.text().await?;
+        return Err(anyhow!(
+            "northbound shell request finished before delayed response: {status} {body}"
+        ));
+    }
+
+    let durable = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match handle
+                .operation_recovery_as(recovery_owner.clone(), recovery_operation_id)
+                .await
+            {
+                Ok(recovery) if recovery.state == HubOperationState::Completed => break recovery,
+                Ok(_) | Err(HubCommandError::UnknownOperation) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected recovery lookup error: {error:?}"),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("shell did not reach durable completion before response loss"))?;
+    let Some(RecoverableOperationResult::Shell { output }) = durable.result.as_ref() else {
+        return Err(anyhow!("durable recovery did not retain shell output"));
+    };
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, "RECOVERED\n");
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout_truncated && !output.stderr_truncated);
+    assert!(!output.timed_out && !output.cancelled);
+    assert!(!first_request.is_finished());
+    first_request.abort();
+
+    // The durable checkpoint contains bounded caller-visible output, but never
+    // the raw shell command or explicit environment value.
+    for entry in std::fs::read_dir(&hub_state)? {
+        let path = entry?.path();
+        if path.is_file() {
+            let bytes = std::fs::read(path)?;
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains("RAW_COMMAND_MUST_NOT_PERSIST"));
+            assert!(!text.contains("RECOVERY_ENV_SECRET"));
+        }
+    }
+
+    // Replay of the known operation reference stays prohibited even though the
+    // original MCP response was lost.
+    let replay_marker = fs_root.join("must-not-replay.marker");
+    let replay = client
+        .post(format!("http://{northbound_address}/mcp"))
+        .header("Origin", "https://hub.example")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "shell")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "name": "shell",
+                "arguments": {
+                    "operation_id": recovery_operation_id,
+                    "command": format!("printf replay > {}", replay_marker.display()),
+                    "cwd": cwd.to_string_lossy(),
+                    "timeout_ms": 5000
+                }
+            }
+        }))
+        .send()
+        .await?;
+    let replay_body = replay.text().await?;
+    assert!(replay_body.contains("operation_replay"), "{replay_body}");
+    assert!(!replay_marker.exists());
+
     let _ = shutdown_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), agent_task)
         .await
         .map_err(|_| anyhow!("Agent did not shut down"))???;
+
+    let recovered = client
+        .post(format!("http://{northbound_address}/mcp"))
+        .header("Origin", "https://hub.example")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "get_operation")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 103,
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "name": "get_operation",
+                "arguments": {"operation_id": recovery_operation_id}
+            }
+        }))
+        .send()
+        .await?;
+    let recovered_body = recovered.text().await?;
+    assert!(
+        recovered_body.contains("operation_status"),
+        "{recovered_body}"
+    );
+    assert!(recovered_body.contains("succeeded"), "{recovered_body}");
+    assert!(recovered_body.contains("RECOVERED"), "{recovered_body}");
+    assert!(
+        recovered_body.contains(recovery_operation_id),
+        "{recovered_body}"
+    );
+
+    // A different authenticated principal cannot use the operation reference as
+    // an existence oracle. The Hub ledger returns the same not-found shape.
+    assert_eq!(
+        handle
+            .operation_recovery_as(OperationOwner::local_hub(), recovery_operation_id)
+            .await,
+        Err(HubCommandError::UnknownOperation)
+    );
+
+    northbound_server.abort();
     server.abort();
     let _ = std::fs::remove_dir_all(hub_state);
     let _ = std::fs::remove_dir_all(agent_state);

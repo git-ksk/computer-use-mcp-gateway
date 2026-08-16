@@ -7,7 +7,8 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionEvidence, ExecutionReceipt,
-    IndeterminateReason, OperationOwner, ResolutionRecord,
+    IndeterminateReason, OperationOwner, OperationRecoverySnapshot, RecoverableOperationResult,
+    ResolutionRecord,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -1273,6 +1274,7 @@ impl SingleDeviceHub {
                 ExecutionEvidence::VerifiedAgentResult,
             ),
         };
+        let recoverable_result = recoverable_result_for(capability, &device_result);
         let (next, receipt) = {
             let mut persistent = self.inner.persistent.lock().await;
             let settled = persistent.execution.finalize(
@@ -1283,6 +1285,14 @@ impl SingleDeviceHub {
                 evidence,
                 unix_time_ms()?,
             )?;
+            if let Some(result) = recoverable_result {
+                persistent.execution.attach_recoverable_result(
+                    &operation_id,
+                    &owner,
+                    generation,
+                    result,
+                )?;
+            }
             persist_locked(&self.inner, &persistent)?;
             settled
         };
@@ -1928,6 +1938,18 @@ impl HubHandle {
         persistent.execution.receipt(operation_id).cloned()
     }
 
+    pub async fn operation_recovery_as(
+        &self,
+        owner: OperationOwner,
+        operation_id: &str,
+    ) -> Result<OperationRecoverySnapshot, HubCommandError> {
+        let persistent = self.inner.persistent.lock().await;
+        persistent
+            .execution
+            .recovery_for_owner(operation_id, &owner)
+            .map_err(command_error_from_execution)
+    }
+
     pub async fn resolution_records(&self) -> Vec<ResolutionRecord> {
         let persistent = self.inner.persistent.lock().await;
         persistent.execution.resolutions().to_vec()
@@ -2082,6 +2104,29 @@ async fn send_hub(
         ))
         .await
         .map_err(|_| HubServiceError::OutboundClosed)
+}
+
+fn recoverable_result_for(
+    capability: DeviceCapability,
+    result: &DeviceResult,
+) -> Option<RecoverableOperationResult> {
+    match (capability, result) {
+        (DeviceCapability::ExecuteProcess, DeviceResult::Process { output }) => {
+            Some(RecoverableOperationResult::Process {
+                output: output.clone(),
+            })
+        }
+        (DeviceCapability::Shell, DeviceResult::Shell { output }) => {
+            Some(RecoverableOperationResult::Shell {
+                output: output.clone(),
+            })
+        }
+        (
+            DeviceCapability::ExecuteProcess | DeviceCapability::Shell,
+            DeviceResult::Error { code },
+        ) => Some(RecoverableOperationResult::Error { code: *code }),
+        _ => None,
+    }
 }
 
 fn command_error_from_execution(error: crate::v2_m0_execution::ExecutionError) -> HubCommandError {

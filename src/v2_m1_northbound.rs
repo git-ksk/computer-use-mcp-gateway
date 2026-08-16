@@ -27,7 +27,7 @@ use crate::{
         BrowserBackendClickTarget, BrowserBackendCommand, BrowserBackendResult,
         BrowserBackendSemanticRef, BrowserStagedUploadFile,
     },
-    v2_execution_safety::OperationOwner,
+    v2_execution_safety::{OperationOwner, RecoverableOperationResult},
     v2_interaction_context::{
         DEFAULT_MAX_REFS_PER_CONTEXT, InteractionContextBinding, InteractionContextId,
         InteractionContextLimits, InteractionContextManager, InteractionScope,
@@ -41,6 +41,7 @@ use crate::{
         PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
         ScrollTarget, ShellRequest, UiElementAction, UiPredicate, UiRect, UiRole,
     },
+    v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
     v2_usage::{UsageError, UsageLease, UsageManager, UsageOperation, UsageSettlement},
@@ -99,6 +100,7 @@ const TOOL_DRAG: &str = "drag";
 const TOOL_TYPE_TEXT: &str = "type_text";
 const TOOL_EXECUTE_PROCESS: &str = "execute_process";
 const TOOL_SHELL: &str = "shell";
+const TOOL_GET_OPERATION: &str = "get_operation";
 const TOOL_READ_FILE: &str = "read_file";
 const TOOL_LIST_DIRECTORY: &str = "list_directory";
 const TOOL_LIST_WINDOWS: &str = "list_windows";
@@ -2500,6 +2502,7 @@ impl V2NorthboundMcp {
             .into_iter()
             .filter(|tool| match tool.name.as_ref() {
                 TOOL_OPEN_INTERACTION_CONTEXT | TOOL_CLOSE_INTERACTION_CONTEXT => context_access,
+                TOOL_GET_OPERATION => self.recovery_access_allowed(principal),
                 name => tool_capability(name).is_some_and(|capability| {
                     self.authorizer
                         .authorize_device_capability(principal, self.hub.device_id(), capability)
@@ -2508,6 +2511,56 @@ impl V2NorthboundMcp {
                 }),
             })
             .collect()
+    }
+
+    fn recovery_access_allowed(&self, principal: &AuthenticatedClientPrincipal) -> bool {
+        [DeviceCapability::ExecuteProcess, DeviceCapability::Shell]
+            .into_iter()
+            .any(|capability| {
+                self.authorizer
+                    .authorize_device_capability(principal, self.hub.device_id(), capability)
+                    .is_ok()
+            })
+    }
+
+    async fn get_operation(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        operation_id: &str,
+    ) -> Result<CallToolResponse, McpError> {
+        validate_operation_id(operation_id)?;
+        let recovery = self
+            .hub
+            .operation_recovery_as(OperationOwner::from_principal(principal), operation_id)
+            .await
+            .map_err(operation_lookup_error_to_mcp)?;
+        if !matches!(
+            recovery.capability,
+            DeviceCapability::ExecuteProcess | DeviceCapability::Shell
+        ) {
+            return Err(operation_not_found_error());
+        }
+        self.authorize(principal, recovery.capability)?;
+
+        let state = public_recovery_state(recovery.state, recovery.result.as_ref());
+        let mut payload = json!({
+            "type": "operation_status",
+            "operation_id": recovery.operation.operation_id,
+            "state": state,
+            "capability": crate::v2_observability::capability_name(recovery.capability),
+            "original_retry_safe": false,
+        });
+        if let Some(reason) = recovery.indeterminate_reason {
+            payload["indeterminate_reason"] =
+                json!(crate::v2_observability::indeterminate_reason_name(reason));
+        }
+        if let Some(receipt) = recovery.receipt {
+            payload["finalized_at_ms"] = json!(receipt.finalized_at_ms);
+        }
+        if let Some(result) = recovery.result {
+            payload["result"] = recoverable_result_json(result);
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]).into())
     }
 
     async fn execute_command(
@@ -2675,9 +2728,19 @@ impl ServerHandler for V2NorthboundMcp {
                 .close_interaction_context(&auth.principal, &args.context_id)
                 .await;
         }
+        if request.name.as_ref() == TOOL_GET_OPERATION {
+            let args: OperationIdArgs = parse_arguments(request.arguments)?;
+            return self
+                .get_operation(&auth.principal, &args.operation_id)
+                .await;
+        }
         let capability = tool_capability(request.name.as_ref())
             .ok_or_else(|| McpError::invalid_params("Unknown V2 Hub tool", None))?;
-        let operation_id = self.hub.new_operation_id();
+        let recoverable_process_call =
+            matches!(request.name.as_ref(), TOOL_EXECUTE_PROCESS | TOOL_SHELL);
+        let operation_id =
+            requested_operation_id(request.name.as_ref(), request.arguments.as_ref())?
+                .unwrap_or_else(|| self.hub.new_operation_id());
         // OAuth has already reduced the bearer token to this verified issuer +
         // subject. Usage admission receives only that principal identity and the
         // tool name; request arguments and bearer material never cross the seam.
@@ -2883,6 +2946,9 @@ impl ServerHandler for V2NorthboundMcp {
             }
             TOOL_EXECUTE_PROCESS => {
                 let args: ExecuteProcessArgs = parse_arguments(request.arguments)?;
+                if let Some(operation_id) = args.operation_id.as_deref() {
+                    validate_operation_id(operation_id)?;
+                }
                 Ok(DeviceCommand::ExecuteProcess {
                     request: ProcessRequest {
                         program: args.program,
@@ -2895,6 +2961,9 @@ impl ServerHandler for V2NorthboundMcp {
             }
             TOOL_SHELL => {
                 let args: ShellArgs = parse_arguments(request.arguments)?;
+                if let Some(operation_id) = args.operation_id.as_deref() {
+                    validate_operation_id(operation_id)?;
+                }
                 Ok(DeviceCommand::Shell {
                     request: ShellRequest {
                         command: args.command,
@@ -3207,12 +3276,20 @@ impl ServerHandler for V2NorthboundMcp {
             _ => None,
         };
 
+        let public_operation_id = recoverable_process_call.then(|| operation_id.clone());
         let mut result = match self
             .execute_command(&auth.principal, operation_id, command, usage, &context)
             .await
         {
             Ok(result) => result,
-            Err(error) => return Ok(execution_error_response(error)),
+            Err(error) => {
+                let error = if let Some(operation_id) = public_operation_id.as_deref() {
+                    mcp_error_with_operation_id(error, operation_id)
+                } else {
+                    error
+                };
+                return Ok(execution_error_response(error));
+            }
         };
         if publicize_snapshot {
             let binding = interaction_binding.as_ref().ok_or_else(|| {
@@ -3339,10 +3416,15 @@ impl ServerHandler for V2NorthboundMcp {
                 Ok(CallToolResult::success(content).into())
             }
             other => {
-                let value = serde_json::to_string(&other).map_err(|_| {
+                let mut value = serde_json::to_value(&other).map_err(|_| {
                     McpError::internal_error("Failed to serialize device result", None)
                 })?;
-                Ok(CallToolResult::success(vec![ContentBlock::text(value)]).into())
+                if let Some(operation_id) = public_operation_id
+                    && let Value::Object(object) = &mut value
+                {
+                    object.insert("operation_id".into(), json!(operation_id));
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(value.to_string())]).into())
             }
         }
     }
@@ -3546,6 +3628,103 @@ fn publicize_browser_semantic_ref(
         frame: backend.frame,
         visibility: backend.visibility,
     }
+}
+
+fn requested_operation_id(
+    tool_name: &str,
+    arguments: Option<&JsonObject>,
+) -> Result<Option<String>, McpError> {
+    if !matches!(tool_name, TOOL_EXECUTE_PROCESS | TOOL_SHELL) {
+        return Ok(None);
+    }
+    let Some(value) = arguments.and_then(|arguments| arguments.get("operation_id")) else {
+        return Ok(None);
+    };
+    let operation_id = value
+        .as_str()
+        .ok_or_else(|| McpError::invalid_params("operation_id must be a string", None))?;
+    validate_operation_id(operation_id)?;
+    Ok(Some(operation_id.to_owned()))
+}
+
+fn validate_operation_id(operation_id: &str) -> Result<(), McpError> {
+    let suffix = operation_id
+        .strip_prefix("op_")
+        .ok_or_else(|| McpError::invalid_params("Invalid operation_id", None))?;
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(McpError::invalid_params("Invalid operation_id", None));
+    }
+    Ok(())
+}
+
+fn operation_not_found_error() -> McpError {
+    McpError::invalid_request(
+        "Operation is unknown or not available to this principal",
+        Some(json!({"code": "operation_not_found"})),
+    )
+}
+
+fn operation_lookup_error_to_mcp(error: HubCommandError) -> McpError {
+    match error {
+        HubCommandError::UnknownOperation | HubCommandError::Rejected => {
+            operation_not_found_error()
+        }
+        other => hub_error_to_mcp(other),
+    }
+}
+
+fn public_recovery_state(
+    state: HubOperationState,
+    result: Option<&RecoverableOperationResult>,
+) -> &'static str {
+    match state {
+        HubOperationState::Queued
+        | HubOperationState::ActiveNotDispatched
+        | HubOperationState::Dispatched
+        | HubOperationState::CancelRequested => "running",
+        HubOperationState::Completed => "succeeded",
+        HubOperationState::Cancelled => "cancelled",
+        HubOperationState::Indeterminate => "indeterminate",
+        HubOperationState::Failed
+            if matches!(
+                result,
+                Some(RecoverableOperationResult::Process { output }
+                    | RecoverableOperationResult::Shell { output }) if output.timed_out
+            ) =>
+        {
+            "timed_out"
+        }
+        HubOperationState::Failed => "failed",
+    }
+}
+
+fn recoverable_result_json(result: RecoverableOperationResult) -> Value {
+    match result {
+        RecoverableOperationResult::Process { output } => {
+            json!({"type": "process", "output": output})
+        }
+        RecoverableOperationResult::Shell { output } => {
+            json!({"type": "shell", "output": output})
+        }
+        RecoverableOperationResult::Error { code } => {
+            json!({"type": "error", "code": code.safe_code()})
+        }
+    }
+}
+
+fn mcp_error_with_operation_id(mut error: McpError, operation_id: &str) -> McpError {
+    let mut data = error.data.take().unwrap_or_else(|| json!({}));
+    if let Value::Object(object) = &mut data {
+        object.insert("operation_id".into(), json!(operation_id));
+    } else {
+        data = json!({"operation_id": operation_id});
+    }
+    error.data = Some(data);
+    error
 }
 
 fn usage_settlement_for_error(
@@ -4003,10 +4182,17 @@ fn all_tools() -> Vec<Tool> {
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
+            TOOL_GET_OPERATION,
+            "Read the durable status/result of a prior process or shell operation without replaying it.",
+            object_schema(vec![("operation_id", operation_id_schema())], &["operation_id"]),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
             TOOL_EXECUTE_PROCESS,
-            "Execute a structured local process on the enrolled device.",
+            "Execute a bounded structured local process. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the process.",
             object_schema(
                 vec![
+                    ("operation_id", operation_id_schema()),
                     ("program", string_schema()),
                     ("args", array_schema(string_schema())),
                     ("cwd", string_schema()),
@@ -4019,9 +4205,10 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_SHELL,
-            "Execute a free-form shell command on the enrolled device.",
+            "Execute a bounded free-form shell command. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the shell command.",
             object_schema(
                 vec![
+                    ("operation_id", operation_id_schema()),
                     ("command", string_schema()),
                     ("cwd", string_schema()),
                     ("env", string_map_schema()),
@@ -4306,6 +4493,13 @@ fn object_schema(properties: Vec<(&str, Value)>, required: &[&str]) -> Arc<JsonO
     Arc::new(schema)
 }
 
+fn operation_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^op_[0-9a-f]{32}$"
+    })
+}
+
 fn interaction_context_id_schema() -> Value {
     json!({
         "type": "string",
@@ -4577,6 +4771,12 @@ fn ui_predicate_schema() -> Value {
             }
         ]
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationIdArgs {
+    operation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5381,6 +5581,8 @@ fn default_scroll_amount() -> u8 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecuteProcessArgs {
+    #[serde(default)]
+    operation_id: Option<String>,
     program: String,
     #[serde(default)]
     args: Vec<String>,
@@ -5393,6 +5595,8 @@ struct ExecuteProcessArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShellArgs {
+    #[serde(default)]
+    operation_id: Option<String>,
     command: String,
     cwd: String,
     #[serde(default)]
@@ -6156,6 +6360,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_recovery_remains_discoverable_while_agent_is_offline() {
+        use crate::{
+            v2_m0::{DeviceIdentity, GrantAuthority},
+            v2_m0_transport::HubIdentity,
+            v2_m1_hub::{HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
+        };
+
+        let device_identity = DeviceIdentity::generate();
+        let state_dir = temp_state_dir("offline-recovery-discovery");
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(1),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device_identity.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let principal =
+            AuthenticatedClientPrincipal::new("https://auth.example", "recovery-user").unwrap();
+        let mut policy = ClientAuthorizationPolicy::default();
+        policy.allow_device_capability(&principal, handle.device_id(), DeviceCapability::Shell);
+        let service = V2NorthboundMcp::new(handle, policy);
+
+        let names: Vec<_> = service
+            .tools_for(&principal)
+            .await
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(names, vec![TOOL_GET_OPERATION.to_owned()]);
+
+        drop(service);
+        drop(hub);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
     async fn authenticated_2026_mcp_request_exposes_no_device_tools_without_live_agent() {
         use crate::{
             v2_m0::{DeviceIdentity, GrantAuthority},
@@ -6520,13 +6772,15 @@ mod tests {
         }
         assert_eq!(tool_capability(TOOL_OPEN_INTERACTION_CONTEXT), None);
         assert_eq!(tool_capability(TOOL_CLOSE_INTERACTION_CONTEXT), None);
+        assert_eq!(tool_capability(TOOL_GET_OPERATION), None);
         let names: Vec<_> = all_tools()
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names.len(), mappings.len() + 2);
+        assert_eq!(names.len(), mappings.len() + 3);
         assert!(names.contains(&TOOL_OPEN_INTERACTION_CONTEXT.to_owned()));
         assert!(names.contains(&TOOL_CLOSE_INTERACTION_CONTEXT.to_owned()));
+        assert!(names.contains(&TOOL_GET_OPERATION.to_owned()));
         assert!(
             !names
                 .iter()
@@ -6629,6 +6883,72 @@ mod tests {
         assert_eq!(
             request.validate(),
             Err(BrowserContractError::InvalidDialogAction)
+        );
+    }
+
+    #[test]
+    fn operation_recovery_ids_and_states_are_closed_and_stable() {
+        let valid = "op_0123456789abcdef0123456789abcdef";
+        assert!(validate_operation_id(valid).is_ok());
+        for invalid in [
+            "",
+            "op_0123",
+            "OP_0123456789abcdef0123456789abcdef",
+            "op_0123456789ABCDEF0123456789abcdef",
+            "op_0123456789abcdef0123456789abcdeg",
+        ] {
+            assert!(
+                validate_operation_id(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+
+        let output = crate::v2_m0::ProcessOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: true,
+            cancelled: false,
+            duration_ms: 10,
+        };
+        assert_eq!(
+            public_recovery_state(
+                HubOperationState::Failed,
+                Some(&RecoverableOperationResult::Shell { output })
+            ),
+            "timed_out"
+        );
+        assert_eq!(
+            public_recovery_state(HubOperationState::Indeterminate, None),
+            "indeterminate"
+        );
+        assert_eq!(
+            public_recovery_state(HubOperationState::Dispatched, None),
+            "running"
+        );
+    }
+
+    #[test]
+    fn process_and_shell_tool_schemas_expose_optional_recovery_ref() {
+        let tools = all_tools();
+        for name in [TOOL_EXECUTE_PROCESS, TOOL_SHELL, TOOL_GET_OPERATION] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(schema.contains("operation_id"));
+            assert!(schema.contains("^op_[0-9a-f]{32}$"));
+        }
+        let recovery = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == TOOL_GET_OPERATION)
+            .unwrap();
+        assert_eq!(
+            recovery.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true)
         );
     }
 

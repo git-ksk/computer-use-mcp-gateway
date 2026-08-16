@@ -205,9 +205,11 @@ The real-Cua macOS acceptance now uses CUMG's native shell executor to launch Te
 
 ## 9. Persistence compatibility
 
-The Hub checkpoint schema is now **v5** because durable owner, operation-state, quarantine, receipt, and resolution semantics cannot be reconstructed safely from the previous v4 Hub checkpoint.
+The outer Hub checkpoint schema remains **v5** because durable owner, operation-state, quarantine, receipt, and resolution semantics cannot be reconstructed safely from the previous v4 Hub checkpoint.
 
-There is intentionally no automatic v4 -> v5 migration in this pass. Loading an incompatible checkpoint fails closed instead of guessing ownership or ambiguity. Operators upgrading an existing development deployment must treat the v5 state boundary as a reviewed migration/re-enrollment event rather than silently reusing old in-flight state.
+The nested execution-safety snapshot is now **v2**. It adds an optional bounded recoverable process/shell result to the authoritative operation record plus a generation-independent bounded recovery archive. Terminal admission records still compact on generation rollover; recoverable results move to an archive capped at 8 entries / 256 KiB encoded total instead of keeping old admission state alive. The v2 reader accepts the previous v1 result-less form, but rejects a snapshot that claims v1 semantics while carrying a recovery result/archive. Raw command, argv, cwd, and environment payloads are not part of recovery state. See [`V2_OPERATION_RECOVERY.md`](V2_OPERATION_RECOVERY.md).
+
+There is intentionally no automatic outer Hub v4 -> v5 migration. Loading an incompatible checkpoint fails closed instead of guessing ownership or ambiguity. Operators upgrading an existing development deployment must treat the v5 state boundary as a reviewed migration/re-enrollment event rather than silently reusing old in-flight state.
 
 ## 10. P0 test matrix
 
