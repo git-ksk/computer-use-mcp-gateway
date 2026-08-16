@@ -306,7 +306,9 @@ def stop_gateway(proc: subprocess.Popen[str], log_file: TextIO) -> None:
         output = read_gateway_log(log_file)
         if output:
             print("--- gateway log ---")
-            print(output[-8000:])
+            tail = output[-8000:]
+            encoding = sys.stdout.encoding or "utf-8"
+            print(tail.encode(encoding, errors="backslashreplace").decode(encoding))
         log_file.close()
 
 
