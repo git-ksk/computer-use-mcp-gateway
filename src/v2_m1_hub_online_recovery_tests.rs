@@ -174,7 +174,7 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     );
 
     let first_ack = inbound.recv().await.unwrap().unwrap();
-    let HubToAgent::RecoveryResolved(first_ack) = decode_hub_frame(&first_ack).unwrap() else {
+    let HubToAgent::RecoveryResolved(first_ack) = decode_hub_frame(first_ack).unwrap() else {
         panic!("expected signed recovery resolution acknowledgement");
     };
     assert_eq!(first_ack.request_id, authorization.request_id);
@@ -190,7 +190,7 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     .await
     .unwrap();
     let duplicate_ack = inbound.recv().await.unwrap().unwrap();
-    let HubToAgent::RecoveryResolved(duplicate_ack) = decode_hub_frame(&duplicate_ack).unwrap()
+    let HubToAgent::RecoveryResolved(duplicate_ack) = decode_hub_frame(duplicate_ack).unwrap()
     else {
         panic!("expected duplicate recovery acknowledgement");
     };
