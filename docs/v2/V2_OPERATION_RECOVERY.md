@@ -10,6 +10,14 @@ This contract provides read-only durable recovery for bounded `execute_process` 
 
 An accepted operation ID is the existing authoritative replay identity. Reusing it for another execution is rejected as `operation_replay`; status lookup never turns that rejection into a replay or resume.
 
+## Process lifetime and background descendants
+
+`execute_process` and `shell` are bounded operations, not service launchers. On Unix the Agent places the launched operation in its own supervised process group; on Windows it uses a Job Object. Cancellation, timeout, and ordinary parent completion clean up descendants that remain in that supervision domain. A plain shell background job, including `nohup ... &`, therefore must not be used as a persistence mechanism: when it remains in the supervised process group it is terminated as the operation reaches its terminal state.
+
+This is a lifecycle contract, not an OS-wide sandbox against an already-authorized Dangerous process/shell caller. In particular, the current Unix process-group primitive cannot guarantee cleanup after a descendant deliberately creates a different session/process group (for example by calling `setsid()`), reparents through an external service manager, or otherwise leaves the supervised group. Such detachment is unsupported and **must not be relied on** to create persistent work. The stricter Unix containment gap is tracked in GitHub issue #96; CUMG does not paper over it with shell-text filtering or heuristic PID killing.
+
+Long-running builds/releases should remain inside the bounded operation and use a caller-retained `operation_id` plus `get_operation` to recover a lost northbound result. If persistent managed jobs are added in the future, they require a separate capability/API with explicit start/status/cancel lifecycle and authorization rather than weakening this process boundary.
+
 ## `get_operation`
 
 `get_operation(operation_id)` is a Hub-local read-only MCP tool. It does not require the Agent to be online and never dispatches a device command. The lookup is scoped to the authenticated issuer+subject that created the original operation, and current authorization for the original `ExecuteProcess` or `Shell` capability is checked again before returning data. Wrong-owner and unknown IDs have the same not-found behavior so the reference cannot be used as a cross-principal existence oracle.
