@@ -21,8 +21,10 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
           rustup default 1.88.0
 
-      - name: Apply integration patch
-        run: python3 scripts/apply_online_recovery.py
+      - name: Apply integration patches
+        run: |
+          python3 scripts/apply_online_recovery.py
+          python3 scripts/harden_online_recovery.py
 
       - name: Synchronize lockfile
         run: cargo check --all-targets
@@ -44,7 +46,7 @@ jobs:
 
       - name: Commit integrated implementation
         run: |
-          git rm scripts/apply_online_recovery.py .github/workflows/online-recovery-dev.yml
+          git rm scripts/apply_online_recovery.py scripts/harden_online_recovery.py .github/workflows/online-recovery-dev.yml
           git add Cargo.toml Cargo.lock src
           git diff --cached --check
           git config user.name github-actions[bot]
