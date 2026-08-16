@@ -59,6 +59,30 @@ completion provable?
 
 candidate area はそれぞれ独立に評価します。
 
+### `0.3.0` candidate: V2 Production Hardening
+
+現在の `0.3.0` candidate theme は **V2 Production Hardening / Operational Readiness** とします。継続的な V2 実運用で見つかった reliability、recoverability、observability、local-abuse、trust-lifecycle の gap を、authoritative operation / quarantine / no-auto-replay safety model を弱めずに close することが目的です。
+
+target issue set は `#64` から `#73` です。
+
+- recovery / restart safety: `#64` production quarantine resolution、`#65` SIGTERM + bounded operation drain、`#72` operator-visible quarantine alerting;
+- persistence / incident closure: `#69` generation 内 checkpoint growth の bounded 化、`#73` persistence crash-loop root cause の確定または evidence-backed な除外;
+- audit / local caller protection: `#70` northbound client correlation、`#71` loopback caller rate limiting / trust gate;
+- trust lifecycle: `#68` bounded Agent session lifetime と device-key rotation procedure、`#67` repeatable enrollment / trust-anchor lifecycle、`#66` grant-signing isolation / external signer boundary。
+
+implementation は **issue-driven / PR-isolated** のまま、dependency を考慮して次の順を優先します。
+
+1. `#65` planned-shutdown safety;
+2. `#69` / `#73` persistence boundedness と incident root cause;
+3. `#64` audited production quarantine resolution;
+4. `#72` / `#70` / `#71` operator visibility、audit correlation、local abuse resistance;
+5. `#68` / `#67` session / device / trust-anchor lifecycle;
+6. `#66` signing-authority isolation。lifecycle boundary を明確にした後で扱う。
+
+単独なら PATCH-compatible な change（例: `#65`、`#69`）でも、途中で `0.2.x` release を切る operational need がなければ `0.3.0` に初めて含めてよいものとします。SemVer classification は release 全体で判断し、含まれるすべての fix に minor bump が必要だとは解釈しません。一方で milestone を単一の巨大 implementation PR にはせず、各 issue は独立した acceptance evidence と review boundary を維持します。
+
+すべての issue が close しただけでは `0.3.0` accepted とはしません。release 前に、結果として得られる public / operator contract が後述の minor-release acceptance gate を満たす必要があります。documented V2 safety invariant を維持できない scope は、milestone 達成のために invariant を弱めるのではなく defer します。
+
 ### Remaining semantic parity decisions
 
 current Cua parity matrix では、次の legitimate gap を意図的に明示しています。

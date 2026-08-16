@@ -59,6 +59,30 @@ The next minor release is created only when accepted work changes or meaningfull
 
 Candidate areas are evaluated independently.
 
+### `0.3.0` candidate: V2 Production Hardening
+
+The current candidate theme for `0.3.0` is **V2 Production Hardening / Operational Readiness**: close the reliability, recoverability, observability, local-abuse, and trust-lifecycle gaps found during sustained V2 operation without weakening the authoritative operation/quarantine/no-auto-replay safety model.
+
+The target issue set is `#64` through `#73`:
+
+- recovery and restart safety: `#64` production quarantine resolution, `#65` SIGTERM plus bounded operation drain, `#72` operator-visible quarantine alerting;
+- persistence and incident closure: `#69` bounded in-generation checkpoint growth, `#73` persistence crash-loop root-cause confirmation or evidence-backed exclusion;
+- audit and local caller protection: `#70` northbound client correlation, `#71` loopback caller rate limiting/trust gate;
+- trust lifecycle: `#68` bounded Agent session lifetime and device-key rotation procedure, `#67` repeatable enrollment/trust-anchor lifecycle, `#66` grant-signing isolation/external signer boundary.
+
+Implementation remains **issue-driven and PR-isolated**, in this preferred dependency order:
+
+1. `#65` planned-shutdown safety;
+2. `#69` and `#73` persistence boundedness and incident root cause;
+3. `#64` audited production quarantine resolution;
+4. `#72`, `#70`, and `#71` operator visibility, audit correlation, and local abuse resistance;
+5. `#68` and `#67` session/device/trust-anchor lifecycle;
+6. `#66` signing-authority isolation, after the lifecycle boundary is explicit.
+
+A change that is PATCH-compatible in isolation (for example `#65` or `#69`) may still ship first in `0.3.0` when no intervening `0.2.x` release is operationally necessary; SemVer classification is based on the release as a whole, not on forcing every included fix to require a minor bump. The milestone must not turn into one aggregate implementation PR: each issue retains its own acceptance evidence and review boundary.
+
+`0.3.0` is not accepted merely because every issue is closed. Before release, the resulting public/operator contract must satisfy the minor-release acceptance gate below, and any scope that cannot preserve the documented V2 safety invariants must be deferred rather than weakened to meet the milestone.
+
 ### Remaining semantic parity decisions
 
 The current Cua parity matrix deliberately leaves these legitimate gaps explicit:
