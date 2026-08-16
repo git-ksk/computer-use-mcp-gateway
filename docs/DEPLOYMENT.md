@@ -124,6 +124,16 @@ OTel counters intentionally expose only closed, low-cardinality attribute domain
 
 Never add `operation_id`, `device_id`, principal/subject, request path, command/tool name or other unbounded values as metric attributes. Those belong in structured logs/traces only when required for incident correlation. Collector, proxy and service-manager logging must preserve the same payload-free boundary; do not enable HTTP/gRPC body capture or Authorization-header logging around the process.
 
+#### Quarantine alerting recipe
+
+Every newly-created quarantine emits a dedicated `ERROR`-level `v2_quarantine_created` event with bounded correlation fields (`operation_id`, `device_id`, `generation`, capability, and indeterminate reason) in addition to incrementing `cumg.v2.quarantine_created`. Treat either signal as operator-action-required; neither signal changes or resolves the quarantine. On systemd, a minimal local watch is:
+
+```bash
+journalctl -u cumg-v2-hub.service --priority=err --grep=v2_quarantine_created --follow
+```
+
+For OTLP-backed monitoring, alert whenever the **increase/delta of `cumg.v2.quarantine_created` is greater than zero** over the collector's shortest reliable alert window (for example one to five minutes), and page or otherwise notify the operator responsible for the device. Metric exporters may translate the meter name to backend-specific syntax; alert on the exported counter corresponding to this exact OpenTelemetry meter rather than adding `operation_id` or `device_id` labels. Use the paired `v2_quarantine_created` error event to recover those incident identifiers, then follow the offline resolution procedure above. Clear the operational alert only after explicit resolution is evidenced by `v2_quarantine_resolved` / `cumg.v2.quarantine_resolved`; reconnect or process restart is not resolution.
+
 The Hub also bounds same-generation checkpoint growth. After a successful checkpoint reaches `CUMG_V2_CHECKPOINT_GENERATION_ROLLOVER_BYTES` (default `524288`, at most half of the 1 MiB checkpoint ceiling), the Hub pauses new operation admission, lets already-admitted work settle, then closes the authenticated Agent session cleanly. The Agent reconnects with a fresh generation, and the existing generation fence makes prior signed commands stale before the Hub prunes old terminal replay/receipt records. `Indeterminate` operations and quarantine are never pruned by this rollover; a quarantined device therefore remains quarantined across every generation. This is a reliability compaction boundary, not permission to replay or forget ambiguity.
 
 For an incident, correlate Hub and Agent by `device_id` + `generation`, then follow `operation_id`. A `v2_operation_indeterminate` event must be followed by durable quarantine until a `v2_quarantine_resolved` event exists for that operation. Persistence failures expose a safe `error_code` such as `persistence_checkpoint_too_large` without a path or serialized checkpoint. Reconnect exhaustion and heartbeat timeouts are visible independently from TLS/transport connection failures. OAuth introspection unavailability is distinct from authorization denial, and a quarantine admission rejection remains `device_indeterminate` rather than being retried or auto-replayed.
