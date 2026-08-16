@@ -10,9 +10,9 @@ use crate::v2_execution_safety::{
     IndeterminateReason, OperationOwner, ResolutionRecord,
 };
 use crate::v2_m0::{
-    CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CommandEnvelope, DeviceCommand,
-    DeviceErrorCode, DeviceRegistry, DeviceResult, DirectoryEntry, GrantAuthority, ProcessOutput,
-    ProcessRequest, ShellRequest, validate_command_result,
+    CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CommandEnvelope, DeviceCapability,
+    DeviceCommand, DeviceErrorCode, DeviceRegistry, DeviceResult, DirectoryEntry, GrantAuthority,
+    ProcessOutput, ProcessRequest, ShellRequest, validate_command_result,
 };
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision,
@@ -1096,7 +1096,13 @@ impl SingleDeviceHub {
             crate::v2_observability::operation_indeterminate(
                 IndeterminateReason::BackendOutcomeUnproven,
             );
-            crate::v2_observability::quarantine_created();
+            emit_quarantine_created_alert(
+                &operation_id,
+                &self.inner.device_id,
+                generation,
+                Some(capability),
+                IndeterminateReason::BackendOutcomeUnproven,
+            );
             tracing::warn!(
                 event = "v2_operation_indeterminate",
                 operation_id = %operation_id,
@@ -1345,7 +1351,13 @@ impl SingleDeviceHub {
             crate::v2_observability::operation_indeterminate(
                 IndeterminateReason::CancellationUnproven,
             );
-            crate::v2_observability::quarantine_created();
+            emit_quarantine_created_alert(
+                &ack.operation_id,
+                &self.inner.device_id,
+                generation,
+                None,
+                IndeterminateReason::CancellationUnproven,
+            );
             tracing::warn!(
                 event = "v2_operation_indeterminate",
                 operation_id = %ack.operation_id,
@@ -1444,7 +1456,13 @@ impl SingleDeviceHub {
         persist_locked(&self.inner, &persistent)?;
         for (operation_id, capability) in connection_lost_indeterminate {
             crate::v2_observability::operation_indeterminate(IndeterminateReason::ConnectionLost);
-            crate::v2_observability::quarantine_created();
+            emit_quarantine_created_alert(
+                &operation_id,
+                &self.inner.device_id,
+                generation,
+                Some(capability),
+                IndeterminateReason::ConnectionLost,
+            );
             tracing::warn!(
                 event = "v2_operation_indeterminate",
                 operation_id = %operation_id,
@@ -1851,6 +1869,29 @@ impl AgentControl for SingleDeviceHub {
         );
         Ok(Response::new(Box::pin(ReceiverStream::new(outbound_rx))))
     }
+}
+
+fn emit_quarantine_created_alert(
+    operation_id: &str,
+    device_id: &str,
+    generation: u64,
+    capability: Option<DeviceCapability>,
+    reason: IndeterminateReason,
+) {
+    crate::v2_observability::quarantine_created();
+    tracing::error!(
+        event = "v2_quarantine_created",
+        operation_id,
+        device_id,
+        generation,
+        capability = capability
+            .map(crate::v2_observability::capability_name)
+            .unwrap_or("unknown"),
+        outcome = "operator_action_required",
+        indeterminate_reason = crate::v2_observability::indeterminate_reason_name(reason),
+        error_code = "device_indeterminate",
+        "device quarantined; explicit operator resolution is required before reuse"
+    );
 }
 
 fn persist_locked(
@@ -2393,6 +2434,39 @@ mod tests {
         assert!(log.contains("message_kind"));
         assert!(log.contains("result"));
         assert!(rendered.contains("got: \"result\"") || rendered.contains("got=result"));
+    }
+
+    #[test]
+    fn quarantine_creation_emits_dedicated_error_alert_with_safe_correlation() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CaptureWriter(bytes.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            emit_quarantine_created_alert(
+                "op-alert-fixture",
+                "dev-alert-fixture",
+                7,
+                Some(DeviceCapability::Shell),
+                IndeterminateReason::ConnectionLost,
+            );
+        });
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "ERROR",
+            "v2_quarantine_created",
+            "op-alert-fixture",
+            "dev-alert-fixture",
+            "operator_action_required",
+            "connection_lost",
+        ] {
+            assert!(
+                log.contains(expected),
+                "missing quarantine alert field {expected}"
+            );
+        }
     }
 
     #[test]
