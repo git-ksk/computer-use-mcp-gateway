@@ -818,8 +818,10 @@ async fn hard_session_lifetime_cuts_off_unsettled_work_fail_closed() -> Result<(
 async fn external_grant_signer_executes_without_hub_key_custody_and_has_no_fallback() -> Result<()>
 {
     let cwd = env::current_dir()?;
+    // Keep the Unix socket pathname short enough for macOS while remaining
+    // portable to Linux CI. The private child directory is mode 0700 below.
     let root = std::path::PathBuf::from(format!(
-        "/private/tmp/cumg-gs-{}-{}",
+        "/tmp/cumg-gs-{}-{}",
         std::process::id(),
         rand::random::<u32>()
     ));
