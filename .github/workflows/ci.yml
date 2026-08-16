@@ -37,6 +37,19 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Temporary v0.3 systemd semantic verification
+        run: |
+          systemd-analyze --version
+          sudo systemd-analyze verify \
+            packaging/systemd/cumg-v2-agent.service \
+            packaging/systemd/cumg-v2-agent-tls-expiry.service \
+            packaging/systemd/cumg-v2-agent-tls-expiry.timer \
+            packaging/systemd/cumg-v2-grant-signer.service \
+            packaging/systemd/cumg-v2-hub.service \
+            packaging/systemd/cumg-v2-tls-expiry.service \
+            packaging/systemd/cumg-v2-tls-expiry.timer \
+            packaging/systemd/cumg-v2-usage-sidecar.service
+
       - name: Python harness syntax
         run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_cua_mcp_backend.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_conformance.py
 
