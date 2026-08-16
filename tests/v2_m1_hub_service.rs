@@ -63,6 +63,7 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 2,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 30,
@@ -262,6 +263,7 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 2,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 30,
@@ -367,6 +369,169 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
     assert_eq!(completed.output.exit_code, Some(0));
     assert_eq!(completed.output.stdout, "done");
     assert!(handle.desktop_quarantine().await.is_none());
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), agent_task)
+        .await
+        .map_err(|_| anyhow!("Agent did not shut down"))???;
+    server.abort();
+    let _ = std::fs::remove_dir_all(hub_state);
+    let _ = std::fs::remove_dir_all(agent_state);
+    let _ = std::fs::remove_dir_all(fs_root);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_high_water_rolls_generation_without_quarantine() -> Result<()> {
+    let cwd = env::current_dir()?;
+    let fs_root = temp_dir("hub-rollover-fs");
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_pem = cert.pem();
+    let cert_der = cert.der().to_vec();
+    let key_pem = signing_key.serialize_pem();
+
+    let device_identity = DeviceIdentity::generate();
+    let hub_identity = HubIdentity::generate();
+    let grant_authority = GrantAuthority::generate();
+    let hub_state = temp_dir("hub-rollover-state");
+    let agent_state = temp_dir("agent-rollover-state");
+
+    let (hub, handle) = SingleDeviceHub::new(
+        HubServiceConfig {
+            state_dir: hub_state.clone(),
+            heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            checkpoint_generation_rollover_bytes: 8 * 1024,
+            max_queued_per_device: 2,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 120,
+        },
+        HubProvisionedMaterial {
+            hub_identity: hub_identity.clone(),
+            grant_authority: grant_authority.clone(),
+            device_verifier: device_identity.verifying_key(),
+            device_rotation: None,
+        },
+    )
+    .map_err(|error| anyhow!("Hub init failed: {error:?}"))?;
+    let device_id = hub.device_id().to_owned();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
+            .add_service(
+                AgentControlServer::new(hub)
+                    .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+
+    let mut agent = AgentService::new(
+        AgentServiceConfig {
+            hub_endpoint: format!("https://localhost:{}", address.port()),
+            hub_domain: "localhost".into(),
+            device_id,
+            allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
+            state_dir: agent_state.clone(),
+            heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(50),
+                max_attempts: 20,
+            },
+            cua: None,
+        },
+        AgentProvisionedMaterial {
+            device_identity,
+            trusted_hub: hub_identity.verifier(),
+            grant_verifier: grant_authority.verifier(),
+            additional_grant_verifiers: vec![],
+            hub_rotation: None,
+            tls_root_der: cert_der,
+        },
+    )
+    .map_err(|error| anyhow!("Agent init failed: {error:?}"))?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let agent_task = tokio::spawn(async move { agent.run(shutdown_rx).await });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while handle.current_generation().await != Some(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Agent did not establish generation 1"))?;
+
+    for index in 0..40_u32 {
+        if handle.current_generation().await.unwrap_or(0) > 1 {
+            break;
+        }
+        match handle
+            .execute_shell(ShellRequest {
+                command: format!("printf rollover-{index}"),
+                cwd: cwd.to_string_lossy().into_owned(),
+                env: vec![],
+                timeout_ms: 5_000,
+            })
+            .await
+        {
+            Ok(result) => assert_eq!(result.output.exit_code, Some(0)),
+            Err(
+                HubCommandError::AgentOffline
+                | HubCommandError::SessionClosed
+                | HubCommandError::Busy,
+            ) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(anyhow!("unexpected rollover command error: {error:?}")),
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.current_generation().await.unwrap_or(0) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("checkpoint high-water did not trigger generation rollover"))?;
+
+    assert!(handle.desktop_quarantine().await.is_none());
+    let mut checkpoints: Vec<_> = std::fs::read_dir(&hub_state)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("hub-"))
+        .collect();
+    checkpoints.sort_by_key(|entry| entry.file_name());
+    let latest_size = checkpoints
+        .last()
+        .and_then(|entry| entry.metadata().ok())
+        .map_or(0, |metadata| metadata.len());
+    let maximum_size = checkpoints
+        .iter()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        latest_size < 8 * 1024,
+        "fresh generation did not compact terminal history"
+    );
+    assert!(maximum_size < computer_use_mcp_gateway::v2_m1_persistence::MAX_CHECKPOINT_BYTES);
+
+    let after = handle
+        .execute_shell(ShellRequest {
+            command: "printf after-rollover".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        })
+        .await
+        .map_err(|error| anyhow!("post-rollover shell failed: {error:?}"))?;
+    assert_eq!(after.output.stdout, "after-rollover");
+    assert!(after.receipt.operation.device_generation >= 2);
 
     let _ = shutdown_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), agent_task)

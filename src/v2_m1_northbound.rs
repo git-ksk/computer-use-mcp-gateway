@@ -5814,6 +5814,7 @@ mod tests {
             HubServiceConfig {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(1),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
                 max_queued_per_device: 1,
                 max_agent_sessions: 2,
                 max_agent_session_starts_per_minute: 30,
@@ -5971,6 +5972,7 @@ mod tests {
             HubServiceConfig {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(1),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
                 max_queued_per_device: 1,
                 max_agent_sessions: 2,
                 max_agent_session_starts_per_minute: 30,
@@ -6098,6 +6100,7 @@ mod tests {
             HubServiceConfig {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(1),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
                 max_queued_per_device: 1,
                 max_agent_sessions: 2,
                 max_agent_session_starts_per_minute: 30,

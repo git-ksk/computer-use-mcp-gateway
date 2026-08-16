@@ -5,7 +5,10 @@ use computer_use_mcp_gateway::{
     v2_m1_grpc::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
     },
-    v2_m1_hub::{HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
+    v2_m1_hub::{
+        DEFAULT_CHECKPOINT_GENERATION_ROLLOVER_BYTES, HubProvisionedMaterial, HubServiceConfig,
+        SingleDeviceHub,
+    },
     v2_m1_keys::{
         load_grant_authority, load_hub_identity, load_secret_text, load_tls_server_identity,
         load_trusted_text, load_verifying_key,
@@ -52,6 +55,12 @@ struct Args {
     /// so already-admitted operations can reach a durable terminal state.
     #[arg(long, env = "CUMG_V2_DRAIN_TIMEOUT_SECS", default_value_t = 30)]
     drain_timeout_secs: u64,
+    #[arg(
+        long,
+        env = "CUMG_V2_CHECKPOINT_GENERATION_ROLLOVER_BYTES",
+        default_value_t = DEFAULT_CHECKPOINT_GENERATION_ROLLOVER_BYTES
+    )]
+    checkpoint_generation_rollover_bytes: usize,
     #[arg(long, env = "CUMG_V2_MAX_QUEUED_PER_DEVICE", default_value_t = 8)]
     max_queued_per_device: usize,
     #[arg(long, env = "CUMG_V2_MAX_AGENT_SESSIONS", default_value_t = 2)]
@@ -180,6 +189,7 @@ async fn main() -> Result<()> {
         HubServiceConfig {
             state_dir: args.state_dir.clone(),
             heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
+            checkpoint_generation_rollover_bytes: args.checkpoint_generation_rollover_bytes,
             max_queued_per_device: args.max_queued_per_device,
             max_agent_sessions: args.max_agent_sessions,
             max_agent_session_starts_per_minute: args.max_agent_session_starts_per_minute,

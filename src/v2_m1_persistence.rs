@@ -136,11 +136,24 @@ impl CheckpointStore {
     }
 
     pub fn save<T: Serialize>(&self, value: &T) -> Result<PathBuf, PersistenceError> {
+        self.save_with_size(value).map(|(path, _)| path)
+    }
+
+    /// Save a checkpoint and return the exact serialized byte count that passed
+    /// the checkpoint size gate. Hub runtime uses this to request a clean Agent
+    /// generation rollover before sustained same-generation history approaches
+    /// `MAX_CHECKPOINT_BYTES`; callers that do not need the size keep using
+    /// `save`.
+    pub fn save_with_size<T: Serialize>(
+        &self,
+        value: &T,
+    ) -> Result<(PathBuf, usize), PersistenceError> {
         self.ensure_directory()?;
         let payload = serde_json::to_vec(value).map_err(PersistenceError::Serialization)?;
         if u64::try_from(payload.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_BYTES {
             return Err(PersistenceError::CheckpointTooLarge);
         }
+        let payload_len = payload.len();
 
         let mut sequence = self.next_sequence()?;
         for _ in 0..8 {
@@ -152,7 +165,7 @@ impl CheckpointStore {
                     file.sync_all().map_err(PersistenceError::Io)?;
                     sync_directory(&self.directory)?;
                     self.prune_old_checkpoints(MAX_RETAINED_CHECKPOINTS)?;
-                    return Ok(path);
+                    return Ok((path, payload_len));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     sequence = sequence.saturating_add(1);
@@ -409,6 +422,21 @@ mod tests {
         assert_eq!(latest["version"], 2);
         let count = fs::read_dir(&directory).unwrap().count();
         assert_eq!(count, 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_store_reports_exact_serialized_size() {
+        let directory = temp_directory("checkpoint-size");
+        let store = CheckpointStore::new(&directory, "hub").unwrap();
+        let value = serde_json::json!({"operation": "op-size", "state": "completed"});
+        let expected = serde_json::to_vec(&value).unwrap().len();
+        let (path, actual) = store.save_with_size(&value).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            fs::metadata(path).unwrap().len(),
+            u64::try_from(expected).unwrap()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
