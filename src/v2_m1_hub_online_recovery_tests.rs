@@ -1,6 +1,6 @@
 use super::*;
 use crate::v2_m0::{DeviceCapability, DeviceIdentity, GrantAuthority};
-use crate::v2_m0_execution::{HubOperationState, OperationRef};
+use crate::v2_m0_execution::{ExecutionError, HubOperationState, OperationRef};
 use crate::v2_m1_grpc::decode_hub_frame;
 use crate::v2_online_recovery::{
     RECOVERY_PUBLIC_KEY_FILENAME, RecoveryAuditAssessment, authorization_signing_bytes,
@@ -30,20 +30,13 @@ fn temp_dir(name: &str) -> PathBuf {
 fn recovery_key() -> (EcdsaKeyPair, [u8; 65]) {
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-    let key = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        pkcs8.as_ref(),
-        &rng,
-    )
-    .unwrap();
+    let key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
     let public: [u8; 65] = key.public_key().as_ref().try_into().unwrap();
     (key, public)
 }
 
-fn sign(
-    key: &EcdsaKeyPair,
-    mut authorization: RecoveryAuthorization,
-) -> RecoveryAuthorization {
+fn sign(key: &EcdsaKeyPair, mut authorization: RecoveryAuthorization) -> RecoveryAuthorization {
     let rng = SystemRandom::new();
     let bytes = authorization_signing_bytes(&authorization).unwrap();
     authorization.signature = key.sign(&rng, &bytes).unwrap().as_ref().to_vec();
@@ -64,7 +57,8 @@ fn config(state_dir: PathBuf) -> HubServiceConfig {
 }
 
 #[tokio::test]
-async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_replays_old_operation() {
+async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_replays_old_operation()
+{
     let state_dir = temp_dir("online-recovery-hub-state");
     let (recovery_key, recovery_public) = recovery_key();
     let recovery_public_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
@@ -128,13 +122,8 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     );
 
     let quarantine = handle.desktop_quarantine().await.unwrap();
-    let challenge = build_recovery_challenge(
-        &hub_identity,
-        &quarantine,
-        current_generation,
-        100,
-    )
-    .unwrap();
+    let challenge =
+        build_recovery_challenge(&hub_identity, &quarantine, current_generation, 100).unwrap();
     hub.inner.recovery_runtime.lock().await.pending = Some(challenge.clone());
     let authorization = sign(
         &recovery_key,
@@ -149,14 +138,9 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
 
     let (outbound, mut inbound) = mpsc::channel(4);
     let clock = TrustedSessionClock::new(100);
-    hub.handle_recovery_authorization(
-        authorization.clone(),
-        &outbound,
-        current_generation,
-        &clock,
-    )
-    .await
-    .unwrap();
+    hub.handle_recovery_authorization(authorization.clone(), &outbound, current_generation, &clock)
+        .await
+        .unwrap();
 
     assert!(handle.desktop_quarantine().await.is_none());
     let receipt = handle.operation_receipt(&operation_id).await.unwrap();
@@ -181,14 +165,9 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     assert_eq!(first_ack.operation_id, operation_id);
 
     // Lost ACK / retransmission in the same live recovery exchange is idempotent.
-    hub.handle_recovery_authorization(
-        authorization.clone(),
-        &outbound,
-        current_generation,
-        &clock,
-    )
-    .await
-    .unwrap();
+    hub.handle_recovery_authorization(authorization.clone(), &outbound, current_generation, &clock)
+        .await
+        .unwrap();
     let duplicate_ack = inbound.recv().await.unwrap().unwrap();
     let HubToAgent::RecoveryResolved(duplicate_ack) = decode_hub_frame(duplicate_ack).unwrap()
     else {
@@ -202,21 +181,18 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     let mut conflicting = authorization.clone();
     conflicting.decision = IndeterminateResolution::ConfirmedNotExecuted;
     assert!(matches!(
-        hub.handle_recovery_authorization(
-            conflicting,
-            &outbound,
-            current_generation,
-            &clock,
-        )
-        .await,
-        Err(HubServiceError::OnlineRecovery(RecoveryError::ChallengeMismatch))
+        hub.handle_recovery_authorization(conflicting, &outbound, current_generation, &clock,)
+            .await,
+        Err(HubServiceError::OnlineRecovery(
+            RecoveryError::ChallengeMismatch
+        ))
     ));
     assert_eq!(handle.resolution_records().await.len(), 1);
 
     // The durable resolved operation remains a replay tombstone after restart.
     drop(handle);
     drop(hub);
-    let (_restarted, restarted_handle) =
+    let (restarted, restarted_handle) =
         SingleDeviceHub::new(config(state_dir.clone()), material).unwrap();
     assert!(restarted_handle.desktop_quarantine().await.is_none());
     let recovery = restarted_handle
@@ -224,17 +200,24 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
         .await
         .unwrap();
     assert_eq!(recovery.state, HubOperationState::Completed);
-    assert_eq!(
-        restarted_handle
-            .start_command_as_with_id(
+    {
+        let mut persistent = restarted.inner.persistent.lock().await;
+        assert!(matches!(
+            persistent.execution.prepare(
+                OperationRef {
+                    device_id: restarted.device_id().to_owned(),
+                    device_generation: current_generation + 1,
+                    operation_id: operation_id.clone(),
+                },
                 owner,
-                operation_id.clone(),
-                DeviceCommand::ScreenGeometry,
-                None,
-            )
-            .await,
-        Err(HubCommandError::AgentOffline)
-    );
+                DeviceCapability::Shell,
+                200,
+            ),
+            Err(ExecutionError::OperationReplay)
+        ));
+    }
 
+    drop(restarted_handle);
+    drop(restarted);
     let _ = std::fs::remove_dir_all(state_dir);
 }

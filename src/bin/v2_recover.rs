@@ -186,6 +186,22 @@ fn resolve(
         evidence,
     )
     .context("invalid recovery decision")?;
+    println!("approving_local_recovery");
+    println!("device_id={}", authorization.device_id);
+    println!("operation_id={}", authorization.operation_id);
+    println!(
+        "quarantine_generation={}",
+        authorization.quarantine_generation
+    );
+    println!("current_generation={}", authorization.current_generation);
+    println!("audit_assessment=inconclusive");
+    println!(
+        "decision={}",
+        match authorization.decision {
+            IndeterminateResolution::ConfirmedCompleted => "confirmed_completed",
+            IndeterminateResolution::ConfirmedNotExecuted => "confirmed_not_executed",
+        }
+    );
     let key = MacRecoveryKey::load(&key_label).context("recovery key is not provisioned")?;
     let authorization = key
         .sign_authorization(authorization)

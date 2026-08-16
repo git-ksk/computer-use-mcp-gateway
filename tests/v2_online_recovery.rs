@@ -44,12 +44,8 @@ fn quarantine() -> DesktopQuarantine {
 fn test_recovery_key() -> (EcdsaKeyPair, RecoveryVerifier) {
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-    let key = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        pkcs8.as_ref(),
-        &rng,
-    )
-    .unwrap();
+    let key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
     let verifier = RecoveryVerifier::from_x963_bytes(key.public_key().as_ref()).unwrap();
     (key, verifier)
 }
@@ -69,8 +65,7 @@ fn recovery_authority_is_bound_to_exact_challenge_and_decision() {
     let hub = HubIdentity::generate();
     let quarantine = quarantine();
     let challenge = build_recovery_challenge(&hub, &quarantine, 8, 100).unwrap();
-    verify_recovery_challenge(&challenge, &hub.verifier(), &quarantine.device_id, 8, 101)
-        .unwrap();
+    verify_recovery_challenge(&challenge, &hub.verifier(), &quarantine.device_id, 8, 101).unwrap();
 
     let (key, verifier) = test_recovery_key();
     let authorization = sign_authorization(
@@ -196,7 +191,11 @@ fn recovery_public_key_uses_existing_trust_anchor_file_hardening() {
     let public_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
     std::fs::write(&public_path, verifier.public_key_bytes()).unwrap();
     std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(RecoveryVerifier::load_optional(&state_dir).unwrap().is_some());
+    assert!(
+        RecoveryVerifier::load_optional(&state_dir)
+            .unwrap()
+            .is_some()
+    );
 
     std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o666)).unwrap();
     assert_eq!(

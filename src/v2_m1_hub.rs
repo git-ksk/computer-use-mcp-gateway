@@ -1633,6 +1633,15 @@ impl SingleDeviceHub {
             (runtime.pending.clone(), duplicate)
         };
         if let Some(ack) = duplicate_ack {
+            if ack.device_id != authorization.device_id
+                || ack.operation_id != authorization.operation_id
+                || ack.current_generation != authorization.current_generation
+                || ack.decision != authorization.decision
+            {
+                return Err(HubServiceError::OnlineRecovery(
+                    RecoveryError::ChallengeMismatch,
+                ));
+            }
             send_hub(outbound, HubToAgent::RecoveryResolved(ack)).await?;
             return Ok(());
         }
@@ -2152,6 +2161,10 @@ impl HubHandle {
         persistent.execution.resolutions().to_vec()
     }
 }
+
+#[cfg(test)]
+#[path = "v2_m1_hub_online_recovery_tests.rs"]
+mod online_recovery_tests;
 
 #[tonic::async_trait]
 impl AgentControl for SingleDeviceHub {

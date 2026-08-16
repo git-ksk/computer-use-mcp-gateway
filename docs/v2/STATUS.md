@@ -9,6 +9,7 @@ Status as of 2026-08-16:
 - **Browser transfer:** complete and accepted. Upload/download use scoped CUMG refs plus Agent-private bounded staging; no arbitrary host path is exposed northbound.
 - **Post-dispatch ambiguity hardening:** after dispatch of a mutating command, a generic backend error, malformed/unprovable completion, or response loss is classified at the adapter/Agent boundary as `BackendOutcomeIndeterminate`, persisted by the Hub as durable `Indeterminate` with reason `BackendOutcomeUnproven`, cancels queued work for that desktop, and keeps the device quarantined until explicit persistence-gated resolution. It is never automatically retried or replayed. Read-only backend failures may remain definite. Northbound operational failures use bounded MCP `CallToolResult` errors with `isError=true` and closed CUMG codes rather than leaking transport/provider/`ExceptionGroup` shapes. Real-Cua browser-alert acceptance covers the observable-side-effect case from issue #47.
 - **Process/shell response-loss recovery:** `execute_process` and `shell` accept a stable caller-retained `operation_id`, and the Hub exposes read-only `get_operation` for owner/capability-scoped recovery without replay or Agent liveness. Proven terminal output is persisted before northbound delivery and survives Agent generation rollover in a bounded recovery archive (8 entries / 256 KiB encoded total). Unknown/evicted references never make the original operation retry-safe.
+- **Local-user online quarantine recovery:** implemented behind explicit recovery-key provisioning. The Agent device key is not recovery authority; a fresh Hub-signed challenge is resolved only by a separately pinned P-256 endpoint recovery key. The initial macOS signer uses a Secure Enclave key with user-presence access control. Automated protocol/persistence coverage is required, and physical Secure Enclave user-presence acceptance remains a release gate.
 - **V1 production:** unchanged by the V2 development branch. V1 regression and conformance coverage remains required during V2 work.
 
 ## Active contracts
@@ -16,6 +17,7 @@ Status as of 2026-08-16:
 - [`V2_POSITIONING.md`](V2_POSITIONING.md) — canonical product boundary.
 - [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) — uncertainty-aware execution and no-auto-replay invariants.
 - [`V2_OPERATION_RECOVERY.md`](V2_OPERATION_RECOVERY.md) — durable bounded process/shell result recovery after northbound response loss.
+- [`V2_ONLINE_RECOVERY.md`](V2_ONLINE_RECOVERY.md) — local-user-authorized online resolution of durable desktop quarantine.
 - [`V2_INTERACTION_CONTEXT.md`](V2_INTERACTION_CONTEXT.md) — scoped interaction state and backend-reference ownership.
 - [`V2_GUI_SEMANTIC_CAPABILITIES.md`](V2_GUI_SEMANTIC_CAPABILITIES.md) — Desktop semantic surface.
 - [`V2_BROWSER_SEMANTIC_CAPABILITIES.md`](V2_BROWSER_SEMANTIC_CAPABILITIES.md) — Browser semantic surface and transfer boundary.
@@ -29,6 +31,7 @@ Status as of 2026-08-16:
 - [`acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) — Browser core closeout.
 - [`acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) — Browser transfer contract, threat controls, automated coverage, and trusted-Mac real-Cua evidence.
 - [`acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md`](acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md) — trusted physical Desktop acceptance procedure/evidence.
+- [`acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md`](acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md) — automated and trusted-Mac acceptance gate for local-user online quarantine recovery.
 - [`acceptance/V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md) — earlier secure-Agent milestone acceptance retained as evidence.
 
 ## Historical records

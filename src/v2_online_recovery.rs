@@ -560,10 +560,12 @@ fn atomic_write_json_private_no_replace<T: Serialize>(
                 RecoveryError::Io
             }
         })?;
-        fs::remove_file(&pending).map_err(|_| RecoveryError::Io)?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| RecoveryError::Io)?;
+        // Publication already succeeded. Pending-file cleanup and directory
+        // durability are best effort because this local handoff is not durable
+        // execution authority; reporting failure here would invite a second,
+        // conflicting local decision while the first authorization is visible.
+        let _ = fs::remove_file(&pending);
+        let _ = File::open(parent).and_then(|directory| directory.sync_all());
         Ok(())
     })();
     if write_result.is_err() {

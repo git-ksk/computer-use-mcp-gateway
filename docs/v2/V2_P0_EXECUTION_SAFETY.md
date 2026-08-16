@@ -283,3 +283,9 @@ The second-backend proof is also adapter-only. A backend may produce an ordinary
 P1 security review also keeps the compromised-backend boundary explicit: an authenticated but compromised Agent/backend can still lie about claimed terminal evidence or act outside the protocol. CUMG prevents stale ownership, cross-device replay, and accidental ambiguity collapse among protocol-conforming components; it does not provide Byzantine attestation of arbitrary desktop effects.
 
 The fixed-set proof is intentionally not a fleet product. Shared-endpoint discovery, mutable device registration, generic failover routing, fleet UX, a new policy language, native GUI expansion, and a ROSClaw fork remain out of scope.
+
+## Local-user-authorized online resolution
+
+The accepted explicit-resolution invariant now also has an online transport that keeps the Hub running. It does not change who owns the safety state: `DesktopQuarantine` remains Hub-authoritative and durable, reconnect remains only a generation fence, and the old operation is never replayed.
+
+The online path separates three identities: the historical operation owner, the currently authenticated Agent/device generation, and a separately provisioned local recovery key. The Agent device key cannot stand in for the recovery key. A Hub-signed challenge binds both historical and current generations plus the exact quarantine fingerprint; a local user signs one exact resolution decision; the Hub revalidates the current durable quarantine and uses the same persistence-gated `resolve_indeterminate` transition. See [`V2_ONLINE_RECOVERY.md`](V2_ONLINE_RECOVERY.md).
