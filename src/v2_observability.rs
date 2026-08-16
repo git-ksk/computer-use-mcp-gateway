@@ -109,6 +109,9 @@ pub enum SessionRejectReason {
 pub enum RequestRejectReason {
     RateLimit,
     ConcurrencyLimit,
+    LocalTrustGate,
+    PeerRateLimit,
+    PeerConcurrencyLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +311,9 @@ const fn request_reject_reason_name(reason: RequestRejectReason) -> &'static str
     match reason {
         RequestRejectReason::RateLimit => "rate_limit",
         RequestRejectReason::ConcurrencyLimit => "concurrency_limit",
+        RequestRejectReason::LocalTrustGate => "local_trust_gate",
+        RequestRejectReason::PeerRateLimit => "peer_rate_limit",
+        RequestRejectReason::PeerConcurrencyLimit => "peer_concurrency_limit",
     }
 }
 

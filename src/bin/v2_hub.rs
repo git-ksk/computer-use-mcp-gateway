@@ -26,6 +26,7 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
 const MAX_OAUTH_SECRET_BYTES: u64 = 16 * 1024;
+const MAX_TRUSTED_PROXY_SECRET_BYTES: u64 = 256;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
@@ -102,6 +103,22 @@ struct Args {
     trusted_proxy_issuer: Option<String>,
     #[arg(long, env = "CUMG_V2_TRUSTED_PROXY_SUBJECT")]
     trusted_proxy_subject: Option<String>,
+    /// Secret file shared only with the reviewed local proxy/tunnel. The proxy must
+    /// overwrite X-CUMG-Trusted-Proxy-Token on every request before loopback forwarding.
+    #[arg(long, env = "CUMG_V2_TRUSTED_PROXY_SECRET_FILE")]
+    trusted_proxy_secret_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "CUMG_V2_TRUSTED_PROXY_MAX_PEER_CONCURRENCY",
+        default_value_t = 4
+    )]
+    trusted_proxy_max_peer_concurrency: usize,
+    #[arg(
+        long,
+        env = "CUMG_V2_TRUSTED_PROXY_MAX_PEER_REQUESTS_PER_MINUTE",
+        default_value_t = 60
+    )]
+    trusted_proxy_max_peer_requests_per_minute: usize,
     #[arg(
         long,
         env = "CUMG_V2_OAUTH_INTROSPECTION_TIMEOUT_SECS",
@@ -272,8 +289,13 @@ async fn main() -> Result<()> {
             "starting protected northbound MCP resource server"
         );
         let http_shutdown = shutdown_rx;
-        let http = axum::serve(listener, northbound.router)
-            .with_graceful_shutdown(wait_for_shutdown(http_shutdown));
+        let http = axum::serve(
+            listener,
+            northbound
+                .router
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(http_shutdown));
         tokio::try_join!(
             async { grpc.await.context("V2 Hub gRPC server failed") },
             async { http.await.context("V2 Hub northbound MCP server failed") },
@@ -298,8 +320,9 @@ fn build_northbound_runtime(
     ]
     .into_iter()
     .any(|value| value);
-    let trusted_proxy_configured =
-        args.trusted_proxy_issuer.is_some() || args.trusted_proxy_subject.is_some();
+    let trusted_proxy_configured = args.trusted_proxy_issuer.is_some()
+        || args.trusted_proxy_subject.is_some()
+        || args.trusted_proxy_secret_file.is_some();
     ensure!(
         !(oauth_configured && trusted_proxy_configured),
         "OAuth introspection and trusted-proxy authentication modes are mutually exclusive"
@@ -351,6 +374,27 @@ fn build_northbound_runtime(
         let subject = required(&args.trusted_proxy_subject, "CUMG_V2_TRUSTED_PROXY_SUBJECT")?;
         let proxy_config = TrustedProxyConfig::new(resource, issuer, subject)
             .context("invalid trusted-proxy fixed-principal configuration")?;
+        let secret_file = args
+            .trusted_proxy_secret_file
+            .as_ref()
+            .context("CUMG_V2_TRUSTED_PROXY_SECRET_FILE is required in trusted-proxy mode")?;
+        ensure!(
+            args.trusted_proxy_max_peer_concurrency < args.max_northbound_concurrency,
+            "CUMG_V2_TRUSTED_PROXY_MAX_PEER_CONCURRENCY must be lower than CUMG_V2_MAX_NORTHBOUND_CONCURRENCY to preserve headroom"
+        );
+        ensure!(
+            args.trusted_proxy_max_peer_requests_per_minute
+                < args.max_northbound_requests_per_minute,
+            "CUMG_V2_TRUSTED_PROXY_MAX_PEER_REQUESTS_PER_MINUTE must be lower than CUMG_V2_MAX_NORTHBOUND_REQUESTS_PER_MINUTE to preserve headroom"
+        );
+        let proxy_secret = load_secret_text(secret_file, MAX_TRUSTED_PROXY_SECRET_BYTES)
+            .context("failed to load trusted-proxy loopback secret")?;
+        let peer_guard = computer_use_mcp_gateway::v2_limits::TrustedProxyLoopbackGuard::new(
+            proxy_secret,
+            args.trusted_proxy_max_peer_concurrency,
+            args.trusted_proxy_max_peer_requests_per_minute,
+        )
+        .context("invalid trusted-proxy loopback trust/rate configuration")?;
         let policy = NorthboundPolicyDocument::from_json(&policy_text)
             .context("failed to parse northbound authorization policy")?
             .build_policy(proxy_config.issuer(), device_id)
@@ -363,6 +407,10 @@ fn build_northbound_runtime(
         .layer(axum::middleware::from_fn_with_state(
             overload,
             computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            peer_guard,
+            computer_use_mcp_gateway::v2_limits::enforce_trusted_proxy_loopback,
         ));
         (router, resource, None, "trusted_proxy_fixed_principal")
     } else {
