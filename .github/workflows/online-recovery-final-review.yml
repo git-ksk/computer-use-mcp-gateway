@@ -1,0 +1,53 @@
+name: Online recovery final review gate
+
+on:
+  push:
+    branches: [feat/local-user-online-recovery]
+
+permissions:
+  contents: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: feat/local-user-online-recovery
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.88.0
+
+      - name: Apply final review fixes
+        run: python3 scripts/online_recovery_final_review.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Documentation links
+        run: python3 scripts/check_docs.py
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Commit reviewed implementation
+        run: |
+          git rm scripts/online_recovery_final_review.py .github/workflows/online-recovery-final-review.yml
+          git add src docs
+          git diff --cached --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "fix(v2): harden online recovery renewal and idempotency"
+          git push origin HEAD:feat/local-user-online-recovery
