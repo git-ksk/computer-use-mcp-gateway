@@ -70,6 +70,7 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
         HubServiceConfig {
             state_dir: temp_dir("v2-real-cua-hub-state"),
             heartbeat_timeout: Duration::from_secs(2),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 1,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 30,

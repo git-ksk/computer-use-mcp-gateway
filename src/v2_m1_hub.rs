@@ -29,7 +29,9 @@ use crate::v2_m1_grpc::{
     decode_agent_frame, encode_hub_frame,
     proto::{AgentFrame, HubFrame, agent_control_server::AgentControl},
 };
-use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
+use crate::v2_m1_persistence::{
+    CheckpointStore, HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError,
+};
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_usage::UsageLease;
 use ed25519_dalek::VerifyingKey;
@@ -39,7 +41,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
@@ -49,6 +51,12 @@ use tracing::Instrument as _;
 
 const SESSION_QUEUE_DEPTH: usize = 16;
 const DEFAULT_GRANT_TTL_MS: u64 = 30_000;
+// Same-generation terminal receipts remain durable for retry/audit semantics, but
+// an indefinitely long Agent session would otherwise grow the Hub checkpoint up
+// to the hard 1 MiB persistence ceiling. Request a clean authenticated generation
+// rollover at half that ceiling, leaving ample headroom for the bounded queue and
+// one final in-flight settlement before the existing generation-prune hook runs.
+pub const DEFAULT_CHECKPOINT_GENERATION_ROLLOVER_BYTES: usize = (MAX_CHECKPOINT_BYTES as usize) / 2;
 // Hub and Agent start their monotonic session clocks on opposite sides of the
 // SessionAccepted network hop. Backdating only `issued_at` shortens the grant's
 // effective remaining life and avoids treating ordinary transport latency as a
@@ -67,6 +75,7 @@ pub struct HubProvisionedMaterial {
 pub struct HubServiceConfig {
     pub state_dir: std::path::PathBuf,
     pub heartbeat_timeout: Duration,
+    pub checkpoint_generation_rollover_bytes: usize,
     pub max_queued_per_device: usize,
     pub max_agent_sessions: usize,
     pub max_agent_session_starts_per_minute: usize,
@@ -84,6 +93,14 @@ impl HubServiceConfig {
         if self.heartbeat_timeout.is_zero() {
             return Err(HubServiceError::InvalidConfig(
                 "heartbeat timeout must be non-zero",
+            ));
+        }
+        if self.checkpoint_generation_rollover_bytes == 0
+            || self.checkpoint_generation_rollover_bytes
+                > DEFAULT_CHECKPOINT_GENERATION_ROLLOVER_BYTES
+        {
+            return Err(HubServiceError::InvalidConfig(
+                "checkpoint generation rollover bytes must be between 1 and half the checkpoint ceiling",
             ));
         }
         if self.max_agent_sessions == 0 || self.max_agent_session_starts_per_minute == 0 {
@@ -115,6 +132,7 @@ struct HubInner {
     persistent: Mutex<PersistentHubState>,
     live: Mutex<Option<LiveSession>>,
     draining: AtomicBool,
+    last_checkpoint_bytes: AtomicUsize,
     session_slots: Arc<Semaphore>,
     session_rate: crate::v2_limits::SlidingWindowRateLimit,
 }
@@ -308,6 +326,7 @@ impl SingleDeviceHub {
             }),
             live: Mutex::new(None),
             draining: AtomicBool::new(false),
+            last_checkpoint_bytes: AtomicUsize::new(0),
             session_slots,
             session_rate,
         });
@@ -470,8 +489,36 @@ impl SingleDeviceHub {
         > = HashMap::new();
         let heartbeat_deadline = tokio::time::sleep(self.inner.config.heartbeat_timeout);
         tokio::pin!(heartbeat_deadline);
+        let mut generation_rollover_requested = false;
 
         loop {
+            if !generation_rollover_requested
+                && self.inner.last_checkpoint_bytes.load(Ordering::Acquire)
+                    >= self.inner.config.checkpoint_generation_rollover_bytes
+            {
+                generation_rollover_requested = true;
+                tracing::info!(
+                    event = "v2_checkpoint_generation_rollover_requested",
+                    device_id = %self.inner.device_id,
+                    generation,
+                    checkpoint_bytes = self.inner.last_checkpoint_bytes.load(Ordering::Acquire),
+                    rollover_bytes = self.inner.config.checkpoint_generation_rollover_bytes,
+                    outcome = "drain_existing",
+                    "Hub checkpoint reached the generation rollover high-water mark; new operation admission is paused"
+                );
+            }
+            if generation_rollover_requested && pending.is_empty() {
+                tracing::info!(
+                    event = "v2_checkpoint_generation_rollover",
+                    device_id = %self.inner.device_id,
+                    generation,
+                    checkpoint_bytes = self.inner.last_checkpoint_bytes.load(Ordering::Acquire),
+                    outcome = "reconnect",
+                    "Hub checkpoint high-water drain completed; closing Agent session for a fresh authenticated generation"
+                );
+                return Ok(());
+            }
+
             tokio::select! {
                 _ = &mut heartbeat_deadline => {
                     tracing::warn!(
@@ -505,6 +552,20 @@ impl SingleDeviceHub {
                                     outcome = "draining",
                                     error_code = "hub_draining",
                                     "operation rejected because Hub shutdown drain has started"
+                                );
+                                let _ = reply.send(Err(HubCommandError::Busy));
+                                continue;
+                            }
+                            if generation_rollover_requested {
+                                tracing::info!(
+                                    event = "v2_operation_rejected",
+                                    operation_id = %operation_id,
+                                    device_id = %self.inner.device_id,
+                                    generation,
+                                    capability = crate::v2_observability::capability_name(command.capability()),
+                                    outcome = "generation_rollover",
+                                    error_code = "state_busy",
+                                    "operation rejected while Hub drains the current generation for checkpoint compaction"
                                 );
                                 let _ = reply.send(Err(HubCommandError::Busy));
                                 continue;
@@ -1792,20 +1853,26 @@ fn persist_locked(
     persistent: &PersistentHubState,
 ) -> Result<(), HubServiceError> {
     let state = HubPersistentState::capture(&persistent.registry, &persistent.execution);
-    if let Err(error) = inner.checkpoint.save(&state) {
-        crate::v2_observability::persistence_failure(
-            crate::v2_observability::PersistenceComponent::Hub,
-        );
-        tracing::error!(
-            event = "v2_persistence_failure",
-            device_id = %inner.device_id,
-            outcome = "failed",
-            error_code = error.safe_error_code(),
-            component = "hub",
-            "Hub checkpoint persistence failed"
-        );
-        return Err(HubServiceError::Persistence(error));
-    }
+    let checkpoint_bytes = match inner.checkpoint.save_with_size(&state) {
+        Ok((_, checkpoint_bytes)) => checkpoint_bytes,
+        Err(error) => {
+            crate::v2_observability::persistence_failure(
+                crate::v2_observability::PersistenceComponent::Hub,
+            );
+            tracing::error!(
+                event = "v2_persistence_failure",
+                device_id = %inner.device_id,
+                outcome = "failed",
+                error_code = error.safe_error_code(),
+                component = "hub",
+                "Hub checkpoint persistence failed"
+            );
+            return Err(HubServiceError::Persistence(error));
+        }
+    };
+    inner
+        .last_checkpoint_bytes
+        .store(checkpoint_bytes, Ordering::Release);
     Ok(())
 }
 
@@ -2059,6 +2126,7 @@ mod tests {
         let config = HubServiceConfig {
             state_dir: state_dir.clone(),
             heartbeat_timeout: Duration::from_secs(5),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 1,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 30,
@@ -2117,6 +2185,7 @@ mod tests {
             HubServiceConfig {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(5),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
                 max_queued_per_device: 1,
                 max_agent_sessions: 2,
                 max_agent_session_starts_per_minute: 30,
@@ -2148,6 +2217,7 @@ mod tests {
             HubServiceConfig {
                 state_dir: state_dir.clone(),
                 heartbeat_timeout: Duration::from_secs(5),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
                 max_queued_per_device: 1,
                 max_agent_sessions: 2,
                 max_agent_session_starts_per_minute: 30,

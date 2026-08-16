@@ -80,6 +80,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
         HubServiceConfig {
             state_dir: hub_state.clone(),
             heartbeat_timeout: E2E_HEARTBEAT_TIMEOUT,
+            checkpoint_generation_rollover_bytes: 512 * 1024,
             max_queued_per_device: 4,
             max_agent_sessions: 2,
             max_agent_session_starts_per_minute: 60,
