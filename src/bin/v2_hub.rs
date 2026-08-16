@@ -52,6 +52,21 @@ struct Args {
     state_dir: PathBuf,
     #[arg(long, env = "CUMG_V2_HEARTBEAT_TIMEOUT_SECS", default_value_t = 45)]
     heartbeat_timeout_secs: u64,
+    /// Hard maximum authenticated Agent session lifetime. A fresh handshake is
+    /// requested before this deadline and the transport is closed at the deadline.
+    #[arg(
+        long,
+        env = "CUMG_V2_MAX_AGENT_SESSION_LIFETIME_SECS",
+        default_value_t = 3600
+    )]
+    max_agent_session_lifetime_secs: u64,
+    /// Headroom before the hard session lifetime used to drain already-admitted work.
+    #[arg(
+        long,
+        env = "CUMG_V2_AGENT_SESSION_REAUTH_DRAIN_SECS",
+        default_value_t = 30
+    )]
+    agent_session_reauth_drain_secs: u64,
     /// Maximum time to keep Agent transport alive after a planned shutdown signal
     /// so already-admitted operations can reach a durable terminal state.
     #[arg(long, env = "CUMG_V2_DRAIN_TIMEOUT_SECS", default_value_t = 30)]
@@ -158,6 +173,12 @@ async fn main() -> Result<()> {
         "CUMG_V2_HEARTBEAT_TIMEOUT_SECS must be greater than zero"
     );
     ensure!(
+        args.max_agent_session_lifetime_secs > 0
+            && args.agent_session_reauth_drain_secs > 0
+            && args.agent_session_reauth_drain_secs < args.max_agent_session_lifetime_secs,
+        "CUMG_V2_MAX_AGENT_SESSION_LIFETIME_SECS must exceed the non-zero CUMG_V2_AGENT_SESSION_REAUTH_DRAIN_SECS"
+    );
+    ensure!(
         args.drain_timeout_secs > 0,
         "CUMG_V2_DRAIN_TIMEOUT_SECS must be greater than zero"
     );
@@ -206,6 +227,8 @@ async fn main() -> Result<()> {
         HubServiceConfig {
             state_dir: args.state_dir.clone(),
             heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
+            max_agent_session_lifetime: Duration::from_secs(args.max_agent_session_lifetime_secs),
+            agent_session_reauth_drain: Duration::from_secs(args.agent_session_reauth_drain_secs),
             checkpoint_generation_rollover_bytes: args.checkpoint_generation_rollover_bytes,
             max_queued_per_device: args.max_queued_per_device,
             max_agent_sessions: args.max_agent_sessions,

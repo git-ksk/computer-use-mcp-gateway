@@ -43,6 +43,8 @@ fn hub_config(state_dir: PathBuf) -> HubServiceConfig {
     HubServiceConfig {
         state_dir,
         heartbeat_timeout: Duration::from_secs(2),
+        max_agent_session_lifetime: Duration::from_secs(60 * 60),
+        agent_session_reauth_drain: Duration::from_secs(30),
         checkpoint_generation_rollover_bytes: 512 * 1024,
         max_queued_per_device: 1,
         max_agent_sessions: 2,

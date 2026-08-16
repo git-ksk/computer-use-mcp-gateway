@@ -149,6 +149,8 @@ post-M1 P0 execution-safety の詳細と residual recovery assumption は [`V2_P
 
 現在の M1 evidence には、pinned certificate trust/domain validation を伴う TLS-protected gRPC bidirectional streaming と、独立した Ed25519 application authentication が含まれます。以前の raw-TLS transport は regression/reference implementation として残り、TLS 1.3-only + dedicated ALPN です。operator-facing `v2_hub` daemon と `v2_agent` は end-to-end TLS/gRPC test でカバーされています。public-edge firewall/reverse-proxy control、raw transport handshake shedding、external authorization-service availability、credential/certificate custody は deployment responsibility のままです。これらを理由に accepted application-level safety model を弱めてはいけません。
 
+production hardening では authenticated Agent session に hard maximum lifetime も設定します。Hub は期限前の bounded drain window で new admission を止め、通常は already-admitted work が settle してから stream を閉じ、fresh nonce-bound handshake / generation を要求します。hard deadline が先に到達した場合も fail closed のままで、unresolved dispatched work は replay せず `Indeterminate` + quarantine になり得ます。
+
 ### Replay / stale-state attacker
 
 Controls:
@@ -205,6 +207,8 @@ transfer ref と staging は context/generation/revision lifecycle とともに�
 ### Agent credential rotation
 
 logical device ID は stable のままです。replacement には currently enrolled device key と proposed new device key の両方で sign された rotation statement が必要です。rotation は current capability session を無効化し、reconnect より前に generation state を進めます。
+
+packaged rotation runbook では continuity document を one-shot として扱います。Agent を停止し、offline/admin context で dual-signed replacement を生成し、Hub が new verifier を verify/persist してから Agent を new secret で起動します。fresh authenticated generation の成功後は rotation-file setting を外し、その document を再利用せず persisted trust だけで subsequent Hub restart が成功しなければなりません。詳細は [`../../packaging/README.md`](../../packaging/README.md) を参照してください。
 
 current Agent key が continuity proof に使える状態ではなく lost した場合、recovery は explicit administrative re-enrollment flow でなければなりません。ordinary in-band rotation として表現してはいけません。
 
