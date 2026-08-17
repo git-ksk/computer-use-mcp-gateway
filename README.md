@@ -79,6 +79,12 @@ CUMG is fail-closed around the capabilities that can change a desktop. In partic
 - backend request arguments/results, screenshots, clipboard data, bearer tokens, and private credentials are excluded from default telemetry/logging;
 - remote deployments keep the Hub listener behind a reviewed TLS/authentication edge and preserve the outbound Agent connection model.
 
+### Authenticated browser profile protection
+
+Ordinary browser inspection and attachment to an existing authenticated browser profile are separate security boundaries. For existing-profile attachment, CUMG does not accept or forward backend approval tokens, launch grants, bearer/proxy/CDP credentials, or host authorization artifacts, so an MCP client cannot self-assert that elevated access was approved. The request must target an exact observed browser window, while backend/operator authorization remains authoritative and may refuse even after CUMG capability authorization succeeds.
+
+This preserves a defense-in-depth boundary between observing page/UI state and attaching to a live authenticated browser profile. See [`docs/v2/V2_BROWSER_SEMANTIC_CAPABILITIES.md`](docs/v2/V2_BROWSER_SEMANTIC_CAPABILITIES.md) and the browser-core acceptance evidence in [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md).
+
 These controls do not replace OS permissions, endpoint hardening, secret custody, network controls, or deployment-specific monitoring. Read [`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/v2/V2_THREAT_MODEL.md`](docs/v2/V2_THREAT_MODEL.md) before exposing a sensitive desktop remotely.
 
 ## V2 status
