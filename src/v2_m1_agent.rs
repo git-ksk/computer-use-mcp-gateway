@@ -34,7 +34,9 @@ use crate::v2_m1_grpc::{
 };
 use crate::v2_m1_keys::AgentProvisionedMaterial;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, PersistenceError};
-use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
+use crate::v2_m1_process::{
+    ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy, ProcessUnprovenStage,
+};
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -701,6 +703,25 @@ impl AgentService {
                                     );
                                     return Ok(SessionExit::Reconnect);
                                 }
+                                AgentIndeterminateCause::ProcessOutcomeUnproven(stage) => {
+                                    // The process/shell operation was dispatched to its local
+                                    // worker, but the Agent cannot prove the spawn/terminal boundary
+                                    // strongly enough to publish an ordinary result. Close
+                                    // this authenticated generation so the Hub's existing
+                                    // connection-loss path durably quarantines the operation.
+                                    tracing::warn!(
+                                        event = "v2_agent_process_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "indeterminate",
+                                        indeterminate_reason = "process_outcome_unproven",
+                                        failure_stage = stage.as_str(),
+                                        error_code = "process_outcome_unproven",
+                                        "process/shell terminality is unproven after spawn; reconnecting without a terminal result"
+                                    );
+                                    return Ok(SessionExit::Reconnect);
+                                }
                             }
                         }
                     }
@@ -803,13 +824,11 @@ impl AgentService {
                                     tokio::spawn(async move {
                                         let result = tokio::task::spawn_blocking(move || {
                                             executor.execute(&request, &worker_cancel)
-                                        }).await
-                                            .map_err(|_| AgentOperationError::WorkerPanicked)
-                                            .and_then(|result| result.map(|output| DeviceResult::Process { output }).map_err(AgentOperationError::Process));
+                                        }).await;
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
                                             device_generation: worker_generation,
-                                            outcome: AgentOperationOutcome::Result(result),
+                                            outcome: process_operation_outcome(result),
                                         }).await;
                                     });
                                     ActiveCancellation::Process(cancellation)
@@ -821,13 +840,11 @@ impl AgentService {
                                     tokio::spawn(async move {
                                         let result = tokio::task::spawn_blocking(move || {
                                             shell.execute(&request, &worker_cancel)
-                                        }).await
-                                            .map_err(|_| AgentOperationError::WorkerPanicked)
-                                            .and_then(|result| result.map(|output| DeviceResult::Shell { output }).map_err(AgentOperationError::Shell));
+                                        }).await;
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
                                             device_generation: worker_generation,
-                                            outcome: AgentOperationOutcome::Result(result),
+                                            outcome: shell_operation_outcome(result),
                                         }).await;
                                     });
                                     ActiveCancellation::Process(cancellation)
@@ -1054,6 +1071,7 @@ enum AgentOperationOutcome {
 enum AgentIndeterminateCause {
     CancellationPropagated,
     BackendTimedOut,
+    ProcessOutcomeUnproven(ProcessUnprovenStage),
 }
 
 #[derive(Debug)]
@@ -1061,6 +1079,40 @@ struct OperationCompletion {
     operation_id: String,
     device_generation: u64,
     outcome: AgentOperationOutcome,
+}
+
+fn process_operation_outcome(
+    result: Result<Result<crate::v2_m0::ProcessOutput, ProcessError>, tokio::task::JoinError>,
+) -> AgentOperationOutcome {
+    match result {
+        Ok(Ok(output)) => AgentOperationOutcome::Result(Ok(DeviceResult::Process { output })),
+        Ok(Err(error)) => match error.outcome_unproven_stage() {
+            Some(stage) => AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
+            ),
+            None => AgentOperationOutcome::Result(Err(AgentOperationError::Process(error))),
+        },
+        Err(_) => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::ProcessOutcomeUnproven(ProcessUnprovenStage::Worker),
+        ),
+    }
+}
+
+fn shell_operation_outcome(
+    result: Result<Result<crate::v2_m0::ProcessOutput, ShellError>, tokio::task::JoinError>,
+) -> AgentOperationOutcome {
+    match result {
+        Ok(Ok(output)) => AgentOperationOutcome::Result(Ok(DeviceResult::Shell { output })),
+        Ok(Err(error)) => match error.outcome_unproven_stage() {
+            Some(stage) => AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
+            ),
+            None => AgentOperationOutcome::Result(Err(AgentOperationError::Shell(error))),
+        },
+        Err(_) => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::ProcessOutcomeUnproven(ProcessUnprovenStage::Worker),
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -1131,6 +1183,13 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
             if error.kind() == std::io::ErrorKind::NotFound =>
         {
             DeviceErrorCode::NotFound
+        }
+        AgentOperationError::Process(ProcessError::OutcomeUnproven(_))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::OutcomeUnproven(_))) => {
+            // Defense in depth: normal process/shell workers intercept this before
+            // constructing a DeviceResult. If a future path bypasses that helper,
+            // the wire fallback must still enter Hub indeterminate/quarantine.
+            DeviceErrorCode::BackendOutcomeIndeterminate
         }
         AgentOperationError::Filesystem(FilesystemError::Io(_))
         | AgentOperationError::Process(ProcessError::Io(_))
@@ -1647,6 +1706,58 @@ impl std::error::Error for AgentServiceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_terminal_proof_classification_controls_indeterminate_routing() {
+        let ordinary = process_operation_outcome(Ok(Err(ProcessError::Io(std::io::Error::other(
+            "terminal reader failure",
+        )))));
+        assert!(matches!(
+            ordinary,
+            AgentOperationOutcome::Result(Err(AgentOperationError::Process(_)))
+        ));
+
+        let unproven = process_operation_outcome(Ok(Err(ProcessError::OutcomeUnproven(
+            ProcessUnprovenStage::Wait,
+        ))));
+        assert!(matches!(
+            unproven,
+            AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
+                ProcessUnprovenStage::Wait
+            ))
+        ));
+
+        let shell_unproven = shell_operation_outcome(Ok(Err(ShellError::Process(
+            ProcessError::OutcomeUnproven(ProcessUnprovenStage::Termination),
+        ))));
+        assert!(matches!(
+            shell_unproven,
+            AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
+                ProcessUnprovenStage::Termination
+            ))
+        ));
+        let leaked =
+            AgentOperationError::Process(ProcessError::OutcomeUnproven(ProcessUnprovenStage::Poll));
+        assert_eq!(
+            operation_error_code(&leaked),
+            DeviceErrorCode::BackendOutcomeIndeterminate
+        );
+    }
+
+    #[tokio::test]
+    async fn process_worker_panic_is_fail_closed_indeterminate() {
+        let joined =
+            tokio::task::spawn_blocking(|| -> Result<crate::v2_m0::ProcessOutput, ProcessError> {
+                panic!("injected process worker panic");
+            })
+            .await;
+        assert!(matches!(
+            process_operation_outcome(joined),
+            AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
+                ProcessUnprovenStage::Worker
+            ))
+        ));
+    }
 
     #[test]
     fn environment_policy_errors_map_to_stable_device_codes_without_values() {

@@ -6,7 +6,9 @@
 //! supervision, and cooperative cancellation machinery as structured execution.
 
 use crate::v2_m0::{ProcessOutput, ShellRequest};
-use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
+use crate::v2_m1_process::{
+    ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy, ProcessUnprovenStage,
+};
 use crate::v2_observability::SafeErrorCode;
 use std::fmt;
 
@@ -45,6 +47,15 @@ pub enum ShellError {
     InvalidCommand,
     CommandTooLarge,
     Process(ProcessError),
+}
+
+impl ShellError {
+    pub(crate) fn outcome_unproven_stage(&self) -> Option<ProcessUnprovenStage> {
+        match self {
+            Self::Process(error) => error.outcome_unproven_stage(),
+            _ => None,
+        }
+    }
 }
 
 impl SafeErrorCode for ShellError {

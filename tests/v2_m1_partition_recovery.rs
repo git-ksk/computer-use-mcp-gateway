@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use computer_use_mcp_gateway::{
     v2_execution_safety::{IndeterminateReason, OperationOwner},
     v2_m0::{DeviceCommand, DeviceIdentity, DeviceResult, GrantAuthority, ShellRequest},
-    v2_m0_execution::IndeterminateResolution,
+    v2_m0_execution::{HubOperationState, IndeterminateResolution},
     v2_m0_transport::HubIdentity,
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig},
@@ -229,6 +229,15 @@ async fn partition_after_dispatch_quarantines_across_agent_restart_and_fences_co
     assert_eq!(quarantine.operation_id, operation_id);
     assert_eq!(quarantine.owner, alice);
     assert_eq!(quarantine.reason, IndeterminateReason::ConnectionLost);
+    let recovery = handle
+        .operation_recovery_as(alice.clone(), &operation_id)
+        .await?;
+    assert_eq!(recovery.state, HubOperationState::Indeterminate);
+    assert_eq!(
+        recovery.indeterminate_reason,
+        Some(IndeterminateReason::ConnectionLost)
+    );
+    assert!(recovery.result.is_none());
 
     // The local effect can finish after transport loss. This is precisely why
     // reconnect cannot infer success/failure from liveness.
