@@ -79,6 +79,12 @@ CUMG は、デスクトップを変更できる capability について fail-clo
 - backend request arguments/results、screenshot、clipboard data、bearer token、private credential はデフォルトの telemetry/logging から除外します。
 - remote deployment では Hub listener をレビュー済み TLS/authentication edge の背後に置き、Agent からの outbound connection model を維持します。
 
+### 認証済みブラウザプロファイルの保護
+
+通常の browser inspection と、既存の認証済み browser profile への attach は別のセキュリティ境界として扱います。existing-profile attachment では、CUMG は backend approval token、launch grant、bearer/proxy/CDP credential、host authorization artifact を受け取ったり転送したりしません。そのため MCP client が「承認済み」と自己申告して昇格アクセスを成立させることはできません。request は観測済みの exact browser window を対象にする必要があり、CUMG の capability authorization が成功した後でも backend/operator authorization が最終的な権限を持ち、拒否できます。
+
+これにより、page/UI state を観測する経路と、live な認証済み browser profile に attach する経路の間に defense-in-depth 境界を維持します。詳細は [`docs/v2/V2_BROWSER_SEMANTIC_CAPABILITIES.md`](docs/v2/V2_BROWSER_SEMANTIC_CAPABILITIES.md) と [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) を参照してください。
+
 これらの制御は OS 権限、endpoint hardening、secret custody、network control、deployment 固有の監視を代替するものではありません。機密性の高い desktop をリモート公開する前に、[`docs/SECURITY.ja.md`](docs/SECURITY.ja.md) と [`docs/v2/V2_THREAT_MODEL.ja.md`](docs/v2/V2_THREAT_MODEL.ja.md) を確認してください。
 
 ## V2 の状況
