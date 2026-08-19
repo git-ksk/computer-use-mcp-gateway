@@ -24,7 +24,6 @@ Status as of 2026-08-19:
 - [`V2_CUA_PARITY_MATRIX.md`](V2_CUA_PARITY_MATRIX.md) — Cua compatibility/parity classification.
 - [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md) — security claims and non-claims.
 - [`V2_STANDARDIZATION.md`](V2_STANDARDIZATION.md) and [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md) — maintained-OSS/standards replacement boundaries.
-- [`V2_USAGE_ACCOUNTING.md`](V2_USAGE_ACCOUNTING.md) — optional accounting integration.
 
 ## Acceptance evidence
 

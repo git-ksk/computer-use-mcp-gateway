@@ -39,7 +39,5 @@ pub mod v2_reference_backend;
 pub mod v2_state_lock;
 pub mod v2_tls_lifecycle;
 
-pub mod v2_usage;
-
 #[cfg(windows)]
 mod v2_windows_acl;

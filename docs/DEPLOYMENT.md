@@ -159,11 +159,6 @@ The signer is not a raw signing oracle: requests are bounded typed grant fields;
 
 For northbound OAuth introspection, use the optional encrypted-credential drop-in in `packaging/systemd/cumg-v2-hub-oauth-credential.conf.example` rather than putting the client secret in `hub.env`. For trusted-proxy mode, use `packaging/systemd/cumg-v2-hub-trusted-proxy-credential.conf.example`; provision the same random secret separately to the proxy/tunnel and never place the value itself in `hub.env`.
 
-#### Optional MemoryUsageStore sidecar
-
-Usage accounting is disabled by default. To enable it, install `packaging/systemd/cumg-v2-usage-sidecar.service`, copy `usage.env.example` outside the repository, build/install `mcp-usage-control` core from source locally, and install the optional `cumg-v2-hub-usage.conf.example` drop-in. The Hub then uses `CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/`.
-
-The drop-in couples the sidecar lifecycle to Hub restart; therefore an explicit packaged Hub restart recreates the non-durable MemoryUsageStore. If you manually supervise Hub and sidecar separately, a Hub-only restart does not reset a still-running sidecar. In either case, usage reset never clears CUMG operation/quarantine checkpoints. Do not use this Memory store as a financial ledger. See [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md).
 
 ### TLS renewal
 

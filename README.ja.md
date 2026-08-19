@@ -32,7 +32,7 @@ V2 Agent
 Computer-use backend (Cua Driver today)
 ```
 
-Hub は admission、authorization、operation state、replay barrier、永続的な `indeterminate` quarantine を所有します。Agent は認証済み device session とローカル実行境界を所有します。任意の usage accounting は独立した accounting authority であり、実行を認可したり、quarantine を解除したり、replay を許可したりする権限はありません。
+Hub は admission、authorization、operation state、replay barrier、永続的な `indeterminate` quarantine を所有します。Agent は認証済み device session とローカル実行境界を所有します。quota、billing、usage control は deployment 側で外付けする責務であり、CUMG の execution、replay、quarantine、recovery authority を得ることはありません。
 
 詳しくは [`docs/ARCHITECTURE.ja.md`](docs/ARCHITECTURE.ja.md) と、V2 の canonical boundary を定義する [`docs/v2/V2_POSITIONING.ja.md`](docs/v2/V2_POSITIONING.ja.md) を参照してください。
 

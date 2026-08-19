@@ -113,11 +113,6 @@ V2 diagnostic output is a security boundary. Default tracing events and OTel met
 
 Higher verbosity through `RUST_LOG` does not relax the payload-free policy. Do not compensate for a diagnostic gap by logging command/result objects or underlying provider exceptions; add a bounded `error_code` or event field instead. External collectors, reverse proxies and service managers must likewise avoid body/header capture that would defeat the application boundary. See [`DEPLOYMENT.md`](DEPLOYMENT.md#overload-and-observability) for the event/metric taxonomy and incident correlation keys.
 
-### Optional MCPUsage security boundary
-
-Usage accounting does not become execution authority. The Hub first completes northbound authentication and derives issuer+subject, then sends only that verified identity, CUMG `operation_id`, and bounded tool/accounting metadata to the loopback sidecar. Authentication credentials, tool arguments/results, screenshots, shell text, file contents, and introspection credentials do not cross the usage bridge. The current RFC 7662 adapter additionally strips its bearer token before Hub execution. The sidecar rejects unexpected reserve fields.
-
-A usage reserve/`markLiable()` failure fails closed before Agent dispatch. A settlement failure after dispatch never clears CUMG quarantine, converts `indeterminate`, retries the operation, or authorizes a competing principal. MemoryUsageStore restart can reset quota state but cannot reset durable CUMG safety state. The packaged sidecar is additionally constrained to localhost traffic. See [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md).
 
 ## V2 P1 fixed-set multi-device security review
 

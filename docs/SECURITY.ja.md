@@ -113,11 +113,6 @@ V2 diagnostic output 自体が security boundary です。default tracing event 
 
 `RUST_LOG` で verbosity を上げても payload-free policy は緩みません。diagnostic gap を埋めるため command/result object や underlying provider exception を log するのではなく、bounded `error_code` / event field を追加してください。external collector、reverse proxy、service manager でも application boundary を無効にする body/header capture を避ける必要があります。event/metric taxonomy と incident correlation key は [`DEPLOYMENT.md`](DEPLOYMENT.md#overload-and-observability) を参照してください。
 
-### Optional MCPUsage security boundary
-
-usage accounting は execution authority にはなりません。Hub はまず northbound authentication を完了して issuer+subject を derive し、その verified identity、CUMG `operation_id`、bounded tool/accounting metadata のみを loopback sidecar に送ります。authentication credential、tool argument/result、screenshot、shell text、file content、introspection credential は usage bridge を越えません。現在の RFC 7662 adapter は Hub execution 前に bearer token も strip します。sidecar は unexpected reserve field を拒否します。
-
-usage reserve / `markLiable()` failure は Agent dispatch 前に fail closed します。dispatch 後の settlement failure が CUMG quarantine を clear したり、`indeterminate` を変換したり、operation を retry したり、competing principal を authorize したりすることはありません。MemoryUsageStore restart は quota state を reset できますが durable CUMG safety state は reset できません。packaged sidecar はさらに localhost traffic のみに制約されます。[`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md) を参照してください。
 
 ## V2 P1 fixed-set multi-device security review
 

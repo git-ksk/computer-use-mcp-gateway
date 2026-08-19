@@ -32,7 +32,7 @@ V2 Agent
 Computer-use backend (Cua Driver today)
 ```
 
-The Hub owns admission, authorization, operation state, replay barriers, and durable `indeterminate` quarantine. The Agent owns the authenticated device session and local execution boundary. Optional usage accounting is separate accounting authority and cannot authorize execution, clear quarantine, or permit replay.
+The Hub owns admission, authorization, operation state, replay barriers, and durable `indeterminate` quarantine. The Agent owns the authenticated device session and local execution boundary. Deployment-specific quota, billing, or usage controls belong outside CUMG and do not gain execution, replay, quarantine, or recovery authority.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the canonical V2 boundary in [`docs/v2/V2_POSITIONING.md`](docs/v2/V2_POSITIONING.md).
 

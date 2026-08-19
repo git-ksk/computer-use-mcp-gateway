@@ -136,23 +136,11 @@ gateway は internet authentication service ではありません。remote deplo
 
 tool exposure は deny-by-default です。Cua 自身の policy engine は argument-aware な second capability ceiling を提供できます。
 
-## V2 runtime と optional accounting seam
+## V2 runtime
 
 実際の northbound runtime は現在 V2 Hub です。default binary と explicit `v2_hub` binary は同じ entrypoint を共有し、`v2_agent` は別の outbound desktop process のままです。旧 single-process V1 entrypoint は `v1_gateway` として保持されています。
 
-usage seam は authoritative execution controller の外側に意図的に置きます。
-
-```text
-northbound authentication -> verified issuer+subject -> reserve(1)
-  -> exact DeviceCapability authorization
-  -> CUMG admission / ownership / generation / quarantine
-  -> markLiable()
-  -> persisted Dispatched -> Agent send
-```
-
-`UsageController` には Noop implementation と local-sidecar implementation があります。lease が運ぶのは accounting state のみで、`v2_execution_safety` は依存しません。`markLiable()` failure は新 safety-state branch を追加せず existing pre-dispatch CUMG transition を通じて cancel します。settlement failure は execution decision 後の best-effort accounting failure であり、business-operation replay を引き起こしません。
-
-bridge は CUMG-owned / loopback-only で、bearer token / tool payload を送りません。initial implementation は `mcp-usage-control` の `MemoryUsageStore` を使います。[`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md) を参照してください。
+quota、billing、usage accounting は CUMG core の外側にある deployment-layer の責務です。reverse proxy、MCP edge、その他 operator-controlled component で Hub 到達前に制御できますが、その component は CUMG の operation identity、authorization、generation fencing、durable execution state、quarantine、replay admission、recovery を変更できません。
 
 authoritative operation record は execution-safety schema v4 を使用します。schema v3 で導入した bounded audit correlation label と optional な keyed shell/process request fingerprint は引き続き non-authoritative であり、owner/device/generation/capability fence、terminal state、retry semantics、replay admission を変更できません。schema v4 はさらに effectful operation の exact pre-send dispatch binding（既存 authoritative な operation/device/original-generation/capability に加え capability revision + one-shot grant ID）と explicit reconciliation status を persist します。Agent は別の bounded / payload-free terminal-evidence journal を保持し、fresh authenticated session 後にだけ報告します。Hub が `Indeterminate` record を self-reconcile できるのは binding/evidence が exact equality の場合だけです。candidate terminal checkpoint を commit してから live controller を swap するため、persistence failure 時は quarantine が残ります。read-only maintenance は label、fingerprint presence/comparison、reconciliation status、bounded auto-resolution history を公開できますが、raw request/result、fingerprint/key value、owner principal、dispatch-fence value は公開しません。schema v1/v2/v3 checkpoint は元の representational limit 内で引き続き読め、新しい state を失う downgrade は拒否します。
 
