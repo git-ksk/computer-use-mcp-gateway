@@ -153,7 +153,7 @@ M0 で既に証明済みの controls:
 - signed Hub time を Agent の monotonic elapsed time に anchor し grant-expiry evaluation に使う。
 - dispatch 後の connection loss は durable `Indeterminate` state + exact-operation desktop quarantine となり、automatic replay しない。
 - authoritative Hub operation record は issuer/subject ownership と device generation にも bind されるため、competing principal や stale Agent generation は operation を settle できない。
-- reconnect/liveness は quarantine を clear できず、explicit resolution は persistence-gated / auditable。
+- reconnect/liveness だけでは quarantine を clear できない。transient ambiguity を self-reconcile できるのは、Hub の durable な operation/device/original-generation/capability-revision/capability/dispatch-fence binding に exact match する authenticated terminal-evidence report だけで、その terminal transition も persistence-gated / auditable。その他は explicit operator resolution が必要。
 
 post-M1 P0 execution-safety の詳細と residual recovery assumption は [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) にあります。
 
@@ -172,7 +172,7 @@ Controls:
 - operation ID は silent reuse できない。completed/cancelled Agent replay tombstone は authenticated device generation によって bounded され、Hub `Indeterminate` operation は explicit resolution まで durable に残る。
 - handshake proof replay は fresh nonce に対して失敗する。
 
-completed/cancelled replay tombstone は authenticated device generation によって bounded されます。fresh generation により old signed command は execution gate 到達前に stale になるため、old terminal ID は prune できます。`Indeterminate` Hub operation は意図的にこの pruning 対象外であり、explicit operator resolution まで device を quarantine し続けます。
+completed/cancelled replay tombstone は authenticated device generation によって bounded されます。fresh generation により old signed command は execution gate 到達前に stale になるため、old terminal ID は prune できます。`Indeterminate` Hub operation は意図的にこの pruning 対象外であり、同じ already-dispatched operation の exact authoritative terminal evidence による self-reconciliation、または explicit operator resolution が durable commit されるまで device を quarantine し続けます。どちらの path も operation を replay しません。
 
 ### Denial of service
 
@@ -250,6 +250,8 @@ raw screenshot、raw backend output、raw command argument、clipboard value、t
 
 schema v3 の reconciliation metadata は evidence を4種類に明確に分離します。**correlation evidence** は bounded な workflow/client label と、明示的に canonicalize された shell/process contract の keyed request fingerprint であり、特定できるのは「どの higher-level step / candidate request を議論しているか」までです。**observational evidence** は独立した read-only postcondition/state check で、capability contract が authority を明示しない限り advisory です。**authoritative terminal evidence** は operation state machine を settle できる既存の signed/verified execution evidence です。**operator resolution** は exact quarantined operation に十分な evidence がある場合だけ適用する explicit / persistence-gated decision です。correlation/fingerprint 一致だけでは terminal evidence、replay permission、side effect 発生の proof にはなりません。fingerprint key/value は normal audit asset ではなく、key rotation 時は request を different と再解釈せず comparison を unavailable に degrade させます。
 
+schema v4 は、このうち **authoritative terminal evidence** class だけを self-reconciliation に使用します。Hub は send 前に stable device ID、original device generation、exact `DeviceCapability`、capability revision、one-shot grant ID からなる original dispatch binding を persist します。Agent の durable journal は request/result payload を一切含まず最大64件で、normal execution path が definite terminal result に到達した後だけ entry を作れます。fresh authenticated session では journal を new session nonce に対して署名します。Hub は current device signature / reporting generation を検証したうえで、older quarantined record との全項目 exact equality を要求します。current/stale wrong generation、wrong device、wrong operation、wrong capability/revision/fence、unsupported evidence/state pair、missing journal entry は quarantine を clear できません。`auto_reconciling`、`auto_resolved`、`operator_required`、`unrecoverable_evidence_gap` を explicit な durable/audit state として扱います。Hub は candidate terminal checkpoint を write してから live quarantine removal を可視化します。したがって compromised Agent に generic な「clear quarantine」primitive は増えず、online 時にその exact dispatched operation へ元々持っていた result authority を別 operation/fence へ拡張できません。correlation fingerprint から execution evidence を捏造することもできません。
+
 ## V2-M1 acceptance と residual deployment responsibility
 
 V2-M1 implementation gate は 2026-08-12 に pass しました。M1 code には verified northbound principal construction、production key/certificate lifecycle procedure、bounded service connection/rate shedding、bounded replay pruning、real-Cua cancellation quarantine、OpenTelemetry/OTLP integration、OS service packaging が含まれます。詳細は [`V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md) を参照してください。
@@ -262,6 +264,6 @@ threat model は deployment に引き続き次の external responsibility を要
 - `ExecuteProcess` / `Shell` は exact `Dangerous` capability であり filesystem sandbox ではない。cwd/root check は arbitrary process argv / shell syntax を制限しない。
 - macOS GUI automation は operator-controlled Cua/TCC trust boundary に依存する。compromised Agent / desktop backend は上記 non-compromise guarantee の対象外。
 - default telemetry は payload-free のままにする。collector/proxy body logging や high-sensitivity debug capture の enable は別 sensitive-data boundary を作る。
-- `indeterminate` operation は explicit resolution まで quarantined のままにする。network recovery、backend reconnect、service restart は replay permission ではない。
+- `indeterminate` operation は persistence-gated な settlement が存在するまで quarantined のままにする。network recovery、backend reconnect、service restart だけでは settlement ではなく、replay permission にもならない。automatic な例外は同じ prior dispatch binding に対する exact signed terminal evidence だけで、missing/mismatch evidence は operator-required / fail-closed のまま。
 
 これらは deployment assumption / residual risk であり、missing V2-M1 protocol feature ではありません。multi-machine identity、fleet attestation、additional native GUI backend は later milestone に意図的に defer されています。

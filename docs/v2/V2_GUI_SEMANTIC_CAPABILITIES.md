@@ -84,7 +84,7 @@ If the Agent is offline, there is no live advertisement and no semantic device t
 reconnect may produce a new device generation or capability revision; stateful requests are fenced
 against both, so a discovery/dispatch race fails closed.
 
-The control schema is version 8 and the capability-advertisement schema remains version 4. Hub and
+The control schema is version 8 and the capability-advertisement schema is version 5. Capability schema v5 coordinates the signed payload-free reconciliation-report frame used after a fresh authenticated generation. Hub and
 Agent control-schema mismatches fail closed; capability advertisements with another schema version are
 also rejected rather than interpreted as an ambiguous rolling-upgrade compatibility mode.
 

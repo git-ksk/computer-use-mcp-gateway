@@ -281,7 +281,7 @@ Before exposing the northbound MCP resource, verify all of these independently:
 - `tools/list` contains only capabilities granted by the exact policy;
 - a harmless V2 Cua-backed operation such as `list_apps` or `get_screen_size` succeeds;
 - optional usage accounting increments only when enabled;
-- reconnect does not clear any unresolved CUMG quarantine.
+- reconnect/liveness alone does not clear unresolved CUMG quarantine; only exact signed terminal evidence for the same prior dispatch may self-reconcile without replay.
 
 Then use [`DEPLOYMENT.md`](DEPLOYMENT.md) for the reviewed reverse-proxy/TLS path. Keep the northbound MCP listener loopback-only.
 

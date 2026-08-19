@@ -9,7 +9,7 @@
 //! stores raw command, argv, cwd, or environment payloads.
 
 use crate::v2_m0::{
-    DeviceCapability, DeviceErrorCode, ProcessOutput, ProcessRequest, ShellRequest,
+    DeviceCapability, DeviceErrorCode, DeviceResult, ProcessOutput, ProcessRequest, ShellRequest,
 };
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision, ExecutionError,
@@ -22,13 +22,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 3;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 4;
+const AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 3;
 const RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 2;
 const LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 1;
 pub const MAX_RESOLUTION_EVIDENCE_BYTES: usize = 1024;
 pub const MAX_RECOVERY_ARCHIVE_ENTRIES: usize = 8;
 pub const MAX_RECOVERY_ARCHIVE_BYTES: usize = 256 * 1024;
 pub const MAX_AUDIT_CORRELATION_ID_BYTES: usize = 128;
+pub const MAX_DISPATCH_FENCE_BYTES: usize = 128;
+pub const MAX_RECONCILIATION_DEVICE_ID_BYTES: usize = 128;
+pub const MAX_RECONCILIATION_OPERATION_ID_BYTES: usize = 128;
+pub const MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES: usize = 64;
+pub const MAX_AUTO_RESOLUTION_RECORDS: usize = 64;
 pub const REQUEST_FINGERPRINT_ALGORITHM: &str = "hmac-sha256:cumg-v2-shell-process-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -100,6 +106,204 @@ pub struct ExecutionReceipt {
     pub terminal_state: HubOperationState,
     pub evidence: ExecutionEvidence,
     pub finalized_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationStatus {
+    AutoReconciling,
+    AutoResolved,
+    OperatorRequired,
+    UnrecoverableEvidenceGap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationDispatchBinding {
+    pub capability_revision: u64,
+    pub grant_id: String,
+}
+
+impl OperationDispatchBinding {
+    pub fn new(
+        capability_revision: u64,
+        grant_id: impl Into<String>,
+    ) -> Result<Self, ExecutionError> {
+        let binding = Self {
+            capability_revision,
+            grant_id: grant_id.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), ExecutionError> {
+        if self.capability_revision == 0
+            || self.grant_id.is_empty()
+            || self.grant_id.len() > MAX_DISPATCH_FENCE_BYTES
+            || !self.grant_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        Ok(())
+    }
+}
+
+/// Payload-free proof that the normal Agent execution path already reached a
+/// terminal result for one exact previously-dispatched operation. The proof is
+/// useful only after the transport layer authenticates it to the enrolled device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTerminalEvidence {
+    pub operation: OperationRef,
+    pub capability_revision: u64,
+    pub capability: DeviceCapability,
+    pub dispatch_grant_id: String,
+    pub terminal_state: HubOperationState,
+    pub evidence: ExecutionEvidence,
+}
+
+impl AgentTerminalEvidence {
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        OperationDispatchBinding::new(self.capability_revision, self.dispatch_grant_id.clone())?;
+        if self.operation.device_id.trim().is_empty()
+            || self.operation.device_id.len() > MAX_RECONCILIATION_DEVICE_ID_BYTES
+            || self.operation.device_generation == 0
+            || self.operation.operation_id.trim().is_empty()
+            || self.operation.operation_id.len() > MAX_RECONCILIATION_OPERATION_ID_BYTES
+            || !authoritative_agent_terminal_pair(self.terminal_state, self.evidence)
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        Ok(())
+    }
+
+    pub fn dispatch_binding(&self) -> OperationDispatchBinding {
+        OperationDispatchBinding {
+            capability_revision: self.capability_revision,
+            grant_id: self.dispatch_grant_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoResolutionRecord {
+    pub operation: OperationRef,
+    pub capability: DeviceCapability,
+    pub terminal_state: HubOperationState,
+    pub evidence: ExecutionEvidence,
+    pub dispatch_binding: OperationDispatchBinding,
+    pub resolved_at_ms: u64,
+}
+
+impl AutoResolutionRecord {
+    fn is_valid(&self) -> bool {
+        !self.operation.device_id.trim().is_empty()
+            && self.operation.device_id.len() <= MAX_RECONCILIATION_DEVICE_ID_BYTES
+            && self.operation.device_generation > 0
+            && !self.operation.operation_id.trim().is_empty()
+            && self.operation.operation_id.len() <= MAX_RECONCILIATION_OPERATION_ID_BYTES
+            && self.dispatch_binding.validate().is_ok()
+            && authoritative_agent_terminal_pair(self.terminal_state, self.evidence)
+    }
+}
+
+fn authoritative_agent_terminal_pair(
+    terminal_state: HubOperationState,
+    evidence: ExecutionEvidence,
+) -> bool {
+    matches!(
+        (terminal_state, evidence),
+        (
+            HubOperationState::Completed,
+            ExecutionEvidence::VerifiedAgentResult
+        ) | (
+            HubOperationState::Failed,
+            ExecutionEvidence::VerifiedRemoteError
+        ) | (
+            HubOperationState::Failed | HubOperationState::Cancelled,
+            ExecutionEvidence::ProvenProcessTermination
+        )
+    )
+}
+
+pub fn terminal_evidence_for_device_result(
+    result: &DeviceResult,
+) -> Option<(HubOperationState, ExecutionEvidence)> {
+    match result {
+        DeviceResult::Error {
+            code: DeviceErrorCode::BackendOutcomeIndeterminate,
+        } => None,
+        DeviceResult::Error { .. } => Some((
+            HubOperationState::Failed,
+            ExecutionEvidence::VerifiedRemoteError,
+        )),
+        DeviceResult::Process { output } | DeviceResult::Shell { output } if output.cancelled => {
+            Some((
+                HubOperationState::Cancelled,
+                ExecutionEvidence::ProvenProcessTermination,
+            ))
+        }
+        DeviceResult::Process { output } | DeviceResult::Shell { output } if output.timed_out => {
+            Some((
+                HubOperationState::Failed,
+                ExecutionEvidence::ProvenProcessTermination,
+            ))
+        }
+        _ => Some((
+            HubOperationState::Completed,
+            ExecutionEvidence::VerifiedAgentResult,
+        )),
+    }
+}
+
+fn default_reconciliation_status(
+    reason: Option<IndeterminateReason>,
+    dispatch_binding: Option<&OperationDispatchBinding>,
+) -> ReconciliationStatus {
+    if dispatch_binding.is_some()
+        && matches!(
+            reason,
+            Some(
+                IndeterminateReason::ConnectionLost
+                    | IndeterminateReason::HubRestartAfterDispatch
+                    | IndeterminateReason::ResultDeliveryLost
+            )
+        )
+    {
+        ReconciliationStatus::AutoReconciling
+    } else {
+        ReconciliationStatus::OperatorRequired
+    }
+}
+
+fn valid_reconciliation_state(
+    state: HubOperationState,
+    status: Option<ReconciliationStatus>,
+    dispatch_binding: Option<&OperationDispatchBinding>,
+) -> bool {
+    match (state, status) {
+        (HubOperationState::Indeterminate, None) => true,
+        (HubOperationState::Indeterminate, Some(ReconciliationStatus::AutoReconciling)) => {
+            dispatch_binding.is_some()
+        }
+        (
+            HubOperationState::Indeterminate,
+            Some(
+                ReconciliationStatus::OperatorRequired
+                | ReconciliationStatus::UnrecoverableEvidenceGap,
+            ),
+        ) => true,
+        (
+            HubOperationState::Completed | HubOperationState::Failed | HubOperationState::Cancelled,
+            Some(ReconciliationStatus::AutoResolved),
+        ) => dispatch_binding.is_some(),
+        (
+            HubOperationState::Completed | HubOperationState::Failed | HubOperationState::Cancelled,
+            None,
+        ) => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +562,8 @@ pub struct QuarantineInspectionSnapshot {
     pub indeterminate_at_ms: u64,
     pub indeterminate_reason: IndeterminateReason,
     pub evidence: Option<ExecutionEvidence>,
+    pub reconciliation_status: ReconciliationStatus,
+    pub dispatch_binding_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +609,10 @@ pub struct SafetyOperationSnapshot {
     pub audit: OperationAuditMetadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_fingerprint: Option<OperationRequestFingerprint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_binding: Option<OperationDispatchBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_status: Option<ReconciliationStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +624,8 @@ pub struct AuthoritativeSafetySnapshot {
     pub recoveries: Vec<ArchivedOperationRecovery>,
     pub quarantines: Vec<DesktopQuarantine>,
     pub resolutions: Vec<ResolutionRecord>,
+    #[serde(default)]
+    pub auto_resolutions: Vec<AutoResolutionRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -429,20 +641,25 @@ struct SafetyOperation {
     recoverable_result: Option<RecoverableOperationResult>,
     audit: OperationAuditMetadata,
     request_fingerprint: Option<OperationRequestFingerprint>,
+    dispatch_binding: Option<OperationDispatchBinding>,
+    reconciliation_status: Option<ReconciliationStatus>,
 }
 
 /// Single authoritative state machine for Hub-side desktop execution safety.
 ///
 /// The invariant is intentionally stricter than transport liveness: once work
 /// may have crossed the side-effect boundary, a missing proof converges to
-/// durable `Indeterminate` + desktop quarantine. Reconnect never resolves it.
-#[derive(Debug)]
+/// durable `Indeterminate` + desktop quarantine. Reconnect/liveness alone never
+/// resolves it; only exact authoritative terminal evidence for the same prior
+/// dispatch may settle it, without replay.
+#[derive(Debug, Clone)]
 pub struct AuthoritativeOperationController {
     admission: HubAdmissionController,
     operations: HashMap<String, SafetyOperation>,
     recovery_archive: HashMap<String, ArchivedOperationRecovery>,
     quarantines: HashMap<String, DesktopQuarantine>,
     resolutions: Vec<ResolutionRecord>,
+    auto_resolutions: Vec<AutoResolutionRecord>,
 }
 
 impl AuthoritativeOperationController {
@@ -453,6 +670,7 @@ impl AuthoritativeOperationController {
             recovery_archive: HashMap::new(),
             quarantines: HashMap::new(),
             resolutions: Vec::new(),
+            auto_resolutions: Vec::new(),
         })
     }
 
@@ -510,6 +728,8 @@ impl AuthoritativeOperationController {
                 recoverable_result: None,
                 audit,
                 request_fingerprint,
+                dispatch_binding: None,
+                reconciliation_status: None,
             },
         );
         Ok(decision)
@@ -525,6 +745,20 @@ impl AuthoritativeOperationController {
         device_generation: u64,
         now_ms: u64,
     ) -> Result<(), ExecutionError> {
+        self.mark_dispatched_with_binding(operation_id, owner, device_generation, None, now_ms)
+    }
+
+    pub fn mark_dispatched_with_binding(
+        &mut self,
+        operation_id: &str,
+        owner: &OperationOwner,
+        device_generation: u64,
+        dispatch_binding: Option<OperationDispatchBinding>,
+        now_ms: u64,
+    ) -> Result<(), ExecutionError> {
+        if let Some(binding) = dispatch_binding.as_ref() {
+            binding.validate()?;
+        }
         {
             let operation = self.checked(operation_id, owner, device_generation)?;
             if operation.state != HubOperationState::ActiveNotDispatched {
@@ -538,6 +772,8 @@ impl AuthoritativeOperationController {
             .ok_or(ExecutionError::UnknownOperation)?;
         operation.state = HubOperationState::Dispatched;
         operation.dispatched_at_ms = Some(now_ms);
+        operation.dispatch_binding = dispatch_binding;
+        operation.reconciliation_status = None;
         Ok(())
     }
 
@@ -709,6 +945,10 @@ impl AuthoritativeOperationController {
         record.indeterminate_reason = Some(reason);
         record.receipt = None;
         record.recoverable_result = None;
+        record.reconciliation_status = Some(default_reconciliation_status(
+            Some(reason),
+            record.dispatch_binding.as_ref(),
+        ));
         let quarantine = DesktopQuarantine {
             device_id: record.operation.device_id.clone(),
             operation_id: record.operation.operation_id.clone(),
@@ -719,6 +959,101 @@ impl AuthoritativeOperationController {
         };
         self.quarantines.insert(device_id, quarantine);
         Ok(next)
+    }
+
+    pub fn mark_reconciliation_evidence_gap(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<(), ExecutionError> {
+        let record = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if record.state != HubOperationState::Indeterminate
+            || record.reconciliation_status != Some(ReconciliationStatus::AutoReconciling)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        record.reconciliation_status = Some(ReconciliationStatus::UnrecoverableEvidenceGap);
+        Ok(())
+    }
+
+    pub fn mark_reconciliation_operator_required(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<(), ExecutionError> {
+        let record = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if record.state != HubOperationState::Indeterminate {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        record.reconciliation_status = Some(ReconciliationStatus::OperatorRequired);
+        Ok(())
+    }
+
+    pub fn reconcile_authoritative_terminal(
+        &mut self,
+        terminal: &AgentTerminalEvidence,
+        now_ms: u64,
+    ) -> Result<(CompletionDecision, ExecutionReceipt), ExecutionError> {
+        terminal.validate()?;
+        let record = self
+            .operations
+            .get(&terminal.operation.operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if record.state != HubOperationState::Indeterminate
+            || record.reconciliation_status != Some(ReconciliationStatus::AutoReconciling)
+            || record.operation != terminal.operation
+            || record.capability != terminal.capability
+            || record.dispatch_binding.as_ref() != Some(&terminal.dispatch_binding())
+        {
+            return Err(ExecutionError::OwnershipFenceMismatch);
+        }
+        let quarantine = self
+            .quarantines
+            .get(&record.operation.device_id)
+            .ok_or(ExecutionError::InvalidTransition)?;
+        if quarantine.operation_id != terminal.operation.operation_id
+            || quarantine.device_generation != terminal.operation.device_generation
+        {
+            return Err(ExecutionError::OwnershipFenceMismatch);
+        }
+
+        let next = self.admission.reconcile_indeterminate_terminal(
+            &terminal.operation.operation_id,
+            terminal.terminal_state,
+        )?;
+        let record = self
+            .operations
+            .get_mut(&terminal.operation.operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        record.state = terminal.terminal_state;
+        record.indeterminate_reason = None;
+        record.reconciliation_status = Some(ReconciliationStatus::AutoResolved);
+        let receipt = Self::receipt_for(record, terminal.terminal_state, terminal.evidence, now_ms);
+        record.receipt = Some(receipt.clone());
+        record.recoverable_result = None;
+        let dispatch_binding = record
+            .dispatch_binding
+            .clone()
+            .ok_or(ExecutionError::InvalidTransition)?;
+        self.quarantines.remove(&record.operation.device_id);
+        self.auto_resolutions.push(AutoResolutionRecord {
+            operation: record.operation.clone(),
+            capability: record.capability,
+            terminal_state: terminal.terminal_state,
+            evidence: terminal.evidence,
+            dispatch_binding,
+            resolved_at_ms: now_ms,
+        });
+        if self.auto_resolutions.len() > MAX_AUTO_RESOLUTION_RECORDS {
+            let excess = self.auto_resolutions.len() - MAX_AUTO_RESOLUTION_RECORDS;
+            self.auto_resolutions.drain(..excess);
+        }
+        self.activate_next(&next);
+        Ok((next, receipt))
     }
 
     pub fn resolve_indeterminate(
@@ -763,6 +1098,7 @@ impl AuthoritativeOperationController {
             .ok_or(ExecutionError::UnknownOperation)?;
         record.state = terminal;
         record.indeterminate_reason = None;
+        record.reconciliation_status = None;
         let receipt = Self::receipt_for(
             record,
             terminal,
@@ -917,6 +1253,10 @@ impl AuthoritativeOperationController {
                     indeterminate_at_ms: quarantine.since_ms,
                     indeterminate_reason: quarantine.reason,
                     evidence: record.receipt.as_ref().map(|receipt| receipt.evidence),
+                    reconciliation_status: record
+                        .reconciliation_status
+                        .unwrap_or(ReconciliationStatus::OperatorRequired),
+                    dispatch_binding_present: record.dispatch_binding.is_some(),
                 })
             })
             .collect()
@@ -924,6 +1264,10 @@ impl AuthoritativeOperationController {
 
     pub fn resolutions(&self) -> &[ResolutionRecord] {
         &self.resolutions
+    }
+
+    pub fn auto_resolutions(&self) -> &[AutoResolutionRecord] {
+        &self.auto_resolutions
     }
 
     pub fn prune_terminal_before_generation(
@@ -1080,6 +1424,14 @@ impl AuthoritativeOperationController {
                 recoverable_result,
                 audit: record.audit.clone(),
                 request_fingerprint: record.request_fingerprint.clone(),
+                dispatch_binding: record.dispatch_binding.clone(),
+                reconciliation_status: if state == HubOperationState::Indeterminate {
+                    Some(record.reconciliation_status.unwrap_or_else(|| {
+                        default_reconciliation_status(reason, record.dispatch_binding.as_ref())
+                    }))
+                } else {
+                    record.reconciliation_status
+                },
             });
         }
         operations.sort_by(|a, b| a.operation.operation_id.cmp(&b.operation.operation_id));
@@ -1094,6 +1446,7 @@ impl AuthoritativeOperationController {
             recoveries,
             quarantines,
             resolutions: self.resolutions.clone(),
+            auto_resolutions: self.auto_resolutions.clone(),
         }
     }
 
@@ -1108,18 +1461,43 @@ impl AuthoritativeOperationController {
         &self,
         target_schema_version: u16,
     ) -> Result<AuthoritativeSafetySnapshot, ExecutionError> {
+        let has_v4_state = !self.auto_resolutions.is_empty()
+            || self.operations.values().any(|record| {
+                record.dispatch_binding.is_some() || record.reconciliation_status.is_some()
+            });
         let mut snapshot = self.snapshot_for_restart();
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v4_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                snapshot.auto_resolutions.clear();
+                for record in &mut snapshot.operations {
+                    record.dispatch_binding = None;
+                    record.reconciliation_status = None;
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version = AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if snapshot
-                    .operations
-                    .iter()
-                    .any(|record| !record.audit.is_empty() || record.request_fingerprint.is_some())
+                if has_v4_state
+                    || snapshot.operations.iter().any(|record| {
+                        !record.audit.is_empty() || record.request_fingerprint.is_some()
+                    })
                 {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
+                snapshot.auto_resolutions.clear();
                 for record in &mut snapshot.operations {
+                    record.dispatch_binding = None;
+                    record.reconciliation_status = None;
                     if let Some(receipt) = &mut record.receipt {
                         receipt.schema_version = RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
                     }
@@ -1131,7 +1509,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if !snapshot.recoveries.is_empty()
+                if has_v4_state
+                    || !snapshot.recoveries.is_empty()
                     || snapshot.operations.iter().any(|record| {
                         record.recoverable_result.is_some()
                             || !record.audit.is_empty()
@@ -1140,7 +1519,10 @@ impl AuthoritativeOperationController {
                 {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
+                snapshot.auto_resolutions.clear();
                 for record in &mut snapshot.operations {
+                    record.dispatch_binding = None;
+                    record.reconciliation_status = None;
                     if let Some(receipt) = &mut record.receipt {
                         receipt.schema_version = LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION;
                     }
@@ -1160,15 +1542,23 @@ impl AuthoritativeOperationController {
             snapshot.schema_version,
             LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION
                 | RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
+                | AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION
             && snapshot
                 .operations
                 .iter()
                 .any(|record| !record.audit.is_empty() || record.request_fingerprint.is_some())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && (snapshot.operations.iter().any(|record| {
+                record.dispatch_binding.is_some() || record.reconciliation_status.is_some()
+            }) || !snapshot.auto_resolutions.is_empty())
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -1202,6 +1592,15 @@ impl AuthoritativeOperationController {
                     .request_fingerprint
                     .as_ref()
                     .is_some_and(|fingerprint| fingerprint.validate().is_err())
+                || record
+                    .dispatch_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.validate().is_err())
+                || !valid_reconciliation_state(
+                    record.state,
+                    record.reconciliation_status,
+                    record.dispatch_binding.as_ref(),
+                )
             {
                 return Err(ExecutionError::InvalidSnapshot);
             }
@@ -1219,6 +1618,8 @@ impl AuthoritativeOperationController {
                     recoverable_result: record.recoverable_result,
                     audit: record.audit,
                     request_fingerprint: record.request_fingerprint,
+                    dispatch_binding: record.dispatch_binding,
+                    reconciliation_status: record.reconciliation_status,
                 },
             );
         }
@@ -1279,12 +1680,64 @@ impl AuthoritativeOperationController {
                 return Err(ExecutionError::InvalidSnapshot);
             }
         }
+        if snapshot.auto_resolutions.len() > MAX_AUTO_RESOLUTION_RECORDS
+            || snapshot
+                .auto_resolutions
+                .iter()
+                .any(|record| !record.is_valid())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        let mut auto_resolution_ids = std::collections::HashSet::new();
+        if snapshot
+            .auto_resolutions
+            .iter()
+            .any(|record| !auto_resolution_ids.insert(record.operation.operation_id.as_str()))
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        for operation in operations.values().filter(|operation| {
+            operation.reconciliation_status == Some(ReconciliationStatus::AutoResolved)
+        }) {
+            let Some(history) = snapshot
+                .auto_resolutions
+                .iter()
+                .find(|history| history.operation.operation_id == operation.operation.operation_id)
+            else {
+                return Err(ExecutionError::InvalidSnapshot);
+            };
+            let Some(receipt) = operation.receipt.as_ref() else {
+                return Err(ExecutionError::InvalidSnapshot);
+            };
+            if history.operation != operation.operation
+                || history.capability != operation.capability
+                || history.terminal_state != operation.state
+                || history.evidence != receipt.evidence
+                || operation.dispatch_binding.as_ref() != Some(&history.dispatch_binding)
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+        }
+        for history in &snapshot.auto_resolutions {
+            if let Some(operation) = operations.get(&history.operation.operation_id)
+                && (operation.reconciliation_status != Some(ReconciliationStatus::AutoResolved)
+                    || operation.operation != history.operation
+                    || operation.capability != history.capability
+                    || operation.state != history.terminal_state
+                    || operation.receipt.as_ref().map(|receipt| receipt.evidence)
+                        != Some(history.evidence)
+                    || operation.dispatch_binding.as_ref() != Some(&history.dispatch_binding))
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+        }
         Ok(Self {
             admission,
             operations,
             recovery_archive,
             quarantines,
             resolutions: snapshot.resolutions,
+            auto_resolutions: snapshot.auto_resolutions,
         })
     }
 
@@ -2399,6 +2852,456 @@ mod tests {
                     max_queued_per_device: 8,
                 },
                 forged_v2,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn authoritative_terminal_evidence_self_reconciles_exact_binding_without_replay() {
+        let mut ledger = controller();
+        let binding = OperationDispatchBinding::new(17, "grant_fence_exact").unwrap();
+        ledger
+            .prepare(
+                op("op-auto-resolve", 4),
+                alice(),
+                DeviceCapability::PointerClick,
+                100,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched_with_binding(
+                "op-auto-resolve",
+                &alice(),
+                4,
+                Some(binding.clone()),
+                110,
+            )
+            .unwrap();
+        ledger.mark_connection_lost("op-auto-resolve", 120).unwrap();
+
+        let inspection = ledger.quarantine_inspections().unwrap().pop().unwrap();
+        assert_eq!(
+            inspection.reconciliation_status,
+            ReconciliationStatus::AutoReconciling
+        );
+        assert!(inspection.dispatch_binding_present);
+
+        let proof = AgentTerminalEvidence {
+            operation: op("op-auto-resolve", 4),
+            capability_revision: binding.capability_revision,
+            capability: DeviceCapability::PointerClick,
+            dispatch_grant_id: binding.grant_id.clone(),
+            terminal_state: HubOperationState::Completed,
+            evidence: ExecutionEvidence::VerifiedAgentResult,
+        };
+        let (next, receipt) = ledger
+            .reconcile_authoritative_terminal(&proof, 130)
+            .unwrap();
+        assert_eq!(next, CompletionDecision::Idle);
+        assert_eq!(receipt.terminal_state, HubOperationState::Completed);
+        assert_eq!(receipt.evidence, ExecutionEvidence::VerifiedAgentResult);
+        assert_eq!(
+            ledger.state("op-auto-resolve"),
+            Some(HubOperationState::Completed)
+        );
+        assert!(ledger.quarantine("desktop-a").is_none());
+        assert_eq!(ledger.auto_resolutions().len(), 1);
+        assert_eq!(
+            ledger.auto_resolutions()[0].operation.operation_id,
+            "op-auto-resolve"
+        );
+
+        // Duplicate evidence is not a new transition and can never trigger replay.
+        assert!(matches!(
+            ledger.reconcile_authoritative_terminal(&proof, 131),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        ));
+        assert_eq!(ledger.auto_resolutions().len(), 1);
+
+        let snapshot = ledger.snapshot_for_restart();
+        let record = snapshot
+            .operations
+            .iter()
+            .find(|record| record.operation.operation_id == "op-auto-resolve")
+            .unwrap();
+        assert_eq!(
+            record.reconciliation_status,
+            Some(ReconciliationStatus::AutoResolved)
+        );
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.state("op-auto-resolve"),
+            Some(HubOperationState::Completed)
+        );
+        assert_eq!(restored.auto_resolutions().len(), 1);
+    }
+
+    #[test]
+    fn hub_restart_and_result_delivery_loss_are_reconciled_only_from_bound_terminal_proof() {
+        for (operation_id, reason) in [
+            (
+                "op-hub-restart",
+                IndeterminateReason::HubRestartAfterDispatch,
+            ),
+            (
+                "op-result-delivery-loss",
+                IndeterminateReason::ResultDeliveryLost,
+            ),
+        ] {
+            let binding =
+                OperationDispatchBinding::new(31, format!("grant_{operation_id}")).unwrap();
+            let mut ledger = controller();
+            ledger
+                .prepare(op(operation_id, 6), alice(), DeviceCapability::Shell, 1)
+                .unwrap();
+            ledger
+                .mark_dispatched_with_binding(operation_id, &alice(), 6, Some(binding.clone()), 2)
+                .unwrap();
+
+            let mut ledger = if reason == IndeterminateReason::HubRestartAfterDispatch {
+                AuthoritativeOperationController::restore_after_restart(
+                    AdmissionLimits {
+                        max_global_active: 1,
+                        max_queued_per_device: 8,
+                    },
+                    ledger.snapshot_for_restart(),
+                )
+                .unwrap()
+            } else {
+                ledger
+                    .mark_indeterminate(operation_id, &alice(), 6, reason, 3)
+                    .unwrap();
+                ledger
+            };
+            let inspection = ledger.quarantine_inspections().unwrap().pop().unwrap();
+            assert_eq!(inspection.indeterminate_reason, reason);
+            assert_eq!(
+                inspection.reconciliation_status,
+                ReconciliationStatus::AutoReconciling
+            );
+
+            let proof = AgentTerminalEvidence {
+                operation: op(operation_id, 6),
+                capability_revision: binding.capability_revision,
+                capability: DeviceCapability::Shell,
+                dispatch_grant_id: binding.grant_id,
+                terminal_state: HubOperationState::Completed,
+                evidence: ExecutionEvidence::VerifiedAgentResult,
+            };
+            ledger.reconcile_authoritative_terminal(&proof, 4).unwrap();
+            assert_eq!(
+                ledger.state(operation_id),
+                Some(HubOperationState::Completed)
+            );
+            assert!(ledger.quarantine("desktop-a").is_none());
+        }
+    }
+
+    #[test]
+    fn reconciliation_requires_exact_operation_generation_capability_and_dispatch_fence() {
+        let binding = OperationDispatchBinding::new(23, "grant_fence_original").unwrap();
+        let mut base = controller();
+        base.prepare(op("op-bound", 8), alice(), DeviceCapability::Shell, 1)
+            .unwrap();
+        base.mark_dispatched_with_binding("op-bound", &alice(), 8, Some(binding.clone()), 2)
+            .unwrap();
+        base.mark_connection_lost("op-bound", 3).unwrap();
+
+        let exact = AgentTerminalEvidence {
+            operation: op("op-bound", 8),
+            capability_revision: 23,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: "grant_fence_original".into(),
+            terminal_state: HubOperationState::Completed,
+            evidence: ExecutionEvidence::VerifiedAgentResult,
+        };
+
+        let mut wrong_generation = base.clone();
+        let mut proof = exact.clone();
+        proof.operation.device_generation = 7;
+        assert_eq!(
+            wrong_generation.reconcile_authoritative_terminal(&proof, 4),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        );
+        assert!(wrong_generation.quarantine("desktop-a").is_some());
+
+        let mut wrong_device = base.clone();
+        let mut proof = exact.clone();
+        proof.operation.device_id = "desktop-b".into();
+        assert_eq!(
+            wrong_device.reconcile_authoritative_terminal(&proof, 4),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        );
+        assert!(wrong_device.quarantine("desktop-a").is_some());
+
+        let mut wrong_capability = base.clone();
+        let mut proof = exact.clone();
+        proof.capability = DeviceCapability::ExecuteProcess;
+        assert_eq!(
+            wrong_capability.reconcile_authoritative_terminal(&proof, 4),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        );
+        assert!(wrong_capability.quarantine("desktop-a").is_some());
+
+        let mut wrong_revision = base.clone();
+        let mut proof = exact.clone();
+        proof.capability_revision = 24;
+        assert_eq!(
+            wrong_revision.reconcile_authoritative_terminal(&proof, 4),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        );
+        assert!(wrong_revision.quarantine("desktop-a").is_some());
+
+        let mut wrong_fence = base;
+        let mut proof = exact;
+        proof.dispatch_grant_id = "grant_fence_other".into();
+        assert_eq!(
+            wrong_fence.reconcile_authoritative_terminal(&proof, 4),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        );
+        assert!(wrong_fence.quarantine("desktop-a").is_some());
+    }
+
+    #[test]
+    fn missing_or_non_authoritative_evidence_never_clears_quarantine() {
+        let binding = OperationDispatchBinding::new(9, "grant_gap").unwrap();
+        let mut ledger = controller();
+        ledger
+            .prepare(op("op-gap", 2), alice(), DeviceCapability::Shell, 1)
+            .unwrap();
+        ledger
+            .mark_dispatched_with_binding("op-gap", &alice(), 2, Some(binding.clone()), 2)
+            .unwrap();
+        ledger.mark_connection_lost("op-gap", 3).unwrap();
+        ledger.mark_reconciliation_evidence_gap("op-gap").unwrap();
+        assert_eq!(
+            ledger.quarantine_inspections().unwrap()[0].reconciliation_status,
+            ReconciliationStatus::UnrecoverableEvidenceGap
+        );
+        let proof = AgentTerminalEvidence {
+            operation: op("op-gap", 2),
+            capability_revision: 9,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: binding.grant_id,
+            terminal_state: HubOperationState::Completed,
+            evidence: ExecutionEvidence::VerifiedAgentResult,
+        };
+        assert!(matches!(
+            ledger.reconcile_authoritative_terminal(&proof, 4),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        ));
+        assert!(ledger.quarantine("desktop-a").is_some());
+
+        let mut operator = controller();
+        operator
+            .prepare(
+                op("op-operator", 3),
+                alice(),
+                DeviceCapability::PointerClick,
+                10,
+            )
+            .unwrap();
+        operator
+            .mark_dispatched_with_binding(
+                "op-operator",
+                &alice(),
+                3,
+                Some(OperationDispatchBinding::new(10, "grant_operator").unwrap()),
+                11,
+            )
+            .unwrap();
+        operator
+            .mark_indeterminate(
+                "op-operator",
+                &alice(),
+                3,
+                IndeterminateReason::CancellationUnproven,
+                12,
+            )
+            .unwrap();
+        assert_eq!(
+            operator.quarantine_inspections().unwrap()[0].reconciliation_status,
+            ReconciliationStatus::OperatorRequired
+        );
+    }
+
+    #[test]
+    fn forged_auto_resolved_state_requires_matching_bounded_audit_history() {
+        let mut ledger = controller();
+        let binding = OperationDispatchBinding::new(13, "grant_history_exact").unwrap();
+        ledger
+            .prepare(
+                op("op-history", 5),
+                alice(),
+                DeviceCapability::PointerClick,
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched_with_binding("op-history", &alice(), 5, Some(binding.clone()), 2)
+            .unwrap();
+        ledger.mark_connection_lost("op-history", 3).unwrap();
+        ledger
+            .reconcile_authoritative_terminal(
+                &AgentTerminalEvidence {
+                    operation: op("op-history", 5),
+                    capability_revision: binding.capability_revision,
+                    capability: DeviceCapability::PointerClick,
+                    dispatch_grant_id: binding.grant_id,
+                    terminal_state: HubOperationState::Completed,
+                    evidence: ExecutionEvidence::VerifiedAgentResult,
+                },
+                4,
+            )
+            .unwrap();
+
+        let valid = ledger.snapshot_for_restart();
+        assert!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                valid.clone(),
+            )
+            .is_ok()
+        );
+
+        let mut missing_history = valid.clone();
+        missing_history.auto_resolutions.clear();
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                missing_history,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+
+        let mut mismatched_history = valid;
+        mismatched_history.auto_resolutions[0]
+            .dispatch_binding
+            .grant_id = "grant_history_other".into();
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                mismatched_history,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn reconciliation_evidence_ids_are_explicitly_bounded_below_transport_limits() {
+        let base = AgentTerminalEvidence {
+            operation: op("op-bounded", 2),
+            capability_revision: 1,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: "grant_bounded".into(),
+            terminal_state: HubOperationState::Completed,
+            evidence: ExecutionEvidence::VerifiedAgentResult,
+        };
+        assert!(base.validate().is_ok());
+
+        let mut oversized_operation = base.clone();
+        oversized_operation.operation.operation_id =
+            "x".repeat(MAX_RECONCILIATION_OPERATION_ID_BYTES + 1);
+        assert_eq!(
+            oversized_operation.validate(),
+            Err(ExecutionError::InvalidOperation)
+        );
+
+        let mut oversized_device = base;
+        oversized_device.operation.device_id = "d".repeat(MAX_RECONCILIATION_DEVICE_ID_BYTES + 1);
+        assert_eq!(
+            oversized_device.validate(),
+            Err(ExecutionError::InvalidOperation)
+        );
+    }
+
+    #[test]
+    fn schema_v3_remains_readable_but_cannot_claim_v4_reconciliation_state() {
+        let mut v3_source = controller();
+        v3_source
+            .prepare_with_audit(
+                op("op-v3-readable", 3),
+                alice(),
+                DeviceCapability::Shell,
+                OperationAuditMetadata {
+                    workflow_id: Some("wf-v3".into()),
+                    workflow_step_id: None,
+                    client_correlation_id: None,
+                },
+                None,
+                1,
+            )
+            .unwrap();
+        v3_source
+            .mark_dispatched("op-v3-readable", &alice(), 3, 2)
+            .unwrap();
+        v3_source
+            .finalize(
+                "op-v3-readable",
+                &alice(),
+                3,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                3,
+            )
+            .unwrap();
+        let mut v3 = v3_source.snapshot_for_restart();
+        v3.schema_version = AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION;
+        v3.operations[0].receipt.as_mut().unwrap().schema_version =
+            AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION;
+        assert!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                v3,
+            )
+            .is_ok()
+        );
+
+        let mut v4 = controller();
+        v4.prepare(op("op-v4-only", 4), alice(), DeviceCapability::Shell, 10)
+            .unwrap();
+        v4.mark_dispatched_with_binding(
+            "op-v4-only",
+            &alice(),
+            4,
+            Some(OperationDispatchBinding::new(11, "grant-v4-only").unwrap()),
+            11,
+        )
+        .unwrap();
+        v4.mark_connection_lost("op-v4-only", 12).unwrap();
+        assert!(matches!(
+            v4.snapshot_for_restart_compatible_with(AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+        let mut forged_v3 = v4.snapshot_for_restart();
+        forged_v3.schema_version = AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION;
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                forged_v3,
             ),
             Err(ExecutionError::InvalidSnapshot)
         ));

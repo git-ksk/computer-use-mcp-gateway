@@ -115,7 +115,7 @@ Cua safety refusal は引き続き authoritative です。同一 PID が複数�
 - `ClipboardWrite` が現在対応するのは plain text のみです。V1/Cua の image clipboard write と file clipboard write は **V2 では未実装**です。
 - `LaunchApplication` は現在、V1/Cua の `additional_arguments` と `webkit_inspector_port` を公開していません。これらは **未parity** です。
 
-`CONTROL_SCHEMA_VERSION` は version 8、`CAPABILITY_SCHEMA_VERSION` は引き続き version 4 です。control schema mismatch と capability-advertisement schema mismatch は fail closed します。通常の signed Hub/Agent message は 64 KiB application bound を維持し、bounded image/UI/clipboard/region observation はレビュー済み large-result allowance を使用します。clipboard plain text の上限は 1 MiB です。
+`CONTROL_SCHEMA_VERSION` は version 8、`CAPABILITY_SCHEMA_VERSION` は version 5 です。capability schema v5 は fresh authenticated generation 後の signed / payload-free Agent reconciliation-report boundary を追加し、v4/v5 mixed peer は stream を部分解釈せず capability-advertisement handshake で fail closed します。control schema mismatch と capability-advertisement schema mismatch も fail closed します。通常の signed Hub/Agent message は 64 KiB application bound を維持し、bounded image/UI/clipboard/region observation はレビュー済み large-result allowance を使用します。clipboard plain text の上限は 1 MiB です。
 
 ## 必須の実装順序
 

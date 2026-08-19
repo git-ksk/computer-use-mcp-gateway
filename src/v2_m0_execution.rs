@@ -85,7 +85,7 @@ pub struct HubAdmissionSnapshot {
     pub operations: Vec<HubOperationSnapshot>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HubAdmissionController {
     limits: AdmissionLimits,
     active_by_device: HashMap<String, String>,
@@ -383,6 +383,43 @@ impl HubAdmissionController {
             IndeterminateResolution::ConfirmedCompleted => HubOperationState::Completed,
             IndeterminateResolution::ConfirmedNotExecuted => HubOperationState::Cancelled,
         };
+        self.blocked_by_indeterminate.remove(&device_id);
+        Ok(self
+            .start_next_for_available_capacity(Some(&device_id))
+            .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
+    }
+
+    /// Settle an indeterminate operation from already-authoritative terminal
+    /// evidence. This never dispatches or retries work; it only changes the
+    /// existing quarantined operation to the exact terminal state proved by
+    /// the normal execution protocol.
+    pub fn reconcile_indeterminate_terminal(
+        &mut self,
+        operation_id: &str,
+        terminal: HubOperationState,
+    ) -> Result<CompletionDecision, ExecutionError> {
+        if !matches!(
+            terminal,
+            HubOperationState::Completed | HubOperationState::Failed | HubOperationState::Cancelled
+        ) {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let operation = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if operation.state != HubOperationState::Indeterminate {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let device_id = operation.operation.device_id.clone();
+        if self
+            .blocked_by_indeterminate
+            .get(&device_id)
+            .is_none_or(|blocked| blocked != operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        operation.state = terminal;
         self.blocked_by_indeterminate.remove(&device_id);
         Ok(self
             .start_next_for_available_capacity(Some(&device_id))

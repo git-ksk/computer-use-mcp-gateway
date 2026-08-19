@@ -8,7 +8,10 @@
 //! permissions, malformed state, and unsupported schema versions instead of
 //! silently falling back from a malformed committed checkpoint.
 
-use crate::v2_execution_safety::{AuthoritativeOperationController, AuthoritativeSafetySnapshot};
+use crate::v2_execution_safety::{
+    AgentTerminalEvidence, AuthoritativeOperationController, AuthoritativeSafetySnapshot,
+    MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES,
+};
 use crate::v2_m0::{DeviceRegistry, DeviceRegistrySnapshot, GrantLedger, GrantLedgerSnapshot};
 use crate::v2_m0_execution::{AdmissionLimits, AgentExecutionGate, AgentExecutionSnapshot};
 use crate::v2_m0_trust::TrustedHubIdentity;
@@ -36,6 +39,8 @@ pub struct AgentPersistentState {
     pub trusted_hub_epoch: u64,
     pub grant_ledger: GrantLedgerSnapshot,
     pub execution: AgentExecutionSnapshot,
+    #[serde(default)]
+    pub terminal_evidence: Vec<AgentTerminalEvidence>,
 }
 
 impl AgentPersistentState {
@@ -45,8 +50,23 @@ impl AgentPersistentState {
         grant_ledger: &GrantLedger,
         execution: &AgentExecutionGate,
     ) -> Result<Self, PersistenceError> {
+        Self::capture_with_terminal_evidence(device_id, trusted_hub, grant_ledger, execution, &[])
+    }
+
+    pub fn capture_with_terminal_evidence(
+        device_id: impl Into<String>,
+        trusted_hub: &TrustedHubIdentity,
+        grant_ledger: &GrantLedger,
+        execution: &AgentExecutionGate,
+        terminal_evidence: &[AgentTerminalEvidence],
+    ) -> Result<Self, PersistenceError> {
         let device_id = device_id.into();
-        if device_id.trim().is_empty() {
+        if device_id.trim().is_empty()
+            || terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
+            || terminal_evidence
+                .iter()
+                .any(|entry| entry.validate().is_err())
+        {
             return Err(PersistenceError::InvalidState);
         }
         Ok(Self {
@@ -56,6 +76,7 @@ impl AgentPersistentState {
             trusted_hub_epoch: trusted_hub.epoch(),
             grant_ledger: grant_ledger.snapshot(),
             execution: execution.snapshot_for_restart(),
+            terminal_evidence: terminal_evidence.to_vec(),
         })
     }
 
@@ -63,8 +84,31 @@ impl AgentPersistentState {
         self,
     ) -> Result<(String, TrustedHubIdentity, GrantLedger, AgentExecutionGate), PersistenceError>
     {
+        let (device_id, trusted_hub, grant_ledger, execution, _) =
+            self.restore_with_terminal_evidence()?;
+        Ok((device_id, trusted_hub, grant_ledger, execution))
+    }
+
+    pub fn restore_with_terminal_evidence(
+        self,
+    ) -> Result<
+        (
+            String,
+            TrustedHubIdentity,
+            GrantLedger,
+            AgentExecutionGate,
+            Vec<AgentTerminalEvidence>,
+        ),
+        PersistenceError,
+    > {
         validate_state_schema(self.schema_version)?;
-        if self.device_id.trim().is_empty() {
+        if self.device_id.trim().is_empty()
+            || self.terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
+            || self
+                .terminal_evidence
+                .iter()
+                .any(|entry| entry.validate().is_err())
+        {
             return Err(PersistenceError::InvalidState);
         }
         let hub_key = VerifyingKey::from_bytes(&self.trusted_hub_public_key)
@@ -75,7 +119,13 @@ impl AgentPersistentState {
             .map_err(PersistenceError::Control)?;
         let execution = AgentExecutionGate::restore_after_restart(self.execution)
             .map_err(PersistenceError::Execution)?;
-        Ok((self.device_id, trusted_hub, grant_ledger, execution))
+        Ok((
+            self.device_id,
+            trusted_hub,
+            grant_ledger,
+            execution,
+            self.terminal_evidence,
+        ))
     }
 }
 
@@ -702,6 +752,51 @@ mod tests {
                 operation_id: "op-active".into(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn agent_terminal_evidence_survives_restart_without_raw_result_payload() {
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let execution = AgentExecutionGate::default();
+        let evidence = AgentTerminalEvidence {
+            operation: OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 2,
+                operation_id: "op-terminal-proof".into(),
+            },
+            capability_revision: 9,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: "grant_terminal_proof".into(),
+            terminal_state: crate::v2_m0_execution::HubOperationState::Completed,
+            evidence: ExecutionEvidence::VerifiedAgentResult,
+        };
+        let state = AgentPersistentState::capture_with_terminal_evidence(
+            "dev-a",
+            &trusted_hub,
+            &grants,
+            &execution,
+            std::slice::from_ref(&evidence),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&state).unwrap();
+        for forbidden in [
+            "\"command\":",
+            "\"stdout\":",
+            "\"stderr\":",
+            "\"cwd\":",
+            "\"env\":",
+            "\"result\":",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "persisted terminal evidence leaked {forbidden}"
+            );
+        }
+        let (_, _, _, _, restored_evidence) = state.restore_with_terminal_evidence().unwrap();
+        assert_eq!(restored_evidence, vec![evidence]);
     }
 
     #[test]

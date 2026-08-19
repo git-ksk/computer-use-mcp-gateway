@@ -6,9 +6,10 @@
 //! future authenticated northbound MCP layer can call without depending on gRPC.
 
 use crate::v2_execution_safety::{
-    AuthoritativeOperationController, DesktopQuarantine, ExecutionEvidence, ExecutionReceipt,
-    IndeterminateReason, OperationAuditMetadata, OperationOwner, OperationRecoverySnapshot,
-    OperationRequestFingerprint, RecoverableOperationResult, ResolutionRecord,
+    AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
+    OperationAuditMetadata, OperationDispatchBinding, OperationOwner, OperationRecoverySnapshot,
+    OperationRequestFingerprint, ReconciliationStatus, RecoverableOperationResult,
+    ResolutionRecord, terminal_evidence_for_device_result,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -22,9 +23,9 @@ use crate::v2_m0_execution::{
 };
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubIdentity, HubToAgent,
-    RemoteCancellationAck, RemoteResult, TrustedSessionClock, verify_agent_heartbeat,
-    verify_agent_proof, verify_remote_backend_session_ended, verify_remote_cancellation_ack,
-    verify_remote_result,
+    RemoteCancellationAck, RemoteReconciliationReport, RemoteResult, TrustedSessionClock,
+    verify_agent_heartbeat, verify_agent_proof, verify_remote_backend_session_ended,
+    verify_remote_cancellation_ack, verify_remote_reconciliation_report, verify_remote_result,
 };
 use crate::v2_m0_trust::{DeviceKeyRotation, apply_device_key_rotation};
 use crate::v2_m1_grpc::{
@@ -883,6 +884,15 @@ impl SingleDeviceHub {
                                 &mut queue_order,
                             ).await?;
                         }
+                        AgentToHub::ReconciliationReport(report) => {
+                            self.handle_reconciliation_report(
+                                report,
+                                &hello,
+                                &challenge,
+                                generation,
+                            )
+                            .await?;
+                        }
                         AgentToHub::BackendSessionEnded(ack) => {
                             {
                                 let persistent = self.inner.persistent.lock().await;
@@ -979,6 +989,14 @@ impl SingleDeviceHub {
                     .await;
             }
         };
+        let dispatch_binding = if command.command.is_read_only() {
+            None
+        } else {
+            Some(OperationDispatchBinding::new(
+                capability_revision,
+                grant.payload.grant_id.clone(),
+            )?)
+        };
         let remote = self.inner.material.hub_identity.remote_command(
             hello,
             challenge,
@@ -1036,10 +1054,11 @@ impl SingleDeviceHub {
         // restore a command that may have executed as runnable.
         {
             let mut persistent = self.inner.persistent.lock().await;
-            persistent.execution.mark_dispatched(
+            persistent.execution.mark_dispatched_with_binding(
                 operation_id,
                 &owner,
                 generation,
+                dispatch_binding,
                 unix_time_ms()?,
             )?;
             persist_locked(&self.inner, &persistent)?;
@@ -1147,6 +1166,142 @@ impl SingleDeviceHub {
             "undispatched operation cancelled during Hub shutdown drain"
         );
         Ok(DispatchOutcome::Rejected(next))
+    }
+
+    async fn handle_reconciliation_report(
+        &self,
+        report: RemoteReconciliationReport,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        generation: u64,
+    ) -> Result<(), HubServiceError> {
+        if report.reporting_generation != generation {
+            return Err(HubServiceError::StaleSession);
+        }
+        let now_ms = unix_time_ms()?;
+        let mut persistent = self.inner.persistent.lock().await;
+        verify_remote_reconciliation_report(&persistent.registry, hello, challenge, &report)?;
+
+        // Reconciliation is deliberately transactional with respect to durable Hub
+        // state. The live authoritative controller is not changed until a complete
+        // candidate state has been committed to disk.
+        let mut candidate = persistent.execution.clone();
+        let mut resolved = Vec::new();
+        let mut operator_required = Vec::new();
+
+        for evidence in &report.terminal_evidence {
+            let operation_id = evidence.operation.operation_id.as_str();
+            if candidate.state(operation_id) != Some(HubOperationState::Indeterminate) {
+                // Old evidence can remain in the bounded Agent journal across later
+                // reconnects. A terminal/unknown operation is therefore an
+                // idempotent stale duplicate, never a reason to replay or mutate.
+                continue;
+            }
+
+            if evidence.operation.device_id != self.inner.device_id
+                || evidence.operation.device_generation >= generation
+            {
+                candidate.mark_reconciliation_operator_required(operation_id)?;
+                operator_required.push(operation_id.to_owned());
+                continue;
+            }
+
+            match candidate.reconcile_authoritative_terminal(evidence, now_ms) {
+                Ok((_next, receipt)) => {
+                    resolved.push((
+                        operation_id.to_owned(),
+                        evidence.capability,
+                        receipt.terminal_state,
+                    ));
+                }
+                Err(crate::v2_m0_execution::ExecutionError::OwnershipFenceMismatch)
+                | Err(crate::v2_m0_execution::ExecutionError::InvalidOperation)
+                | Err(crate::v2_m0_execution::ExecutionError::InvalidTransition) => {
+                    // A signed Agent claim that does not exactly bind to the Hub's
+                    // operation/device/generation/fence/capability record is not
+                    // authoritative for this quarantine. Escalate; never retry.
+                    candidate.mark_reconciliation_operator_required(operation_id)?;
+                    operator_required.push(operation_id.to_owned());
+                }
+                Err(error) => return Err(HubServiceError::Execution(error)),
+            }
+        }
+
+        // The report is the Agent's complete bounded authoritative journal for
+        // this newly authenticated session. If an auto-reconciling quarantine has
+        // no exact proof in it, no protocol-defined proof source remains in this
+        // Agent state; retain quarantine and surface an explicit evidence gap.
+        let remaining = candidate.quarantine_inspections()?;
+        let mut evidence_gaps = Vec::new();
+        for inspection in remaining {
+            if inspection.operation.device_id == self.inner.device_id
+                && inspection.reconciliation_status == ReconciliationStatus::AutoReconciling
+            {
+                candidate.mark_reconciliation_evidence_gap(&inspection.operation.operation_id)?;
+                evidence_gaps.push(inspection.operation.operation_id);
+            }
+        }
+
+        let state = HubPersistentState::capture(&persistent.registry, &candidate);
+        let checkpoint_bytes = match self.inner.checkpoint.save_with_size(&state) {
+            Ok((_, checkpoint_bytes)) => checkpoint_bytes,
+            Err(error) => {
+                crate::v2_observability::persistence_failure(
+                    crate::v2_observability::PersistenceComponent::Hub,
+                );
+                tracing::error!(
+                    event = "v2_persistence_failure",
+                    device_id = %self.inner.device_id,
+                    outcome = "failed",
+                    error_code = error.safe_error_code(),
+                    component = "hub",
+                    "Hub reconciliation checkpoint persistence failed"
+                );
+                return Err(HubServiceError::Persistence(error));
+            }
+        };
+        self.inner
+            .last_checkpoint_bytes
+            .store(checkpoint_bytes, Ordering::Release);
+        // Only now can quarantine disappear from the live authoritative state.
+        persistent.execution = candidate;
+        drop(persistent);
+
+        for (operation_id, capability, terminal_state) in resolved {
+            tracing::info!(
+                event = "v2_operation_auto_resolved",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                capability = crate::v2_observability::capability_name(capability),
+                terminal_state = ?terminal_state,
+                outcome = "auto_resolved",
+                "authoritative Agent terminal evidence reconciled quarantined operation without replay"
+            );
+        }
+        for operation_id in operator_required {
+            tracing::warn!(
+                event = "v2_operation_reconciliation_operator_required",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "operator_required",
+                error_code = "reconciliation_binding_mismatch",
+                "signed reconciliation evidence did not match the exact Hub authority binding; quarantine retained"
+            );
+        }
+        for operation_id in evidence_gaps {
+            tracing::warn!(
+                event = "v2_operation_reconciliation_evidence_gap",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "unrecoverable_evidence_gap",
+                error_code = "reconciliation_evidence_unavailable",
+                "Agent journal has no authoritative terminal proof for quarantined operation; quarantine retained"
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1260,32 +1415,8 @@ impl SingleDeviceHub {
             return Ok(());
         }
 
-        let (terminal_state, evidence) = match &device_result {
-            DeviceResult::Error { .. } => (
-                HubOperationState::Failed,
-                ExecutionEvidence::VerifiedRemoteError,
-            ),
-            DeviceResult::Process { output } | DeviceResult::Shell { output }
-                if output.cancelled =>
-            {
-                (
-                    HubOperationState::Cancelled,
-                    ExecutionEvidence::ProvenProcessTermination,
-                )
-            }
-            DeviceResult::Process { output } | DeviceResult::Shell { output }
-                if output.timed_out =>
-            {
-                (
-                    HubOperationState::Failed,
-                    ExecutionEvidence::ProvenProcessTermination,
-                )
-            }
-            _ => (
-                HubOperationState::Completed,
-                ExecutionEvidence::VerifiedAgentResult,
-            ),
-        };
+        let (terminal_state, evidence) = terminal_evidence_for_device_result(&device_result)
+            .ok_or(HubServiceError::UnexpectedResultType)?;
         let recoverable_result = recoverable_result_for(capability, &device_result);
         let (next, receipt) = {
             let mut persistent = self.inner.persistent.lock().await;
@@ -2732,6 +2863,37 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_commits_candidate_before_live_clear_and_has_no_dispatch_path() {
+        let source = include_str!("v2_m1_hub.rs");
+        let start = source
+            .find("async fn handle_reconciliation_report(")
+            .unwrap();
+        let end = source[start..]
+            .find("async fn handle_result(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let block = &source[start..end];
+        let durable = block.find("checkpoint.save_with_size(&state)").unwrap();
+        let live_swap = block.find("persistent.execution = candidate").unwrap();
+        assert!(durable < live_swap);
+        for forbidden in [
+            "dispatch_operation(",
+            "HubToAgent::Command",
+            "start_command(",
+            "request_fingerprint",
+            "compare_request_fingerprint",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "reconciliation must not contain {forbidden}"
+            );
+        }
+        assert!(block.contains("ReconciliationStatus::AutoReconciling"));
+        assert!(block.contains("mark_reconciliation_evidence_gap"));
+        assert!(block.contains("mark_reconciliation_operator_required"));
+    }
+
+    #[test]
     fn usage_liability_boundary_precedes_cumg_dispatched_and_agent_send() {
         let source = include_str!("v2_m1_hub.rs");
         let start = source.find("async fn dispatch_operation(").unwrap();
@@ -2741,7 +2903,9 @@ mod tests {
             .unwrap();
         let block = &source[start..end];
         let liable = block.find("usage.mark_liable().await").unwrap();
-        let durable_dispatch = block.find("persistent.execution.mark_dispatched(").unwrap();
+        let durable_dispatch = block
+            .find("persistent.execution.mark_dispatched_with_binding(")
+            .unwrap();
         let agent_send = block
             .find("send_hub(outbound, HubToAgent::Command(remote)).await?")
             .unwrap();
