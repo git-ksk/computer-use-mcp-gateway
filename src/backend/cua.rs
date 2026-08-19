@@ -414,6 +414,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    fn fixture_python() -> String {
+        std::env::var("CUMG_TEST_PYTHON").unwrap_or_else(|_| "python3".into())
+    }
     async fn wait_for_file(path: &std::path::Path) {
         timeout(Duration::from_secs(5), async {
             while !path.exists() {
@@ -437,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn exact_server_version_pin_accepts_match_and_rejects_mismatch() {
         let matching = CuaBackend::new(
-            "python3",
+            fixture_python(),
             vec!["scripts/mock_mcp_backend.py".into()],
             Duration::from_secs(5),
             Duration::from_secs(5),
@@ -455,7 +458,7 @@ mod tests {
             .expect("matching fixture shuts down");
 
         let mismatched = CuaBackend::new(
-            "python3",
+            fixture_python(),
             vec!["scripts/mock_mcp_backend.py".into()],
             Duration::from_secs(5),
             Duration::from_secs(5),
@@ -480,7 +483,7 @@ mod tests {
         let cancel_marker = dir.join(format!("cumg-cancel-{}-{nonce}", std::process::id()));
 
         let backend = CuaBackend::new(
-            "python3",
+            fixture_python(),
             vec![
                 "scripts/mock_mcp_backend.py".into(),
                 "--call-marker".into(),
