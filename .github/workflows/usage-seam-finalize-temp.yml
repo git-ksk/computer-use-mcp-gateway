@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - refactor/remove-usage-seam
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -54,6 +57,7 @@ jobs:
           grep -q 'reconciliation_commits_candidate_before_live_clear_and_has_no_dispatch_path' src/v2_m1_hub.rs
           grep -q 'ReconciliationStatus::AutoReconciling' src/v2_m1_hub.rs
       - name: Commit validated removal
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
