@@ -1,5 +1,6 @@
 name: Finalize usage seam removal (temporary)
 
+# Triggered explicitly to commit the validated transformation on push.
 on:
   push:
     branches:
