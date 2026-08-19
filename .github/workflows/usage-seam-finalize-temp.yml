@@ -30,6 +30,7 @@ jobs:
         run: |
           python .github/scripts/cleanup_usage_docs_temp.py
           python .github/scripts/cleanup_usage_status_temp.py
+          python .github/scripts/normalize_usage_cleanup_temp.py
       - name: Format
         run: |
           cargo fmt --all
@@ -52,6 +53,7 @@ jobs:
             ':!.github/scripts/remove_usage_seam_temp.py' \
             ':!.github/scripts/cleanup_usage_docs_temp.py' \
             ':!.github/scripts/cleanup_usage_status_temp.py' \
+            ':!.github/scripts/normalize_usage_cleanup_temp.py' \
             ':!.github/workflows/usage-seam-finalize-temp.yml'; then
             echo 'first-party usage seam references remain' >&2
             exit 1
