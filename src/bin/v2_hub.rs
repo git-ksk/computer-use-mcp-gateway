@@ -28,6 +28,8 @@ use tracing::{info, warn};
 
 const MAX_OAUTH_SECRET_BYTES: u64 = 16 * 1024;
 const MAX_TRUSTED_PROXY_SECRET_BYTES: u64 = 256;
+const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
+const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
@@ -123,6 +125,11 @@ struct Args {
     /// Integrity-protected JSON principal -> device -> exact-capability mapping.
     #[arg(long, env = "CUMG_V2_NORTHBOUND_POLICY_FILE")]
     northbound_policy_file: Option<PathBuf>,
+    /// Optional private key material used only to HMAC canonical shell/process requests for
+    /// privacy-preserving same/different reconciliation. The raw key and fingerprint are never
+    /// emitted by normal audit surfaces.
+    #[arg(long, env = "CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE")]
+    audit_fingerprint_secret_file: Option<PathBuf>,
     /// Fixed authenticated principal for an explicitly single-principal trusted-proxy deployment.
     /// Must be used only with a loopback listener reachable through the reviewed proxy/tunnel.
     #[arg(long, env = "CUMG_V2_TRUSTED_PROXY_ISSUER")]
@@ -456,6 +463,19 @@ fn build_northbound_runtime(
         args.max_northbound_requests_per_minute,
     )
     .context("invalid V2 northbound connection/rate limits")?;
+    let audit_fingerprint_secret: Option<Arc<[u8]>> = args
+        .audit_fingerprint_secret_file
+        .as_ref()
+        .map(|path| {
+            let secret = load_secret_text(path, MAX_AUDIT_FINGERPRINT_SECRET_BYTES)
+                .context("failed to load audit fingerprint secret")?;
+            ensure!(
+                secret.len() >= MIN_AUDIT_FINGERPRINT_SECRET_BYTES,
+                "CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE must contain at least 32 bytes"
+            );
+            Ok::<Arc<[u8]>, anyhow::Error>(Arc::from(secret.into_bytes()))
+        })
+        .transpose()?;
 
     let (router, resource, metadata_url, auth_mode) = if trusted_proxy_configured {
         let issuer = required(&args.trusted_proxy_issuer, "CUMG_V2_TRUSTED_PROXY_ISSUER")?;
@@ -488,18 +508,19 @@ fn build_northbound_runtime(
             .build_policy(proxy_config.issuer(), device_id)
             .context("invalid northbound principal/device/capability policy")?;
         let resource = proxy_config.resource().to_owned();
-        let router = build_trusted_proxy_router(
-            V2NorthboundMcp::new_with_usage(handle, policy, usage),
-            proxy_config,
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            overload,
-            computer_use_mcp_gateway::v2_limits::enforce_http_limits,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            peer_guard,
-            computer_use_mcp_gateway::v2_limits::enforce_trusted_proxy_loopback,
-        ));
+        let mut service = V2NorthboundMcp::new_with_usage(handle, policy, usage);
+        if let Some(secret) = audit_fingerprint_secret.clone() {
+            service = service.with_request_fingerprint_secret(secret);
+        }
+        let router = build_trusted_proxy_router(service, proxy_config)
+            .layer(axum::middleware::from_fn_with_state(
+                overload,
+                computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                peer_guard,
+                computer_use_mcp_gateway::v2_limits::enforce_trusted_proxy_loopback,
+            ));
         (router, resource, None, "trusted_proxy_fixed_principal")
     } else {
         let authorization_server = required(
@@ -542,15 +563,16 @@ fn build_northbound_runtime(
             .context("invalid OAuth token introspection configuration")?;
         let metadata_url = mcp_config.metadata_url().to_owned();
         let resource = mcp_config.resource().to_owned();
-        let router = build_northbound_router(
-            V2NorthboundMcp::new_with_usage(handle, policy, usage),
-            mcp_config,
-            Arc::new(verifier),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            overload,
-            computer_use_mcp_gateway::v2_limits::enforce_http_limits,
-        ));
+        let mut service = V2NorthboundMcp::new_with_usage(handle, policy, usage);
+        if let Some(secret) = audit_fingerprint_secret.clone() {
+            service = service.with_request_fingerprint_secret(secret);
+        }
+        let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
+            axum::middleware::from_fn_with_state(
+                overload,
+                computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+            ),
+        );
         (router, resource, Some(metadata_url), "oauth_introspection")
     };
 

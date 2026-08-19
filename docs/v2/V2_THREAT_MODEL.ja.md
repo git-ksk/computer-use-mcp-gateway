@@ -248,6 +248,8 @@ normal audit event には device ID、generation、grant ID、operation ID、sem
 
 raw screenshot、raw backend output、raw command argument、clipboard value、typed text、credential、full accessibility tree は含めるべきではありません。意図的にそれらを含む Debug capture は別の high-sensitivity mode であり、暗黙に enable してはいけません。
 
+schema v3 の reconciliation metadata は evidence を4種類に明確に分離します。**correlation evidence** は bounded な workflow/client label と、明示的に canonicalize された shell/process contract の keyed request fingerprint であり、特定できるのは「どの higher-level step / candidate request を議論しているか」までです。**observational evidence** は独立した read-only postcondition/state check で、capability contract が authority を明示しない限り advisory です。**authoritative terminal evidence** は operation state machine を settle できる既存の signed/verified execution evidence です。**operator resolution** は exact quarantined operation に十分な evidence がある場合だけ適用する explicit / persistence-gated decision です。correlation/fingerprint 一致だけでは terminal evidence、replay permission、side effect 発生の proof にはなりません。fingerprint key/value は normal audit asset ではなく、key rotation 時は request を different と再解釈せず comparison を unavailable に degrade させます。
+
 ## V2-M1 acceptance と residual deployment responsibility
 
 V2-M1 implementation gate は 2026-08-12 に pass しました。M1 code には verified northbound principal construction、production key/certificate lifecycle procedure、bounded service connection/rate shedding、bounded replay pruning、real-Cua cancellation quarantine、OpenTelemetry/OTLP integration、OS service packaging が含まれます。詳細は [`V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md) を参照してください。

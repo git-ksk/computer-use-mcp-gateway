@@ -154,6 +154,8 @@ northbound authentication -> verified issuer+subject -> reserve(1)
 
 The bridge is CUMG-owned, loopback-only, and sends no bearer token or tool payload. The initial implementation uses `mcp-usage-control` `MemoryUsageStore`; see [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md).
 
+The authoritative operation record now uses execution-safety schema v3. Before dispatch, an effectful request may persist bounded audit correlation labels and, only for explicitly canonicalized shell/process contracts, a keyed request fingerprint. These fields travel with the operation checkpoint/quarantine metadata but remain outside execution authority: they cannot alter owner/device/generation/capability fences, terminal state, retry semantics, or replay admission. Read-only maintenance may expose the labels and fingerprint-presence/comparison status while withholding raw request content and the fingerprint/key value. Older schema-v1/v2 checkpoints remain readable under their original representational limits; downgrade is rejected when v3-only state would be lost.
+
 ## V2 accepted boundary
 
 V2 is **not** "V1 plus multi-machine routing." The completed competitor-gap PoC and GO/NO-GO review narrowed the accepted boundary to **uncertainty-aware execution safety for delegated control of stateful interactive desktops**. The Hub/Agent topology remains an implementation vehicle for that safety boundary, not a generic fleet/device-fabric product:

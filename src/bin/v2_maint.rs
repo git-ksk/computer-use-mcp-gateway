@@ -1,10 +1,18 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
-    v2_maintenance::{inspect_quarantines_read_only, resolve_indeterminate_offline},
+    v2_m1_keys::load_secret_text,
+    v2_maintenance::{
+        compare_quarantined_request_read_only, inspect_quarantines_read_only,
+        resolve_indeterminate_offline,
+    },
 };
 use std::path::PathBuf;
+
+const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
+const MAX_CANDIDATE_REQUEST_BYTES: u64 = 256 * 1024;
+const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 
 #[derive(Debug, Parser)]
 #[command(name = "v2_maint")]
@@ -36,6 +44,39 @@ enum Command {
         #[arg(long)]
         device_id: Option<String>,
     },
+    /// Compare one local candidate shell/process request to a quarantined request.
+    /// Output is only same_request, different_request, or unavailable; request content
+    /// and the keyed fingerprint are never printed.
+    CompareQuarantineRequest {
+        #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long, value_enum)]
+        tool: CandidateTool,
+        /// Private JSON file containing the candidate tool arguments.
+        #[arg(long)]
+        request_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE")]
+        fingerprint_secret_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CandidateTool {
+    #[value(name = "shell")]
+    Shell,
+    #[value(name = "execute_process")]
+    ExecuteProcess,
+}
+
+impl CandidateTool {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::ExecuteProcess => "execute_process",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -94,6 +135,34 @@ fn main() -> Result<()> {
             let report = inspect_quarantines_read_only(&state_dir, device_id.as_deref())
                 .context("read-only quarantine inspection failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::CompareQuarantineRequest {
+            state_dir,
+            operation_id,
+            tool,
+            request_file,
+            fingerprint_secret_file,
+        } => {
+            let request_text = load_secret_text(&request_file, MAX_CANDIDATE_REQUEST_BYTES)
+                .context("failed to load private candidate request file")?;
+            let candidate_request = serde_json::from_str(&request_text)
+                .context("candidate request file must contain one JSON object")?;
+            let fingerprint_secret =
+                load_secret_text(&fingerprint_secret_file, MAX_AUDIT_FINGERPRINT_SECRET_BYTES)
+                    .context("failed to load audit fingerprint secret")?;
+            ensure!(
+                fingerprint_secret.len() >= MIN_AUDIT_FINGERPRINT_SECRET_BYTES,
+                "audit fingerprint secret must contain at least 32 bytes"
+            );
+            let comparison = compare_quarantined_request_read_only(
+                &state_dir,
+                &operation_id,
+                tool.as_str(),
+                candidate_request,
+                fingerprint_secret.as_bytes(),
+            )
+            .context("read-only quarantined-request comparison failed")?;
+            println!("{}", serde_json::to_string(&comparison)?);
         }
     }
     Ok(())
