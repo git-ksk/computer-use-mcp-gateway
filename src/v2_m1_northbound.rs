@@ -27,7 +27,10 @@ use crate::{
         BrowserBackendClickTarget, BrowserBackendCommand, BrowserBackendResult,
         BrowserBackendSemanticRef, BrowserStagedUploadFile,
     },
-    v2_execution_safety::{OperationOwner, RecoverableOperationResult},
+    v2_execution_safety::{
+        OperationAuditMetadata, OperationOwner, OperationRequestFingerprint,
+        RecoverableOperationResult, fingerprint_process_request, fingerprint_shell_request,
+    },
     v2_interaction_context::{
         DEFAULT_MAX_REFS_PER_CONTEXT, InteractionContextBinding, InteractionContextId,
         InteractionContextLimits, InteractionContextManager, InteractionScope,
@@ -1140,11 +1143,18 @@ struct PreparedBrowserCall {
     public_dialog_ref: Option<String>,
 }
 
+struct NorthboundOperationCall {
+    operation_id: String,
+    audit: OperationAuditMetadata,
+    usage: UsageLease,
+}
+
 #[derive(Clone)]
 pub struct V2NorthboundMcp {
     hub: HubHandle,
     authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
     usage: UsageManager,
+    request_fingerprint_secret: Option<Arc<[u8]>>,
     interactions: Arc<TokioMutex<NorthboundInteractionState>>,
 }
 
@@ -1204,8 +1214,14 @@ impl V2NorthboundMcp {
             hub,
             authorizer,
             usage,
+            request_fingerprint_secret: None,
             interactions: Arc::new(TokioMutex::new(NorthboundInteractionState::new())),
         }
+    }
+
+    pub fn with_request_fingerprint_secret(mut self, secret: impl Into<Arc<[u8]>>) -> Self {
+        self.request_fingerprint_secret = Some(secret.into());
+        self
     }
 
     fn auth_context(
@@ -1960,15 +1976,14 @@ impl V2NorthboundMcp {
         &self,
         principal: &AuthenticatedClientPrincipal,
         arguments: Option<JsonObject>,
-        operation_id: String,
-        usage: UsageLease,
+        operation: NorthboundOperationCall,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let request: BrowserStageUploadRequest = match parse_arguments(arguments) {
             Ok(request) => request,
             Err(error) => {
                 settle_usage_best_effort(
-                    &usage,
+                    &operation.usage,
                     UsageSettlement::Zero,
                     "invalid_browser_upload_stage",
                 )
@@ -1980,7 +1995,7 @@ impl V2NorthboundMcp {
             Ok(bytes) => bytes,
             Err(error) => {
                 settle_usage_best_effort(
-                    &usage,
+                    &operation.usage,
                     UsageSettlement::Zero,
                     "invalid_browser_upload_stage",
                 )
@@ -1995,7 +2010,7 @@ impl V2NorthboundMcp {
             Ok(binding) => binding,
             Err(error) => {
                 settle_usage_best_effort(
-                    &usage,
+                    &operation.usage,
                     UsageSettlement::Zero,
                     "invalid_browser_upload_context",
                 )
@@ -2006,7 +2021,6 @@ impl V2NorthboundMcp {
         let execution = self
             .execute_command(
                 principal,
-                operation_id,
                 DeviceCommand::StageBrowserUploadFile {
                     context_id: request.context_id,
                     file_name: request.file_name,
@@ -2015,7 +2029,7 @@ impl V2NorthboundMcp {
                     ),
                     expected_bytes: expected_bytes as u64,
                 },
-                usage,
+                operation,
                 context,
             )
             .await;
@@ -2058,8 +2072,7 @@ impl V2NorthboundMcp {
         principal: &AuthenticatedClientPrincipal,
         tool_name: &str,
         arguments: Option<JsonObject>,
-        operation_id: String,
-        usage: UsageLease,
+        operation: NorthboundOperationCall,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let prepared = match self
@@ -2068,8 +2081,12 @@ impl V2NorthboundMcp {
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                settle_usage_best_effort(&usage, UsageSettlement::Zero, "invalid_browser_request")
-                    .await;
+                settle_usage_best_effort(
+                    &operation.usage,
+                    UsageSettlement::Zero,
+                    "invalid_browser_request",
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -2077,7 +2094,7 @@ impl V2NorthboundMcp {
             command: prepared.command.clone(),
         };
         let result = match self
-            .execute_command(principal, operation_id, command, usage, context)
+            .execute_command(principal, command, operation, context)
             .await
         {
             Ok(result) => result,
@@ -2563,22 +2580,53 @@ impl V2NorthboundMcp {
         Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]).into())
     }
 
+    fn request_fingerprint_for_command(
+        &self,
+        command: &DeviceCommand,
+    ) -> Result<Option<OperationRequestFingerprint>, McpError> {
+        let Some(secret) = self.request_fingerprint_secret.as_deref() else {
+            return Ok(None);
+        };
+        if secret.len() < 32 {
+            return Err(McpError::internal_error(
+                "Request fingerprint secret is invalid",
+                None,
+            ));
+        }
+        let fingerprint = match command {
+            DeviceCommand::ExecuteProcess { request } => {
+                fingerprint_process_request(secret, request)
+            }
+            DeviceCommand::Shell { request } => fingerprint_shell_request(secret, request),
+            _ => return Ok(None),
+        }
+        .map_err(|_| McpError::internal_error("Request fingerprinting failed", None))?;
+        Ok(Some(fingerprint))
+    }
+
     async fn execute_command(
         &self,
         principal: &AuthenticatedClientPrincipal,
-        operation_id: String,
         command: DeviceCommand,
-        usage: UsageLease,
+        operation: NorthboundOperationCall,
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
+        let request_fingerprint = self.request_fingerprint_for_command(&command)?;
+        let NorthboundOperationCall {
+            operation_id,
+            audit,
+            usage,
+        } = operation;
         let owner = OperationOwner::from_principal(principal);
         let read_only = command.is_read_only();
         let pending = match self
             .hub
-            .start_command_as_with_id(
+            .start_command_as_with_id_and_audit(
                 owner.clone(),
                 operation_id.clone(),
                 command,
+                audit,
+                request_fingerprint,
                 Some(usage.clone()),
             )
             .await
@@ -2718,29 +2766,34 @@ impl ServerHandler for V2NorthboundMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let auth = Self::auth_context(&context)?;
+        let mut arguments = request.arguments;
         if request.name.as_ref() == TOOL_OPEN_INTERACTION_CONTEXT {
-            let _: EmptyArgs = parse_arguments(request.arguments)?;
+            let _: EmptyArgs = parse_arguments(arguments)?;
             return self.open_interaction_context(&auth.principal).await;
         }
         if request.name.as_ref() == TOOL_CLOSE_INTERACTION_CONTEXT {
-            let args: ContextIdArgs = parse_arguments(request.arguments)?;
+            let args: ContextIdArgs = parse_arguments(arguments)?;
             return self
                 .close_interaction_context(&auth.principal, &args.context_id)
                 .await;
         }
         if request.name.as_ref() == TOOL_GET_OPERATION {
-            let args: OperationIdArgs = parse_arguments(request.arguments)?;
+            let args: OperationIdArgs = parse_arguments(arguments)?;
             return self
                 .get_operation(&auth.principal, &args.operation_id)
                 .await;
         }
         let capability = tool_capability(request.name.as_ref())
             .ok_or_else(|| McpError::invalid_params("Unknown V2 Hub tool", None))?;
+        let audit = if capability_accepts_audit(capability) {
+            extract_audit_metadata(&mut arguments)?
+        } else {
+            OperationAuditMetadata::empty()
+        };
         let recoverable_process_call =
             matches!(request.name.as_ref(), TOOL_EXECUTE_PROCESS | TOOL_SHELL);
-        let operation_id =
-            requested_operation_id(request.name.as_ref(), request.arguments.as_ref())?
-                .unwrap_or_else(|| self.hub.new_operation_id());
+        let operation_id = requested_operation_id(request.name.as_ref(), arguments.as_ref())?
+            .unwrap_or_else(|| self.hub.new_operation_id());
         // OAuth has already reduced the bearer token to this verified issuer +
         // subject. Usage admission receives only that principal identity and the
         // tool name; request arguments and bearer material never cross the seam.
@@ -2770,9 +2823,12 @@ impl ServerHandler for V2NorthboundMcp {
             return self
                 .call_browser_stage_upload(
                     &auth.principal,
-                    request.arguments,
-                    operation_id,
-                    usage,
+                    arguments,
+                    NorthboundOperationCall {
+                        operation_id,
+                        audit,
+                        usage,
+                    },
                     &context,
                 )
                 .await;
@@ -2783,9 +2839,12 @@ impl ServerHandler for V2NorthboundMcp {
                 .call_browser_tool(
                     &auth.principal,
                     request.name.as_ref(),
-                    request.arguments,
-                    operation_id,
-                    usage,
+                    arguments,
+                    NorthboundOperationCall {
+                        operation_id,
+                        audit,
+                        usage,
+                    },
                     &context,
                 )
                 .await;
@@ -2795,13 +2854,13 @@ impl ServerHandler for V2NorthboundMcp {
             TOOL_LIST_APPS => Ok(DeviceCommand::ListApplications),
             TOOL_GET_SCREEN_SIZE => Ok(DeviceCommand::ScreenGeometry),
             TOOL_SCREENSHOT => {
-                let args: ScreenshotArgs = parse_arguments(request.arguments)?;
+                let args: ScreenshotArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::ScreenshotContextual {
                     context_id: args.context_id,
                 })
             }
             TOOL_CLICK => {
-                let args: ClickArgs = parse_arguments(request.arguments)?;
+                let args: ClickArgs = parse_arguments(arguments)?;
                 let button = parse_pointer_button(args.button.as_deref())?;
                 let action = args
                     .action
@@ -2848,7 +2907,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_DRAG => {
-                let args: DragArgs = parse_arguments(request.arguments)?;
+                let args: DragArgs = parse_arguments(arguments)?;
                 if args.duration_ms > 10_000 {
                     return Err(McpError::invalid_params(
                         "duration_ms must be within 0..=10000",
@@ -2904,7 +2963,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_TYPE_TEXT => {
-                let args: TypeTextArgs = parse_arguments(request.arguments)?;
+                let args: TypeTextArgs = parse_arguments(arguments)?;
                 if args.text.is_empty() || args.text.len() > MAX_TYPE_TEXT_BYTES {
                     return Err(McpError::invalid_params(
                         "text must be within 1..=32768 UTF-8 bytes",
@@ -2945,7 +3004,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_EXECUTE_PROCESS => {
-                let args: ExecuteProcessArgs = parse_arguments(request.arguments)?;
+                let args: ExecuteProcessArgs = parse_arguments(arguments)?;
                 if let Some(operation_id) = args.operation_id.as_deref() {
                     validate_operation_id(operation_id)?;
                 }
@@ -2960,7 +3019,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_SHELL => {
-                let args: ShellArgs = parse_arguments(request.arguments)?;
+                let args: ShellArgs = parse_arguments(arguments)?;
                 if let Some(operation_id) = args.operation_id.as_deref() {
                     validate_operation_id(operation_id)?;
                 }
@@ -2974,22 +3033,22 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_READ_FILE => {
-                let args: PathArgs = parse_arguments(request.arguments)?;
+                let args: PathArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::ReadFile { path: args.path })
             }
             TOOL_LIST_DIRECTORY => {
-                let args: PathArgs = parse_arguments(request.arguments)?;
+                let args: PathArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::ListDirectory { path: args.path })
             }
             TOOL_LIST_WINDOWS => {
-                let args: ListWindowsArgs = parse_arguments(request.arguments)?;
+                let args: ListWindowsArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::ListWindows {
                     process_id: args.process_id,
                     on_screen_only: args.on_screen_only,
                 })
             }
             TOOL_LAUNCH_APPLICATION => {
-                let args: LaunchApplicationArgs = parse_arguments(request.arguments)?;
+                let args: LaunchApplicationArgs = parse_arguments(arguments)?;
                 validate_launch_args(&args)?;
                 Ok(DeviceCommand::LaunchApplication {
                     identifier: args.identifier,
@@ -2999,7 +3058,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_INSPECT_WINDOW => {
-                let args: InspectWindowArgs = parse_arguments(request.arguments)?;
+                let args: InspectWindowArgs = parse_arguments(arguments)?;
                 validate_window_args(args.process_id, args.window_id)?;
                 if args
                     .query
@@ -3037,7 +3096,7 @@ impl ServerHandler for V2NorthboundMcp {
                 }
             }
             TOOL_VERIFY_UI_STATE => {
-                let args: VerifyUiStateArgs = parse_arguments(request.arguments)?;
+                let args: VerifyUiStateArgs = parse_arguments(arguments)?;
                 validate_window_args(args.process_id, args.window_id)?;
                 validate_ui_predicates(&args.expect)?;
                 if args.timeout_ms > 10_000 || !(1..=5).contains(&args.stable_samples) {
@@ -3068,14 +3127,14 @@ impl ServerHandler for V2NorthboundMcp {
                 }
             }
             TOOL_TERMINATE_APPLICATION => {
-                let args: ProcessIdArgs = parse_arguments(request.arguments)?;
+                let args: ProcessIdArgs = parse_arguments(arguments)?;
                 require_positive_process_id(args.process_id)?;
                 Ok(DeviceCommand::TerminateApplication {
                     process_id: args.process_id,
                 })
             }
             TOOL_ACTIVATE_WINDOW => {
-                let args: ActivateWindowArgs = parse_arguments(request.arguments)?;
+                let args: ActivateWindowArgs = parse_arguments(arguments)?;
                 require_positive_process_id(args.process_id)?;
                 if args.window_id == Some(0) {
                     return Err(McpError::invalid_params("window_id must be positive", None));
@@ -3086,7 +3145,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_SET_WINDOW_FRAME => {
-                let args: SetWindowFrameArgs = parse_arguments(request.arguments)?;
+                let args: SetWindowFrameArgs = parse_arguments(arguments)?;
                 validate_window_args(args.process_id, args.window_id)?;
                 if args.width == 0 || args.height == 0 {
                     return Err(McpError::invalid_params(
@@ -3107,7 +3166,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_INVOKE_MENU => {
-                let args: InvokeMenuArgs = parse_arguments(request.arguments)?;
+                let args: InvokeMenuArgs = parse_arguments(arguments)?;
                 validate_window_args(args.process_id, args.window_id)?;
                 validate_menu_path(&args.path)?;
                 Ok(DeviceCommand::InvokeMenu {
@@ -3118,7 +3177,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_KEYBOARD_INPUT => {
-                let args: KeyboardInputArgs = parse_arguments(request.arguments)?;
+                let args: KeyboardInputArgs = parse_arguments(arguments)?;
                 validate_keyboard_key_input(&args.key)?;
                 if args.element_ref.is_some() && args.context_id.is_none() {
                     return Err(McpError::invalid_params(
@@ -3142,7 +3201,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_SCROLL => {
-                let args: ScrollArgs = parse_arguments(request.arguments)?;
+                let args: ScrollArgs = parse_arguments(arguments)?;
                 if !(1..=50).contains(&args.amount) {
                     return Err(McpError::invalid_params(
                         "amount must be within 1..=50",
@@ -3165,14 +3224,14 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_CLIPBOARD_READ => {
-                let args: ClipboardReadArgs = parse_arguments(request.arguments)?;
+                let args: ClipboardReadArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::ClipboardRead {
                     context_id: args.context_id,
                     include_text: args.include_text,
                 })
             }
             TOOL_CLIPBOARD_WRITE => {
-                let args: ClipboardWriteArgs = parse_arguments(request.arguments)?;
+                let args: ClipboardWriteArgs = parse_arguments(arguments)?;
                 if args.text.len() > MAX_CLIPBOARD_TEXT_BYTES {
                     return Err(McpError::invalid_params(
                         "clipboard text exceeds the 1 MiB bound",
@@ -3185,13 +3244,13 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_GET_POINTER_POSITION => {
-                let args: PointerPositionArgs = parse_arguments(request.arguments)?;
+                let args: PointerPositionArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::PointerPosition {
                     context_id: Some(args.context_id),
                 })
             }
             TOOL_MOVE_POINTER => {
-                let args: MovePointerArgs = parse_arguments(request.arguments)?;
+                let args: MovePointerArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::MovePointer {
                     context_id: args.context_id,
                     x: args.x,
@@ -3199,7 +3258,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_SET_UI_VALUE => {
-                let args: SetUiValueArgs = parse_arguments(request.arguments)?;
+                let args: SetUiValueArgs = parse_arguments(arguments)?;
                 validate_window_args(args.process_id, args.window_id)?;
                 if args.element_ref.len() > 128 || args.value.len() > MAX_TYPE_TEXT_BYTES {
                     return Err(McpError::invalid_params("Invalid UI value arguments", None));
@@ -3213,7 +3272,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_CAPTURE_REGION => {
-                let args: CaptureRegionArgs = parse_arguments(request.arguments)?;
+                let args: CaptureRegionArgs = parse_arguments(arguments)?;
                 validate_window_args(args.process_id, args.window_id)?;
                 if args.width == 0 || args.height == 0 {
                     return Err(McpError::invalid_params(
@@ -3234,7 +3293,7 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_EXPAND_INTERACTION_SCOPE => {
-                let args: ExpandInteractionScopeArgs = parse_arguments(request.arguments)?;
+                let args: ExpandInteractionScopeArgs = parse_arguments(arguments)?;
                 if args.reason.trim().is_empty() || args.reason.len() > 200 {
                     return Err(McpError::invalid_params(
                         "reason must contain 1..=200 UTF-8 bytes",
@@ -3278,7 +3337,16 @@ impl ServerHandler for V2NorthboundMcp {
 
         let public_operation_id = recoverable_process_call.then(|| operation_id.clone());
         let mut result = match self
-            .execute_command(&auth.principal, operation_id, command, usage, &context)
+            .execute_command(
+                &auth.principal,
+                command,
+                NorthboundOperationCall {
+                    operation_id,
+                    audit,
+                    usage,
+                },
+                &context,
+            )
             .await
         {
             Ok(result) => result,
@@ -3909,7 +3977,7 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
 }
 
 fn all_tools() -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         Tool::new(
             TOOL_OPEN_INTERACTION_CONTEXT,
             "Open bounded CUMG workflow state for stateful Computer Use. The opaque context id is not authorization.",
@@ -4469,7 +4537,21 @@ fn all_tools() -> Vec<Tool> {
             ),
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(true)),
-    ]
+    ];
+    for tool in &mut tools {
+        if tool_capability(tool.name.as_ref()).is_some_and(capability_accepts_audit) {
+            let schema = Arc::make_mut(&mut tool.input_schema);
+            if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+                properties.insert("workflow_id".into(), audit_correlation_id_schema());
+                properties.insert("workflow_step_id".into(), audit_correlation_id_schema());
+                properties.insert(
+                    "client_correlation_id".into(),
+                    audit_correlation_id_schema(),
+                );
+            }
+        }
+    }
+    tools
 }
 
 fn object_schema(properties: Vec<(&str, Value)>, required: &[&str]) -> Arc<JsonObject> {
@@ -4491,6 +4573,15 @@ fn object_schema(properties: Vec<(&str, Value)>, required: &[&str]) -> Arc<JsonO
     );
     schema.insert("additionalProperties".into(), Value::Bool(false));
     Arc::new(schema)
+}
+
+fn audit_correlation_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": crate::v2_execution_safety::MAX_AUDIT_CORRELATION_ID_BYTES,
+        "pattern": "^[A-Za-z0-9_.:-]+$"
+    })
 }
 
 fn operation_id_schema() -> Value {
@@ -5613,6 +5704,37 @@ struct PathArgs {
 fn parse_arguments<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
     serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
         .map_err(|_| McpError::invalid_params("Tool arguments do not match the input schema", None))
+}
+
+fn extract_audit_metadata(
+    arguments: &mut Option<JsonObject>,
+) -> Result<OperationAuditMetadata, McpError> {
+    let Some(arguments) = arguments else {
+        return Ok(OperationAuditMetadata::empty());
+    };
+    let mut audit = OperationAuditMetadata::empty();
+    audit.workflow_id = take_audit_string(arguments, "workflow_id")?;
+    audit.workflow_step_id = take_audit_string(arguments, "workflow_step_id")?;
+    audit.client_correlation_id = take_audit_string(arguments, "client_correlation_id")?;
+    audit
+        .validate()
+        .map_err(|_| McpError::invalid_params("Audit correlation labels are invalid", None))?;
+    Ok(audit)
+}
+
+fn take_audit_string(arguments: &mut JsonObject, key: &str) -> Result<Option<String>, McpError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .map(Some)
+        .ok_or_else(|| McpError::invalid_params("Audit correlation labels must be strings", None))
+}
+
+fn capability_accepts_audit(capability: DeviceCapability) -> bool {
+    !matches!(capability.class(), crate::v2_m0::CapabilityClass::Observe)
 }
 
 fn env_map(env: BTreeMap<String, String>) -> Vec<ProcessEnvVar> {
@@ -6928,6 +7050,80 @@ mod tests {
             public_recovery_state(HubOperationState::Dispatched, None),
             "running"
         );
+    }
+
+    #[test]
+    fn effectful_tool_schemas_accept_bounded_audit_labels_but_observe_tools_do_not() {
+        let tools = all_tools();
+        for name in [
+            TOOL_SHELL,
+            TOOL_EXECUTE_PROCESS,
+            TOOL_BROWSER_NAVIGATE,
+            TOOL_CLICK,
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(
+                schema.contains("workflow_id"),
+                "missing workflow_id on {name}"
+            );
+            assert!(
+                schema.contains("workflow_step_id"),
+                "missing workflow_step_id on {name}"
+            );
+            assert!(
+                schema.contains("client_correlation_id"),
+                "missing client_correlation_id on {name}"
+            );
+            assert!(schema.contains("^[A-Za-z0-9_.:-]+$"));
+        }
+        for name in [TOOL_GET_OPERATION, TOOL_READ_FILE, TOOL_BROWSER_INSPECT] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(
+                !schema.contains("workflow_id"),
+                "audit label leaked onto {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_labels_are_stripped_before_strict_tool_argument_parsing() {
+        let mut arguments = Some(
+            serde_json::json!({
+                "operation_id": "op_0123456789abcdef0123456789abcdef",
+                "workflow_id": "wf_release_42",
+                "workflow_step_id": "step_verify",
+                "client_correlation_id": "corr_7",
+                "command": "echo bounded",
+                "cwd": "/tmp",
+                "env": {},
+                "timeout_ms": 1000
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let audit = extract_audit_metadata(&mut arguments).unwrap();
+        assert_eq!(audit.workflow_id.as_deref(), Some("wf_release_42"));
+        assert_eq!(audit.workflow_step_id.as_deref(), Some("step_verify"));
+        assert_eq!(audit.client_correlation_id.as_deref(), Some("corr_7"));
+        let parsed: ShellArgs = parse_arguments(arguments).unwrap();
+        assert_eq!(parsed.command, "echo bounded");
+
+        let mut invalid = Some(
+            serde_json::json!({"workflow_id": "contains whitespace"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(extract_audit_metadata(&mut invalid).is_err());
     }
 
     #[test]

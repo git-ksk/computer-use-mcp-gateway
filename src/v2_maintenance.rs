@@ -5,13 +5,19 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
-    ExecutionReceipt, OperationOwner, ResolutionRecord,
+    ExecutionReceipt, OperationOwner, RequestFingerprintComparison, ResolutionRecord,
+    compare_request_fingerprint, fingerprint_process_request, fingerprint_shell_request,
 };
-use crate::v2_m0::{CapabilityClass, DeviceCapability, DeviceRegistrySnapshot};
+use crate::v2_m0::{
+    CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
+    ShellRequest,
+};
 use crate::v2_m0_execution::{AdmissionLimits, ExecutionError, IndeterminateResolution};
 use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,14 +38,23 @@ pub struct QuarantineInspection {
     pub device_id: String,
     pub device_generation: u64,
     pub capability: String,
+    pub workflow_id: Option<String>,
+    pub workflow_step_id: Option<String>,
+    pub client_correlation_id: Option<String>,
+    pub request_fingerprint_present: bool,
     pub semantic_operation_class: String,
     pub effect_class: String,
+    pub target_class: String,
+    pub effect_kind: String,
+    pub verification_kind: String,
     pub dispatch_recorded: bool,
     pub prepared_at_ms: u64,
     pub dispatched_at_ms: Option<u64>,
     pub indeterminate_at_ms: u64,
     pub indeterminate_reason: String,
     pub evidence_class: Option<String>,
+    pub evidence_status: String,
+    pub reconciliation_status: String,
     pub recovery_disposition: String,
     pub retry_safe: bool,
 }
@@ -90,8 +105,15 @@ pub fn inspect_quarantines_read_only(
                 device_id: inspection.operation.device_id,
                 device_generation: inspection.operation.device_generation,
                 capability: capability.to_owned(),
+                workflow_id: inspection.audit.workflow_id,
+                workflow_step_id: inspection.audit.workflow_step_id,
+                client_correlation_id: inspection.audit.client_correlation_id,
+                request_fingerprint_present: inspection.request_fingerprint.is_some(),
                 semantic_operation_class: capability.to_owned(),
                 effect_class: capability_effect_class(inspection.capability).to_owned(),
+                target_class: capability_target_class(inspection.capability).to_owned(),
+                effect_kind: capability_effect_kind(inspection.capability).to_owned(),
+                verification_kind: capability_verification_kind(inspection.capability).to_owned(),
                 dispatch_recorded: inspection.dispatched_at_ms.is_some(),
                 prepared_at_ms: inspection.prepared_at_ms,
                 dispatched_at_ms: inspection.dispatched_at_ms,
@@ -101,6 +123,8 @@ pub fn inspect_quarantines_read_only(
                 )
                 .to_owned(),
                 evidence_class: inspection.evidence.map(evidence_name).map(str::to_owned),
+                evidence_status: evidence_status(inspection.evidence).to_owned(),
+                reconciliation_status: "operator_required".into(),
                 recovery_disposition: "needs_reconciliation".into(),
                 retry_safe: false,
             }
@@ -119,12 +143,252 @@ pub fn inspect_quarantines_read_only(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestComparisonReport {
+    SameRequest,
+    DifferentRequest,
+    Unavailable,
+}
+
+pub fn compare_quarantined_request_read_only(
+    state_dir: &Path,
+    operation_id: &str,
+    tool_name: &str,
+    candidate_request: Value,
+    fingerprint_secret: &[u8],
+) -> Result<RequestComparisonReport, MaintenanceError> {
+    let checkpoint = CheckpointStore::new(state_dir.to_path_buf(), "hub")
+        .map_err(MaintenanceError::Persistence)?;
+    let state = checkpoint
+        .load_latest::<HubPersistentState>()
+        .map_err(MaintenanceError::Persistence)?;
+    let limits = AdmissionLimits {
+        max_global_active: 1,
+        max_queued_per_device: 1,
+    };
+    let (_registry, execution) = state
+        .restore(limits)
+        .map_err(MaintenanceError::Persistence)?;
+    let Some(inspection) = execution
+        .quarantine_inspections()
+        .map_err(MaintenanceError::Execution)?
+        .into_iter()
+        .find(|inspection| inspection.operation.operation_id == operation_id)
+    else {
+        return Ok(RequestComparisonReport::Unavailable);
+    };
+    let candidate = match tool_name {
+        "execute_process" => {
+            let request = candidate_process_request(candidate_request)?;
+            Some(
+                fingerprint_process_request(fingerprint_secret, &request)
+                    .map_err(MaintenanceError::Execution)?,
+            )
+        }
+        "shell" => {
+            let request = candidate_shell_request(candidate_request)?;
+            Some(
+                fingerprint_shell_request(fingerprint_secret, &request)
+                    .map_err(MaintenanceError::Execution)?,
+            )
+        }
+        _ => return Ok(RequestComparisonReport::Unavailable),
+    };
+    Ok(
+        match compare_request_fingerprint(
+            inspection.request_fingerprint.as_ref(),
+            candidate.as_ref(),
+        ) {
+            RequestFingerprintComparison::SameRequest => RequestComparisonReport::SameRequest,
+            RequestFingerprintComparison::DifferentRequest => {
+                RequestComparisonReport::DifferentRequest
+            }
+            RequestFingerprintComparison::Unavailable => RequestComparisonReport::Unavailable,
+        },
+    )
+}
+
 fn capability_effect_class(capability: DeviceCapability) -> &'static str {
     if matches!(capability.class(), CapabilityClass::Observe) {
         "read_only"
     } else {
         "effectful"
     }
+}
+
+fn capability_target_class(capability: DeviceCapability) -> &'static str {
+    match capability {
+        DeviceCapability::ExecuteProcess | DeviceCapability::Shell => "process",
+        DeviceCapability::ReadFile | DeviceCapability::ListDirectory => "filesystem",
+        DeviceCapability::BrowserInspect
+        | DeviceCapability::BrowserPrepare
+        | DeviceCapability::BrowserNavigate
+        | DeviceCapability::BrowserClick
+        | DeviceCapability::BrowserType
+        | DeviceCapability::BrowserDialog
+        | DeviceCapability::BrowserPointer
+        | DeviceCapability::BrowserUploadFile
+        | DeviceCapability::BrowserDownload => "browser",
+        DeviceCapability::Screenshot
+        | DeviceCapability::PointerClick
+        | DeviceCapability::PointerDrag
+        | DeviceCapability::TypeText
+        | DeviceCapability::ListApplications
+        | DeviceCapability::ScreenGeometry
+        | DeviceCapability::ListWindows
+        | DeviceCapability::LaunchApplication
+        | DeviceCapability::InspectWindow
+        | DeviceCapability::VerifyUiState
+        | DeviceCapability::TerminateApplication
+        | DeviceCapability::ActivateWindow
+        | DeviceCapability::SetWindowFrame
+        | DeviceCapability::InvokeMenu
+        | DeviceCapability::KeyboardInput
+        | DeviceCapability::Scroll
+        | DeviceCapability::ClipboardRead
+        | DeviceCapability::ClipboardWrite
+        | DeviceCapability::PointerPosition
+        | DeviceCapability::MovePointer
+        | DeviceCapability::SetUiValue
+        | DeviceCapability::CaptureRegion
+        | DeviceCapability::DesktopScope => "desktop",
+    }
+}
+
+fn capability_effect_kind(capability: DeviceCapability) -> &'static str {
+    if matches!(capability.class(), CapabilityClass::Observe) {
+        return "observation";
+    }
+    match capability {
+        DeviceCapability::ExecuteProcess | DeviceCapability::Shell => "execute",
+        DeviceCapability::LaunchApplication => "launch",
+        DeviceCapability::TerminateApplication => "terminate",
+        DeviceCapability::BrowserNavigate => "navigate",
+        DeviceCapability::BrowserUploadFile => "upload",
+        DeviceCapability::BrowserDownload => "create",
+        DeviceCapability::DesktopScope => "scope_expand",
+        DeviceCapability::PointerClick
+        | DeviceCapability::PointerDrag
+        | DeviceCapability::TypeText
+        | DeviceCapability::ActivateWindow
+        | DeviceCapability::SetWindowFrame
+        | DeviceCapability::InvokeMenu
+        | DeviceCapability::KeyboardInput
+        | DeviceCapability::Scroll
+        | DeviceCapability::ClipboardWrite
+        | DeviceCapability::MovePointer
+        | DeviceCapability::SetUiValue
+        | DeviceCapability::BrowserPrepare
+        | DeviceCapability::BrowserClick
+        | DeviceCapability::BrowserType
+        | DeviceCapability::BrowserDialog
+        | DeviceCapability::BrowserPointer => "modify",
+        _ => "interact",
+    }
+}
+
+fn capability_verification_kind(capability: DeviceCapability) -> &'static str {
+    match capability {
+        DeviceCapability::LaunchApplication
+        | DeviceCapability::TerminateApplication
+        | DeviceCapability::ActivateWindow
+        | DeviceCapability::SetWindowFrame
+        | DeviceCapability::InvokeMenu
+        | DeviceCapability::KeyboardInput
+        | DeviceCapability::Scroll
+        | DeviceCapability::ClipboardWrite
+        | DeviceCapability::MovePointer
+        | DeviceCapability::SetUiValue
+        | DeviceCapability::PointerClick
+        | DeviceCapability::PointerDrag
+        | DeviceCapability::TypeText => "application_state",
+        DeviceCapability::BrowserPrepare
+        | DeviceCapability::BrowserNavigate
+        | DeviceCapability::BrowserClick
+        | DeviceCapability::BrowserType
+        | DeviceCapability::BrowserDialog
+        | DeviceCapability::BrowserPointer
+        | DeviceCapability::BrowserUploadFile => "browser_state",
+        DeviceCapability::BrowserDownload => "filesystem_postcondition",
+        // Arbitrary shell/process semantics are intentionally not inferred from text/argv.
+        DeviceCapability::ExecuteProcess | DeviceCapability::Shell => "none",
+        _ => "none",
+    }
+}
+
+fn evidence_status(evidence: Option<ExecutionEvidence>) -> &'static str {
+    if evidence.is_some() {
+        "available"
+    } else {
+        "insufficient"
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateProcessArgs {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateShellArgs {
+    command: String,
+    cwd: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    timeout_ms: u64,
+}
+
+fn candidate_process_request(value: Value) -> Result<ProcessRequest, MaintenanceError> {
+    let args: CandidateProcessArgs = serde_json::from_value(strip_audit_and_operation_id(value)?)
+        .map_err(|_| MaintenanceError::InvalidCandidateRequest)?;
+    Ok(ProcessRequest {
+        program: args.program,
+        args: args.args,
+        cwd: args.cwd,
+        env: env_map(args.env),
+        timeout_ms: args.timeout_ms,
+    })
+}
+
+fn candidate_shell_request(value: Value) -> Result<ShellRequest, MaintenanceError> {
+    let args: CandidateShellArgs = serde_json::from_value(strip_audit_and_operation_id(value)?)
+        .map_err(|_| MaintenanceError::InvalidCandidateRequest)?;
+    Ok(ShellRequest {
+        command: args.command,
+        cwd: args.cwd,
+        env: env_map(args.env),
+        timeout_ms: args.timeout_ms,
+    })
+}
+
+fn strip_audit_and_operation_id(mut value: Value) -> Result<Value, MaintenanceError> {
+    let Value::Object(object) = &mut value else {
+        return Err(MaintenanceError::InvalidCandidateRequest);
+    };
+    for key in [
+        "operation_id",
+        "workflow_id",
+        "workflow_step_id",
+        "client_correlation_id",
+    ] {
+        object.remove(key);
+    }
+    Ok(value)
+}
+
+fn env_map(env: BTreeMap<String, String>) -> Vec<ProcessEnvVar> {
+    env.into_iter()
+        .map(|(key, value)| ProcessEnvVar { key, value })
+        .collect()
 }
 
 const fn evidence_name(evidence: ExecutionEvidence) -> &'static str {
@@ -254,6 +518,7 @@ pub enum MaintenanceError {
     Persistence(PersistenceError),
     Execution(ExecutionError),
     MissingResolutionRecord,
+    InvalidCandidateRequest,
     PersistenceCompatibility {
         checkpoint_execution_schema: u16,
         maintenance_execution_schema: u16,
@@ -269,6 +534,9 @@ impl fmt::Display for MaintenanceError {
             Self::MissingResolutionRecord => {
                 f.write_str("quarantine resolution produced no audit record")
             }
+            Self::InvalidCandidateRequest => f.write_str(
+                "candidate request does not match the supported shell/process comparison contract",
+            ),
             Self::PersistenceCompatibility {
                 checkpoint_execution_schema,
                 maintenance_execution_schema,
@@ -337,6 +605,68 @@ mod tests {
         (device_id, operation_id)
     }
 
+    fn seed_correlated_shell_quarantine(
+        state_dir: &Path,
+    ) -> (
+        String,
+        String,
+        Vec<u8>,
+        crate::v2_execution_safety::OperationRequestFingerprint,
+    ) {
+        use crate::v2_execution_safety::{OperationAuditMetadata, fingerprint_shell_request};
+        use crate::v2_m0::{ProcessEnvVar, ShellRequest};
+
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation_id = "op_correlated_maintenance".to_owned();
+        let secret = b"0123456789abcdef0123456789abcdef".to_vec();
+        let request = ShellRequest {
+            command: "printf raw-command-must-not-escape".into(),
+            cwd: "/private/raw-cwd-must-not-escape".into(),
+            env: vec![ProcessEnvVar {
+                key: "RAW_SECRET".into(),
+                value: "raw-env-must-not-escape".into(),
+            }],
+            timeout_ms: 2_000,
+        };
+        let fingerprint = fingerprint_shell_request(&secret, &request).unwrap();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: operation_id.clone(),
+        };
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare_with_audit(
+                operation,
+                owner.clone(),
+                DeviceCapability::Shell,
+                OperationAuditMetadata {
+                    workflow_id: Some("wf_release_42".into()),
+                    workflow_step_id: Some("step_package".into()),
+                    client_correlation_id: Some("client_corr_7".into()),
+                },
+                Some(fingerprint.clone()),
+                100,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched(&operation_id, &owner, 1, 110)
+            .unwrap();
+        execution.mark_connection_lost(&operation_id, 120).unwrap();
+        CheckpointStore::new(state_dir.to_path_buf(), "hub")
+            .unwrap()
+            .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+        (device_id, operation_id, secret, fingerprint)
+    }
+
     #[test]
     fn read_only_quarantine_inspection_requires_no_hub_stop_and_mutates_nothing() {
         let dir = test_dir("inspect-live");
@@ -365,12 +695,21 @@ mod tests {
         assert_eq!(inspection.capability, "shell");
         assert_eq!(inspection.semantic_operation_class, "shell");
         assert_eq!(inspection.effect_class, "effectful");
+        assert_eq!(inspection.workflow_id, None);
+        assert_eq!(inspection.workflow_step_id, None);
+        assert_eq!(inspection.client_correlation_id, None);
+        assert!(!inspection.request_fingerprint_present);
+        assert_eq!(inspection.target_class, "process");
+        assert_eq!(inspection.effect_kind, "execute");
+        assert_eq!(inspection.verification_kind, "none");
         assert!(inspection.dispatch_recorded);
         assert_eq!(inspection.prepared_at_ms, 100);
         assert_eq!(inspection.dispatched_at_ms, Some(110));
         assert_eq!(inspection.indeterminate_at_ms, 120);
         assert_eq!(inspection.indeterminate_reason, "connection_lost");
         assert_eq!(inspection.evidence_class, None);
+        assert_eq!(inspection.evidence_status, "insufficient");
+        assert_eq!(inspection.reconciliation_status, "operator_required");
         assert_eq!(inspection.recovery_disposition, "needs_reconciliation");
         assert!(!inspection.retry_safe);
         assert!(!report.recovery_guidance.replay_old_operation);
@@ -386,6 +725,98 @@ mod tests {
         assert!(!serialized.contains("alice"));
         assert!(!serialized.contains("owner"));
         assert_eq!(checkpoint_count(), before_count);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn correlated_inspection_and_request_comparison_are_private_read_only_evidence() {
+        let dir = test_dir("correlated-inspection");
+        let (device_id, operation_id, secret, fingerprint) = seed_correlated_shell_quarantine(&dir);
+        let checkpoint_count = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("hub-") && name.ends_with(".json"))
+                })
+                .count()
+        };
+        let before = checkpoint_count();
+
+        let report = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        let inspection = &report.quarantines[0];
+        assert_eq!(inspection.blocking_operation_id, operation_id);
+        assert_eq!(inspection.workflow_id.as_deref(), Some("wf_release_42"));
+        assert_eq!(inspection.workflow_step_id.as_deref(), Some("step_package"));
+        assert_eq!(
+            inspection.client_correlation_id.as_deref(),
+            Some("client_corr_7")
+        );
+        assert!(inspection.request_fingerprint_present);
+        assert_eq!(inspection.target_class, "process");
+        assert_eq!(inspection.effect_kind, "execute");
+        assert_eq!(inspection.verification_kind, "none");
+        assert_eq!(inspection.reconciliation_status, "operator_required");
+        assert!(!inspection.retry_safe);
+
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("raw-command-must-not-escape"));
+        assert!(!serialized.contains("raw-cwd-must-not-escape"));
+        assert!(!serialized.contains("raw-env-must-not-escape"));
+        assert!(!serialized.contains(&fingerprint.value));
+        assert!(!serialized.contains(&fingerprint.key_id));
+        assert!(!serialized.contains("https://issuer.example"));
+        assert!(!serialized.contains("alice"));
+
+        let candidate = serde_json::json!({
+            "operation_id": "op_0123456789abcdef0123456789abcdef",
+            "workflow_id": "wf_release_42",
+            "workflow_step_id": "step_package",
+            "client_correlation_id": "client_corr_7",
+            "command": "printf raw-command-must-not-escape",
+            "cwd": "/private/raw-cwd-must-not-escape",
+            "env": {"RAW_SECRET": "raw-env-must-not-escape"},
+            "timeout_ms": 2000
+        });
+        assert_eq!(
+            compare_quarantined_request_read_only(
+                &dir,
+                &operation_id,
+                "shell",
+                candidate.clone(),
+                &secret,
+            )
+            .unwrap(),
+            RequestComparisonReport::SameRequest
+        );
+        let mut different = candidate.clone();
+        different["timeout_ms"] = serde_json::json!(2001);
+        assert_eq!(
+            compare_quarantined_request_read_only(
+                &dir,
+                &operation_id,
+                "shell",
+                different,
+                &secret,
+            )
+            .unwrap(),
+            RequestComparisonReport::DifferentRequest
+        );
+        assert_eq!(
+            compare_quarantined_request_read_only(
+                &dir,
+                &operation_id,
+                "shell",
+                candidate,
+                b"fedcba9876543210fedcba9876543210",
+            )
+            .unwrap(),
+            RequestComparisonReport::Unavailable
+        );
+        assert_eq!(checkpoint_count(), before);
         let _ = std::fs::remove_dir_all(dir);
     }
 

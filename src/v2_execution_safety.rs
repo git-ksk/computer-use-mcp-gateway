@@ -8,21 +8,28 @@
 //! receipts, and bounded recoverable process/shell results. Recovery state never
 //! stores raw command, argv, cwd, or environment payloads.
 
-use crate::v2_m0::{DeviceCapability, DeviceErrorCode, ProcessOutput};
+use crate::v2_m0::{
+    DeviceCapability, DeviceErrorCode, ProcessOutput, ProcessRequest, ShellRequest,
+};
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision, ExecutionError,
     HubAdmissionController, HubAdmissionSnapshot, HubOperationState, IndeterminateResolution,
     OperationRef,
 };
 use crate::v2_m0_trust::AuthenticatedClientPrincipal;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 2;
-const PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 1;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 3;
+const RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 2;
+const LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 1;
 pub const MAX_RESOLUTION_EVIDENCE_BYTES: usize = 1024;
 pub const MAX_RECOVERY_ARCHIVE_ENTRIES: usize = 8;
 pub const MAX_RECOVERY_ARCHIVE_BYTES: usize = 256 * 1024;
+pub const MAX_AUDIT_CORRELATION_ID_BYTES: usize = 128;
+pub const REQUEST_FINGERPRINT_ALGORITHM: &str = "hmac-sha256:cumg-v2-shell-process-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OperationOwner {
@@ -105,6 +112,161 @@ pub struct DesktopQuarantine {
     pub since_ms: u64,
 }
 
+/// Untrusted caller-supplied workflow correlation metadata. These fields are
+/// bounded opaque audit labels only: they never authorize admission, replay,
+/// quarantine resolution, or proof of completion.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OperationAuditMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_step_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_correlation_id: Option<String>,
+}
+
+impl OperationAuditMetadata {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.workflow_id.is_none()
+            && self.workflow_step_id.is_none()
+            && self.client_correlation_id.is_none()
+    }
+
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        for value in [
+            self.workflow_id.as_deref(),
+            self.workflow_step_id.as_deref(),
+            self.client_correlation_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_audit_correlation_id(value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Keyed, non-authoritative request comparison material. The value is never
+/// exposed to operators or clients; inspection can only report same/different
+/// against a candidate request when the same optional key is supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationRequestFingerprint {
+    pub algorithm: String,
+    /// Non-secret key generation identifier derived with HMAC from the configured key.
+    /// A key change therefore makes comparison unavailable instead of falsely reporting
+    /// that the request itself changed.
+    pub key_id: String,
+    pub value: String,
+}
+
+impl OperationRequestFingerprint {
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        if self.algorithm != REQUEST_FINGERPRINT_ALGORITHM
+            || self.key_id.len() != 16
+            || !self
+                .key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.value.len() != 64
+            || !self
+                .value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFingerprintComparison {
+    SameRequest,
+    DifferentRequest,
+    Unavailable,
+}
+
+pub fn fingerprint_process_request(
+    secret: &[u8],
+    request: &ProcessRequest,
+) -> Result<OperationRequestFingerprint, ExecutionError> {
+    let contract = json!({
+        "contract": "execute_process",
+        "program": request.program,
+        "args": request.args,
+        "cwd": request.cwd,
+        "env": request.env,
+        "timeout_ms": request.timeout_ms,
+    });
+    fingerprint_canonical_contract(secret, &contract)
+}
+
+pub fn fingerprint_shell_request(
+    secret: &[u8],
+    request: &ShellRequest,
+) -> Result<OperationRequestFingerprint, ExecutionError> {
+    let contract = json!({
+        "contract": "shell",
+        "command": request.command,
+        "cwd": request.cwd,
+        "env": request.env,
+        "timeout_ms": request.timeout_ms,
+    });
+    fingerprint_canonical_contract(secret, &contract)
+}
+
+pub fn compare_request_fingerprint(
+    stored: Option<&OperationRequestFingerprint>,
+    candidate: Option<&OperationRequestFingerprint>,
+) -> RequestFingerprintComparison {
+    match (stored, candidate) {
+        (Some(stored), Some(candidate))
+            if stored.algorithm != candidate.algorithm || stored.key_id != candidate.key_id =>
+        {
+            RequestFingerprintComparison::Unavailable
+        }
+        (Some(stored), Some(candidate)) if stored.value == candidate.value => {
+            RequestFingerprintComparison::SameRequest
+        }
+        (Some(_), Some(_)) => RequestFingerprintComparison::DifferentRequest,
+        _ => RequestFingerprintComparison::Unavailable,
+    }
+}
+
+fn fingerprint_canonical_contract(
+    secret: &[u8],
+    contract: &serde_json::Value,
+) -> Result<OperationRequestFingerprint, ExecutionError> {
+    if secret.is_empty() {
+        return Err(ExecutionError::InvalidOperation);
+    }
+    let canonical = serde_json::to_vec(contract).map_err(|_| ExecutionError::InvalidOperation)?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    let tag = hmac::sign(&key, &canonical);
+    let key_id_tag = hmac::sign(&key, b"cumg-v2-audit-fingerprint-key-id");
+    let key_id_full = hex_lower(key_id_tag.as_ref());
+    Ok(OperationRequestFingerprint {
+        algorithm: REQUEST_FINGERPRINT_ALGORITHM.to_owned(),
+        key_id: key_id_full[..16].to_owned(),
+        value: hex_lower(tag.as_ref()),
+    })
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolutionRecord {
     pub operation_id: String,
@@ -160,6 +322,18 @@ fn process_output_matches_state(output: &ProcessOutput, state: HubOperationState
     }
 }
 
+fn validate_audit_correlation_id(value: &str) -> Result<(), ExecutionError> {
+    if value.is_empty()
+        || value.len() > MAX_AUDIT_CORRELATION_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(ExecutionError::InvalidOperation);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationRecoverySnapshot {
     pub operation: OperationRef,
@@ -177,6 +351,8 @@ pub struct OperationRecoverySnapshot {
 pub struct QuarantineInspectionSnapshot {
     pub operation: OperationRef,
     pub capability: DeviceCapability,
+    pub audit: OperationAuditMetadata,
+    pub request_fingerprint: Option<OperationRequestFingerprint>,
     pub prepared_at_ms: u64,
     pub dispatched_at_ms: Option<u64>,
     pub indeterminate_at_ms: u64,
@@ -223,6 +399,10 @@ pub struct SafetyOperationSnapshot {
     pub receipt: Option<ExecutionReceipt>,
     #[serde(default)]
     pub recoverable_result: Option<RecoverableOperationResult>,
+    #[serde(default, skip_serializing_if = "OperationAuditMetadata::is_empty")]
+    pub audit: OperationAuditMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<OperationRequestFingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +427,8 @@ struct SafetyOperation {
     indeterminate_reason: Option<IndeterminateReason>,
     receipt: Option<ExecutionReceipt>,
     recoverable_result: Option<RecoverableOperationResult>,
+    audit: OperationAuditMetadata,
+    request_fingerprint: Option<OperationRequestFingerprint>,
 }
 
 /// Single authoritative state machine for Hub-side desktop execution safety.
@@ -281,10 +463,33 @@ impl AuthoritativeOperationController {
         capability: DeviceCapability,
         now_ms: u64,
     ) -> Result<AdmissionDecision, ExecutionError> {
+        self.prepare_with_audit(
+            operation,
+            owner,
+            capability,
+            OperationAuditMetadata::empty(),
+            None,
+            now_ms,
+        )
+    }
+
+    pub fn prepare_with_audit(
+        &mut self,
+        operation: OperationRef,
+        owner: OperationOwner,
+        capability: DeviceCapability,
+        audit: OperationAuditMetadata,
+        request_fingerprint: Option<OperationRequestFingerprint>,
+        now_ms: u64,
+    ) -> Result<AdmissionDecision, ExecutionError> {
         if self.operations.contains_key(&operation.operation_id)
             || self.recovery_archive.contains_key(&operation.operation_id)
         {
             return Err(ExecutionError::OperationReplay);
+        }
+        audit.validate()?;
+        if let Some(fingerprint) = request_fingerprint.as_ref() {
+            fingerprint.validate()?;
         }
         let decision = self.admission.admit(operation.clone())?;
         let state = match decision {
@@ -303,6 +508,8 @@ impl AuthoritativeOperationController {
                 indeterminate_reason: None,
                 receipt: None,
                 recoverable_result: None,
+                audit,
+                request_fingerprint,
             },
         );
         Ok(decision)
@@ -703,6 +910,8 @@ impl AuthoritativeOperationController {
                 Ok(QuarantineInspectionSnapshot {
                     operation: record.operation.clone(),
                     capability: record.capability,
+                    audit: record.audit.clone(),
+                    request_fingerprint: record.request_fingerprint.clone(),
                     prepared_at_ms: record.prepared_at_ms,
                     dispatched_at_ms: record.dispatched_at_ms,
                     indeterminate_at_ms: quarantine.since_ms,
@@ -869,6 +1078,8 @@ impl AuthoritativeOperationController {
                 indeterminate_reason: reason,
                 receipt,
                 recoverable_result,
+                audit: record.audit.clone(),
+                request_fingerprint: record.request_fingerprint.clone(),
             });
         }
         operations.sort_by(|a, b| a.operation.operation_id.cmp(&b.operation.operation_id));
@@ -900,21 +1111,41 @@ impl AuthoritativeOperationController {
         let mut snapshot = self.snapshot_for_restart();
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
-            PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if !snapshot.recoveries.is_empty()
-                    || snapshot
-                        .operations
-                        .iter()
-                        .any(|record| record.recoverable_result.is_some())
+            RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if snapshot
+                    .operations
+                    .iter()
+                    .any(|record| !record.audit.is_empty() || record.request_fingerprint.is_some())
                 {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
                     if let Some(receipt) = &mut record.receipt {
-                        receipt.schema_version = PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION;
+                        receipt.schema_version = RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
                     }
                 }
-                snapshot.schema_version = PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION;
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version = RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
+            LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if !snapshot.recoveries.is_empty()
+                    || snapshot.operations.iter().any(|record| {
+                        record.recoverable_result.is_some()
+                            || !record.audit.is_empty()
+                            || record.request_fingerprint.is_some()
+                    })
+                {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                snapshot.schema_version = LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION;
                 Ok(snapshot)
             }
             _ => Err(ExecutionError::InvalidSnapshot),
@@ -927,11 +1158,21 @@ impl AuthoritativeOperationController {
     ) -> Result<Self, ExecutionError> {
         if !matches!(
             snapshot.schema_version,
-            PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION | EXECUTION_SAFETY_SCHEMA_VERSION
+            LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION
+                | RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
+                | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version == PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && snapshot
+                .operations
+                .iter()
+                .any(|record| !record.audit.is_empty() || record.request_fingerprint.is_some())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version == LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION
             && (!snapshot.recoveries.is_empty()
                 || snapshot
                     .operations
@@ -956,6 +1197,11 @@ impl AuthoritativeOperationController {
                 })
                 || (record.state == HubOperationState::Indeterminate
                     && record.recoverable_result.is_some())
+                || record.audit.validate().is_err()
+                || record
+                    .request_fingerprint
+                    .as_ref()
+                    .is_some_and(|fingerprint| fingerprint.validate().is_err())
             {
                 return Err(ExecutionError::InvalidSnapshot);
             }
@@ -971,6 +1217,8 @@ impl AuthoritativeOperationController {
                     indeterminate_reason: record.indeterminate_reason,
                     receipt: record.receipt,
                     recoverable_result: record.recoverable_result,
+                    audit: record.audit,
+                    request_fingerprint: record.request_fingerprint,
                 },
             );
         }
@@ -1419,11 +1667,11 @@ mod tests {
             .unwrap();
 
         let snapshot = ledger
-            .snapshot_for_restart_compatible_with(PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION)
+            .snapshot_for_restart_compatible_with(LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION)
             .unwrap();
         assert_eq!(
             snapshot.schema_version,
-            PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION
+            LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION
         );
         assert!(snapshot.recoveries.is_empty());
         assert!(
@@ -1484,7 +1732,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            ledger.snapshot_for_restart_compatible_with(PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION),
+            ledger.snapshot_for_restart_compatible_with(LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION),
             Err(ExecutionError::InvalidSnapshot)
         ));
     }
@@ -1507,7 +1755,7 @@ mod tests {
             )
             .unwrap();
         let mut legacy = ledger.snapshot_for_restart();
-        legacy.schema_version = PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION;
+        legacy.schema_version = LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION;
         assert!(
             AuthoritativeOperationController::restore_after_restart(
                 AdmissionLimits {
@@ -2027,6 +2275,130 @@ mod tests {
                     max_queued_per_device: 8,
                 },
                 snapshot,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn correlated_quarantine_survives_restart_without_persisting_raw_request() {
+        use crate::v2_m0::ProcessEnvVar;
+
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let rotated_secret = b"fedcba9876543210fedcba9876543210";
+        let request = ShellRequest {
+            command: "printf super-sensitive-command-marker".into(),
+            cwd: "/private/sensitive-cwd".into(),
+            env: vec![ProcessEnvVar {
+                key: "SECRET_NAME".into(),
+                value: "super-sensitive-env-marker".into(),
+            }],
+            timeout_ms: 1_000,
+        };
+        let fingerprint = fingerprint_shell_request(secret, &request).unwrap();
+        let audit = OperationAuditMetadata {
+            workflow_id: Some("wf_release_42".into()),
+            workflow_step_id: Some("step_verify".into()),
+            client_correlation_id: Some("client_abc123".into()),
+        };
+        let mut ledger = controller();
+        ledger
+            .prepare_with_audit(
+                op("op-correlated", 7),
+                alice(),
+                DeviceCapability::Shell,
+                audit.clone(),
+                Some(fingerprint.clone()),
+                10,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-correlated", &alice(), 7, 11)
+            .unwrap();
+        ledger.mark_connection_lost("op-correlated", 12).unwrap();
+
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.schema_version, EXECUTION_SAFETY_SCHEMA_VERSION);
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(encoded.contains("wf_release_42"));
+        assert!(!encoded.contains("super-sensitive-command-marker"));
+        assert!(!encoded.contains("/private/sensitive-cwd"));
+        assert!(!encoded.contains("super-sensitive-env-marker"));
+
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        let inspection = restored.quarantine_inspections().unwrap().remove(0);
+        assert_eq!(inspection.audit, audit);
+        assert_eq!(inspection.request_fingerprint.as_ref(), Some(&fingerprint));
+
+        let same = fingerprint_shell_request(secret, &request).unwrap();
+        assert_eq!(
+            compare_request_fingerprint(Some(&fingerprint), Some(&same)),
+            RequestFingerprintComparison::SameRequest
+        );
+        let mut changed_request = request.clone();
+        changed_request.timeout_ms += 1;
+        let changed = fingerprint_shell_request(secret, &changed_request).unwrap();
+        assert_eq!(
+            compare_request_fingerprint(Some(&fingerprint), Some(&changed)),
+            RequestFingerprintComparison::DifferentRequest
+        );
+        let rotated = fingerprint_shell_request(rotated_secret, &request).unwrap();
+        assert_eq!(
+            compare_request_fingerprint(Some(&fingerprint), Some(&rotated)),
+            RequestFingerprintComparison::Unavailable
+        );
+    }
+
+    #[test]
+    fn schema_v2_cannot_claim_v3_audit_or_fingerprint_state() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let request = ShellRequest {
+            command: "echo bounded".into(),
+            cwd: "/tmp".into(),
+            env: vec![],
+            timeout_ms: 1_000,
+        };
+        let fingerprint = fingerprint_shell_request(secret, &request).unwrap();
+        let mut ledger = controller();
+        ledger
+            .prepare_with_audit(
+                op("op-v3-audit", 7),
+                alice(),
+                DeviceCapability::Shell,
+                OperationAuditMetadata {
+                    workflow_id: Some("wf_v3".into()),
+                    workflow_step_id: None,
+                    client_correlation_id: None,
+                },
+                Some(fingerprint),
+                10,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-v3-audit", &alice(), 7, 11)
+            .unwrap();
+        ledger.mark_connection_lost("op-v3-audit", 12).unwrap();
+
+        assert!(matches!(
+            ledger.snapshot_for_restart_compatible_with(RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+        let mut forged_v2 = ledger.snapshot_for_restart();
+        forged_v2.schema_version = RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                forged_v2,
             ),
             Err(ExecutionError::InvalidSnapshot)
         ));

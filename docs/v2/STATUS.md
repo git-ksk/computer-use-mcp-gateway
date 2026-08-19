@@ -2,13 +2,14 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](STATUS.ja.md)
 
-Status as of 2026-08-16:
+Status as of 2026-08-19:
 
 - **Desktop semantic path:** complete and accepted, including same-context native element click/type/key targeting and real-Cua background AX element-action evidence.
 - **Browser core semantic path:** complete and accepted for prepare, bind, inspect, navigate, click, type, dialog, and pointer semantics.
 - **Browser transfer:** complete and accepted. Upload/download use scoped CUMG refs plus Agent-private bounded staging; no arbitrary host path is exposed northbound.
 - **Post-dispatch ambiguity hardening:** after dispatch of a mutating command, a generic backend error, malformed/unprovable completion, or response loss is classified at the adapter/Agent boundary as `BackendOutcomeIndeterminate`, persisted by the Hub as durable `Indeterminate` with reason `BackendOutcomeUnproven`, cancels queued work for that desktop, and keeps the device quarantined until explicit persistence-gated resolution. It is never automatically retried or replayed. Read-only backend failures may remain definite. Northbound operational failures use bounded MCP `CallToolResult` errors with `isError=true` and closed CUMG codes rather than leaking transport/provider/`ExceptionGroup` shapes. Real-Cua browser-alert acceptance covers the observable-side-effect case from issue #47.
 - **Process/shell response-loss recovery:** `execute_process` and `shell` accept a stable caller-retained `operation_id`, and the Hub exposes read-only `get_operation` for owner/capability-scoped recovery without replay or Agent liveness. Proven terminal output is persisted before northbound delivery and survives Agent generation rollover in a bounded recovery archive (8 entries / 256 KiB encoded total). Unknown/evicted references never make the original operation retry-safe.
+- **Privacy-preserving audit correlation:** execution-safety schema v3 persists bounded workflow/client correlation labels plus optional keyed shell/process request fingerprints before dispatch. `inspect-quarantine` exposes correlation and reconciliation guidance without raw request/result/credential payloads; `compare-quarantine-request` can return only `same_request`, `different_request`, or `unavailable`. Correlation/fingerprint evidence cannot settle an operation, clear quarantine, or authorize replay, and schema v1/v2 restore remains fail-closed compatible.
 - **V1 production:** unchanged by the V2 development branch. V1 regression and conformance coverage remains required during V2 work.
 
 ## Active contracts

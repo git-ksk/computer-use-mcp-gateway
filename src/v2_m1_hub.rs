@@ -7,8 +7,8 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionEvidence, ExecutionReceipt,
-    IndeterminateReason, OperationOwner, OperationRecoverySnapshot, RecoverableOperationResult,
-    ResolutionRecord,
+    IndeterminateReason, OperationAuditMetadata, OperationOwner, OperationRecoverySnapshot,
+    OperationRequestFingerprint, RecoverableOperationResult, ResolutionRecord,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -240,7 +240,9 @@ enum HubRequest {
     Execute {
         operation_id: String,
         owner: OperationOwner,
-        command: DeviceCommand,
+        command: Box<DeviceCommand>,
+        audit: OperationAuditMetadata,
+        request_fingerprint: Option<OperationRequestFingerprint>,
         usage: Option<UsageLease>,
         reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
     },
@@ -609,7 +611,15 @@ impl SingleDeviceHub {
                         return Ok(());
                     };
                     match request {
-                        HubRequest::Execute { operation_id, owner, command, usage, reply } => {
+                        HubRequest::Execute {
+                            operation_id,
+                            owner,
+                            command,
+                            audit,
+                            request_fingerprint,
+                            usage,
+                            reply,
+                        } => {
                             if self.inner.draining.load(Ordering::Acquire) {
                                 tracing::info!(
                                     event = "v2_operation_rejected",
@@ -663,10 +673,12 @@ impl SingleDeviceHub {
                             };
                             let decision = {
                                 let mut persistent = self.inner.persistent.lock().await;
-                                match persistent.execution.prepare(
+                                match persistent.execution.prepare_with_audit(
                                     operation,
                                     owner.clone(),
                                     command.capability(),
+                                    audit,
+                                    request_fingerprint,
                                     unix_time_ms()?,
                                 ) {
                                     Ok(decision) => {
@@ -708,7 +720,7 @@ impl SingleDeviceHub {
                             );
                             pending.insert(operation_id.clone(), PendingOperation {
                                 owner,
-                                command,
+                                command: *command,
                                 usage,
                                 envelope: None,
                                 reply,
@@ -1729,6 +1741,26 @@ impl HubHandle {
         command: DeviceCommand,
         usage: Option<UsageLease>,
     ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as_with_id_and_audit(
+            owner,
+            operation_id,
+            command,
+            OperationAuditMetadata::empty(),
+            None,
+            usage,
+        )
+        .await
+    }
+
+    pub async fn start_command_as_with_id_and_audit(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        audit: OperationAuditMetadata,
+        request_fingerprint: Option<OperationRequestFingerprint>,
+        usage: Option<UsageLease>,
+    ) -> Result<HubPendingCommand, HubCommandError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(HubCommandError::Busy);
         }
@@ -1749,7 +1781,9 @@ impl HubHandle {
         tx.send(HubRequest::Execute {
             operation_id: operation_id.clone(),
             owner,
-            command,
+            command: Box::new(command),
+            audit,
+            request_fingerprint,
             usage,
             reply: reply_tx,
         })

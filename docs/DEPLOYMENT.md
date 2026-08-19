@@ -65,9 +65,22 @@ v2_maint inspect-quarantine \
 
 Use `--device-id DEVICE_ID` to restrict output in a multi-device state directory. Inspection reads only the latest atomically committed checkpoint and does **not** take the Hub's exclusive maintenance lock, so it may run while the Hub is serving. It never resolves quarantine, signs recovery, dispatches device work, or rewrites the checkpoint. The output is a point-in-time durable view; a later normal Hub checkpoint may advance after the inspection returns.
 
-Each unresolved entry identifies the exact `blocking_operation_id`, stable device/generation, capability/semantic operation class, conservative `read_only` or `effectful` class, durable dispatch marker/timestamps, indeterminate timestamp/reason, any safe receipt-evidence class, and `recovery_disposition=needs_reconciliation`. It deliberately omits authenticated owner issuer/subject and every raw command, argv, cwd, environment value, typed text, URL, clipboard value, screenshot, backend identifier, result payload, credential, or secret. The state-directory filesystem permissions are the authorization boundary for this local operator surface; no equivalent cross-principal northbound inspection endpoint is exposed.
+Each unresolved entry identifies the exact `blocking_operation_id`, stable device/generation, capability/semantic operation class, conservative `read_only` or `effectful` class, bounded workflow/client correlation labels when supplied, fingerprint presence, target/effect/verification classes, durable dispatch marker/timestamps, indeterminate timestamp/reason, available evidence class, `evidence_status`, `reconciliation_status`, and `recovery_disposition=needs_reconciliation`. It deliberately omits authenticated owner issuer/subject, the request fingerprint/key value, and every raw command, argv, cwd, environment value, typed text, URL, clipboard value, screenshot, backend identifier, result payload, credential, or secret. Correlation labels are audit-only and do not authenticate the caller or authorize recovery. The state-directory filesystem permissions are the authorization boundary for this local operator surface; no equivalent cross-principal northbound inspection endpoint is exposed.
 
 A northbound tool request rejected by an existing quarantine returns `code=device_indeterminate`, `blocking_operation_id=op_...`, and `retry_safe=false`. `blocking_operation_id` always names the **earlier ambiguous operation that is already quarantining the device**, not a newly generated ID for the rejected request. Do not replay that operation. `confirmed_not_executed` is valid only with independent evidence that no side effect occurred; `confirmed_completed` is valid only with independent evidence that the intended side effect completed; otherwise leave quarantine intact.
+
+For shell/process deployments that want privacy-preserving candidate matching, provision one private file of at least 32 bytes and configure the Hub with `CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE`. The file must be readable only by the Hub/operator account and must not be committed or copied into logs. The Hub HMACs the canonical request before dispatch; no raw request is persisted for this purpose. To compare a locally-held candidate request, place that candidate JSON in a private file and run:
+
+```bash
+v2_maint compare-quarantine-request \
+  --state-dir /var/lib/cumg-v2/hub \
+  --operation-id op_... \
+  --tool shell \
+  --request-file /secure/tmp/candidate.json \
+  --fingerprint-secret-file /secure/path/audit-fingerprint.key
+```
+
+The command prints only `"same_request"`, `"different_request"`, or `"unavailable"`; it does not print the candidate, stored fingerprint, key identifier, or key. A different/rotated key intentionally yields `unavailable`, not `different_request`. Matching proves only request correlation. It never proves completion, clears quarantine, changes retry safety, or authorizes replay. Arbitrary shell text is never parsed to infer idempotency or postconditions. Remove the temporary candidate file according to the deployment's sensitive-file handling policy after use.
 
 ### Offline quarantine resolution
 

@@ -154,6 +154,8 @@ northbound authentication -> verified issuer+subject -> reserve(1)
 
 bridge は CUMG-owned / loopback-only で、bearer token / tool payload を送りません。initial implementation は `mcp-usage-control` の `MemoryUsageStore` を使います。[`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md) を参照してください。
 
+authoritative operation record は execution-safety schema v3 を使用します。dispatch 前に effectful request は bounded audit correlation label を persist でき、明示的に canonicalize された shell/process contract に限って keyed request fingerprint も保持できます。これらは operation checkpoint/quarantine metadata とともに移動しますが execution authority の外側にあり、owner/device/generation/capability fence、terminal state、retry semantics、replay admission を変更できません。read-only maintenance は label と fingerprint の presence/comparison status を公開できますが、raw request content と fingerprint/key value は公開しません。既存 schema v1/v2 checkpoint は元の representational limit の範囲で引き続き読め、v3-only state を失う downgrade は拒否します。
+
 ## V2 accepted boundary
 
 V2 は **「V1 + multi-machine routing」ではありません。** completed competitor-gap PoC と GO/NO-GO review により、accepted boundary は **stateful interactive desktop の delegated control に対する uncertainty-aware execution safety** に絞られました。Hub/Agent topology はその safety boundary の implementation vehicle であり、generic fleet/device-fabric product ではありません。
