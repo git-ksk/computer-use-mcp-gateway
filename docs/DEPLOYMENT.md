@@ -59,7 +59,7 @@ Configure the service manager's stop/kill timeout to be **longer** than `CUMG_V2
 A durable `Indeterminate` quarantine is never cleared by reconnect or restart. After an operator establishes out-of-band evidence for the exact ambiguous operation, stop `v2_hub` completely and use the offline maintenance CLI instead of editing checkpoint JSON:
 
 ```bash
-cargo run --locked --bin v2_maint -- resolve \
+v2_maint resolve \
   --state-dir /var/lib/cumg-v2/hub \
   --operation-id op_... \
   --decision confirmed_not_executed \
@@ -68,7 +68,9 @@ cargo run --locked --bin v2_maint -- resolve \
 
 `confirmed_completed` is also available when the side effect is positively confirmed. Evidence is required and remains subject to `MAX_RESOLUTION_EVIDENCE_BYTES`; keep it to bounded audit metadata and never place commands, results, desktop content, credentials, tokens, or secrets in it.
 
-The Hub and maintenance CLI take the same exclusive state-directory lock. `v2_maint` therefore fails closed while any `SingleDeviceHub` instance still owns that state directory. A successful resolution restores the checkpoint through the normal schema-validation path, invokes the existing authoritative `resolve_indeterminate` transition, and appends a new checkpoint through the same private-pending-file/fsync/atomic-publication persistence path. The resulting `ResolutionRecord` remains durable even after terminal operation tombstones are pruned on later generations. Restart the Hub only after the CLI exits successfully.
+The Hub and maintenance CLI take the same exclusive state-directory lock. `v2_maint` therefore fails closed while any `SingleDeviceHub` instance still owns that state directory. Before applying the in-memory resolution transition, maintenance verifies that the restored execution state can still be represented by the execution-safety schema of the authoritative input checkpoint. It validates the post-resolution candidate again before publishing bytes. Maintenance preserves the input checkpoint's outer state schema, registry snapshot, and execution-safety writer contract instead of silently upgrading durable state while the intended Hub is offline. If the source writer contract cannot represent the candidate state, recovery fails before checkpoint publication with a bounded persistence-compatibility error; do not edit the checkpoint or force a downgrade. Use a `v2_maint` paired with the deployed Hub release, or upgrade the Hub through the documented compatibility path before retrying recovery.
+
+A successful resolution invokes the existing authoritative `resolve_indeterminate` transition and appends a new checkpoint through the same private-pending-file/fsync/atomic-publication persistence path. The resulting `ResolutionRecord` remains durable even after terminal operation tombstones are pruned on later generations. Restart the Hub only after the CLI exits successfully. For packaged deployments, install `v2_hub` and `v2_maint` from the same reviewed build/release artifact. Running `cargo run --bin v2_maint` from a newer checkout against state owned by an older deployed Hub is not a supported shortcut unless that checkout is the exact source used for the deployed Hub.
 
 ### Initial Agent enrollment
 
@@ -93,7 +95,7 @@ Transfer `agent/` over an authenticated operator channel and preserve the device
 
 ### Linux Hub
 
-Use `packaging/systemd/cumg-v2-hub.service`, `packaging/systemd/cumg-v2-grant-signer.service`, and `packaging/systemd/hub.env.example` as templates. Production packaging deliberately separates grant-key custody from the Hub process: the Hub unit receives the Hub Ed25519 key and ACME TLS key, while the dedicated signer unit receives the grant Ed25519 key. Provision them independently outside the repository:
+Use `packaging/systemd/cumg-v2-hub.service`, `packaging/systemd/cumg-v2-grant-signer.service`, and `packaging/systemd/hub.env.example` as templates. Install the operator maintenance binary `v2_maint` from the same reviewed build/release artifact as `/usr/local/bin/v2_hub`; offline recovery relies on the durable-state compatibility contract shared by that pair. Production packaging deliberately separates grant-key custody from the Hub process: the Hub unit receives the Hub Ed25519 key and ACME TLS key, while the dedicated signer unit receives the grant Ed25519 key. Provision them independently outside the repository:
 
 ```bash
 sudo systemd-creds encrypt --name=hub-secret \

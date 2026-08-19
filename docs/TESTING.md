@@ -278,7 +278,7 @@ cargo test --test v2_m1_desktop_boundary_e2e
 cargo test --test v2_m1_partition_recovery
 ```
 
-The issue-#64 maintenance regressions prove the offline resolver refuses a concurrently owned Hub state directory, writes resolution only through the append-only checkpoint store, restores the exact authoritative quarantine transition, and retains `ResolutionRecord` audit history after terminal operation pruning and another restart.
+The issue-#64 maintenance regressions prove the offline resolver refuses a concurrently owned Hub state directory, writes resolution only through the append-only checkpoint store, restores the exact authoritative quarantine transition, and retains `ResolutionRecord` audit history after terminal operation pruning and another restart. Issue #117 adds writer-compatibility regressions: a current maintenance binary resolving a legacy execution-safety schema-v1 checkpoint must preserve the v1 writer contract (including the newly generated receipt) rather than silently emitting schema v2, while a candidate containing v2-only recoverable-result state must fail compatibility checks before any checkpoint is published.
 
 `v2_m1_desktop_boundary_e2e` uses a deterministic Cua-shaped stdio fixture and a real Hub-Agent TLS/gRPC session. It proves native shell and GUI-adapter commands share one owner/fence/quarantine boundary, includes a forced checkpoint-write failure during resolution, and requires rollback to quarantine before a successful retry.
 
