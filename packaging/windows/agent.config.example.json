@@ -1,0 +1,19 @@
+{
+  "component": "agent",
+  "executable": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\bin\\v2_agent.exe",
+  "workingDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway",
+  "logDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\logs",
+  "restartDelaySeconds": 2,
+  "waitForTcp": "127.0.0.1:7443",
+  "arguments": [
+    "--hub-endpoint", "https://127.0.0.1:7443",
+    "--hub-domain", "localhost",
+    "--device-id", "replace-with-enrolled-device-id",
+    "--device-secret-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\enrollment\\agent\\secrets\\device.key",
+    "--hub-public-key-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\enrollment\\agent\\trust\\hub.pub",
+    "--grant-public-key-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\enrollment\\agent\\trust\\grant.pub",
+    "--tls-root-der-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\enrollment\\agent\\trust\\tls-root.der",
+    "--state-dir", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\state\\agent",
+    "--allowed-cwd-root", "D:\\StudioProjects"
+  ]
+}

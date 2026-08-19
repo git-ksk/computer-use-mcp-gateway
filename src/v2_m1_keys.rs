@@ -16,6 +16,11 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
 pub const MAX_TLS_ROOT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone)]
@@ -244,9 +249,37 @@ fn validate_regular_file(
             _ => {}
         }
     }
+    #[cfg(windows)]
+    {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(KeyMaterialError::UnsafePath);
+        }
+        let subject = match sensitivity {
+            FileSensitivity::Secret => crate::v2_windows_acl::AclSubject::SecretFile,
+            FileSensitivity::PublicTrustAnchor => {
+                crate::v2_windows_acl::AclSubject::PublicTrustFile
+            }
+        };
+        crate::v2_windows_acl::validate_acl(path, subject)
+            .map_err(|error| map_windows_acl_error(error, sensitivity))?;
+    }
     Ok(())
 }
 
+#[cfg(windows)]
+fn map_windows_acl_error(
+    error: crate::v2_windows_acl::AclCheckError,
+    sensitivity: FileSensitivity,
+) -> KeyMaterialError {
+    match error {
+        crate::v2_windows_acl::AclCheckError::Io(error) => KeyMaterialError::Io(error),
+        crate::v2_windows_acl::AclCheckError::UntrustedOwner
+        | crate::v2_windows_acl::AclCheckError::UntrustedAccess => match sensitivity {
+            FileSensitivity::Secret => KeyMaterialError::UnsafeSecretPermissions,
+            FileSensitivity::PublicTrustAnchor => KeyMaterialError::WritableTrustAnchor,
+        },
+    }
+}
 fn ensure_parent_is_safe(path: &Path) -> Result<(), KeyMaterialError> {
     let parent = path.parent().ok_or(KeyMaterialError::UnsafePath)?;
     let metadata = fs::symlink_metadata(parent).map_err(KeyMaterialError::Io)?;
@@ -256,6 +289,23 @@ fn ensure_parent_is_safe(path: &Path) -> Result<(), KeyMaterialError> {
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(KeyMaterialError::WritableParentDirectory);
+    }
+    #[cfg(windows)]
+    {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(KeyMaterialError::UnsafePath);
+        }
+        crate::v2_windows_acl::validate_acl(
+            parent,
+            crate::v2_windows_acl::AclSubject::ParentDirectory,
+        )
+        .map_err(|error| match error {
+            crate::v2_windows_acl::AclCheckError::Io(error) => KeyMaterialError::Io(error),
+            crate::v2_windows_acl::AclCheckError::UntrustedOwner
+            | crate::v2_windows_acl::AclCheckError::UntrustedAccess => {
+                KeyMaterialError::WritableParentDirectory
+            }
+        })?;
     }
     Ok(())
 }
@@ -331,6 +381,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(windows)]
+    use std::process::Command;
+
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -346,9 +399,61 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         #[cfg(unix)]
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(windows)]
+        lock_down_windows_path(&directory, true);
         directory
     }
 
+    #[cfg(windows)]
+    fn windows_identity() -> String {
+        let output = Command::new("whoami").output().expect("run whoami");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(windows)]
+    fn run_icacls(path: &Path, args: &[String]) {
+        let mut command = Command::new("icacls.exe");
+        command.arg(path);
+        for argument in args {
+            command.arg(argument);
+        }
+        let output = command.output().expect("run icacls");
+        assert!(
+            output.status.success(),
+            "icacls failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    fn lock_down_windows_path(path: &Path, directory: bool) {
+        let current = windows_identity();
+        let suffix = if directory { "(OI)(CI)F" } else { "F" };
+        run_icacls(
+            path,
+            &[
+                "/inheritance:r".into(),
+                "/grant:r".into(),
+                format!("{current}:{suffix}"),
+                format!("*S-1-5-18:{suffix}"),
+                format!("*S-1-5-32-544:{suffix}"),
+                "/Q".into(),
+            ],
+        );
+    }
+
+    #[cfg(windows)]
+    fn grant_builtin_users(path: &Path, rights: &str) {
+        run_icacls(
+            path,
+            &[
+                "/grant".into(),
+                format!("*S-1-5-32-545:{rights}"),
+                "/Q".into(),
+            ],
+        );
+    }
     #[test]
     fn generated_device_secret_round_trips_without_checkpoint_storage() {
         let directory = temp_directory("device");
@@ -438,6 +543,85 @@ mod tests {
         assert!(matches!(
             load_verifying_key(&path),
             Err(KeyMaterialError::WritableTrustAnchor)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_secret_rejects_unrelated_read_or_write() {
+        let directory = temp_directory("windows-secret-acl");
+        let path = directory.join("device.key");
+        create_new_device_identity(&path).unwrap();
+
+        grant_builtin_users(&path, "R");
+        assert!(matches!(
+            load_device_identity(&path),
+            Err(KeyMaterialError::UnsafeSecretPermissions)
+        ));
+
+        lock_down_windows_path(&path, false);
+        grant_builtin_users(&path, "W");
+        assert!(matches!(
+            load_device_identity(&path),
+            Err(KeyMaterialError::UnsafeSecretPermissions)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_public_trust_allows_unrelated_read_but_rejects_write() {
+        let directory = temp_directory("windows-public-acl");
+        let path = directory.join("hub.pub");
+        let hub = HubIdentity::generate();
+        write_new_verifying_key(&path, &hub.verifier()).unwrap();
+
+        grant_builtin_users(&path, "R");
+        assert_eq!(load_verifying_key(&path).unwrap(), hub.verifier());
+
+        grant_builtin_users(&path, "W");
+        assert!(matches!(
+            load_verifying_key(&path),
+            Err(KeyMaterialError::WritableTrustAnchor)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_inherited_writable_parent_acl_is_rejected() {
+        let directory = temp_directory("windows-parent-acl");
+        grant_builtin_users(&directory, "(OI)(CI)M");
+        let child = directory.join("inherited");
+        fs::create_dir(&child).unwrap();
+
+        let path = child.join("device.key");
+        assert!(matches!(
+            create_new_device_identity(&path),
+            Err(KeyMaterialError::WritableParentDirectory)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_point_parent_is_rejected() {
+        let directory = temp_directory("windows-reparse");
+        let target = directory.join("target");
+        fs::create_dir(&target).unwrap();
+        let junction = directory.join("junction");
+        let status = Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .expect("create junction");
+        assert!(status.success());
+
+        assert!(matches!(
+            create_new_device_identity(&junction.join("device.key")),
+            Err(KeyMaterialError::UnsafePath)
         ));
         fs::remove_dir_all(directory).unwrap();
     }

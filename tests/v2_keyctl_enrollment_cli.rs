@@ -6,6 +6,26 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+fn lock_down_windows_directory(path: &std::path::Path) {
+    let output = Command::new("whoami").output().expect("run whoami");
+    assert!(output.status.success());
+    let identity = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let output = Command::new("icacls.exe")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("{identity}:(OI)(CI)F"),
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            "/Q",
+        ])
+        .output()
+        .expect("run icacls");
+    assert!(output.status.success());
+}
+
 fn private_temp_dir() -> std::path::PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -13,6 +33,8 @@ fn private_temp_dir() -> std::path::PathBuf {
         .as_nanos();
     let path = std::env::temp_dir().join(format!("cumg-v2-enrollment-cli-{unique}"));
     fs::create_dir(&path).unwrap();
+    #[cfg(windows)]
+    lock_down_windows_directory(&path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

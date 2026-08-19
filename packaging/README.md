@@ -2,6 +2,8 @@
 
 V2-M1 uses the operating system service manager instead of implementing a daemon supervisor. The Linux Hub is a hardened systemd system service; Linux Agents are systemd user services; macOS Agents are LaunchAgents so Cua and macOS privacy/TCC attribution remain in the interactive user session.
 
+Windows desktop/user deployments use the reviewed limited per-user Task Scheduler profile in [windows/README.md](windows/README.md). The scheduled-task action is a small child-process launcher because a force-terminated executable can leave a direct task stopped even with Task Scheduler restart settings; keeping the Agent in the interactive user session also avoids the Session 0 limitation of Windows Services.
+
 ## TLS certificate lifecycle
 
 Use an existing ACME client (Certbot, Caddy, lego, etc.) as the certificate authority/renewal mechanism. `v2_hub` intentionally rejects symlinked secret-key inputs, so do not point it directly at an ACME client's `live/` symlink tree. Run `scripts/v2-install-renewed-tls.sh` from the ACME deploy hook to validate the certificate/key pair and atomically copy regular files into `/etc/cumg-v2/tls/`, then `systemctl try-restart cumg-v2-hub.service`. Renewal logic remains owned by ACME, not this project.

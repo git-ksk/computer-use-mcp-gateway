@@ -2675,6 +2675,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{sleep, timeout};
 
+    fn fixture_python() -> String {
+        std::env::var("CUMG_TEST_PYTHON").unwrap_or_else(|_| "python3".into())
+    }
     async fn wait_for_file(path: &Path) {
         timeout(Duration::from_secs(5), async {
             while !path.exists() {
@@ -2691,7 +2694,7 @@ mod tests {
 
     fn fixture_with_timeout(args: Vec<String>, tool_timeout: Duration) -> CuaMcpAdapter {
         CuaMcpAdapter::new(
-            "python3",
+            fixture_python(),
             args,
             "1.0.0",
             "test",

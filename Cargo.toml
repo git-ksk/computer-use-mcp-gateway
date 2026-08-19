@@ -45,6 +45,16 @@ opentelemetry_sdk = { version = "0.32.0", default-features = false, features = [
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace", "metrics"] }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading"
+] }
 [dev-dependencies]
 pretty_assertions = "1"
 proptest = "1"
