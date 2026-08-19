@@ -1,7 +1,11 @@
 //! Offline operator maintenance for durable V2 Hub safety state.
 //! No network entrypoint is provided: maintenance shares the Hub state lock.
 
-use crate::v2_execution_safety::{ExecutionReceipt, OperationOwner, ResolutionRecord};
+use crate::v2_execution_safety::{
+    AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionReceipt,
+    OperationOwner, ResolutionRecord,
+};
+use crate::v2_m0::DeviceRegistrySnapshot;
 use crate::v2_m0_execution::{AdmissionLimits, ExecutionError, IndeterminateResolution};
 use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
@@ -49,18 +53,31 @@ fn resolve_indeterminate_offline_at(
     let state = checkpoint
         .load_latest::<HubPersistentState>()
         .map_err(MaintenanceError::Persistence)?;
+    let source_state_schema = state.schema_version;
+    let source_registry = state.registry.clone();
+    let source_execution_schema = state.execution.schema_version;
     // Checkpoints are restart-normalized before serialization, so queue capacity
     // is irrelevant to this single offline transition. V2 remains single-active.
     let limits = AdmissionLimits {
         max_global_active: 1,
         max_queued_per_device: 1,
     };
-    let (registry, mut execution) = state
+    let (_registry, mut execution) = state
         .restore(limits)
         .map_err(MaintenanceError::Persistence)?;
+    // Prove the restored state can still be represented by the source writer
+    // contract before applying even the in-memory authority-bearing transition.
+    // A second check below validates the post-resolution candidate before bytes
+    // are published, protecting this invariant if resolution gains new fields.
+    execution
+        .snapshot_for_restart_compatible_with(source_execution_schema)
+        .map_err(|_| MaintenanceError::PersistenceCompatibility {
+            checkpoint_execution_schema: source_execution_schema,
+            maintenance_execution_schema: EXECUTION_SAFETY_SCHEMA_VERSION,
+        })?;
     let resolver = OperationOwner::new(RESOLVER_ISSUER, RESOLVER_SUBJECT)
         .map_err(MaintenanceError::Execution)?;
-    let (_next, receipt) = execution
+    let (_next, mut receipt) = execution
         .resolve_indeterminate(operation_id, resolver, decision, evidence, now_ms)
         .map_err(MaintenanceError::Execution)?;
     let resolution = execution
@@ -68,13 +85,52 @@ fn resolve_indeterminate_offline_at(
         .last()
         .cloned()
         .ok_or(MaintenanceError::MissingResolutionRecord)?;
+    let candidate = compatible_checkpoint(
+        source_state_schema,
+        source_registry,
+        source_execution_schema,
+        &execution,
+    )?;
+    // Return the same receipt schema that is actually persisted. The CLI does
+    // not expose the schema today, but keeping the in-memory result aligned with
+    // durable evidence avoids a split audit contract for future callers.
+    receipt.schema_version = source_execution_schema;
+    // Validate the complete candidate through the current restore path before
+    // publishing any bytes. This is deliberately non-destructive: a failed
+    // compatibility/preflight check leaves the authoritative checkpoint intact.
+    candidate
+        .clone()
+        .restore(limits)
+        .map_err(MaintenanceError::Persistence)?;
     let checkpoint_path = checkpoint
-        .save(&HubPersistentState::capture(&registry, &execution))
+        .save(&candidate)
         .map_err(MaintenanceError::Persistence)?;
     Ok(OfflineResolutionResult {
         receipt,
         resolution,
         checkpoint: checkpoint_path,
+    })
+}
+
+fn compatible_checkpoint(
+    source_state_schema: u16,
+    source_registry: DeviceRegistrySnapshot,
+    source_execution_schema: u16,
+    execution: &AuthoritativeOperationController,
+) -> Result<HubPersistentState, MaintenanceError> {
+    let execution = execution
+        .snapshot_for_restart_compatible_with(source_execution_schema)
+        .map_err(|_| MaintenanceError::PersistenceCompatibility {
+            checkpoint_execution_schema: source_execution_schema,
+            maintenance_execution_schema: EXECUTION_SAFETY_SCHEMA_VERSION,
+        })?;
+    Ok(HubPersistentState {
+        // Maintenance changes only the execution-safety transition. Preserve the
+        // outer/registry writer contract instead of performing an incidental
+        // persisted-state migration while the intended Hub is offline.
+        schema_version: source_state_schema,
+        registry: source_registry,
+        execution,
     })
 }
 
@@ -84,6 +140,10 @@ pub enum MaintenanceError {
     Persistence(PersistenceError),
     Execution(ExecutionError),
     MissingResolutionRecord,
+    PersistenceCompatibility {
+        checkpoint_execution_schema: u16,
+        maintenance_execution_schema: u16,
+    },
     SystemClockBeforeEpoch,
 }
 impl fmt::Display for MaintenanceError {
@@ -95,6 +155,13 @@ impl fmt::Display for MaintenanceError {
             Self::MissingResolutionRecord => {
                 f.write_str("quarantine resolution produced no audit record")
             }
+            Self::PersistenceCompatibility {
+                checkpoint_execution_schema,
+                maintenance_execution_schema,
+            } => write!(
+                f,
+                "offline recovery persistence compatibility check failed: checkpoint execution schema {checkpoint_execution_schema} cannot represent maintenance schema {maintenance_execution_schema}; no checkpoint was written; use a version-paired Hub/v2_maint or upgrade the Hub before recovery"
+            ),
             Self::SystemClockBeforeEpoch => f.write_str("system clock is before the Unix epoch"),
         }
     }
@@ -209,6 +276,160 @@ mod tests {
             .unwrap();
         assert_eq!(execution.resolutions().len(), 1);
         assert_eq!(execution.resolutions()[0].operation_id, operation_id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offline_resolution_preserves_legacy_writer_contract_instead_of_upgrading_it() {
+        let dir = test_dir("legacy-writer-contract");
+        let (_, operation_id) = seed_quarantine(&dir);
+        let store = CheckpointStore::new(dir.clone(), "hub").unwrap();
+        let mut legacy = store.load_latest::<HubPersistentState>().unwrap();
+        legacy.execution.schema_version = 1;
+        // Exercise preservation of the registry writer contract too. Maintenance
+        // does not own a registry transition and must not incidentally migrate it.
+        legacy.registry.schema_version = 5;
+        let legacy_registry = legacy.registry.clone();
+        store.save(&legacy).unwrap();
+        let checkpoint_count = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("hub-") && name.ends_with(".json"))
+                })
+                .count()
+        };
+        let before_count = checkpoint_count();
+
+        let result = resolve_indeterminate_offline_at(
+            &dir,
+            &operation_id,
+            IndeterminateResolution::ConfirmedNotExecuted,
+            "operator verified no side effect".into(),
+            200,
+        )
+        .unwrap();
+        assert_eq!(result.receipt.schema_version, 1);
+
+        let after_count = checkpoint_count();
+        assert_eq!(after_count, before_count + 1);
+        let resolved = store.load_latest::<HubPersistentState>().unwrap();
+        assert_eq!(resolved.schema_version, legacy.schema_version);
+        assert_eq!(resolved.registry, legacy_registry);
+        assert_eq!(resolved.execution.schema_version, 1);
+        assert_eq!(
+            resolved
+                .execution
+                .operations
+                .iter()
+                .find(|record| record.operation.operation_id == operation_id)
+                .and_then(|record| record.receipt.as_ref())
+                .unwrap()
+                .schema_version,
+            1
+        );
+        let (registry, execution) = resolved
+            .restore(AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 2,
+            })
+            .unwrap();
+        let device_id = registry.snapshot().devices[0].device_id.clone();
+        assert!(execution.quarantine(&device_id).is_none());
+        assert_eq!(
+            execution.receipt(&operation_id).unwrap().terminal_state,
+            HubOperationState::Cancelled
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn incompatible_legacy_writer_contract_fails_before_checkpoint_publication() {
+        use crate::v2_execution_safety::{
+            EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence, RecoverableOperationResult,
+        };
+        use crate::v2_m0::ProcessOutput;
+
+        let dir = test_dir("legacy-writer-refusal");
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation = OperationRef {
+            device_id,
+            device_generation: 1,
+            operation_id: "op-v2-recovery-only".into(),
+        };
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare(
+                operation.clone(),
+                owner.clone(),
+                DeviceCapability::Shell,
+                100,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched(&operation.operation_id, &owner, 1, 110)
+            .unwrap();
+        execution
+            .finalize(
+                &operation.operation_id,
+                &owner,
+                1,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                120,
+            )
+            .unwrap();
+        execution
+            .attach_recoverable_result(
+                &operation.operation_id,
+                &owner,
+                1,
+                RecoverableOperationResult::Shell {
+                    output: ProcessOutput {
+                        exit_code: Some(0),
+                        stdout: "bounded result".into(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        timed_out: false,
+                        cancelled: false,
+                        duration_ms: 1,
+                    },
+                },
+            )
+            .unwrap();
+        let store = CheckpointStore::new(dir.clone(), "hub").unwrap();
+        store
+            .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+        let before_count = std::fs::read_dir(&dir).unwrap().count();
+
+        let error = compatible_checkpoint(
+            crate::v2_m1_persistence::M1_STATE_SCHEMA_VERSION,
+            registry.snapshot(),
+            1,
+            &execution,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MaintenanceError::PersistenceCompatibility {
+                checkpoint_execution_schema: 1,
+                maintenance_execution_schema: EXECUTION_SAFETY_SCHEMA_VERSION,
+            }
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before_count);
         let _ = std::fs::remove_dir_all(dir);
     }
 

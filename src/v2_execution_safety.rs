@@ -834,6 +834,41 @@ impl AuthoritativeOperationController {
         }
     }
 
+    /// Capture restart state without silently upgrading the durable execution
+    /// schema that the intended reader already proved it can consume.
+    ///
+    /// Offline maintenance uses this to preserve the writer contract of the
+    /// authoritative input checkpoint. Schema v1 can represent the resolution
+    /// ledger and terminal receipts, but it cannot represent v2 recoverable
+    /// process/shell results or the recovery archive.
+    pub(crate) fn snapshot_for_restart_compatible_with(
+        &self,
+        target_schema_version: u16,
+    ) -> Result<AuthoritativeSafetySnapshot, ExecutionError> {
+        let mut snapshot = self.snapshot_for_restart();
+        match target_schema_version {
+            EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if !snapshot.recoveries.is_empty()
+                    || snapshot
+                        .operations
+                        .iter()
+                        .any(|record| record.recoverable_result.is_some())
+                {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                snapshot.schema_version = PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
+            _ => Err(ExecutionError::InvalidSnapshot),
+        }
+    }
+
     pub fn restore_after_restart(
         limits: AdmissionLimits,
         snapshot: AuthoritativeSafetySnapshot,
@@ -1304,6 +1339,102 @@ mod tests {
         )
         .unwrap();
         assert!(restored.recovery_archive_encoded_bytes() <= MAX_RECOVERY_ARCHIVE_BYTES);
+    }
+
+    #[test]
+    fn compatible_restart_snapshot_preserves_previous_schema_when_state_is_representable() {
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-legacy-compatible", 7),
+                alice(),
+                DeviceCapability::Shell,
+                10,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-legacy-compatible", &alice(), 7, 11)
+            .unwrap();
+        ledger
+            .finalize(
+                "op-legacy-compatible",
+                &alice(),
+                7,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                12,
+            )
+            .unwrap();
+
+        let snapshot = ledger
+            .snapshot_for_restart_compatible_with(PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION)
+            .unwrap();
+        assert_eq!(
+            snapshot.schema_version,
+            PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION
+        );
+        assert!(snapshot.recoveries.is_empty());
+        assert!(
+            snapshot
+                .operations
+                .iter()
+                .all(|record| record.recoverable_result.is_none())
+        );
+        assert!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                snapshot,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn compatible_restart_snapshot_refuses_previous_schema_when_v2_recovery_data_exists() {
+        let mut ledger = controller();
+        ledger
+            .prepare(op("op-v2-only", 7), alice(), DeviceCapability::Shell, 10)
+            .unwrap();
+        ledger
+            .mark_dispatched("op-v2-only", &alice(), 7, 11)
+            .unwrap();
+        ledger
+            .finalize(
+                "op-v2-only",
+                &alice(),
+                7,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                12,
+            )
+            .unwrap();
+        ledger
+            .attach_recoverable_result(
+                "op-v2-only",
+                &alice(),
+                7,
+                RecoverableOperationResult::Shell {
+                    output: ProcessOutput {
+                        exit_code: Some(0),
+                        stdout: "bounded result".into(),
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        timed_out: false,
+                        cancelled: false,
+                        duration_ms: 1,
+                    },
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            ledger.snapshot_for_restart_compatible_with(PREVIOUS_EXECUTION_SAFETY_SCHEMA_VERSION),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
     }
 
     #[test]
