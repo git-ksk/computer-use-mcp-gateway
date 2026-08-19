@@ -66,7 +66,7 @@ current live Agent CapabilityAdvertisement
 
 Agent が offline の場合は live advertisement がないため、semantic device tool は公開されません。reconnect によって新しい device generation または capability revision になる場合があります。stateful request は両方に対して fence されるため、discovery/dispatch race は fail closed します。
 
-control schema は version 8、capability-advertisement schema は version 4 のままです。Hub と Agent の control-schema mismatch は fail closed し、別 version の capability advertisement も曖昧な rolling-upgrade compatibility と解釈せず拒否します。
+control schema は version 8、capability-advertisement schema は version 5 です。capability schema v5 は fresh authenticated generation 後の signed / payload-free reconciliation-report frame を coordinated boundary として追加します。Hub と Agent の control-schema mismatch は fail closed し、別 version の capability advertisement も曖昧な rolling-upgrade compatibility と解釈せず拒否します。
 
 ## Interaction context と backend lifecycle
 

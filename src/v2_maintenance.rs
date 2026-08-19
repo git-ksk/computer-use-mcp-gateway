@@ -5,8 +5,9 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
-    ExecutionReceipt, OperationOwner, RequestFingerprintComparison, ResolutionRecord,
-    compare_request_fingerprint, fingerprint_process_request, fingerprint_shell_request,
+    ExecutionReceipt, OperationOwner, ReconciliationStatus, RequestFingerprintComparison,
+    ResolutionRecord, compare_request_fingerprint, fingerprint_process_request,
+    fingerprint_shell_request,
 };
 use crate::v2_m0::{
     CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
@@ -42,6 +43,7 @@ pub struct QuarantineInspection {
     pub workflow_step_id: Option<String>,
     pub client_correlation_id: Option<String>,
     pub request_fingerprint_present: bool,
+    pub dispatch_binding_present: bool,
     pub semantic_operation_class: String,
     pub effect_class: String,
     pub target_class: String,
@@ -56,6 +58,7 @@ pub struct QuarantineInspection {
     pub evidence_status: String,
     pub reconciliation_status: String,
     pub recovery_disposition: String,
+    pub manual_audit_required: bool,
     pub retry_safe: bool,
 }
 
@@ -71,6 +74,25 @@ pub struct QuarantineRecoveryGuidance {
 pub struct QuarantineInspectionReport {
     pub quarantines: Vec<QuarantineInspection>,
     pub recovery_guidance: QuarantineRecoveryGuidance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutoResolutionInspection {
+    pub operation_id: String,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub capability: String,
+    pub terminal_state: String,
+    pub evidence_class: String,
+    pub reconciliation_status: String,
+    pub dispatch_binding_present: bool,
+    pub resolved_at_ms: u64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutoResolutionInspectionReport {
+    pub auto_resolved: Vec<AutoResolutionInspection>,
 }
 
 /// Read the latest committed Hub checkpoint without taking recovery authority.
@@ -109,6 +131,7 @@ pub fn inspect_quarantines_read_only(
                 workflow_step_id: inspection.audit.workflow_step_id,
                 client_correlation_id: inspection.audit.client_correlation_id,
                 request_fingerprint_present: inspection.request_fingerprint.is_some(),
+                dispatch_binding_present: inspection.dispatch_binding_present,
                 semantic_operation_class: capability.to_owned(),
                 effect_class: capability_effect_class(inspection.capability).to_owned(),
                 target_class: capability_target_class(inspection.capability).to_owned(),
@@ -124,8 +147,15 @@ pub fn inspect_quarantines_read_only(
                 .to_owned(),
                 evidence_class: inspection.evidence.map(evidence_name).map(str::to_owned),
                 evidence_status: evidence_status(inspection.evidence).to_owned(),
-                reconciliation_status: "operator_required".into(),
-                recovery_disposition: "needs_reconciliation".into(),
+                reconciliation_status: reconciliation_status_name(inspection.reconciliation_status)
+                    .to_owned(),
+                recovery_disposition: reconciliation_disposition(inspection.reconciliation_status)
+                    .to_owned(),
+                manual_audit_required: matches!(
+                    inspection.reconciliation_status,
+                    ReconciliationStatus::OperatorRequired
+                        | ReconciliationStatus::UnrecoverableEvidenceGap
+                ),
                 retry_safe: false,
             }
         })
@@ -141,6 +171,42 @@ pub fn inspect_quarantines_read_only(
             replay_old_operation: false,
         },
     })
+}
+
+pub fn inspect_auto_resolutions_read_only(
+    state_dir: &Path,
+    device_id: Option<&str>,
+) -> Result<AutoResolutionInspectionReport, MaintenanceError> {
+    let checkpoint = CheckpointStore::new(state_dir.to_path_buf(), "hub")
+        .map_err(MaintenanceError::Persistence)?;
+    let state = checkpoint
+        .load_latest::<HubPersistentState>()
+        .map_err(MaintenanceError::Persistence)?;
+    let limits = AdmissionLimits {
+        max_global_active: 1,
+        max_queued_per_device: 1,
+    };
+    let (_registry, execution) = state
+        .restore(limits)
+        .map_err(MaintenanceError::Persistence)?;
+    let auto_resolved = execution
+        .auto_resolutions()
+        .iter()
+        .filter(|resolution| device_id.is_none_or(|id| resolution.operation.device_id == id))
+        .map(|resolution| AutoResolutionInspection {
+            operation_id: resolution.operation.operation_id.clone(),
+            device_id: resolution.operation.device_id.clone(),
+            device_generation: resolution.operation.device_generation,
+            capability: crate::v2_observability::capability_name(resolution.capability).to_owned(),
+            terminal_state: hub_operation_state_name(resolution.terminal_state).to_owned(),
+            evidence_class: evidence_name(resolution.evidence).to_owned(),
+            reconciliation_status: "auto_resolved".to_owned(),
+            dispatch_binding_present: true,
+            resolved_at_ms: resolution.resolved_at_ms,
+            replayed: false,
+        })
+        .collect();
+    Ok(AutoResolutionInspectionReport { auto_resolved })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -314,6 +380,39 @@ fn capability_verification_kind(capability: DeviceCapability) -> &'static str {
         // Arbitrary shell/process semantics are intentionally not inferred from text/argv.
         DeviceCapability::ExecuteProcess | DeviceCapability::Shell => "none",
         _ => "none",
+    }
+}
+
+const fn reconciliation_status_name(status: ReconciliationStatus) -> &'static str {
+    match status {
+        ReconciliationStatus::AutoReconciling => "auto_reconciling",
+        ReconciliationStatus::AutoResolved => "auto_resolved",
+        ReconciliationStatus::OperatorRequired => "operator_required",
+        ReconciliationStatus::UnrecoverableEvidenceGap => "unrecoverable_evidence_gap",
+    }
+}
+
+const fn reconciliation_disposition(status: ReconciliationStatus) -> &'static str {
+    match status {
+        ReconciliationStatus::AutoReconciling => "await_authoritative_evidence",
+        ReconciliationStatus::AutoResolved => "resolved_without_replay",
+        ReconciliationStatus::OperatorRequired => "needs_reconciliation",
+        ReconciliationStatus::UnrecoverableEvidenceGap => "needs_reconciliation",
+    }
+}
+
+const fn hub_operation_state_name(
+    state: crate::v2_m0_execution::HubOperationState,
+) -> &'static str {
+    match state {
+        crate::v2_m0_execution::HubOperationState::Queued => "queued",
+        crate::v2_m0_execution::HubOperationState::ActiveNotDispatched => "active_not_dispatched",
+        crate::v2_m0_execution::HubOperationState::Dispatched => "dispatched",
+        crate::v2_m0_execution::HubOperationState::CancelRequested => "cancel_requested",
+        crate::v2_m0_execution::HubOperationState::Completed => "completed",
+        crate::v2_m0_execution::HubOperationState::Failed => "failed",
+        crate::v2_m0_execution::HubOperationState::Cancelled => "cancelled",
+        crate::v2_m0_execution::HubOperationState::Indeterminate => "indeterminate",
     }
 }
 
@@ -553,7 +652,10 @@ impl std::error::Error for MaintenanceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2_execution_safety::{AuthoritativeOperationController, OperationOwner};
+    use crate::v2_execution_safety::{
+        AgentTerminalEvidence, AuthoritativeOperationController, ExecutionEvidence,
+        OperationDispatchBinding, OperationOwner,
+    };
     use crate::v2_m0::{DeviceCapability, DeviceIdentity, DeviceRegistry};
     use crate::v2_m0_execution::{AdmissionDecision, HubOperationState, OperationRef};
 
@@ -821,6 +923,73 @@ mod tests {
     }
 
     #[test]
+    fn auto_resolution_history_is_private_bounded_and_read_only() {
+        let dir = test_dir("auto-resolution-history");
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation_id = "op_auto_resolution_history".to_owned();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 3,
+            operation_id: operation_id.clone(),
+        };
+        let binding = OperationDispatchBinding::new(21, "grant_private_dispatch_fence").unwrap();
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare(operation.clone(), owner, DeviceCapability::Shell, 100)
+            .unwrap();
+        execution
+            .mark_dispatched_with_binding(
+                &operation_id,
+                &OperationOwner::new("https://issuer.example", "alice").unwrap(),
+                3,
+                Some(binding.clone()),
+                110,
+            )
+            .unwrap();
+        execution.mark_connection_lost(&operation_id, 120).unwrap();
+        execution
+            .reconcile_authoritative_terminal(
+                &AgentTerminalEvidence {
+                    operation,
+                    capability_revision: binding.capability_revision,
+                    capability: DeviceCapability::Shell,
+                    dispatch_grant_id: binding.grant_id.clone(),
+                    terminal_state: HubOperationState::Completed,
+                    evidence: ExecutionEvidence::VerifiedAgentResult,
+                },
+                130,
+            )
+            .unwrap();
+        CheckpointStore::new(dir.clone(), "hub")
+            .unwrap()
+            .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+        let checkpoint_count = std::fs::read_dir(&dir).unwrap().count();
+
+        let report = inspect_auto_resolutions_read_only(&dir, Some(&device_id)).unwrap();
+        assert_eq!(report.auto_resolved.len(), 1);
+        let entry = &report.auto_resolved[0];
+        assert_eq!(entry.operation_id, operation_id);
+        assert_eq!(entry.reconciliation_status, "auto_resolved");
+        assert!(entry.dispatch_binding_present);
+        assert!(!entry.replayed);
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("grant_private_dispatch_fence"));
+        assert!(!serialized.contains("https://issuer.example"));
+        assert!(!serialized.contains("alice"));
+        assert!(!serialized.contains("owner"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), checkpoint_count);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn offline_resolution_is_durable_and_audit_survives_pruning() {
         let dir = test_dir("durable");
         let (device_id, operation_id) = seed_quarantine(&dir);
@@ -883,6 +1052,15 @@ mod tests {
         let store = CheckpointStore::new(dir.clone(), "hub").unwrap();
         let mut legacy = store.load_latest::<HubPersistentState>().unwrap();
         legacy.execution.schema_version = 1;
+        for operation in &mut legacy.execution.operations {
+            operation.audit = Default::default();
+            operation.request_fingerprint = None;
+            operation.dispatch_binding = None;
+            operation.reconciliation_status = None;
+            operation.recoverable_result = None;
+        }
+        legacy.execution.recoveries.clear();
+        legacy.execution.auto_resolutions.clear();
         // Exercise preservation of the registry writer contract too. Maintenance
         // does not own a registry transition and must not incidentally migrate it.
         legacy.registry.schema_version = 5;

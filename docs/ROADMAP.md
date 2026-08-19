@@ -41,7 +41,7 @@ The completed V1/V2 implementation history and acceptance evidence remain availa
 Current priorities:
 
 - preserve the authoritative operation/quarantine/resolution/no-auto-replay state machine;
-- keep control schema v8 and capability-advertisement schema v4 behavior explicit until a reviewed change requires otherwise;
+- keep control schema v8 and capability-advertisement schema v5 behavior explicit; v5 is the reviewed change that adds the signed payload-free reconciliation-report boundary and mixed versions fail closed;
 - keep Cua Driver upgrades as reviewed compatibility changes with pinned/repeatable evidence;
 - maintain security, dependency, documentation, packaging, CI, conformance, soak, and resource-regression quality;
 - investigate and close or explicitly document the remaining V1 compatibility/quality issues:

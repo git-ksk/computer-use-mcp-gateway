@@ -153,7 +153,7 @@ Controls already proven in M0:
 - a signed Hub time anchors grant-expiry evaluation to monotonic elapsed time on the Agent;
 - connection loss after dispatch becomes durable `Indeterminate` state plus exact-operation desktop quarantine and is never automatically replayed;
 - the authoritative Hub operation record additionally binds issuer/subject ownership and device generation, so a competing principal or stale Agent generation cannot settle the operation;
-- reconnect/liveness cannot clear quarantine; explicit resolution is persistence-gated and auditable.
+- reconnect/liveness alone cannot clear quarantine; only an exact authenticated terminal-evidence report that matches the Hub's durable operation/device/original-generation/capability-revision/capability/dispatch-fence binding may self-reconcile a transient ambiguity, and that terminal transition is persistence-gated and auditable. Otherwise explicit operator resolution remains required.
 
 Post-M1 P0 execution-safety details and residual recovery assumptions are recorded in [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md).
 
@@ -172,7 +172,7 @@ Controls:
 - operation IDs cannot be silently reused; completed/cancelled Agent replay tombstones are bounded by authenticated device generation, while Hub `Indeterminate` operations remain durable until explicit resolution;
 - handshake proof replay fails against fresh nonces.
 
-Completed/cancelled replay tombstones are bounded by authenticated device generation. A fresh generation makes older signed commands stale before they reach the execution gate, so old terminal IDs may be pruned. `Indeterminate` Hub operations are intentionally exempt from this pruning and continue to quarantine the device until explicit operator resolution.
+Completed/cancelled replay tombstones are bounded by authenticated device generation. A fresh generation makes older signed commands stale before they reach the execution gate, so old terminal IDs may be pruned. `Indeterminate` Hub operations are intentionally exempt from this pruning and continue to quarantine the device until either exact authoritative terminal evidence self-reconciles the same already-dispatched operation or an explicit operator resolution is durably committed. Neither path replays the operation.
 
 ### Denial of service
 
@@ -248,6 +248,8 @@ They should not contain raw screenshots, raw backend output, raw command argumen
 
 Schema-v3 reconciliation metadata deliberately separates four evidence classes. **Correlation evidence** is bounded workflow/client labeling plus, for explicitly canonicalized shell/process contracts, a keyed request fingerprint; it can establish only which higher-level step/candidate request is being discussed. **Observational evidence** is an independent read-only postcondition or state check and is advisory unless a capability contract explicitly promotes it. **Authoritative terminal evidence** is the existing signed/verified execution evidence that can settle the operation state machine. **Operator resolution** is the explicit persistence-gated decision applied only after the operator has sufficient evidence for the exact quarantined operation. Correlation/fingerprint equality alone is never terminal evidence, replay permission, or proof that a side effect occurred. Fingerprint keys and values are not normal audit assets, and key rotation must degrade comparison to unavailable rather than reinterpret a request as different.
 
+Schema v4 operationalizes only the **authoritative terminal evidence** class for self-reconciliation. The Hub persists the original dispatch binding before send: stable device ID, original device generation, exact `DeviceCapability`, capability revision, and one-shot grant ID. The Agent's durable journal contains no request/result payload and is capped at 64 entries; an entry may be created only after the normal execution path has a definite terminal result. A fresh authenticated session signs the journal against new session nonces. The Hub verifies the current device signature and reporting generation, then requires exact equality with its older quarantined record before settlement. A proof from the current/stale wrong generation, wrong device, wrong operation, wrong capability/revision/fence, an unsupported evidence/state pair, or a missing journal entry cannot clear quarantine. `auto_reconciling`, `auto_resolved`, `operator_required`, and `unrecoverable_evidence_gap` are explicit durable/audit states. The Hub writes the candidate terminal checkpoint before making the live quarantine removal visible. A compromised Agent therefore gains no generic “clear quarantine” primitive beyond the exact-result authority it already possessed for that dispatched operation while online; it cannot name a different operation/fence or use a correlation fingerprint to manufacture execution evidence.
+
 ## V2-M1 acceptance and residual deployment responsibilities
 
 The V2-M1 implementation gate passed on 2026-08-12. The M1 code now includes verified northbound principal construction, production key/certificate lifecycle procedures, bounded service connection/rate shedding, bounded replay pruning, real-Cua cancellation quarantine, OpenTelemetry/OTLP integration, and OS service packaging. See [`V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md).
@@ -260,6 +262,6 @@ The threat model still requires the deployment to preserve these external respon
 - `ExecuteProcess` and `Shell` remain exact `Dangerous` capabilities, not filesystem sandboxes; cwd/root checks do not constrain arbitrary process argv or shell syntax;
 - macOS GUI automation still depends on the operator-controlled Cua/TCC trust boundary; a compromised Agent or desktop backend remains outside the non-compromise guarantees stated above;
 - default telemetry must remain payload-free. Enabling collector/proxy body logging or high-sensitivity debug capture creates a separate sensitive-data boundary;
-- an `indeterminate` operation must remain quarantined until explicit resolution. Network recovery, backend reconnect, or service restart is not permission to replay it.
+- an `indeterminate` operation must remain quarantined until a persistence-gated settlement exists. Network recovery, backend reconnect, or service restart alone is not settlement and is never permission to replay it. The only automatic exception is exact signed terminal evidence for the same prior dispatch binding; missing/mismatched evidence remains operator-required/fail-closed.
 
 These are deployment assumptions/residual risks, not missing V2-M1 protocol features. Multi-machine identity, fleet attestation, and additional native GUI backends remain intentionally deferred to later milestones.

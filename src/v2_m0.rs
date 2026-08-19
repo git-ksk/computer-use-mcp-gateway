@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub const CONTROL_SCHEMA_VERSION: u16 = 8;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 5;
 /// First dedicated persisted registry schema. The numeric value intentionally
 /// matches the last historical control schema that was written into this field,
 /// so current rollback binaries can still read newly persisted checkpoints.

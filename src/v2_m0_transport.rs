@@ -5,6 +5,7 @@
 //! production remote transport still requires confidentiality/integrity such as
 //! authenticated TLS or an equivalently reviewed secure tunnel.
 
+use crate::v2_execution_safety::{AgentTerminalEvidence, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES};
 use crate::v2_m0::{
     CapabilityAdvertisement, CommandEnvelope, CommandResultEnvelope, ControlError, DeviceIdentity,
     DeviceRegistry, GrantToken,
@@ -256,6 +257,15 @@ pub struct RemoteResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteReconciliationReport {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub reporting_generation: u64,
+    pub terminal_evidence: Vec<AgentTerminalEvidence>,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteCancel {
     pub schema_version: u16,
     pub device_id: String,
@@ -327,6 +337,7 @@ pub enum AgentToHub {
     Hello(AgentHello),
     Proof(AgentProof),
     Result(RemoteResult),
+    ReconciliationReport(RemoteReconciliationReport),
     CancellationAck(RemoteCancellationAck),
     BackendSessionEnded(RemoteBackendSessionEnded),
     Heartbeat(AgentHeartbeat),
@@ -352,6 +363,7 @@ impl AgentToHub {
             Self::Hello(_) => "hello",
             Self::Proof(_) => "proof",
             Self::Result(_) => "result",
+            Self::ReconciliationReport(_) => "reconciliation_report",
             Self::CancellationAck(_) => "cancellation_ack",
             Self::BackendSessionEnded(_) => "backend_session_ended",
             Self::Heartbeat(_) => "heartbeat",
@@ -650,6 +662,56 @@ pub fn verify_remote_result(
 ) -> Result<(), TransportError> {
     validate_schema(remote.schema_version)?;
     let transcript = remote_result_bytes(hello, challenge, remote)?;
+    registry
+        .verify_device_signature(&hello.device_id, &transcript, &remote.signature)
+        .map_err(TransportError::Control)
+}
+
+pub fn build_remote_reconciliation_report(
+    identity: &DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    reporting_generation: u64,
+    terminal_evidence: Vec<AgentTerminalEvidence>,
+) -> Result<RemoteReconciliationReport, TransportError> {
+    if reporting_generation == 0
+        || terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
+        || terminal_evidence
+            .iter()
+            .any(|evidence| evidence.validate().is_err())
+    {
+        return Err(TransportError::InvalidReconciliationReport);
+    }
+    let mut remote = RemoteReconciliationReport {
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: hello.device_id.clone(),
+        reporting_generation,
+        terminal_evidence,
+        signature: Vec::new(),
+    };
+    let transcript = remote_reconciliation_report_bytes(hello, challenge, &remote)?;
+    remote.signature = identity.sign_message(&transcript);
+    Ok(remote)
+}
+
+pub fn verify_remote_reconciliation_report(
+    registry: &DeviceRegistry,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteReconciliationReport,
+) -> Result<(), TransportError> {
+    validate_schema(remote.schema_version)?;
+    if remote.device_id != hello.device_id
+        || remote.reporting_generation == 0
+        || remote.terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
+        || remote
+            .terminal_evidence
+            .iter()
+            .any(|evidence| evidence.validate().is_err())
+    {
+        return Err(TransportError::InvalidReconciliationReport);
+    }
+    let transcript = remote_reconciliation_report_bytes(hello, challenge, remote)?;
     registry
         .verify_device_signature(&hello.device_id, &transcript, &remote.signature)
         .map_err(TransportError::Control)
@@ -968,6 +1030,33 @@ fn remote_cancellation_ack_bytes(
     .map_err(TransportError::Serialization)
 }
 
+fn remote_reconciliation_report_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteReconciliationReport,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        reporting_generation: u64,
+        terminal_evidence: &'a [AgentTerminalEvidence],
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m1-reconciliation-report-v1",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &remote.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        reporting_generation: remote.reporting_generation,
+        terminal_evidence: &remote.terminal_evidence,
+    })
+    .map_err(TransportError::Serialization)
+}
+
 fn remote_result_bytes(
     hello: &AgentHello,
     challenge: &HubChallenge,
@@ -1000,6 +1089,7 @@ pub enum TransportError {
     FrameTooLarge(usize),
     UnsupportedSchema { got: u16 },
     HubKeyMismatch,
+    InvalidReconciliationReport,
     InvalidHubSignature,
     HandshakeMismatch,
     Control(ControlError),
@@ -1015,6 +1105,7 @@ impl fmt::Display for TransportError {
             }
             Self::UnsupportedSchema { got } => write!(f, "unsupported Hub-Agent schema {got}"),
             Self::HubKeyMismatch => write!(f, "Hub public key does not match the pinned identity"),
+            Self::InvalidReconciliationReport => write!(f, "reconciliation report is invalid"),
             Self::InvalidHubSignature => write!(f, "Hub challenge signature is invalid"),
             Self::HandshakeMismatch => write!(f, "Hub-Agent handshake transcript mismatch"),
             Self::Control(error) => write!(f, "control-plane rejection: {error}"),
@@ -1283,6 +1374,84 @@ mod tests {
             Err(TransportError::Control(
                 ControlError::InvalidDeviceSignature
             ))
+        ));
+    }
+
+    #[test]
+    fn reconciliation_report_is_signed_connection_bound_and_payload_free() {
+        let (registry, identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id.clone(), caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let evidence = AgentTerminalEvidence {
+            operation: crate::v2_m0_execution::OperationRef {
+                device_id,
+                device_generation: 4,
+                operation_id: "op-reconcile".into(),
+            },
+            capability_revision: 7,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: "grant_reconcile_fence".into(),
+            terminal_state: crate::v2_m0_execution::HubOperationState::Completed,
+            evidence: crate::v2_execution_safety::ExecutionEvidence::VerifiedAgentResult,
+        };
+        let report =
+            build_remote_reconciliation_report(&identity, &hello, &challenge, 5, vec![evidence])
+                .unwrap();
+        verify_remote_reconciliation_report(&registry, &hello, &challenge, &report).unwrap();
+
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("command"));
+        assert!(!encoded.contains("stdout"));
+        assert!(!encoded.contains("stderr"));
+        assert!(!encoded.contains("\"result\":"));
+        assert!(!encoded.contains("credential"));
+
+        let mut tampered = report.clone();
+        tampered.terminal_evidence[0].dispatch_grant_id = "grant_other_fence".into();
+        assert!(matches!(
+            verify_remote_reconciliation_report(&registry, &hello, &challenge, &tampered),
+            Err(TransportError::Control(
+                ControlError::InvalidDeviceSignature
+            ))
+        ));
+
+        let fresh_challenge = hub.challenge(&hello).unwrap();
+        assert!(matches!(
+            verify_remote_reconciliation_report(&registry, &hello, &fresh_challenge, &report),
+            Err(TransportError::Control(
+                ControlError::InvalidDeviceSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn reconciliation_report_rejects_more_than_the_bounded_journal_window() {
+        let (_registry, identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id.clone(), caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let evidence = AgentTerminalEvidence {
+            operation: crate::v2_m0_execution::OperationRef {
+                device_id,
+                device_generation: 1,
+                operation_id: "op-bounded-report".into(),
+            },
+            capability_revision: 1,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: "grant_bounded_report".into(),
+            terminal_state: crate::v2_m0_execution::HubOperationState::Completed,
+            evidence: crate::v2_execution_safety::ExecutionEvidence::VerifiedAgentResult,
+        };
+        assert!(matches!(
+            build_remote_reconciliation_report(
+                &identity,
+                &hello,
+                &challenge,
+                2,
+                vec![evidence; MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES + 1],
+            ),
+            Err(TransportError::InvalidReconciliationReport)
         ));
     }
 

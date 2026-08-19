@@ -281,7 +281,7 @@ northbound MCP resource を公開する前に、次をそれぞれ独立して�
 - `tools/list` に exact policy で grant された capability のみが含まれる。
 - `list_apps` / `get_screen_size` のような harmless V2 Cua-backed operation が成功する。
 - optional usage accounting は enable 時のみ increment する。
-- reconnect が unresolved CUMG quarantine を clear しない。
+- reconnect/liveness だけでは unresolved CUMG quarantine を clear しない。同じ prior dispatch に対する exact signed terminal evidence だけが replay なしで self-reconcile できる。
 
 その後、reviewed reverse-proxy/TLS path について [`DEPLOYMENT.md`](DEPLOYMENT.md) に従ってください。northbound MCP listener は loopback-only のままにします。
 
