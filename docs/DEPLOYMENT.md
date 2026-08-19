@@ -479,3 +479,15 @@ V1 has no built-in:
 - cloud control plane.
 
 All MCP clients connected to one V1 gateway ultimately share one serialized physical desktop/backend state.
+
+## Local-user online quarantine recovery
+
+The optional online quarantine-recovery path is documented in [`v2/V2_ONLINE_RECOVERY.md`](v2/V2_ONLINE_RECOVERY.md). It does not expose recovery through northbound MCP and does not make the Agent device key a resolver credential.
+
+For macOS, install `v2_recover` alongside `v2_agent`. Provision its Secure Enclave recovery key once from the logged-in Agent account, transfer only the exported P-256 public key through the authenticated administrative channel, and install it as `<HUB_STATE_DIR>/recovery-public-key.p256`. The Hub validates that file with the existing public trust-anchor symlink/permission rules and loads it only at startup. An absent verifier disables online recovery without changing fail-closed quarantine behavior.
+
+The existing `v2_maint` offline resolver remains required as break-glass for an unreachable Agent, unavailable recovery key, failed local user-presence authorization, or damaged online recovery transport.
+
+### Online recovery upgrade compatibility
+
+The online recovery transport advances `HUB_AGENT_SCHEMA_VERSION` from 1 to 2. Hub-Agent schema mismatch is rejected fail-closed, so deploy the corresponding v0.3 Hub and Agent as a coordinated upgrade; do not assume mixed-version rolling operation across this boundary. This requirement is limited to the V2 Hub-Agent application protocol and does not change V1 gateway compatibility.

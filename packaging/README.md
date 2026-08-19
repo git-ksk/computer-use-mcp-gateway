@@ -74,3 +74,18 @@ Local structured tracing is always available through `RUST_LOG`. OTLP is opt-in 
 ## Optional MCPUsage Memory sidecar
 
 `cumg-v2-usage-sidecar.service` runs the private CUMG-owned bridge on loopback only. Install `cumg-v2-hub-usage.conf.example` as a Hub drop-in only when usage accounting is desired. `PartOf=` plus the Hub `Requires/After` drop-in couples explicit Hub restart to sidecar recreation, intentionally resetting MemoryUsageStore runtime state. The service must point `CUMG_MCP_USAGE_CONTROL_MODULE` at a locally built/installed `mcp-usage-control` core; no npm publication is required. See [`../docs/V2_USAGE_ACCOUNTING.md`](../docs/V2_USAGE_ACCOUNTING.md).
+
+## macOS local-user online quarantine recovery
+
+The macOS Agent remains a LaunchAgent in the interactive login session; online recovery does not add a daemon or a second service supervisor. Install the `v2_recover` binary alongside `v2_agent`. Its local challenge/authorization handoff uses the same `CUMG_V2_STATE_DIR` configured for the LaunchAgent.
+
+Initialize the recovery key once as the Agent's logged-in user:
+
+```bash
+v2_recover init-key \
+  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery-public-key.p256"
+```
+
+The private P-256 key remains in the Secure Enclave and requires user presence for signing. `init-key` is create-new and refuses an existing label. Move only the exported public key through the operator-authenticated provisioning channel and install it as `<HUB_STATE_DIR>/recovery-public-key.p256` with reviewed ownership/permissions. Restart the Hub so it explicitly loads the new recovery verifier.
+
+When a Hub-signed challenge is present, use `v2_recover status` and then `v2_recover resolve` as documented in [`../docs/v2/V2_ONLINE_RECOVERY.md`](../docs/v2/V2_ONLINE_RECOVERY.md). Keep `v2_maint` available for offline break-glass recovery.
