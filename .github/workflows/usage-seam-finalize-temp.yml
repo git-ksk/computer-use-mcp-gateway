@@ -68,6 +68,11 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/scripts/remove_usage_seam_temp.py \
+                .github/scripts/cleanup_usage_docs_temp.py \
+                .github/scripts/cleanup_usage_status_temp.py \
+                .github/scripts/normalize_usage_cleanup_temp.py \
+                .github/workflows/usage-seam-finalize-temp.yml
           git add -A
           git commit -m 'refactor(v2): externalize usage control from gateway core'
           git push origin HEAD:refactor/remove-usage-seam
