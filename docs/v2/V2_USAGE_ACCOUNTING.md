@@ -109,6 +109,8 @@ Tool arguments/results, screenshots, file contents, shell text, bearer tokens, O
 
 With no `CUMG_V2_USAGE_ENDPOINT`, V2 constructs `NoopUsageController`; Node and `mcp-usage-control` are not required and the existing V2 execution path remains compatible.
 
+The current dogfood compatibility baseline is `mcp-usage-control` **v0.7.0**. The sidecar intentionally uses only the compatible scalar `UsageControl` / `MemoryUsageStore` surface; v0.7 progressive/vector capabilities remain optional and do not widen CUMG execution authority.
+
 When enabled:
 
 ```text

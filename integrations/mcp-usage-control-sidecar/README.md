@@ -4,6 +4,8 @@ This private integration bridge lets the Rust V2 Hub use `mcp-usage-control` wit
 
 It is intentionally loopback-only and language-local. It is **not** a public or general-purpose MCPUsage API.
 
+Dogfood compatibility is validated against `mcp-usage-control` **v0.7.0**. CUMG deliberately consumes only the scalar reservation/liability/renewal/settlement contract, so optional progressive-growth and vector APIs do not become execution authority.
+
 The sidecar uses `MemoryUsageStore`, so all quota/replay/accounting state disappears when the sidecar process restarts. It is suitable for runtime/session quota only, not durable billing, financial ledgers, or cross-instance enforcement.
 
 Required environment:

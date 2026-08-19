@@ -112,7 +112,7 @@ The smoke harness exercises the actual Gateway → `cua-driver mcp` path, backen
 
 ### Optional MCPUsage sidecar test
 
-The sidecar is intentionally not published as a package. To test it against a checked-out/built `mcp-usage-control` core, point the module specifier at that local ESM build:
+The sidecar is intentionally not published as a package. The current dogfood compatibility baseline is `mcp-usage-control` v0.7.0. Check out/build that source tag, then point the module specifier at its local ESM core build:
 
 ```bash
 CUMG_MCP_USAGE_CONTROL_MODULE=file:///absolute/path/to/mcp-usage-control/packages/core/dist/index.js \
