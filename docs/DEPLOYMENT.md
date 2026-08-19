@@ -54,6 +54,21 @@ A successful drain then shuts down the gRPC and northbound HTTP servers. If the 
 
 Configure the service manager's stop/kill timeout to be **longer** than `CUMG_V2_DRAIN_TIMEOUT_SECS`; otherwise the supervisor can kill the Hub before its own bounded drain completes. The packaged systemd unit uses `TimeoutStopSec=45s` for the default 30-second drain. Apply the same ordering to operator-maintained launchd or other service-manager definitions.
 
+### Read-only quarantine inspection
+
+When a caller receives `device_indeterminate`, inspect the durable checkpoint before choosing any recovery action:
+
+```bash
+v2_maint inspect-quarantine \
+  --state-dir /var/lib/cumg-v2/hub
+```
+
+Use `--device-id DEVICE_ID` to restrict output in a multi-device state directory. Inspection reads only the latest atomically committed checkpoint and does **not** take the Hub's exclusive maintenance lock, so it may run while the Hub is serving. It never resolves quarantine, signs recovery, dispatches device work, or rewrites the checkpoint. The output is a point-in-time durable view; a later normal Hub checkpoint may advance after the inspection returns.
+
+Each unresolved entry identifies the exact `blocking_operation_id`, stable device/generation, capability/semantic operation class, conservative `read_only` or `effectful` class, durable dispatch marker/timestamps, indeterminate timestamp/reason, any safe receipt-evidence class, and `recovery_disposition=needs_reconciliation`. It deliberately omits authenticated owner issuer/subject and every raw command, argv, cwd, environment value, typed text, URL, clipboard value, screenshot, backend identifier, result payload, credential, or secret. The state-directory filesystem permissions are the authorization boundary for this local operator surface; no equivalent cross-principal northbound inspection endpoint is exposed.
+
+A northbound tool request rejected by an existing quarantine returns `code=device_indeterminate`, `blocking_operation_id=op_...`, and `retry_safe=false`. `blocking_operation_id` always names the **earlier ambiguous operation that is already quarantining the device**, not a newly generated ID for the rejected request. Do not replay that operation. `confirmed_not_executed` is valid only with independent evidence that no side effect occurred; `confirmed_completed` is valid only with independent evidence that the intended side effect completed; otherwise leave quarantine intact.
+
 ### Offline quarantine resolution
 
 A durable `Indeterminate` quarantine is never cleared by reconnect or restart. After an operator establishes out-of-band evidence for the exact ambiguous operation, stop `v2_hub` completely and use the offline maintenance CLI instead of editing checkpoint JSON:
