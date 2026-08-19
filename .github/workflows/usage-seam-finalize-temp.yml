@@ -27,7 +27,9 @@ jobs:
       - name: Remove built-in usage runtime seam
         run: python .github/scripts/remove_usage_seam_temp.py
       - name: Remove usage-specific docs and packaging
-        run: python .github/scripts/cleanup_usage_docs_temp.py
+        run: |
+          python .github/scripts/cleanup_usage_docs_temp.py
+          python .github/scripts/cleanup_usage_status_temp.py
       - name: Format
         run: |
           cargo fmt --all
@@ -49,6 +51,7 @@ jobs:
           if git grep -nE 'CUMG_V2_USAGE|mcp-usage-control|MCPUsage|NoopUsageController|UsageController|UsageLease|UsageManager|UsageSettlement|UsageOperation|V2_USAGE_ACCOUNTING|usage-sidecar|usage\.env\.example' -- \
             ':!.github/scripts/remove_usage_seam_temp.py' \
             ':!.github/scripts/cleanup_usage_docs_temp.py' \
+            ':!.github/scripts/cleanup_usage_status_temp.py' \
             ':!.github/workflows/usage-seam-finalize-temp.yml'; then
             echo 'first-party usage seam references remain' >&2
             exit 1
