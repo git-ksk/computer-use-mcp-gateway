@@ -14,8 +14,8 @@ use windows_sys::Win32::{
         ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation,
         Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetTokenInformation,
-        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER,
+        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
     Storage::FileSystem::{
         DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
@@ -23,6 +23,7 @@ use windows_sys::Win32::{
         WRITE_OWNER,
     },
     System::{
+        Diagnostics::Debug::ReadProcessMemory,
         SystemServices::{
             ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
             ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
@@ -104,12 +105,17 @@ pub(crate) fn validate_acl(path: &Path, subject: AclSubject) -> Result<(), AclCh
         if raw_ace.is_null() {
             return Err(AclCheckError::UntrustedAccess);
         }
-        let header = unsafe { &*(raw_ace.cast::<windows_sys::Win32::Security::ACE_HEADER>()) };
-        let ace_type = header.AceType as u32;
+        let ace = read_ace(raw_ace.cast_const())?;
+        let ace_type = ace[0] as u32;
         if ace_type == ACCESS_ALLOWED_ACE_TYPE {
-            let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
-            let sid = ptr::addr_of!(ace.SidStart).cast::<c_void>() as PSID;
-            if !is_trusted_sid(sid, current_sid.sid()) && mask_is_sensitive(ace.Mask, subject) {
+            let mask = u32::from_le_bytes(ace[4..8].try_into().expect("validated ACE mask"));
+            let sid_offset = mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            let sid_bytes = &ace[sid_offset..];
+            if !valid_sid_bytes(sid_bytes) {
+                return Err(AclCheckError::UntrustedAccess);
+            }
+            let sid = sid_bytes.as_ptr().cast_mut().cast::<c_void>() as PSID;
+            if !is_trusted_sid(sid, current_sid.sid()) && mask_is_sensitive(mask, subject) {
                 return Err(AclCheckError::UntrustedAccess);
             }
         } else if is_other_allow_ace(ace_type) {
@@ -122,6 +128,52 @@ pub(crate) fn validate_acl(path: &Path, subject: AclSubject) -> Result<(), AclCh
 
     drop(descriptor);
     Ok(())
+}
+
+fn read_ace(address: *const c_void) -> Result<Vec<u8>, AclCheckError> {
+    const MAX_ACE_BYTES: usize = 64 * 1024;
+    let mut header = [0_u8; mem::size_of::<windows_sys::Win32::Security::ACE_HEADER>()];
+    read_process_bytes(address, &mut header)?;
+    let ace_size = u16::from_le_bytes([header[2], header[3]]) as usize;
+    let sid_offset = mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+    if ace_size < sid_offset + 8 || ace_size > MAX_ACE_BYTES {
+        return Err(AclCheckError::UntrustedAccess);
+    }
+    let mut ace = vec![0_u8; ace_size];
+    read_process_bytes(address, &mut ace)?;
+    Ok(ace)
+}
+
+fn read_process_bytes(address: *const c_void, destination: &mut [u8]) -> Result<(), AclCheckError> {
+    let mut bytes_read = 0_usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address,
+            destination.as_mut_ptr().cast::<c_void>(),
+            destination.len(),
+            &mut bytes_read,
+        )
+    };
+    if ok == 0 || bytes_read != destination.len() {
+        return Err(AclCheckError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn valid_sid_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let sub_authorities = bytes[1] as usize;
+    let Some(required) = 8_usize.checked_add(sub_authorities.saturating_mul(4)) else {
+        return false;
+    };
+    if required > bytes.len() {
+        return false;
+    }
+    let sid = bytes.as_ptr().cast_mut().cast::<c_void>() as PSID;
+    unsafe { IsValidSid(sid) != 0 }
 }
 
 fn mask_is_sensitive(mask: u32, subject: AclSubject) -> bool {
@@ -160,9 +212,10 @@ fn is_trusted_sid(candidate: PSID, current: PSID) -> bool {
         return false;
     }
     unsafe {
-        EqualSid(candidate, current) != 0
-            || IsWellKnownSid(candidate, WinLocalSystemSid) != 0
-            || IsWellKnownSid(candidate, WinBuiltinAdministratorsSid) != 0
+        IsValidSid(candidate) != 0
+            && (EqualSid(candidate, current) != 0
+                || IsWellKnownSid(candidate, WinLocalSystemSid) != 0
+                || IsWellKnownSid(candidate, WinBuiltinAdministratorsSid) != 0)
     }
 }
 
