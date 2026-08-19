@@ -3,7 +3,6 @@
 
 External URLs and same-document anchors are intentionally not fetched here.
 The goal is a deterministic CI guard for repository documentation paths.
-Deployment-layer usage controls do not participate in this repository-local check.
 """
 
 from __future__ import annotations
