@@ -3777,7 +3777,7 @@ fn usage_error_to_mcp(error: UsageError) -> McpError {
 }
 
 fn hub_error_to_mcp(error: HubCommandError) -> McpError {
-    let (message, code, operation_id) = match error {
+    let (message, code, blocking_operation_id) = match error {
         HubCommandError::AgentOffline => ("Agent is offline", "agent_offline", None),
         HubCommandError::Busy => ("Device is busy", "busy", None),
         HubCommandError::DeviceIndeterminate { operation_id } => (
@@ -3834,8 +3834,8 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         ),
     };
     let mut data = json!({"code": code});
-    if let Some(operation_id) = operation_id {
-        data["operation_id"] = json!(operation_id);
+    if let Some(operation_id) = blocking_operation_id {
+        data["blocking_operation_id"] = json!(operation_id);
     }
     McpError::invalid_request(message, Some(data))
 }
@@ -3856,10 +3856,10 @@ fn execution_error_response(error: McpError) -> CallToolResponse {
     if let Some(operation_id) = error
         .data
         .as_ref()
-        .and_then(|value| value.get("operation_id"))
+        .and_then(|value| value.get("blocking_operation_id"))
         .and_then(Value::as_str)
     {
-        payload["operation_id"] = json!(operation_id);
+        payload["blocking_operation_id"] = json!(operation_id);
     }
     CallToolResult::error(vec![ContentBlock::text(payload.to_string())]).into()
 }
@@ -6954,10 +6954,16 @@ mod tests {
 
     #[test]
     fn operational_failures_are_tool_results_not_protocol_errors() {
-        let response =
-            execution_error_response(hub_error_to_mcp(HubCommandError::DeviceIndeterminate {
-                operation_id: "op_0123456789abcdef0123456789abcdef".into(),
-            }));
+        let error = hub_error_to_mcp(HubCommandError::DeviceIndeterminate {
+            operation_id: "op_0123456789abcdef0123456789abcdef".into(),
+        });
+        let data = error.data.as_ref().unwrap();
+        assert_eq!(
+            data.get("blocking_operation_id").and_then(Value::as_str),
+            Some("op_0123456789abcdef0123456789abcdef")
+        );
+        assert!(data.get("operation_id").is_none());
+        let response = execution_error_response(error);
         let serialized = match response {
             CallToolResponse::Complete(result) => {
                 assert_eq!(result.is_error, Some(true));
@@ -6967,6 +6973,7 @@ mod tests {
         };
         assert!(serialized.contains("device_indeterminate"));
         assert!(serialized.contains("retry_safe"));
+        assert!(serialized.contains("blocking_operation_id"));
         assert!(serialized.contains("op_0123456789abcdef0123456789abcdef"));
         assert!(!serialized.contains("ExceptionGroup"));
 

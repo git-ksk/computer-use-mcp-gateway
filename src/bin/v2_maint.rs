@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use computer_use_mcp_gateway::{
-    v2_m0_execution::IndeterminateResolution, v2_maintenance::resolve_indeterminate_offline,
+    v2_m0_execution::IndeterminateResolution,
+    v2_maintenance::{inspect_quarantines_read_only, resolve_indeterminate_offline},
 };
 use std::path::PathBuf;
 
@@ -26,6 +27,14 @@ enum Command {
         /// Audit metadata only; never include commands, results, desktop content, or secrets.
         #[arg(long)]
         evidence: String,
+    },
+    /// Inspect durable quarantine metadata without resolving or dispatching work.
+    InspectQuarantine {
+        #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
+        state_dir: PathBuf,
+        /// Optionally restrict output to one stable device ID.
+        #[arg(long)]
+        device_id: Option<String>,
     },
 }
 
@@ -77,6 +86,14 @@ fn main() -> Result<()> {
                 result.receipt.operation.device_generation,
                 result.receipt.terminal_state,
             );
+        }
+        Command::InspectQuarantine {
+            state_dir,
+            device_id,
+        } => {
+            let report = inspect_quarantines_read_only(&state_dir, device_id.as_deref())
+                .context("read-only quarantine inspection failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())

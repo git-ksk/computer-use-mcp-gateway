@@ -1,14 +1,17 @@
-//! Offline operator maintenance for durable V2 Hub safety state.
-//! No network entrypoint is provided: maintenance shares the Hub state lock.
+//! Local operator maintenance for durable V2 Hub safety state.
+//! Authority-bearing mutation shares the Hub state lock; read-only quarantine
+//! inspection only reads atomically committed checkpoints and takes no lock.
+//! No network entrypoint is provided.
 
 use crate::v2_execution_safety::{
-    AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionReceipt,
-    OperationOwner, ResolutionRecord,
+    AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
+    ExecutionReceipt, OperationOwner, ResolutionRecord,
 };
-use crate::v2_m0::DeviceRegistrySnapshot;
+use crate::v2_m0::{CapabilityClass, DeviceCapability, DeviceRegistrySnapshot};
 use crate::v2_m0_execution::{AdmissionLimits, ExecutionError, IndeterminateResolution};
 use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
+use serde::Serialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +24,117 @@ pub struct OfflineResolutionResult {
     pub receipt: ExecutionReceipt,
     pub resolution: ResolutionRecord,
     pub checkpoint: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineInspection {
+    pub blocking_operation_id: String,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub capability: String,
+    pub semantic_operation_class: String,
+    pub effect_class: String,
+    pub dispatch_recorded: bool,
+    pub prepared_at_ms: u64,
+    pub dispatched_at_ms: Option<u64>,
+    pub indeterminate_at_ms: u64,
+    pub indeterminate_reason: String,
+    pub evidence_class: Option<String>,
+    pub recovery_disposition: String,
+    pub retry_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineRecoveryGuidance {
+    pub confirmed_not_executed: String,
+    pub confirmed_completed: String,
+    pub otherwise: String,
+    pub replay_old_operation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuarantineInspectionReport {
+    pub quarantines: Vec<QuarantineInspection>,
+    pub recovery_guidance: QuarantineRecoveryGuidance,
+}
+
+/// Read the latest committed Hub checkpoint without taking recovery authority.
+/// Checkpoint publication is append-only/atomic, so this inspection may run while
+/// the Hub owns the state lock. The result intentionally excludes owner identity
+/// and every raw command/browser/GUI/result payload.
+pub fn inspect_quarantines_read_only(
+    state_dir: &Path,
+    device_id: Option<&str>,
+) -> Result<QuarantineInspectionReport, MaintenanceError> {
+    let checkpoint = CheckpointStore::new(state_dir.to_path_buf(), "hub")
+        .map_err(MaintenanceError::Persistence)?;
+    let state = checkpoint
+        .load_latest::<HubPersistentState>()
+        .map_err(MaintenanceError::Persistence)?;
+    let limits = AdmissionLimits {
+        max_global_active: 1,
+        max_queued_per_device: 1,
+    };
+    let (_registry, execution) = state
+        .restore(limits)
+        .map_err(MaintenanceError::Persistence)?;
+    let inspections = execution
+        .quarantine_inspections()
+        .map_err(MaintenanceError::Execution)?
+        .into_iter()
+        .filter(|inspection| device_id.is_none_or(|id| inspection.operation.device_id == id))
+        .map(|inspection| {
+            let capability = crate::v2_observability::capability_name(inspection.capability);
+            QuarantineInspection {
+                blocking_operation_id: inspection.operation.operation_id,
+                device_id: inspection.operation.device_id,
+                device_generation: inspection.operation.device_generation,
+                capability: capability.to_owned(),
+                semantic_operation_class: capability.to_owned(),
+                effect_class: capability_effect_class(inspection.capability).to_owned(),
+                dispatch_recorded: inspection.dispatched_at_ms.is_some(),
+                prepared_at_ms: inspection.prepared_at_ms,
+                dispatched_at_ms: inspection.dispatched_at_ms,
+                indeterminate_at_ms: inspection.indeterminate_at_ms,
+                indeterminate_reason: crate::v2_observability::indeterminate_reason_name(
+                    inspection.indeterminate_reason,
+                )
+                .to_owned(),
+                evidence_class: inspection.evidence.map(evidence_name).map(str::to_owned),
+                recovery_disposition: "needs_reconciliation".into(),
+                retry_safe: false,
+            }
+        })
+        .collect();
+    Ok(QuarantineInspectionReport {
+        quarantines: inspections,
+        recovery_guidance: QuarantineRecoveryGuidance {
+            confirmed_not_executed:
+                "requires independent evidence that the side effect did not occur".into(),
+            confirmed_completed:
+                "requires independent evidence that the intended side effect completed".into(),
+            otherwise: "keep quarantine intact".into(),
+            replay_old_operation: false,
+        },
+    })
+}
+
+fn capability_effect_class(capability: DeviceCapability) -> &'static str {
+    if matches!(capability.class(), CapabilityClass::Observe) {
+        "read_only"
+    } else {
+        "effectful"
+    }
+}
+
+const fn evidence_name(evidence: ExecutionEvidence) -> &'static str {
+    match evidence {
+        ExecutionEvidence::VerifiedAgentResult => "verified_agent_result",
+        ExecutionEvidence::VerifiedRemoteError => "verified_remote_error",
+        ExecutionEvidence::ProvenProcessTermination => "proven_process_termination",
+        ExecutionEvidence::CancelledBeforeDispatch => "cancelled_before_dispatch",
+        ExecutionEvidence::OperatorResolution => "operator_resolution",
+    }
 }
 
 pub fn resolve_indeterminate_offline(
@@ -221,6 +335,58 @@ mod tests {
             .save(&HubPersistentState::capture(&registry, &execution))
             .unwrap();
         (device_id, operation_id)
+    }
+
+    #[test]
+    fn read_only_quarantine_inspection_requires_no_hub_stop_and_mutates_nothing() {
+        let dir = test_dir("inspect-live");
+        let (device_id, operation_id) = seed_quarantine(&dir);
+        let checkpoint_count = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("hub-") && name.ends_with(".json"))
+                })
+                .count()
+        };
+        let before_count = checkpoint_count();
+        let _hub_lock = StateDirectoryLock::acquire(&dir).unwrap();
+
+        let report = inspect_quarantines_read_only(&dir, None).unwrap();
+        assert_eq!(report.quarantines.len(), 1);
+        let inspection = &report.quarantines[0];
+        assert_eq!(inspection.blocking_operation_id, operation_id);
+        assert_eq!(inspection.device_id, device_id);
+        assert_eq!(inspection.device_generation, 1);
+        assert_eq!(inspection.capability, "shell");
+        assert_eq!(inspection.semantic_operation_class, "shell");
+        assert_eq!(inspection.effect_class, "effectful");
+        assert!(inspection.dispatch_recorded);
+        assert_eq!(inspection.prepared_at_ms, 100);
+        assert_eq!(inspection.dispatched_at_ms, Some(110));
+        assert_eq!(inspection.indeterminate_at_ms, 120);
+        assert_eq!(inspection.indeterminate_reason, "connection_lost");
+        assert_eq!(inspection.evidence_class, None);
+        assert_eq!(inspection.recovery_disposition, "needs_reconciliation");
+        assert!(!inspection.retry_safe);
+        assert!(!report.recovery_guidance.replay_old_operation);
+        assert_eq!(checkpoint_count(), before_count);
+
+        let filtered = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        assert_eq!(filtered.quarantines, report.quarantines);
+        let missing = inspect_quarantines_read_only(&dir, Some("device-not-present")).unwrap();
+        assert!(missing.quarantines.is_empty());
+
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("https://issuer.example"));
+        assert!(!serialized.contains("alice"));
+        assert!(!serialized.contains("owner"));
+        assert_eq!(checkpoint_count(), before_count);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

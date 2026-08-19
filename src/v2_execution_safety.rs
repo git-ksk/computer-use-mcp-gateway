@@ -170,6 +170,20 @@ pub struct OperationRecoverySnapshot {
     pub result: Option<RecoverableOperationResult>,
 }
 
+/// Privacy-preserving durable metadata for one unresolved desktop quarantine.
+/// Raw command/browser/GUI payloads and authenticated owner identity are
+/// intentionally absent from this inspection shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineInspectionSnapshot {
+    pub operation: OperationRef,
+    pub capability: DeviceCapability,
+    pub prepared_at_ms: u64,
+    pub dispatched_at_ms: Option<u64>,
+    pub indeterminate_at_ms: u64,
+    pub indeterminate_reason: IndeterminateReason,
+    pub evidence: Option<ExecutionEvidence>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedOperationRecovery {
     pub operation: OperationRef,
@@ -659,6 +673,44 @@ impl AuthoritativeOperationController {
 
     pub fn quarantine(&self, device_id: &str) -> Option<&DesktopQuarantine> {
         self.quarantines.get(device_id)
+    }
+
+    /// Return bounded durable audit metadata for unresolved quarantines without
+    /// exposing owner identity or any raw operation payload. The controller was
+    /// already restored through invariant validation; this accessor still
+    /// rechecks the quarantine/operation correlation and fails closed if it ever
+    /// diverges.
+    pub fn quarantine_inspections(
+        &self,
+    ) -> Result<Vec<QuarantineInspectionSnapshot>, ExecutionError> {
+        let mut quarantines: Vec<_> = self.quarantines.values().collect();
+        quarantines.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        quarantines
+            .into_iter()
+            .map(|quarantine| {
+                let record = self
+                    .operations
+                    .get(&quarantine.operation_id)
+                    .ok_or(ExecutionError::InvalidSnapshot)?;
+                if record.state != HubOperationState::Indeterminate
+                    || record.operation.device_id != quarantine.device_id
+                    || record.operation.device_generation != quarantine.device_generation
+                    || record.owner != quarantine.owner
+                    || record.indeterminate_reason != Some(quarantine.reason)
+                {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                Ok(QuarantineInspectionSnapshot {
+                    operation: record.operation.clone(),
+                    capability: record.capability,
+                    prepared_at_ms: record.prepared_at_ms,
+                    dispatched_at_ms: record.dispatched_at_ms,
+                    indeterminate_at_ms: quarantine.since_ms,
+                    indeterminate_reason: quarantine.reason,
+                    evidence: record.receipt.as_ref().map(|receipt| receipt.evidence),
+                })
+            })
+            .collect()
     }
 
     pub fn resolutions(&self) -> &[ResolutionRecord] {
@@ -1580,6 +1632,64 @@ mod tests {
                 .prepare(op("op-bob", 5), bob(), DeviceCapability::Shell, 201)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn quarantine_inspection_is_privacy_bounded_and_stable_across_restart() {
+        let mut ledger = controller();
+        ledger
+            .prepare(op("op-audit", 4), alice(), DeviceCapability::Shell, 100)
+            .unwrap();
+        ledger
+            .mark_dispatched("op-audit", &alice(), 4, 110)
+            .unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-audit",
+                &alice(),
+                4,
+                IndeterminateReason::ConnectionLost,
+                120,
+            )
+            .unwrap();
+        assert_eq!(
+            ledger
+                .prepare(
+                    op("op-later-rejected", 5),
+                    bob(),
+                    DeviceCapability::Shell,
+                    130,
+                )
+                .unwrap_err(),
+            ExecutionError::DeviceIndeterminate {
+                operation_id: "op-audit".into(),
+            }
+        );
+
+        let before = ledger.quarantine_inspections().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].operation.operation_id, "op-audit");
+        assert_eq!(before[0].operation.device_id, "desktop-a");
+        assert_eq!(before[0].operation.device_generation, 4);
+        assert_eq!(before[0].capability, DeviceCapability::Shell);
+        assert_eq!(before[0].prepared_at_ms, 100);
+        assert_eq!(before[0].dispatched_at_ms, Some(110));
+        assert_eq!(before[0].indeterminate_at_ms, 120);
+        assert_eq!(
+            before[0].indeterminate_reason,
+            IndeterminateReason::ConnectionLost
+        );
+        assert_eq!(before[0].evidence, None);
+
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            ledger.snapshot_for_restart(),
+        )
+        .unwrap();
+        assert_eq!(restored.quarantine_inspections().unwrap(), before);
     }
 
     #[test]
