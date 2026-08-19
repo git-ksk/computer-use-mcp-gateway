@@ -1,0 +1,22 @@
+{
+  "component": "hub",
+  "executable": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\bin\\v2_hub.exe",
+  "workingDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway",
+  "logDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\logs",
+  "restartDelaySeconds": 2,
+  "arguments": [
+    "--bind", "127.0.0.1:7443",
+    "--hub-secret-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\hub\\hub.key",
+    "--grant-secret-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\hub\\grant.key",
+    "--device-public-key-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\enrollment\\hub\\device.pub",
+    "--tls-cert-pem-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\tls\\tls-server.pem",
+    "--tls-key-pem-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\tls\\tls-server.key",
+    "--state-dir", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\state\\hub",
+    "--mcp-bind", "127.0.0.1:8102",
+    "--mcp-resource", "https://example.invalid/mcp",
+    "--northbound-policy-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\trust\\northbound-policy.json",
+    "--trusted-proxy-issuer", "https://access.example.invalid",
+    "--trusted-proxy-subject", "replace-with-fixed-principal",
+    "--trusted-proxy-secret-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\secrets\\trusted-proxy-secret"
+  ]
+}
