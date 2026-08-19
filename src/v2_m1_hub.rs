@@ -37,7 +37,6 @@ use crate::v2_m1_persistence::{
 };
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
-use crate::v2_usage::UsageLease;
 use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
 use std::collections::{HashMap, VecDeque};
@@ -244,7 +243,6 @@ enum HubRequest {
         command: Box<DeviceCommand>,
         audit: OperationAuditMetadata,
         request_fingerprint: Option<OperationRequestFingerprint>,
-        usage: Option<UsageLease>,
         reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
     },
     Cancel {
@@ -261,7 +259,6 @@ enum HubRequest {
 struct PendingOperation {
     owner: OperationOwner,
     command: DeviceCommand,
-    usage: Option<UsageLease>,
     envelope: Option<CommandEnvelope>,
     reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
 }
@@ -618,7 +615,6 @@ impl SingleDeviceHub {
                             command,
                             audit,
                             request_fingerprint,
-                            usage,
                             reply,
                         } => {
                             if self.inner.draining.load(Ordering::Acquire) {
@@ -722,7 +718,6 @@ impl SingleDeviceHub {
                             pending.insert(operation_id.clone(), PendingOperation {
                                 owner,
                                 command: *command,
-                                usage,
                                 envelope: None,
                                 reply,
                             });
@@ -944,15 +939,11 @@ impl SingleDeviceHub {
         operation_id: &str,
         pending: &mut HashMap<String, PendingOperation>,
     ) -> Result<DispatchOutcome, HubServiceError> {
-        let (owner, device_command, usage) = {
+        let (owner, device_command) = {
             let operation = pending
                 .get(operation_id)
                 .ok_or(HubServiceError::PendingOperationMissing)?;
-            (
-                operation.owner.clone(),
-                operation.command.clone(),
-                operation.usage.clone(),
-            )
+            (operation.owner.clone(), operation.command.clone())
         };
         if self.inner.draining.load(Ordering::Acquire) {
             return self
@@ -1004,45 +995,7 @@ impl SingleDeviceHub {
             grant,
         )?;
 
-        // Usage accounting is deliberately outside the authoritative execution
-        // controller. It is marked liable only after CUMG admission has selected
-        // this operation for execution and before either the durable Dispatched
-        // transition or any Agent-visible bytes can occur.
-        if let Some(usage) = usage.as_ref()
-            && let Err(error) = usage.mark_liable().await
-        {
-            tracing::warn!(
-                event = "v2_usage_mark_liable_failed",
-                operation_id,
-                device_id = %self.inner.device_id,
-                generation,
-                outcome = "cancelled_before_dispatch",
-                error_code = error.safe_error_code(),
-                "usage liability transition failed; Agent dispatch blocked"
-            );
-            let next = {
-                let mut persistent = self.inner.persistent.lock().await;
-                let decision = persistent.execution.request_cancel(
-                    operation_id,
-                    &owner,
-                    generation,
-                    unix_time_ms()?,
-                )?;
-                persist_locked(&self.inner, &persistent)?;
-                match decision {
-                    CancellationDecision::CancelledBeforeDispatch { next } => next,
-                    _ => return Err(HubServiceError::StateBusy),
-                }
-            };
-            if let Some(operation) = pending.remove(operation_id) {
-                let _ = operation.reply.send(Err(HubCommandError::UsageUnavailable));
-            }
-            return Ok(DispatchOutcome::Rejected(next));
-        }
-
-        // A shutdown signal may arrive while usage accounting is awaiting its
-        // pre-dispatch liability transition. Re-check the drain gate before the
-        // durable side-effect boundary so such work remains provably unexecuted.
+        // Re-check the drain gate immediately before the durable side-effect boundary.
         if self.inner.draining.load(Ordering::Acquire) {
             return self
                 .cancel_for_shutdown_drain(operation_id, &owner, generation, pending)
@@ -1069,9 +1022,6 @@ impl SingleDeviceHub {
             .ok_or(HubServiceError::PendingOperationMissing)?
             .envelope = Some(command);
         send_hub(outbound, HubToAgent::Command(remote)).await?;
-        if let Some(usage) = usage.as_ref() {
-            usage.mark_dispatched();
-        }
         tracing::info!(
             event = "v2_operation_dispatched",
             operation_id,
@@ -1855,12 +1805,11 @@ impl HubHandle {
         owner: OperationOwner,
         command: DeviceCommand,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        self.start_command_as_with_id(owner, random_operation_id(), command, None)
+        self.start_command_as_with_id(owner, random_operation_id(), command)
             .await
     }
 
-    /// Allocates the CUMG logical operation identity before accounting admission.
-    /// The same value is passed unchanged to MCPUsage as `operationId`.
+    /// Allocates a CUMG logical operation identity before command admission.
     pub fn new_operation_id(&self) -> String {
         random_operation_id()
     }
@@ -1870,7 +1819,6 @@ impl HubHandle {
         owner: OperationOwner,
         operation_id: String,
         command: DeviceCommand,
-        usage: Option<UsageLease>,
     ) -> Result<HubPendingCommand, HubCommandError> {
         self.start_command_as_with_id_and_audit(
             owner,
@@ -1878,7 +1826,6 @@ impl HubHandle {
             command,
             OperationAuditMetadata::empty(),
             None,
-            usage,
         )
         .await
     }
@@ -1890,16 +1837,11 @@ impl HubHandle {
         command: DeviceCommand,
         audit: OperationAuditMetadata,
         request_fingerprint: Option<OperationRequestFingerprint>,
-        usage: Option<UsageLease>,
     ) -> Result<HubPendingCommand, HubCommandError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(HubCommandError::Busy);
         }
-        if operation_id.is_empty()
-            || usage
-                .as_ref()
-                .is_some_and(|lease| lease.operation_id() != operation_id)
-        {
+        if operation_id.is_empty() {
             return Err(HubCommandError::Rejected);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1915,7 +1857,6 @@ impl HubHandle {
             command: Box::new(command),
             audit,
             request_fingerprint,
-            usage,
             reply: reply_tx,
         })
         .await
@@ -2339,7 +2280,6 @@ pub enum HubCommandError {
     UnknownOperation,
     DeviceIndeterminate { operation_id: String },
     Rejected,
-    UsageUnavailable,
     GrantSigningUnavailable,
     Remote(DeviceErrorCode),
     UnexpectedResult,
@@ -2358,7 +2298,6 @@ impl SafeErrorCode for HubCommandError {
             Self::UnknownOperation => "unknown_operation",
             Self::DeviceIndeterminate { .. } | Self::Indeterminate => "device_indeterminate",
             Self::Rejected => "rejected",
-            Self::UsageUnavailable => "usage_unavailable",
             Self::GrantSigningUnavailable => "grant_signing_unavailable",
             Self::Remote(_) => "remote_error",
             Self::UnexpectedResult => "unexpected_result",
@@ -2891,36 +2830,5 @@ mod tests {
         assert!(block.contains("ReconciliationStatus::AutoReconciling"));
         assert!(block.contains("mark_reconciliation_evidence_gap"));
         assert!(block.contains("mark_reconciliation_operator_required"));
-    }
-
-    #[test]
-    fn usage_liability_boundary_precedes_cumg_dispatched_and_agent_send() {
-        let source = include_str!("v2_m1_hub.rs");
-        let start = source.find("async fn dispatch_operation(").unwrap();
-        let end = source[start..]
-            .find("async fn handle_result(")
-            .map(|offset| start + offset)
-            .unwrap();
-        let block = &source[start..end];
-        let liable = block.find("usage.mark_liable().await").unwrap();
-        let durable_dispatch = block
-            .find("persistent.execution.mark_dispatched_with_binding(")
-            .unwrap();
-        let agent_send = block
-            .find("send_hub(outbound, HubToAgent::Command(remote)).await?")
-            .unwrap();
-        let effect_possible = block.find("usage.mark_dispatched()").unwrap();
-        assert!(liable < durable_dispatch);
-        assert!(durable_dispatch < agent_send);
-        assert!(agent_send < effect_possible);
-        assert!(block.contains("CancellationDecision::CancelledBeforeDispatch"));
-    }
-
-    #[test]
-    fn usage_accounting_is_not_part_of_execution_safety_state_machine() {
-        let safety = include_str!("v2_execution_safety.rs");
-        assert!(!safety.contains("v2_usage"));
-        assert!(!safety.contains("UsageController"));
-        assert!(!safety.contains("UsageLease"));
     }
 }

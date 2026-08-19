@@ -24,7 +24,6 @@
 - [`V2_CUA_PARITY_MATRIX.ja.md`](V2_CUA_PARITY_MATRIX.ja.md) — Cua compatibility/parity classification。
 - [`V2_THREAT_MODEL.ja.md`](V2_THREAT_MODEL.ja.md) — security claim と non-claim。
 - [`V2_STANDARDIZATION.md`](V2_STANDARDIZATION.md) と [`V2_P2_REPLACEMENT_SEAMS.md`](V2_P2_REPLACEMENT_SEAMS.md) — maintained OSS / standards の replacement boundary。
-- [`V2_USAGE_ACCOUNTING.md`](V2_USAGE_ACCOUNTING.md) — optional accounting integration。
 
 ## Acceptance evidence
 

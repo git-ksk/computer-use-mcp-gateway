@@ -22,6 +22,7 @@ pub mod v2_m1_process;
 pub mod v2_m1_shell;
 pub mod v2_m1_tls;
 
+// Deployment-layer quota and billing controls intentionally have no core module here.
 pub mod v2_m1_filesystem;
 pub mod v2_m1_grpc;
 pub mod v2_m1_hub;
@@ -38,8 +39,6 @@ pub mod v2_observability;
 pub mod v2_reference_backend;
 pub mod v2_state_lock;
 pub mod v2_tls_lifecycle;
-
-pub mod v2_usage;
 
 #[cfg(windows)]
 mod v2_windows_acl;

@@ -47,7 +47,6 @@ use crate::{
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
-    v2_usage::{UsageError, UsageLease, UsageManager, UsageOperation, UsageSettlement},
 };
 use async_trait::async_trait;
 use axum::{
@@ -87,7 +86,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::Mutex as TokioMutex, time::MissedTickBehavior};
+use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
 const DEFAULT_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1146,14 +1145,12 @@ struct PreparedBrowserCall {
 struct NorthboundOperationCall {
     operation_id: String,
     audit: OperationAuditMetadata,
-    usage: UsageLease,
 }
 
 #[derive(Clone)]
 pub struct V2NorthboundMcp {
     hub: HubHandle,
     authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
-    usage: UsageManager,
     request_fingerprint_secret: Option<Arc<[u8]>>,
     interactions: Arc<TokioMutex<NorthboundInteractionState>>,
 }
@@ -1187,33 +1184,16 @@ impl DeviceCapabilityAuthorizer for ClientAuthorizationPolicy {
 
 impl V2NorthboundMcp {
     pub fn new(hub: HubHandle, policy: ClientAuthorizationPolicy) -> Self {
-        Self::new_with_authorizer_and_usage(hub, Arc::new(policy), UsageManager::noop())
-    }
-
-    pub fn new_with_usage(
-        hub: HubHandle,
-        policy: ClientAuthorizationPolicy,
-        usage: UsageManager,
-    ) -> Self {
-        Self::new_with_authorizer_and_usage(hub, Arc::new(policy), usage)
+        Self::new_with_authorizer(hub, Arc::new(policy))
     }
 
     pub fn new_with_authorizer(
         hub: HubHandle,
         authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
     ) -> Self {
-        Self::new_with_authorizer_and_usage(hub, authorizer, UsageManager::noop())
-    }
-
-    pub fn new_with_authorizer_and_usage(
-        hub: HubHandle,
-        authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
-        usage: UsageManager,
-    ) -> Self {
         Self {
             hub,
             authorizer,
-            usage,
             request_fingerprint_secret: None,
             interactions: Arc::new(TokioMutex::new(NorthboundInteractionState::new())),
         }
@@ -1981,42 +1961,18 @@ impl V2NorthboundMcp {
     ) -> Result<CallToolResponse, McpError> {
         let request: BrowserStageUploadRequest = match parse_arguments(arguments) {
             Ok(request) => request,
-            Err(error) => {
-                settle_usage_best_effort(
-                    &operation.usage,
-                    UsageSettlement::Zero,
-                    "invalid_browser_upload_stage",
-                )
-                .await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let expected_bytes = match request.validate() {
             Ok(bytes) => bytes,
-            Err(error) => {
-                settle_usage_best_effort(
-                    &operation.usage,
-                    UsageSettlement::Zero,
-                    "invalid_browser_upload_stage",
-                )
-                .await;
-                return Err(browser_contract_error_to_mcp(error));
-            }
+            Err(error) => return Err(browser_contract_error_to_mcp(error)),
         };
         let binding = match self
             .validate_browser_interaction_context(principal, &request.context_id)
             .await
         {
             Ok(binding) => binding,
-            Err(error) => {
-                settle_usage_best_effort(
-                    &operation.usage,
-                    UsageSettlement::Zero,
-                    "invalid_browser_upload_context",
-                )
-                .await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let execution = self
             .execute_command(
@@ -2080,15 +2036,7 @@ impl V2NorthboundMcp {
             .await
         {
             Ok(prepared) => prepared,
-            Err(error) => {
-                settle_usage_best_effort(
-                    &operation.usage,
-                    UsageSettlement::Zero,
-                    "invalid_browser_request",
-                )
-                .await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let command = DeviceCommand::Browser {
             command: prepared.command.clone(),
@@ -2615,11 +2563,9 @@ impl V2NorthboundMcp {
         let NorthboundOperationCall {
             operation_id,
             audit,
-            usage,
         } = operation;
         let owner = OperationOwner::from_principal(principal);
-        let read_only = command.is_read_only();
-        let pending = match self
+        let pending = self
             .hub
             .start_command_as_with_id_and_audit(
                 owner.clone(),
@@ -2627,78 +2573,23 @@ impl V2NorthboundMcp {
                 command,
                 audit,
                 request_fingerprint,
-                Some(usage.clone()),
             )
             .await
-        {
-            Ok(pending) => pending,
-            Err(error) => {
-                settle_usage_best_effort(&usage, UsageSettlement::Zero, "pre_dispatch_rejected")
-                    .await;
-                return Err(hub_error_to_mcp(error));
-            }
-        };
+            .map_err(hub_error_to_mcp)?;
         let mut wait = Box::pin(pending.wait());
-        let renew_after = usage.renew_after();
-        let renew_enabled = renew_after.is_some();
-        let renew_period = renew_after.unwrap_or(Duration::from_secs(60));
-        let mut renew_tick = tokio::time::interval(renew_period);
-        renew_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // `interval()` ticks immediately once; consume that tick so the first
-        // renewal occurs only after the sidecar-provided heartbeat period.
-        renew_tick.tick().await;
-
-        loop {
-            tokio::select! {
-                result = &mut wait => {
-                    return match result {
-                        Ok(result) => {
-                            let settlement = if usage.was_dispatched() {
-                                UsageSettlement::Full
-                            } else {
-                                UsageSettlement::Zero
-                            };
-                            let outcome = if usage.was_dispatched() { "completed" } else { "pre_dispatch_no_effect" };
-                            settle_usage_best_effort(&usage, settlement, outcome).await;
-                            Ok(result.result)
-                        }
-                        Err(error) => {
-                            let (settlement, outcome) =
-                                usage_settlement_for_error(usage.was_dispatched(), read_only, &error);
-                            settle_usage_best_effort(&usage, settlement, outcome).await;
-                            Err(hub_error_to_mcp(error))
-                        }
-                    };
-                },
-                _ = renew_tick.tick(), if renew_enabled => {
-                    if let Err(error) = usage.renew().await {
-                        warn!(
-                            event = "v2_usage_renew_failed",
-                            operation_id,
-                            outcome = "execution_state_unchanged",
-                            error_code = error.safe_error_code(),
-                            "usage lease renewal failed; CUMG execution remains authoritative"
-                        );
-                    }
-                },
-                _ = context.ct.cancelled() => {
-                    let cancellation = self.hub.cancel_as(owner, operation_id).await;
-                    let (settlement, outcome) = if usage.was_dispatched() {
-                        (UsageSettlement::Full, "cancelled_after_dispatch")
-                    } else {
-                        (UsageSettlement::Zero, "cancelled_before_dispatch")
-                    };
-                    settle_usage_best_effort(&usage, settlement, outcome).await;
-                    if let Err(error) = cancellation {
-                        warn!(
-                            event = "v2_northbound_cancel_failed",
-                            outcome = "original_call_cancelled",
-                            error_code = error.safe_error_code(),
-                            "CUMG cancellation request failed; execution safety state remains authoritative"
-                        );
-                    }
-                    return Err(McpError::invalid_request("Tool call was cancelled", None));
+        tokio::select! {
+            result = &mut wait => result.map(|result| result.result).map_err(hub_error_to_mcp),
+            _ = context.ct.cancelled() => {
+                let cancellation = self.hub.cancel_as(owner, operation_id).await;
+                if let Err(error) = cancellation {
+                    warn!(
+                        event = "v2_northbound_cancel_failed",
+                        outcome = "original_call_cancelled",
+                        error_code = error.safe_error_code(),
+                        "CUMG cancellation request failed; execution safety state remains authoritative"
+                    );
                 }
+                Err(McpError::invalid_request("Tool call was cancelled", None))
             }
         }
     }
@@ -2794,24 +2685,7 @@ impl ServerHandler for V2NorthboundMcp {
             matches!(request.name.as_ref(), TOOL_EXECUTE_PROCESS | TOOL_SHELL);
         let operation_id = requested_operation_id(request.name.as_ref(), arguments.as_ref())?
             .unwrap_or_else(|| self.hub.new_operation_id());
-        // OAuth has already reduced the bearer token to this verified issuer +
-        // subject. Usage admission receives only that principal identity and the
-        // tool name; request arguments and bearer material never cross the seam.
-        let usage = self
-            .usage
-            .reserve(UsageOperation {
-                operation_id: operation_id.clone(),
-                issuer: auth.principal.issuer.clone(),
-                subject: auth.principal.subject.clone(),
-                tool: request.name.to_string(),
-            })
-            .await
-            .map_err(usage_error_to_mcp)?;
-
-        if let Err(error) = self.authorize(&auth.principal, capability) {
-            settle_usage_best_effort(&usage, UsageSettlement::Zero, "authorization_denied").await;
-            return Err(error);
-        }
+        self.authorize(&auth.principal, capability)?;
         log_northbound_operation_requested(
             &operation_id,
             self.hub.device_id(),
@@ -2827,7 +2701,6 @@ impl ServerHandler for V2NorthboundMcp {
                     NorthboundOperationCall {
                         operation_id,
                         audit,
-                        usage,
                     },
                     &context,
                 )
@@ -2843,7 +2716,6 @@ impl ServerHandler for V2NorthboundMcp {
                     NorthboundOperationCall {
                         operation_id,
                         audit,
-                        usage,
                     },
                     &context,
                 )
@@ -3307,28 +3179,10 @@ impl ServerHandler for V2NorthboundMcp {
             }
             _ => Err(McpError::invalid_params("Unknown V2 Hub tool", None)),
         })();
-        let command = match command_result {
-            Ok(command) => command,
-            Err(error) => {
-                settle_usage_best_effort(&usage, UsageSettlement::Zero, "invalid_arguments").await;
-                return Err(error);
-            }
-        };
-        let (command, interaction_binding) = match self
+        let command = command_result?;
+        let (command, interaction_binding) = self
             .prepare_contextual_command(&auth.principal, command)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                settle_usage_best_effort(
-                    &usage,
-                    UsageSettlement::Zero,
-                    "invalid_interaction_context",
-                )
-                .await;
-                return Err(error);
-            }
-        };
+            .await?;
         let publicize_snapshot = matches!(command, DeviceCommand::InspectWindowContextual { .. });
         let expand_context_id = match &command {
             DeviceCommand::ExpandInteractionScope { context_id, .. } => Some(context_id.clone()),
@@ -3343,7 +3197,6 @@ impl ServerHandler for V2NorthboundMcp {
                 NorthboundOperationCall {
                     operation_id,
                     audit,
-                    usage,
                 },
                 &context,
             )
@@ -3795,55 +3648,6 @@ fn mcp_error_with_operation_id(mut error: McpError, operation_id: &str) -> McpEr
     error
 }
 
-fn usage_settlement_for_error(
-    dispatched: bool,
-    read_only: bool,
-    error: &HubCommandError,
-) -> (UsageSettlement, &'static str) {
-    if !dispatched {
-        return (UsageSettlement::Zero, "pre_dispatch_rejected");
-    }
-    if read_only && matches!(error, HubCommandError::Remote(_)) {
-        // A verified remote failure of a read-only operation is the intentionally
-        // narrow current post-dispatch path where no state-changing effect can be
-        // attributed to the business operation.
-        return (UsageSettlement::Zero, "proven_no_effect");
-    }
-    // Any dispatched mutable-operation failure, timeout/disconnect, or
-    // indeterminate state is charged fully. Accounting never authorizes replay.
-    (UsageSettlement::Full, "dispatched_conservative")
-}
-
-async fn settle_usage_best_effort(
-    usage: &UsageLease,
-    settlement: UsageSettlement,
-    outcome: &'static str,
-) {
-    if let Err(error) = usage.settle(settlement, outcome).await {
-        // Settlement/reconciliation is intentionally separated from execution.
-        // Never clear quarantine, retry a business operation, or hide a completed
-        // result because the optional accounting sidecar is unavailable.
-        warn!(
-            event = "v2_usage_settlement_failed",
-            operation_id = usage.operation_id(),
-            outcome,
-            error_code = error.safe_error_code(),
-            "usage settlement failed; CUMG execution state remains authoritative"
-        );
-    }
-}
-
-fn usage_error_to_mcp(error: UsageError) -> McpError {
-    match error {
-        UsageError::Denied(_) => McpError::invalid_request("Usage quota denied", None),
-        UsageError::Unavailable
-        | UsageError::InvalidResponse
-        | UsageError::InvalidConfiguration => {
-            McpError::internal_error("Usage accounting is temporarily unavailable", None)
-        }
-    }
-}
-
 fn hub_error_to_mcp(error: HubCommandError) -> McpError {
     let (message, code, blocking_operation_id) = match error {
         HubCommandError::AgentOffline => ("Agent is offline", "agent_offline", None),
@@ -3861,11 +3665,6 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         HubCommandError::CancelledBeforeDispatch => (
             "Operation was cancelled before dispatch",
             "cancelled_before_dispatch",
-            None,
-        ),
-        HubCommandError::UsageUnavailable => (
-            "Usage accounting is temporarily unavailable",
-            "usage_unavailable",
             None,
         ),
         HubCommandError::GrantSigningUnavailable => {
@@ -7536,78 +7335,5 @@ mod tests {
         };
         assert!(!command_requires_window_scope(&clipboard));
         assert!(!command_requires_desktop_scope(&clipboard));
-    }
-
-    #[test]
-    fn screenshot_failure_is_read_only_but_type_text_is_mutating_for_accounting() {
-        assert!(DeviceCommand::Screenshot.is_read_only());
-        assert!(
-            DeviceCommand::ListWindows {
-                process_id: None,
-                on_screen_only: true,
-            }
-            .is_read_only()
-        );
-        assert!(
-            DeviceCommand::InspectWindow {
-                process_id: 1,
-                window_id: 1,
-                query: None,
-                max_elements: 10,
-                max_depth: 5,
-                include_screenshot: false,
-            }
-            .is_read_only()
-        );
-        assert!(
-            !DeviceCommand::LaunchApplication {
-                identifier: Some("app".into()),
-                name: None,
-                targets: vec![],
-                new_instance: false,
-            }
-            .is_read_only()
-        );
-        assert!(!DeviceCommand::TypeText { text: "x".into() }.is_read_only());
-        let remote = HubCommandError::Remote(crate::v2_m0::DeviceErrorCode::InternalFailure);
-        assert_eq!(
-            usage_settlement_for_error(true, DeviceCommand::Screenshot.is_read_only(), &remote),
-            (UsageSettlement::Zero, "proven_no_effect")
-        );
-        assert_eq!(
-            usage_settlement_for_error(
-                true,
-                DeviceCommand::TypeText { text: "x".into() }.is_read_only(),
-                &remote,
-            ),
-            (UsageSettlement::Full, "dispatched_conservative")
-        );
-    }
-
-    #[test]
-    fn usage_outcome_mapping_is_conservative_after_dispatch() {
-        let remote = HubCommandError::Remote(crate::v2_m0::DeviceErrorCode::InternalFailure);
-        // Screenshot is read-only: a verified remote failure proves no business
-        // side effect. TypeText is mutable: any dispatched failure is charged fully.
-        assert_eq!(
-            usage_settlement_for_error(false, false, &HubCommandError::Rejected),
-            (UsageSettlement::Zero, "pre_dispatch_rejected")
-        );
-        assert_eq!(
-            usage_settlement_for_error(true, true, &remote),
-            (UsageSettlement::Zero, "proven_no_effect")
-        );
-        assert_eq!(
-            usage_settlement_for_error(true, false, &remote),
-            (UsageSettlement::Full, "dispatched_conservative")
-        );
-        assert_eq!(
-            usage_settlement_for_error(true, false, &HubCommandError::Indeterminate),
-            (UsageSettlement::Full, "dispatched_conservative")
-        );
-        assert_eq!(
-            usage_settlement_for_error(true, false, &HubCommandError::SessionClosed),
-            (UsageSettlement::Full, "dispatched_conservative")
-        );
     }
 }
