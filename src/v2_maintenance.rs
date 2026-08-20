@@ -6,15 +6,18 @@
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
     ExecutionReceipt, OperationOwner, ReconciliationStatus, RequestFingerprintComparison,
-    ResolutionRecord, compare_request_fingerprint, fingerprint_process_request,
-    fingerprint_shell_request,
+    ResolutionRecord, RetirementAuthority, RetirementPolicy, RetirementRecord,
+    compare_request_fingerprint, fingerprint_process_request, fingerprint_shell_request,
+    retirement_policy_for_capability,
 };
 use crate::v2_m0::{
     CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
     ShellRequest,
 };
 use crate::v2_m0_execution::{AdmissionLimits, ExecutionError, IndeterminateResolution};
-use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
+use crate::v2_m1_persistence::{
+    CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION, PersistenceError,
+};
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESOLVER_ISSUER: &str = "cumg://local-maintenance";
 const RESOLVER_SUBJECT: &str = "operator";
+const MIN_RETIREMENT_SOURCE_EXECUTION_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfflineResolutionResult {
@@ -33,11 +37,18 @@ pub struct OfflineResolutionResult {
     pub checkpoint: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineRetirementResult {
+    pub retirement: RetirementRecord,
+    pub checkpoint: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuarantineInspection {
     pub blocking_operation_id: String,
     pub device_id: String,
     pub device_generation: u64,
+    pub current_device_generation: Option<u64>,
     pub capability: String,
     pub workflow_id: Option<String>,
     pub workflow_step_id: Option<String>,
@@ -60,6 +71,10 @@ pub struct QuarantineInspection {
     pub recovery_disposition: String,
     pub manual_audit_required: bool,
     pub retry_safe: bool,
+    pub execution_outcome: String,
+    pub retirement_eligibility: String,
+    pub retirement_policy: Option<String>,
+    pub recommended_action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -93,6 +108,26 @@ pub struct AutoResolutionInspection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AutoResolutionInspectionReport {
     pub auto_resolved: Vec<AutoResolutionInspection>,
+    pub retired_indeterminate: Vec<RetirementInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetirementInspection {
+    pub operation_id: String,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub authorized_device_generation: u64,
+    pub capability: String,
+    pub execution_outcome: String,
+    pub operational_disposition: String,
+    pub indeterminate_reason: String,
+    pub prior_reconciliation_status: String,
+    pub retirement_policy: String,
+    pub authority: String,
+    pub reason_present: bool,
+    pub retired_at_ms: u64,
+    pub replayed: bool,
+    pub quarantine_active: bool,
 }
 
 /// Read the latest committed Hub checkpoint without taking recovery authority.
@@ -108,6 +143,12 @@ pub fn inspect_quarantines_read_only(
     let state = checkpoint
         .load_latest::<HubPersistentState>()
         .map_err(MaintenanceError::Persistence)?;
+    let registry_generations: BTreeMap<_, _> = state
+        .registry
+        .devices
+        .iter()
+        .map(|device| (device.device_id.clone(), device.generation))
+        .collect();
     let limits = AdmissionLimits {
         max_global_active: 1,
         max_queued_per_device: 1,
@@ -122,10 +163,37 @@ pub fn inspect_quarantines_read_only(
         .filter(|inspection| device_id.is_none_or(|id| inspection.operation.device_id == id))
         .map(|inspection| {
             let capability = crate::v2_observability::capability_name(inspection.capability);
+            let current_device_generation = registry_generations
+                .get(&inspection.operation.device_id)
+                .copied();
+            let retirement_policy = retirement_policy_for_capability(inspection.capability);
+            let retirement_eligibility = if retirement_policy.is_none() {
+                "ineligible_policy"
+            } else if !matches!(
+                inspection.reconciliation_status,
+                ReconciliationStatus::OperatorRequired
+                    | ReconciliationStatus::UnrecoverableEvidenceGap
+            ) {
+                "await_reconciliation"
+            } else if inspection.dispatched_at_ms.is_none() {
+                "ineligible_missing_dispatch_record"
+            } else if current_device_generation
+                .is_none_or(|generation| generation <= inspection.operation.device_generation)
+            {
+                "requires_newer_generation"
+            } else {
+                "eligible"
+            };
+            let recommended_action = if retirement_eligibility == "eligible" {
+                "retire_with_local_maintenance_authorization"
+            } else {
+                "keep_quarantine"
+            };
             QuarantineInspection {
                 blocking_operation_id: inspection.operation.operation_id,
                 device_id: inspection.operation.device_id,
                 device_generation: inspection.operation.device_generation,
+                current_device_generation,
                 capability: capability.to_owned(),
                 workflow_id: inspection.audit.workflow_id,
                 workflow_step_id: inspection.audit.workflow_step_id,
@@ -157,6 +225,12 @@ pub fn inspect_quarantines_read_only(
                         | ReconciliationStatus::UnrecoverableEvidenceGap
                 ),
                 retry_safe: false,
+                execution_outcome: "indeterminate".to_owned(),
+                retirement_eligibility: retirement_eligibility.to_owned(),
+                retirement_policy: retirement_policy
+                    .map(retirement_policy_name)
+                    .map(str::to_owned),
+                recommended_action: recommended_action.to_owned(),
             }
         })
         .collect();
@@ -167,7 +241,7 @@ pub fn inspect_quarantines_read_only(
                 "requires independent evidence that the side effect did not occur".into(),
             confirmed_completed:
                 "requires independent evidence that the intended side effect completed".into(),
-            otherwise: "keep quarantine intact".into(),
+            otherwise: "keep quarantine intact unless an eligible unknown-outcome retirement is explicitly authorized".into(),
             replay_old_operation: false,
         },
     })
@@ -206,7 +280,38 @@ pub fn inspect_auto_resolutions_read_only(
             replayed: false,
         })
         .collect();
-    Ok(AutoResolutionInspectionReport { auto_resolved })
+    let retired_indeterminate = execution
+        .retirements()
+        .iter()
+        .filter(|retirement| device_id.is_none_or(|id| retirement.operation.device_id == id))
+        .map(|retirement| RetirementInspection {
+            operation_id: retirement.operation.operation_id.clone(),
+            device_id: retirement.operation.device_id.clone(),
+            device_generation: retirement.operation.device_generation,
+            authorized_device_generation: retirement.authorized_device_generation,
+            capability: crate::v2_observability::capability_name(retirement.capability).to_owned(),
+            execution_outcome: "indeterminate".to_owned(),
+            operational_disposition: "retired".to_owned(),
+            indeterminate_reason: crate::v2_observability::indeterminate_reason_name(
+                retirement.indeterminate_reason,
+            )
+            .to_owned(),
+            prior_reconciliation_status: reconciliation_status_name(
+                retirement.prior_reconciliation_status,
+            )
+            .to_owned(),
+            retirement_policy: retirement_policy_name(retirement.policy).to_owned(),
+            authority: retirement_authority_name(retirement.authority).to_owned(),
+            reason_present: !retirement.reason.is_empty(),
+            retired_at_ms: retirement.retired_at_ms,
+            replayed: retirement.replayed,
+            quarantine_active: false,
+        })
+        .collect();
+    Ok(AutoResolutionInspectionReport {
+        auto_resolved,
+        retired_indeterminate,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -401,6 +506,18 @@ const fn reconciliation_disposition(status: ReconciliationStatus) -> &'static st
     }
 }
 
+const fn retirement_policy_name(policy: RetirementPolicy) -> &'static str {
+    match policy {
+        RetirementPolicy::TransientUiInteractionV1 => "transient_ui_interaction_v1",
+    }
+}
+
+const fn retirement_authority_name(authority: RetirementAuthority) -> &'static str {
+    match authority {
+        RetirementAuthority::LocalMaintenanceOperator => "local_maintenance_operator",
+    }
+}
+
 const fn hub_operation_state_name(
     state: crate::v2_m0_execution::HubOperationState,
 ) -> &'static str {
@@ -589,6 +706,136 @@ fn resolve_indeterminate_offline_at(
     })
 }
 
+pub fn retire_indeterminate_offline(
+    state_dir: &Path,
+    operation_id: &str,
+    policy: RetirementPolicy,
+    reason: impl Into<String>,
+) -> Result<OfflineRetirementResult, MaintenanceError> {
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MaintenanceError::SystemClockBeforeEpoch)?
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    retire_indeterminate_offline_at(state_dir, operation_id, policy, reason.into(), now_ms)
+}
+
+fn retire_indeterminate_offline_at(
+    state_dir: &Path,
+    operation_id: &str,
+    policy: RetirementPolicy,
+    reason: String,
+    now_ms: u64,
+) -> Result<OfflineRetirementResult, MaintenanceError> {
+    retire_indeterminate_offline_at_with_commit(
+        state_dir,
+        operation_id,
+        policy,
+        reason,
+        now_ms,
+        |checkpoint, candidate| checkpoint.save(candidate),
+    )
+}
+
+fn retire_indeterminate_offline_at_with_commit<F>(
+    state_dir: &Path,
+    operation_id: &str,
+    policy: RetirementPolicy,
+    reason: String,
+    now_ms: u64,
+    commit: F,
+) -> Result<OfflineRetirementResult, MaintenanceError>
+where
+    F: FnOnce(&CheckpointStore, &HubPersistentState) -> Result<PathBuf, PersistenceError>,
+{
+    let _state_lock =
+        StateDirectoryLock::acquire(state_dir).map_err(MaintenanceError::StateLock)?;
+    let checkpoint = CheckpointStore::new(state_dir.to_path_buf(), "hub")
+        .map_err(MaintenanceError::Persistence)?;
+    let state = checkpoint
+        .load_latest::<HubPersistentState>()
+        .map_err(MaintenanceError::Persistence)?;
+    let source_state_schema = state.schema_version;
+    let source_registry = state.registry.clone();
+    let source_execution_schema = state.execution.schema_version;
+    if source_state_schema != M1_STATE_SCHEMA_VERSION {
+        return Err(MaintenanceError::RetirementRequiresCurrentStateSchema {
+            checkpoint_state_schema: source_state_schema,
+            maintenance_state_schema: M1_STATE_SCHEMA_VERSION,
+        });
+    }
+    if source_execution_schema < MIN_RETIREMENT_SOURCE_EXECUTION_SCHEMA_VERSION {
+        return Err(MaintenanceError::RetirementSchemaTooOld {
+            checkpoint_execution_schema: source_execution_schema,
+            minimum_execution_schema: MIN_RETIREMENT_SOURCE_EXECUTION_SCHEMA_VERSION,
+        });
+    }
+    let limits = AdmissionLimits {
+        max_global_active: 1,
+        max_queued_per_device: 1,
+    };
+    let (_registry, mut execution) = state
+        .restore(limits)
+        .map_err(MaintenanceError::Persistence)?;
+    // Preflight the input writer contract before performing the in-memory
+    // authority-bearing transition. Retirement intentionally upgrades only the
+    // nested execution-safety schema to v5 because older schemas cannot represent
+    // an unknown-outcome tombstone truthfully.
+    execution
+        .snapshot_for_restart_compatible_with(source_execution_schema)
+        .map_err(|_| MaintenanceError::PersistenceCompatibility {
+            checkpoint_execution_schema: source_execution_schema,
+            maintenance_execution_schema: EXECUTION_SAFETY_SCHEMA_VERSION,
+        })?;
+    let inspection = execution
+        .quarantine_inspections()
+        .map_err(MaintenanceError::Execution)?
+        .into_iter()
+        .find(|inspection| inspection.operation.operation_id == operation_id)
+        .ok_or(MaintenanceError::Execution(
+            ExecutionError::UnknownOperation,
+        ))?;
+    let current_device_generation = source_registry
+        .devices
+        .iter()
+        .find(|device| device.device_id == inspection.operation.device_id)
+        .map(|device| device.generation)
+        .ok_or(MaintenanceError::RetirementDeviceMissing)?;
+    let (_next, retirement) = execution
+        .retire_indeterminate(
+            operation_id,
+            RetirementAuthority::LocalMaintenanceOperator,
+            policy,
+            reason,
+            current_device_generation,
+            now_ms,
+        )
+        .map_err(MaintenanceError::Execution)?;
+    if execution
+        .retirements()
+        .last()
+        .is_none_or(|record| record != &retirement)
+    {
+        return Err(MaintenanceError::MissingRetirementRecord);
+    }
+    let candidate = HubPersistentState {
+        schema_version: source_state_schema,
+        registry: source_registry,
+        execution: execution.snapshot_for_restart(),
+    };
+    candidate
+        .clone()
+        .restore(limits)
+        .map_err(MaintenanceError::Persistence)?;
+    let checkpoint_path = commit(&checkpoint, &candidate).map_err(MaintenanceError::Persistence)?;
+    Ok(OfflineRetirementResult {
+        retirement,
+        checkpoint: checkpoint_path,
+    })
+}
+
 fn compatible_checkpoint(
     source_state_schema: u16,
     source_registry: DeviceRegistrySnapshot,
@@ -617,6 +864,16 @@ pub enum MaintenanceError {
     Persistence(PersistenceError),
     Execution(ExecutionError),
     MissingResolutionRecord,
+    MissingRetirementRecord,
+    RetirementDeviceMissing,
+    RetirementSchemaTooOld {
+        checkpoint_execution_schema: u16,
+        minimum_execution_schema: u16,
+    },
+    RetirementRequiresCurrentStateSchema {
+        checkpoint_state_schema: u16,
+        maintenance_state_schema: u16,
+    },
     InvalidCandidateRequest,
     PersistenceCompatibility {
         checkpoint_execution_schema: u16,
@@ -629,10 +886,30 @@ impl fmt::Display for MaintenanceError {
         match self {
             Self::StateLock(error) => write!(f, "{error}"),
             Self::Persistence(error) => write!(f, "checkpoint maintenance failed: {error}"),
-            Self::Execution(error) => write!(f, "quarantine resolution rejected: {error}"),
+            Self::Execution(error) => write!(f, "quarantine transition rejected: {error}"),
             Self::MissingResolutionRecord => {
                 f.write_str("quarantine resolution produced no audit record")
             }
+            Self::MissingRetirementRecord => {
+                f.write_str("quarantine retirement produced no durable audit record")
+            }
+            Self::RetirementDeviceMissing => {
+                f.write_str("quarantine retirement device is missing from the durable registry")
+            }
+            Self::RetirementSchemaTooOld {
+                checkpoint_execution_schema,
+                minimum_execution_schema,
+            } => write!(
+                f,
+                "quarantine retirement requires execution-safety schema >= {minimum_execution_schema}; checkpoint has schema {checkpoint_execution_schema}; upgrade and normalize the Hub checkpoint before retirement"
+            ),
+            Self::RetirementRequiresCurrentStateSchema {
+                checkpoint_state_schema,
+                maintenance_state_schema,
+            } => write!(
+                f,
+                "quarantine retirement requires current Hub state schema {maintenance_state_schema}; checkpoint has schema {checkpoint_state_schema}; upgrade the Hub before retirement"
+            ),
             Self::InvalidCandidateRequest => f.write_str(
                 "candidate request does not match the supported shell/process comparison contract",
             ),
@@ -703,6 +980,64 @@ mod tests {
         CheckpointStore::new(state_dir.to_path_buf(), "hub")
             .unwrap()
             .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+        (device_id, operation_id)
+    }
+
+    fn seed_retirable_quarantine(
+        state_dir: &Path,
+        capability: DeviceCapability,
+        current_device_generation: u64,
+    ) -> (String, String) {
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation_id = "op_retirable_legacy".to_owned();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: operation_id.clone(),
+        };
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare(operation, owner.clone(), capability, 100)
+            .unwrap();
+        execution
+            .mark_dispatched(&operation_id, &owner, 1, 110)
+            .unwrap();
+        execution
+            .mark_indeterminate(
+                &operation_id,
+                &owner,
+                1,
+                crate::v2_execution_safety::IndeterminateReason::BackendOutcomeUnproven,
+                120,
+            )
+            .unwrap();
+        let mut registry_snapshot = registry.snapshot();
+        registry_snapshot
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+            .unwrap()
+            .generation = current_device_generation;
+        let state = HubPersistentState {
+            schema_version: M1_STATE_SCHEMA_VERSION,
+            registry: registry_snapshot,
+            execution: execution
+                .snapshot_for_restart_compatible_with(
+                    MIN_RETIREMENT_SOURCE_EXECUTION_SCHEMA_VERSION,
+                )
+                .unwrap(),
+        };
+        CheckpointStore::new(state_dir.to_path_buf(), "hub")
+            .unwrap()
+            .save(&state)
             .unwrap();
         (device_id, operation_id)
     }
@@ -987,6 +1322,268 @@ mod tests {
         assert!(!serialized.contains("owner"));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), checkpoint_count);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retirement_inspection_and_offline_transition_preserve_unknown_outcome_without_replay() {
+        let dir = test_dir("retire-unknown");
+        let (device_id, operation_id) =
+            seed_retirable_quarantine(&dir, DeviceCapability::Scroll, 2);
+
+        let before = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        assert_eq!(before.quarantines.len(), 1);
+        let inspection = &before.quarantines[0];
+        assert_eq!(inspection.blocking_operation_id, operation_id);
+        assert_eq!(inspection.device_generation, 1);
+        assert_eq!(inspection.current_device_generation, Some(2));
+        assert_eq!(inspection.capability, "scroll");
+        assert_eq!(inspection.execution_outcome, "indeterminate");
+        assert_eq!(inspection.retirement_eligibility, "eligible");
+        assert_eq!(
+            inspection.retirement_policy.as_deref(),
+            Some("transient_ui_interaction_v1")
+        );
+        assert_eq!(
+            inspection.recommended_action,
+            "retire_with_local_maintenance_authorization"
+        );
+
+        let audit_reason =
+            "legacy transient UI outcome permanently unknowable; retired without replay";
+        let result = retire_indeterminate_offline_at(
+            &dir,
+            &operation_id,
+            RetirementPolicy::TransientUiInteractionV1,
+            audit_reason.into(),
+            200,
+        )
+        .unwrap();
+        assert_eq!(result.retirement.operation.operation_id, operation_id);
+        assert_eq!(result.retirement.authorized_device_generation, 2);
+        assert_eq!(
+            result.retirement.outcome,
+            crate::v2_execution_safety::RetirementOutcome::Unknown
+        );
+        assert!(!result.retirement.replayed);
+
+        let latest = CheckpointStore::new(dir.clone(), "hub")
+            .unwrap()
+            .load_latest::<HubPersistentState>()
+            .unwrap();
+        assert_eq!(
+            latest.execution.schema_version,
+            EXECUTION_SAFETY_SCHEMA_VERSION
+        );
+        let (_registry, mut execution) = latest
+            .restore(AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 2,
+            })
+            .unwrap();
+        assert!(execution.quarantine(&device_id).is_none());
+        assert_eq!(
+            execution.state(&operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(execution.receipt(&operation_id).is_none());
+        assert_eq!(execution.retirements().len(), 1);
+        assert_eq!(
+            execution.prepare(
+                OperationRef {
+                    device_id: device_id.clone(),
+                    device_generation: 2,
+                    operation_id: operation_id.clone(),
+                },
+                OperationOwner::new("https://issuer.example", "alice").unwrap(),
+                DeviceCapability::Scroll,
+                210,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert!(
+            execution
+                .prepare(
+                    OperationRef {
+                        device_id: device_id.clone(),
+                        device_generation: 2,
+                        operation_id: "op_fresh_after_retirement".into(),
+                    },
+                    OperationOwner::new("https://issuer.example", "alice").unwrap(),
+                    DeviceCapability::Scroll,
+                    210,
+                )
+                .is_ok()
+        );
+
+        let after = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        assert!(after.quarantines.is_empty());
+        let history = inspect_auto_resolutions_read_only(&dir, Some(&device_id)).unwrap();
+        assert_eq!(history.retired_indeterminate.len(), 1);
+        let retired = &history.retired_indeterminate[0];
+        assert_eq!(retired.operation_id, operation_id);
+        assert_eq!(retired.execution_outcome, "indeterminate");
+        assert_eq!(retired.operational_disposition, "retired");
+        assert_eq!(retired.retirement_policy, "transient_ui_interaction_v1");
+        assert_eq!(retired.authority, "local_maintenance_operator");
+        assert!(retired.reason_present);
+        assert!(!retired.replayed);
+        assert!(!retired.quarantine_active);
+        let serialized_history = serde_json::to_string(&history).unwrap();
+        assert!(!serialized_history.contains(audit_reason));
+        assert!(!serialized_history.contains("https://issuer.example"));
+        assert!(!serialized_history.contains("alice"));
+
+        let before_duplicate_count = std::fs::read_dir(&dir).unwrap().count();
+        assert!(
+            retire_indeterminate_offline_at(
+                &dir,
+                &operation_id,
+                RetirementPolicy::TransientUiInteractionV1,
+                "duplicate retirement".into(),
+                220,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            before_duplicate_count
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offline_retirement_requires_newer_generation_and_policy_eligible_capability() {
+        let stale_dir = test_dir("retire-stale-generation");
+        let (stale_device, stale_operation) =
+            seed_retirable_quarantine(&stale_dir, DeviceCapability::Scroll, 1);
+        let stale_inspection =
+            inspect_quarantines_read_only(&stale_dir, Some(&stale_device)).unwrap();
+        assert_eq!(
+            stale_inspection.quarantines[0].retirement_eligibility,
+            "requires_newer_generation"
+        );
+        let checkpoint_count = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("hub-") && name.ends_with(".json"))
+                })
+                .count()
+        };
+        let stale_count = checkpoint_count(&stale_dir);
+        assert!(
+            retire_indeterminate_offline_at(
+                &stale_dir,
+                &stale_operation,
+                RetirementPolicy::TransientUiInteractionV1,
+                "stale generation must fail closed".into(),
+                200,
+            )
+            .is_err()
+        );
+        assert_eq!(checkpoint_count(&stale_dir), stale_count);
+        assert_eq!(
+            inspect_quarantines_read_only(&stale_dir, Some(&stale_device))
+                .unwrap()
+                .quarantines
+                .len(),
+            1
+        );
+
+        let shell_dir = test_dir("retire-shell-ineligible");
+        let (shell_device, shell_operation) =
+            seed_retirable_quarantine(&shell_dir, DeviceCapability::Shell, 2);
+        let shell_inspection =
+            inspect_quarantines_read_only(&shell_dir, Some(&shell_device)).unwrap();
+        assert_eq!(
+            shell_inspection.quarantines[0].retirement_eligibility,
+            "ineligible_policy"
+        );
+        let shell_count = checkpoint_count(&shell_dir);
+        assert!(
+            retire_indeterminate_offline_at(
+                &shell_dir,
+                &shell_operation,
+                RetirementPolicy::TransientUiInteractionV1,
+                "dangerous operation must remain quarantined".into(),
+                200,
+            )
+            .is_err()
+        );
+        assert_eq!(checkpoint_count(&shell_dir), shell_count);
+        assert_eq!(
+            inspect_quarantines_read_only(&shell_dir, Some(&shell_device))
+                .unwrap()
+                .quarantines
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(stale_dir);
+        let _ = std::fs::remove_dir_all(shell_dir);
+    }
+
+    #[test]
+    fn retirement_persistence_failure_leaves_last_committed_quarantine_authoritative() {
+        let dir = test_dir("retire-persistence-failure");
+        let (device_id, operation_id) =
+            seed_retirable_quarantine(&dir, DeviceCapability::Scroll, 2);
+        let checkpoint_count = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("hub-") && name.ends_with(".json"))
+                })
+                .count()
+        };
+        let before = checkpoint_count();
+        let error = retire_indeterminate_offline_at_with_commit(
+            &dir,
+            &operation_id,
+            RetirementPolicy::TransientUiInteractionV1,
+            "candidate must not become authoritative when commit fails".into(),
+            200,
+            |_checkpoint, _candidate| Err(PersistenceError::CheckpointTooLarge),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MaintenanceError::Persistence(PersistenceError::CheckpointTooLarge)
+        ));
+        assert_eq!(checkpoint_count(), before);
+        let inspection = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        assert_eq!(inspection.quarantines.len(), 1);
+        assert_eq!(
+            inspection.quarantines[0].blocking_operation_id,
+            operation_id
+        );
+        let history = inspect_auto_resolutions_read_only(&dir, Some(&device_id)).unwrap();
+        assert!(history.retired_indeterminate.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offline_retirement_refuses_when_state_directory_is_owned() {
+        let dir = test_dir("retire-busy");
+        let (_, operation_id) = seed_retirable_quarantine(&dir, DeviceCapability::Scroll, 2);
+        let _hub_lock = StateDirectoryLock::acquire(&dir).unwrap();
+        assert!(matches!(
+            retire_indeterminate_offline_at(
+                &dir,
+                &operation_id,
+                RetirementPolicy::TransientUiInteractionV1,
+                "must require exclusive maintenance authority".into(),
+                200,
+            ),
+            Err(MaintenanceError::StateLock(StateDirectoryLockError::Busy))
+        ));
     }
 
     #[test]

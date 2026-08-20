@@ -99,9 +99,29 @@ v2_maint inspect-reconciliation-history \
   --state-dir /var/lib/cumg-v2/hub
 ```
 
-Add `--device-id DEVICE_ID` to filter by stable device. History is bounded to 64 entries and reports safe fields such as operation/device/generation, capability, terminal/evidence class, `reconciliation_status=auto_resolved`, resolution timestamp, and `replayed=false`.
+Add `--device-id DEVICE_ID` to filter by stable device. Auto-resolution history and retired-indeterminate history are each bounded to 64 entries and report only safe fields such as operation/device/generation, capability, terminal/evidence or retirement class, resolution/retirement timestamp, and `replayed=false`.
 
-This feature requires capability schema v5 on both Hub and Agent. Upgrade the pair together. Mixed old/new peers fail the capability-schema handshake closed rather than attempting a partially compatible session. Execution-safety checkpoint restore remains compatible with schemas v1/v2/v3 when those checkpoints do not claim v4-only fields; downgrading a state that already contains v4 dispatch/reconciliation metadata is intentionally rejected.
+This feature requires capability schema v5 on both Hub and Agent. Upgrade the pair together. Mixed old/new peers fail the capability-schema handshake closed rather than attempting a partially compatible session. Execution-safety checkpoint restore remains compatible with schemas v1/v2/v3/v4 when those checkpoints stay within their representational limits; downgrading a state that already contains v4 dispatch/reconciliation metadata or v5 retirement state is intentionally rejected.
+
+### Unknown-outcome retirement for permanently unknowable legacy ambiguity
+
+Execution-safety schema v5 adds a separate retirement path for a narrow class of legacy `Indeterminate` operations whose historical outcome can no longer be established truthfully. This is **not** a resolution and does not mean completed, failed, cancelled, or not-executed. `inspect-quarantine` reports `execution_outcome=indeterminate`, the current durable device generation, `retirement_eligibility`, the reviewed `retirement_policy`, and a bounded `recommended_action`. The initial policy allows only `scroll` and pointer movement; every other capability, including shell/process and other higher-impact effects, remains ineligible by default. Eligibility also requires a recorded dispatch, `operator_required` or `unrecoverable_evidence_gap`, and a durable device generation strictly newer than the original operation generation.
+
+If and only if inspection reports `retirement_eligibility=eligible`, install `v2_hub` and `v2_maint` from the same reviewed schema-v5 build, stop `v2_hub` completely, and use the exclusive offline maintenance path:
+
+```bash
+v2_maint retire-indeterminate \
+  --state-dir /var/lib/cumg-v2/hub \
+  --operation-id op_... \
+  --policy transient_ui_interaction_v1 \
+  --reason "legacy transient UI outcome permanently unknowable; retired without replay"
+```
+
+The policy must be named explicitly so an existing runbook can never opt into a future retirement policy merely because the binary gained one. The reason is bounded audit metadata; never include raw commands, results, desktop content, URLs, credentials, tokens, or secrets. A successful retirement appends a schema-v5 execution checkpoint before the prior checkpoint stops being authoritative. The operation itself remains `Indeterminate` with no terminal receipt, its exact operation ID remains permanently non-replayable, and the retirement record preserves `outcome=unknown`, original/authorizing generations, capability/policy, prior reconciliation state, local-maintenance authority, timestamp, and `replayed=false`. Only the device quarantine is removed. The old command is never reconstructed, re-signed, resumed, retried, or dispatched. Any later requested work uses a fresh operation ID and ordinary authorization/admission.
+
+Retirement intentionally creates state that execution-safety schema v4 cannot represent. After a successful retirement, do not roll back to an older Hub binary while keeping the new checkpoint. A binary rollback requires restoring the pre-retirement checkpoint as well, which also restores the original quarantine. A failed checkpoint publication leaves the previous quarantined checkpoint authoritative. `inspect-reconciliation-history` includes a privacy-bounded `retired_indeterminate` history entry and never prints the operator reason text.
+
+Do not use retirement as a substitute for independent evidence. When authoritative/independent evidence proves a terminal outcome, use self-reconciliation or explicit `confirmed_completed` / `confirmed_not_executed` resolution instead. Retirement exists only for the distinct case where the outcome remains permanently unknown but the reviewed low-impact operation can be abandoned without replay. The `Scroll`/`MovePointer` allowlist is a risk policy, not a claim that every application treats those inputs as side-effect-free or idempotent. An application may attach its own state changes to input events; authorizing retirement explicitly accepts that historical uncertainty. The strictly newer Agent generation invalidates prior interaction contexts/scoped refs, and quarantine has already cancelled queued pre-ambiguity work, so later effectful work must be newly admitted rather than continuing the old operation chain.
 
 ### Offline quarantine resolution
 
