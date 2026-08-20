@@ -162,6 +162,20 @@ impl HubPersistentState {
         let execution =
             AuthoritativeOperationController::restore_after_restart(limits, self.execution)
                 .map_err(PersistenceError::Execution)?;
+        let registry_snapshot = registry.snapshot();
+        if execution.retirements().iter().any(|retirement| {
+            registry_snapshot
+                .devices
+                .iter()
+                .find(|device| device.device_id == retirement.operation.device_id)
+                .is_none_or(|device| {
+                    device.generation < retirement.authorized_device_generation
+                        || retirement.authorized_device_generation
+                            <= retirement.operation.device_generation
+                })
+        }) {
+            return Err(PersistenceError::InvalidState);
+        }
         Ok((registry, execution))
     }
 }

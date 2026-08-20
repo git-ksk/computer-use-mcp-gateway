@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 4;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 5;
+const RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 4;
 const AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 3;
 const RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 2;
 const LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 1;
@@ -35,6 +36,8 @@ pub const MAX_RECONCILIATION_DEVICE_ID_BYTES: usize = 128;
 pub const MAX_RECONCILIATION_OPERATION_ID_BYTES: usize = 128;
 pub const MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES: usize = 64;
 pub const MAX_AUTO_RESOLUTION_RECORDS: usize = 64;
+pub const MAX_RETIREMENT_REASON_BYTES: usize = 1024;
+pub const MAX_RETIREMENT_RECORDS: usize = 64;
 pub const REQUEST_FINGERPRINT_ALGORITHM: &str = "hmac-sha256:cumg-v2-shell-process-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -115,6 +118,35 @@ pub enum ReconciliationStatus {
     AutoResolved,
     OperatorRequired,
     UnrecoverableEvidenceGap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetirementOutcome {
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetirementPolicy {
+    TransientUiInteractionV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetirementAuthority {
+    LocalMaintenanceOperator,
+}
+
+pub const fn retirement_policy_for_capability(
+    capability: DeviceCapability,
+) -> Option<RetirementPolicy> {
+    match capability {
+        DeviceCapability::Scroll | DeviceCapability::MovePointer => {
+            Some(RetirementPolicy::TransientUiInteractionV1)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +504,46 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetirementRecord {
+    pub operation: OperationRef,
+    pub capability: DeviceCapability,
+    pub outcome: RetirementOutcome,
+    pub indeterminate_reason: IndeterminateReason,
+    pub prior_reconciliation_status: ReconciliationStatus,
+    pub policy: RetirementPolicy,
+    pub authority: RetirementAuthority,
+    /// Bounded operator-supplied retirement rationale. Never include raw command,
+    /// result, desktop content, credentials, URLs, or other sensitive payloads.
+    pub reason: String,
+    /// Current durable device generation observed by local maintenance when the
+    /// older operation generation was permanently fenced from resumption.
+    pub authorized_device_generation: u64,
+    pub retired_at_ms: u64,
+    pub replayed: bool,
+}
+
+impl RetirementRecord {
+    fn is_valid(&self) -> bool {
+        !self.operation.device_id.trim().is_empty()
+            && self.operation.device_id.len() <= MAX_RECONCILIATION_DEVICE_ID_BYTES
+            && self.operation.device_generation > 0
+            && !self.operation.operation_id.trim().is_empty()
+            && self.operation.operation_id.len() <= MAX_RECONCILIATION_OPERATION_ID_BYTES
+            && self.outcome == RetirementOutcome::Unknown
+            && matches!(
+                self.prior_reconciliation_status,
+                ReconciliationStatus::OperatorRequired
+                    | ReconciliationStatus::UnrecoverableEvidenceGap
+            )
+            && retirement_policy_for_capability(self.capability) == Some(self.policy)
+            && !self.reason.trim().is_empty()
+            && self.reason.len() <= MAX_RETIREMENT_REASON_BYTES
+            && self.authorized_device_generation > self.operation.device_generation
+            && !self.replayed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolutionRecord {
     pub operation_id: String,
     pub device_id: String,
@@ -626,6 +698,8 @@ pub struct AuthoritativeSafetySnapshot {
     pub resolutions: Vec<ResolutionRecord>,
     #[serde(default)]
     pub auto_resolutions: Vec<AutoResolutionRecord>,
+    #[serde(default)]
+    pub retirements: Vec<RetirementRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +734,7 @@ pub struct AuthoritativeOperationController {
     quarantines: HashMap<String, DesktopQuarantine>,
     resolutions: Vec<ResolutionRecord>,
     auto_resolutions: Vec<AutoResolutionRecord>,
+    retirements: Vec<RetirementRecord>,
 }
 
 impl AuthoritativeOperationController {
@@ -671,6 +746,7 @@ impl AuthoritativeOperationController {
             quarantines: HashMap::new(),
             resolutions: Vec::new(),
             auto_resolutions: Vec::new(),
+            retirements: Vec::new(),
         })
     }
 
@@ -702,6 +778,10 @@ impl AuthoritativeOperationController {
     ) -> Result<AdmissionDecision, ExecutionError> {
         if self.operations.contains_key(&operation.operation_id)
             || self.recovery_archive.contains_key(&operation.operation_id)
+            || self
+                .retirements
+                .iter()
+                .any(|retirement| retirement.operation.operation_id == operation.operation_id)
         {
             return Err(ExecutionError::OperationReplay);
         }
@@ -1120,6 +1200,94 @@ impl AuthoritativeOperationController {
         Ok((next, receipt))
     }
 
+    /// Retire a permanently unknowable, policy-eligible indeterminate operation
+    /// without asserting a synthetic execution outcome. Retirement is allowed
+    /// only after a strictly newer durable device generation fences the original
+    /// session and only for a reviewed capability allowlist.
+    pub fn retire_indeterminate(
+        &mut self,
+        operation_id: &str,
+        authority: RetirementAuthority,
+        requested_policy: RetirementPolicy,
+        reason: impl Into<String>,
+        authorized_device_generation: u64,
+        now_ms: u64,
+    ) -> Result<(CompletionDecision, RetirementRecord), ExecutionError> {
+        let reason = reason.into();
+        if reason.trim().is_empty() || reason.len() > MAX_RETIREMENT_REASON_BYTES {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        if self.retirements.len() >= MAX_RETIREMENT_RECORDS
+            || self
+                .retirements
+                .iter()
+                .any(|retirement| retirement.operation.operation_id == operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let record = self
+            .operations
+            .get(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if record.state != HubOperationState::Indeterminate
+            || record.dispatched_at_ms.is_none()
+            || record.receipt.is_some()
+            || record.recoverable_result.is_some()
+            || authorized_device_generation <= record.operation.device_generation
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let prior_reconciliation_status = record
+            .reconciliation_status
+            .unwrap_or(ReconciliationStatus::OperatorRequired);
+        if !matches!(
+            prior_reconciliation_status,
+            ReconciliationStatus::OperatorRequired | ReconciliationStatus::UnrecoverableEvidenceGap
+        ) {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let policy = retirement_policy_for_capability(record.capability)
+            .ok_or(ExecutionError::InvalidTransition)?;
+        if policy != requested_policy {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let indeterminate_reason = record
+            .indeterminate_reason
+            .ok_or(ExecutionError::InvalidTransition)?;
+        let quarantine = self
+            .quarantines
+            .get(&record.operation.device_id)
+            .ok_or(ExecutionError::InvalidTransition)?;
+        if quarantine.operation_id != operation_id
+            || quarantine.device_generation != record.operation.device_generation
+            || quarantine.reason != indeterminate_reason
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let retirement = RetirementRecord {
+            operation: record.operation.clone(),
+            capability: record.capability,
+            outcome: RetirementOutcome::Unknown,
+            indeterminate_reason,
+            prior_reconciliation_status,
+            policy,
+            authority,
+            reason,
+            authorized_device_generation,
+            retired_at_ms: now_ms,
+            replayed: false,
+        };
+        if !retirement.is_valid() {
+            return Err(ExecutionError::InvalidTransition);
+        }
+
+        let next = self.admission.retire_indeterminate(operation_id)?;
+        self.quarantines.remove(&retirement.operation.device_id);
+        self.retirements.push(retirement.clone());
+        self.activate_next(&next);
+        Ok((next, retirement))
+    }
+
     pub fn state(&self, operation_id: &str) -> Option<HubOperationState> {
         self.operations.get(operation_id).map(|record| record.state)
     }
@@ -1268,6 +1436,10 @@ impl AuthoritativeOperationController {
 
     pub fn auto_resolutions(&self) -> &[AutoResolutionRecord] {
         &self.auto_resolutions
+    }
+
+    pub fn retirements(&self) -> &[RetirementRecord] {
+        &self.retirements
     }
 
     pub fn prune_terminal_before_generation(
@@ -1447,6 +1619,7 @@ impl AuthoritativeOperationController {
             quarantines,
             resolutions: self.resolutions.clone(),
             auto_resolutions: self.auto_resolutions.clone(),
+            retirements: self.retirements.clone(),
         }
     }
 
@@ -1466,13 +1639,44 @@ impl AuthoritativeOperationController {
                 record.dispatch_binding.is_some() || record.reconciliation_status.is_some()
             });
         let mut snapshot = self.snapshot_for_restart();
+        let has_v5_state = !snapshot.retirements.is_empty()
+            || !snapshot
+                .admission
+                .retired_indeterminate_operation_ids
+                .is_empty();
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v5_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                snapshot.retirements.clear();
+                snapshot
+                    .admission
+                    .retired_indeterminate_operation_ids
+                    .clear();
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version =
+                        RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v4_state {
+                if has_v4_state || has_v5_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.auto_resolutions.clear();
+                snapshot.retirements.clear();
+                snapshot
+                    .admission
+                    .retired_indeterminate_operation_ids
+                    .clear();
                 for record in &mut snapshot.operations {
                     record.dispatch_binding = None;
                     record.reconciliation_status = None;
@@ -1488,6 +1692,7 @@ impl AuthoritativeOperationController {
             }
             RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION => {
                 if has_v4_state
+                    || has_v5_state
                     || snapshot.operations.iter().any(|record| {
                         !record.audit.is_empty() || record.request_fingerprint.is_some()
                     })
@@ -1495,6 +1700,11 @@ impl AuthoritativeOperationController {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.auto_resolutions.clear();
+                snapshot.retirements.clear();
+                snapshot
+                    .admission
+                    .retired_indeterminate_operation_ids
+                    .clear();
                 for record in &mut snapshot.operations {
                     record.dispatch_binding = None;
                     record.reconciliation_status = None;
@@ -1510,6 +1720,7 @@ impl AuthoritativeOperationController {
             }
             LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION => {
                 if has_v4_state
+                    || has_v5_state
                     || !snapshot.recoveries.is_empty()
                     || snapshot.operations.iter().any(|record| {
                         record.recoverable_result.is_some()
@@ -1520,6 +1731,11 @@ impl AuthoritativeOperationController {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.auto_resolutions.clear();
+                snapshot.retirements.clear();
+                snapshot
+                    .admission
+                    .retired_indeterminate_operation_ids
+                    .clear();
                 for record in &mut snapshot.operations {
                     record.dispatch_binding = None;
                     record.reconciliation_status = None;
@@ -1543,6 +1759,7 @@ impl AuthoritativeOperationController {
             LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION
                 | RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
                 | AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION
+                | RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -1555,10 +1772,19 @@ impl AuthoritativeOperationController {
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION
             && (snapshot.operations.iter().any(|record| {
                 record.dispatch_binding.is_some() || record.reconciliation_status.is_some()
             }) || !snapshot.auto_resolutions.is_empty())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && (!snapshot.retirements.is_empty()
+                || !snapshot
+                    .admission
+                    .retired_indeterminate_operation_ids
+                    .is_empty())
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -1571,6 +1797,10 @@ impl AuthoritativeOperationController {
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
+        let admission_retired_ids = snapshot
+            .admission
+            .retired_indeterminate_operation_ids
+            .clone();
         let admission = HubAdmissionController::restore_after_restart(limits, snapshot.admission)?;
         let mut operations = HashMap::new();
         for record in snapshot.operations {
@@ -1673,12 +1903,63 @@ impl AuthoritativeOperationController {
                 return Err(ExecutionError::InvalidSnapshot);
             }
         }
-        for record in operations.values() {
-            if record.state == HubOperationState::Indeterminate
-                && !quarantines.contains_key(&record.operation.device_id)
+        let mut retirement_ids = std::collections::HashSet::new();
+        for retirement in &snapshot.retirements {
+            if !retirement.is_valid()
+                || !retirement_ids.insert(retirement.operation.operation_id.clone())
+                || snapshot
+                    .resolutions
+                    .iter()
+                    .any(|resolution| resolution.operation_id == retirement.operation.operation_id)
+                || snapshot.auto_resolutions.iter().any(|resolution| {
+                    resolution.operation.operation_id == retirement.operation.operation_id
+                })
             {
                 return Err(ExecutionError::InvalidSnapshot);
             }
+            let Some(record) = operations.get(&retirement.operation.operation_id) else {
+                return Err(ExecutionError::InvalidSnapshot);
+            };
+            if record.state != HubOperationState::Indeterminate
+                || record.operation != retirement.operation
+                || record.capability != retirement.capability
+                || record.indeterminate_reason != Some(retirement.indeterminate_reason)
+                || record
+                    .reconciliation_status
+                    .unwrap_or(ReconciliationStatus::OperatorRequired)
+                    != retirement.prior_reconciliation_status
+                || record.receipt.is_some()
+                || record.recoverable_result.is_some()
+                || quarantines
+                    .values()
+                    .any(|quarantine| quarantine.operation_id == retirement.operation.operation_id)
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+        }
+        let admission_retired_ids: std::collections::HashSet<_> =
+            admission_retired_ids.into_iter().collect();
+        if admission_retired_ids != retirement_ids {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        for record in operations.values() {
+            if record.state == HubOperationState::Indeterminate {
+                let retired = retirement_ids.contains(&record.operation.operation_id);
+                let matching_quarantine =
+                    quarantines
+                        .get(&record.operation.device_id)
+                        .is_some_and(|quarantine| {
+                            quarantine.operation_id == record.operation.operation_id
+                                && quarantine.device_generation
+                                    == record.operation.device_generation
+                        });
+                if retired == matching_quarantine {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+            }
+        }
+        if snapshot.retirements.len() > MAX_RETIREMENT_RECORDS {
+            return Err(ExecutionError::InvalidSnapshot);
         }
         if snapshot.auto_resolutions.len() > MAX_AUTO_RESOLUTION_RECORDS
             || snapshot
@@ -1738,6 +2019,7 @@ impl AuthoritativeOperationController {
             quarantines,
             resolutions: snapshot.resolutions,
             auto_resolutions: snapshot.auto_resolutions,
+            retirements: snapshot.retirements,
         })
     }
 
@@ -2852,6 +3134,337 @@ mod tests {
                     max_queued_per_device: 8,
                 },
                 forged_v2,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn policy_eligible_unknown_scroll_can_retire_without_replay_or_synthetic_outcome() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 8,
+        };
+        let mut ledger = AuthoritativeOperationController::new(limits).unwrap();
+        ledger
+            .prepare(
+                op("op-retire-scroll", 4),
+                alice(),
+                DeviceCapability::Scroll,
+                100,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-retire-scroll", &alice(), 4, 110)
+            .unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-retire-scroll",
+                &alice(),
+                4,
+                IndeterminateReason::BackendOutcomeUnproven,
+                120,
+            )
+            .unwrap();
+
+        let (_next, retirement) = ledger
+            .retire_indeterminate(
+                "op-retire-scroll",
+                RetirementAuthority::LocalMaintenanceOperator,
+                RetirementPolicy::TransientUiInteractionV1,
+                "legacy transient UI outcome permanently unknowable",
+                5,
+                130,
+            )
+            .unwrap();
+        assert_eq!(retirement.outcome, RetirementOutcome::Unknown);
+        assert_eq!(
+            retirement.policy,
+            RetirementPolicy::TransientUiInteractionV1
+        );
+        assert_eq!(retirement.authorized_device_generation, 5);
+        assert!(!retirement.replayed);
+        assert_eq!(
+            ledger.state("op-retire-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(ledger.receipt("op-retire-scroll").is_none());
+        assert!(ledger.quarantine("desktop-a").is_none());
+        assert_eq!(ledger.retirements(), &[retirement.clone()]);
+
+        assert_eq!(
+            ledger.resolve_indeterminate(
+                "op-retire-scroll",
+                bob(),
+                IndeterminateResolution::ConfirmedCompleted,
+                "must not synthesize completion after retirement",
+                140,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert_eq!(
+            ledger.retire_indeterminate(
+                "op-retire-scroll",
+                RetirementAuthority::LocalMaintenanceOperator,
+                RetirementPolicy::TransientUiInteractionV1,
+                "duplicate",
+                6,
+                141,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert_eq!(
+            ledger.prepare(
+                op("op-retire-scroll", 5),
+                alice(),
+                DeviceCapability::Scroll,
+                150,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert!(
+            ledger
+                .prepare(
+                    op("op-fresh-after-retirement", 5),
+                    alice(),
+                    DeviceCapability::Scroll,
+                    150,
+                )
+                .is_ok()
+        );
+
+        let snapshot = ledger.snapshot_for_restart();
+        let mut restored =
+            AuthoritativeOperationController::restore_after_restart(limits, snapshot).unwrap();
+        assert_eq!(
+            restored.state("op-retire-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(restored.quarantine("desktop-a").is_none());
+        assert_eq!(restored.retirements().len(), 1);
+        assert_eq!(
+            restored
+                .prune_terminal_before_generation("desktop-a", 100)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            restored.state("op-retire-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+    }
+
+    #[test]
+    fn retirement_requires_newer_generation_and_rejects_high_impact_capabilities() {
+        let mut stale = controller();
+        stale
+            .prepare(
+                op("op-stale-retire", 7),
+                alice(),
+                DeviceCapability::Scroll,
+                1,
+            )
+            .unwrap();
+        stale
+            .mark_dispatched("op-stale-retire", &alice(), 7, 2)
+            .unwrap();
+        stale
+            .mark_indeterminate(
+                "op-stale-retire",
+                &alice(),
+                7,
+                IndeterminateReason::BackendOutcomeUnproven,
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            stale.retire_indeterminate(
+                "op-stale-retire",
+                RetirementAuthority::LocalMaintenanceOperator,
+                RetirementPolicy::TransientUiInteractionV1,
+                "not yet fenced",
+                7,
+                4,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert!(stale.quarantine("desktop-a").is_some());
+
+        let mut dangerous = controller();
+        dangerous
+            .prepare(
+                op("op-shell-unknown", 3),
+                alice(),
+                DeviceCapability::Shell,
+                10,
+            )
+            .unwrap();
+        dangerous
+            .mark_dispatched("op-shell-unknown", &alice(), 3, 11)
+            .unwrap();
+        dangerous
+            .mark_indeterminate(
+                "op-shell-unknown",
+                &alice(),
+                3,
+                IndeterminateReason::BackendOutcomeUnproven,
+                12,
+            )
+            .unwrap();
+        assert_eq!(
+            dangerous.retire_indeterminate(
+                "op-shell-unknown",
+                RetirementAuthority::LocalMaintenanceOperator,
+                RetirementPolicy::TransientUiInteractionV1,
+                "high impact must fail closed",
+                4,
+                13,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert!(dangerous.quarantine("desktop-a").is_some());
+        assert!(dangerous.retirements().is_empty());
+    }
+
+    #[test]
+    fn retirement_history_is_bounded_and_capacity_exhaustion_fails_closed() {
+        let mut ledger = controller();
+        for index in 0..MAX_RETIREMENT_RECORDS {
+            let generation = u64::try_from(index).unwrap() + 1;
+            let operation_id = format!("op-retirement-bounded-{index}");
+            ledger
+                .prepare(
+                    op(&operation_id, generation),
+                    alice(),
+                    DeviceCapability::Scroll,
+                    generation * 10,
+                )
+                .unwrap();
+            ledger
+                .mark_dispatched(&operation_id, &alice(), generation, generation * 10 + 1)
+                .unwrap();
+            ledger
+                .mark_indeterminate(
+                    &operation_id,
+                    &alice(),
+                    generation,
+                    IndeterminateReason::BackendOutcomeUnproven,
+                    generation * 10 + 2,
+                )
+                .unwrap();
+            ledger
+                .retire_indeterminate(
+                    &operation_id,
+                    RetirementAuthority::LocalMaintenanceOperator,
+                    RetirementPolicy::TransientUiInteractionV1,
+                    "bounded retirement audit",
+                    generation + 1,
+                    generation * 10 + 3,
+                )
+                .unwrap();
+        }
+        assert_eq!(ledger.retirements().len(), MAX_RETIREMENT_RECORDS);
+
+        let overflow_generation = u64::try_from(MAX_RETIREMENT_RECORDS).unwrap() + 1;
+        ledger
+            .prepare(
+                op("op-retirement-overflow", overflow_generation),
+                alice(),
+                DeviceCapability::Scroll,
+                10_000,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched(
+                "op-retirement-overflow",
+                &alice(),
+                overflow_generation,
+                10_001,
+            )
+            .unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-retirement-overflow",
+                &alice(),
+                overflow_generation,
+                IndeterminateReason::BackendOutcomeUnproven,
+                10_002,
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.retire_indeterminate(
+                "op-retirement-overflow",
+                RetirementAuthority::LocalMaintenanceOperator,
+                RetirementPolicy::TransientUiInteractionV1,
+                "must fail closed instead of growing checkpoint state without bound",
+                overflow_generation + 1,
+                10_003,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert!(ledger.quarantine("desktop-a").is_some());
+        assert_eq!(ledger.retirements().len(), MAX_RETIREMENT_RECORDS);
+    }
+
+    #[test]
+    fn schema_v4_remains_readable_but_cannot_claim_v5_retirement_state() {
+        let mut source = controller();
+        source
+            .prepare(op("op-v4-scroll", 4), alice(), DeviceCapability::Scroll, 1)
+            .unwrap();
+        source
+            .mark_dispatched("op-v4-scroll", &alice(), 4, 2)
+            .unwrap();
+        source
+            .mark_indeterminate(
+                "op-v4-scroll",
+                &alice(),
+                4,
+                IndeterminateReason::BackendOutcomeUnproven,
+                3,
+            )
+            .unwrap();
+        let v4 = source
+            .snapshot_for_restart_compatible_with(RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION)
+            .unwrap();
+        assert_eq!(
+            v4.schema_version,
+            RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION
+        );
+        let mut restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            v4,
+        )
+        .unwrap();
+        restored
+            .retire_indeterminate(
+                "op-v4-scroll",
+                RetirementAuthority::LocalMaintenanceOperator,
+                RetirementPolicy::TransientUiInteractionV1,
+                "upgrade to v5 retirement",
+                5,
+                4,
+            )
+            .unwrap();
+        assert!(matches!(
+            restored.snapshot_for_restart_compatible_with(
+                RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+
+        let mut forged_v4 = restored.snapshot_for_restart();
+        forged_v4.schema_version = RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION;
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                forged_v4,
             ),
             Err(ExecutionError::InvalidSnapshot)
         ));

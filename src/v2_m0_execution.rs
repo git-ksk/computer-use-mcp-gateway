@@ -83,6 +83,8 @@ pub struct HubOperationSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubAdmissionSnapshot {
     pub operations: Vec<HubOperationSnapshot>,
+    #[serde(default)]
+    pub retired_indeterminate_operation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,7 @@ pub struct HubAdmissionController {
     operations: HashMap<String, HubOperation>,
     queued_by_device: HashMap<String, VecDeque<OperationRef>>,
     blocked_by_indeterminate: HashMap<String, String>,
+    retired_indeterminate: HashSet<String>,
 }
 
 impl HubAdmissionController {
@@ -102,6 +105,7 @@ impl HubAdmissionController {
             operations: HashMap::new(),
             queued_by_device: HashMap::new(),
             blocked_by_indeterminate: HashMap::new(),
+            retired_indeterminate: HashSet::new(),
         })
     }
 
@@ -127,13 +131,31 @@ impl HubAdmissionController {
                 .operation_id
                 .cmp(&right.operation.operation_id)
         });
-        HubAdmissionSnapshot { operations }
+        let mut retired_indeterminate_operation_ids: Vec<_> =
+            self.retired_indeterminate.iter().cloned().collect();
+        retired_indeterminate_operation_ids.sort();
+        HubAdmissionSnapshot {
+            operations,
+            retired_indeterminate_operation_ids,
+        }
     }
 
     pub fn restore_after_restart(
         limits: AdmissionLimits,
         snapshot: HubAdmissionSnapshot,
     ) -> Result<Self, ExecutionError> {
+        let retired_indeterminate: HashSet<_> = snapshot
+            .retired_indeterminate_operation_ids
+            .iter()
+            .cloned()
+            .collect();
+        if retired_indeterminate.len() != snapshot.retired_indeterminate_operation_ids.len()
+            || retired_indeterminate
+                .iter()
+                .any(|operation_id| operation_id.trim().is_empty())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
         let mut controller = Self::new(limits)?;
         for persisted in snapshot.operations {
             if !matches!(
@@ -152,6 +174,7 @@ impl HubAdmissionController {
                 return Err(ExecutionError::InvalidSnapshot);
             }
             if persisted.state == HubOperationState::Indeterminate
+                && !retired_indeterminate.contains(&persisted.operation.operation_id)
                 && controller
                     .blocked_by_indeterminate
                     .insert(
@@ -170,6 +193,15 @@ impl HubAdmissionController {
                 },
             );
         }
+        if retired_indeterminate.iter().any(|operation_id| {
+            controller
+                .operations
+                .get(operation_id)
+                .is_none_or(|operation| operation.state != HubOperationState::Indeterminate)
+        }) {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        controller.retired_indeterminate = retired_indeterminate;
         Ok(controller)
     }
 
@@ -384,6 +416,38 @@ impl HubAdmissionController {
             IndeterminateResolution::ConfirmedNotExecuted => HubOperationState::Cancelled,
         };
         self.blocked_by_indeterminate.remove(&device_id);
+        Ok(self
+            .start_next_for_available_capacity(Some(&device_id))
+            .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
+    }
+
+    /// Retire an indeterminate operation without claiming a historical execution
+    /// outcome. The exact operation ID remains in the admission ledger forever,
+    /// but it no longer blocks new work for the device. This transition never
+    /// dispatches, retries, resumes, or reconstructs the old operation.
+    pub fn retire_indeterminate(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<CompletionDecision, ExecutionError> {
+        let operation = self
+            .operations
+            .get(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if operation.state != HubOperationState::Indeterminate
+            || self.retired_indeterminate.contains(operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let device_id = operation.operation.device_id.clone();
+        if self
+            .blocked_by_indeterminate
+            .get(&device_id)
+            .is_none_or(|blocked| blocked != operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        self.blocked_by_indeterminate.remove(&device_id);
+        self.retired_indeterminate.insert(operation_id.to_owned());
         Ok(self
             .start_next_for_available_capacity(Some(&device_id))
             .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
@@ -852,6 +916,62 @@ mod tests {
             Err(ExecutionError::DeviceIndeterminate {
                 operation_id: "ambiguous".into()
             })
+        );
+    }
+
+    #[test]
+    fn retired_indeterminate_remains_unknown_tombstoned_and_unblocked_across_restart() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 0,
+        };
+        let mut hub = HubAdmissionController::new(limits).unwrap();
+        hub.admit(op("dev-a", 4, "legacy-scroll")).unwrap();
+        hub.mark_dispatched("legacy-scroll").unwrap();
+        hub.mark_indeterminate("legacy-scroll").unwrap();
+
+        assert_eq!(
+            hub.retire_indeterminate("legacy-scroll").unwrap(),
+            CompletionDecision::Idle
+        );
+        assert_eq!(
+            hub.state("legacy-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert_eq!(
+            hub.admit(op("dev-a", 5, "legacy-scroll")),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert!(matches!(
+            hub.admit(op("dev-a", 5, "fresh-after-retirement")).unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+
+        hub.mark_dispatched("fresh-after-retirement").unwrap();
+        hub.complete("fresh-after-retirement", false).unwrap();
+        let snapshot = hub.snapshot_for_restart();
+        assert_eq!(
+            snapshot.retired_indeterminate_operation_ids,
+            vec!["legacy-scroll".to_owned()]
+        );
+        let mut restored = HubAdmissionController::restore_after_restart(limits, snapshot).unwrap();
+        assert_eq!(
+            restored.state("legacy-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(matches!(
+            restored
+                .admit(op("dev-a", 6, "fresh-after-restart"))
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        assert_eq!(
+            restored.admit(op("dev-a", 6, "legacy-scroll")),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert_eq!(
+            restored.retire_indeterminate("legacy-scroll"),
+            Err(ExecutionError::InvalidTransition)
         );
     }
 
