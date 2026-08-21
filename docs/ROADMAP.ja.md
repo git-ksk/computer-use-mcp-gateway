@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-08-15 時点の status: **V1 closed、V2 execution-safety baseline complete、current released version は `v0.2.0` です。**
+2026-08-21 時点の status: **V1 closed、V2 execution-safety baseline complete、current released version は `v0.2.0` です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -82,6 +82,32 @@ implementation は **issue-driven / PR-isolated** のまま、dependency を考�
 単独なら PATCH-compatible な change（例: `#65`、`#69`）でも、途中で `0.2.x` release を切る operational need がなければ `0.3.0` に初めて含めてよいものとします。SemVer classification は release 全体で判断し、含まれるすべての fix に minor bump が必要だとは解釈しません。一方で milestone を単一の巨大 implementation PR にはせず、各 issue は独立した acceptance evidence と review boundary を維持します。
 
 すべての issue が close しただけでは `0.3.0` accepted とはしません。release 前に、結果として得られる public / operator contract が後述の minor-release acceptance gate を満たす必要があります。documented V2 safety invariant を維持できない scope は、milestone 達成のために invariant を弱めるのではなく defer します。
+
+### `0.3.0` 後の candidate: multi-principal northbound identity
+
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は `0.3.0` Production Hardening closeout には**意図的に含めません**。operational-readiness work を close した後に扱う、次の northbound authentication expansion candidate とします。追跡 milestone は `Post-v0.3 — Multi-principal Northbound Identity` とし、この milestone 自体では release number を事前固定しません。
+
+target architecture は次です。
+
+```text
+external OAuth/OIDC identity provider
+        |
+verified signed token (provider boundary)
+        |
+generic OIDC/JWT adapter
+        |
+AuthenticatedClientPrincipal { issuer, subject }
+        |
+DeviceCapabilityAuthorizer
+        |
+principal -> stable device -> exact DeviceCapability
+```
+
+adapter は provider-neutral / fail-closed を維持します。signature、issuer、audience、time claim、subject、algorithm policy、bounded な JWKS/metadata rotation を検証した後にだけ既存 CUMG principal を生成します。caller-supplied identity header と MCP `clientInfo` は audit metadata のままで、authorization authority にはしません。
+
+この work により CUMG を identity provider、account database、session manager、token issuer にはしません。既存 RFC 7662 introspection と、明示的に single-principal とする trusted-proxy adapter は引き続き deployment option として維持します。signed-token deployment では、fixed-principal local proxy bridge が identity 確立だけのために存在する場合は取り除けます。一方、reverse proxy / tunnel は transport、origin hardening、rate limiting、defense in depth のために残して構いません。
+
+acceptance では少なくとも2つの verified subject が既存 `DeviceCapabilityAuthorizer` を通じて異なる exact device/capability decision を受けることを証明し、bad signature / issuer / audience / time / key / subject / algorithm は fail closed、既存 authentication adapter に regression がないことを要求します。
 
 ### Remaining semantic parity decisions
 

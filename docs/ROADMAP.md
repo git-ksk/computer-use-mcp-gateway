@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-08-15: **V1 closed, V2 execution-safety baseline complete, current released version `v0.2.0`.**
+Status as of 2026-08-21: **V1 closed, V2 execution-safety baseline complete, current released version `v0.2.0`.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -82,6 +82,32 @@ Implementation remains **issue-driven and PR-isolated**, in this preferred depen
 A change that is PATCH-compatible in isolation (for example `#65` or `#69`) may still ship first in `0.3.0` when no intervening `0.2.x` release is operationally necessary; SemVer classification is based on the release as a whole, not on forcing every included fix to require a minor bump. The milestone must not turn into one aggregate implementation PR: each issue retains its own acceptance evidence and review boundary.
 
 `0.3.0` is not accepted merely because every issue is closed. Before release, the resulting public/operator contract must satisfy the minor-release acceptance gate below, and any scope that cannot preserve the documented V2 safety invariants must be deferred rather than weakened to meet the milestone.
+
+### Post-`0.3.0` candidate: multi-principal northbound identity
+
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) is deliberately **not** part of the `0.3.0` Production Hardening closeout. It is the next admitted northbound-authentication expansion candidate after that operational-readiness work is closed. The tracking milestone is `Post-v0.3 — Multi-principal Northbound Identity`; the milestone intentionally does not pre-assign a release number.
+
+The target architecture is:
+
+```text
+external OAuth/OIDC identity provider
+        |
+verified signed token (provider boundary)
+        |
+generic OIDC/JWT adapter
+        |
+AuthenticatedClientPrincipal { issuer, subject }
+        |
+DeviceCapabilityAuthorizer
+        |
+principal -> stable device -> exact DeviceCapability
+```
+
+The adapter must remain provider-neutral and fail closed. It verifies signature, issuer, audience, time claims, subject, algorithm policy, and bounded JWKS/metadata rotation before producing the existing CUMG principal. Caller-supplied identity headers and MCP `clientInfo` remain audit metadata only and never become authorization authority.
+
+This work does **not** make CUMG an identity provider, account database, session manager, or token issuer. Existing RFC 7662 introspection and the explicitly single-principal trusted-proxy adapter remain supported deployment choices. A signed-token deployment may remove a fixed-principal local proxy bridge when that bridge exists only to establish identity; a reverse proxy or tunnel may still remain for transport, origin hardening, rate limiting, or defense in depth.
+
+Acceptance requires at least two verified subjects receiving different exact device/capability decisions through the existing `DeviceCapabilityAuthorizer`, with bad signature/issuer/audience/time/key/subject/algorithm cases failing closed and no regression to the existing authentication adapters.
 
 ### Remaining semantic parity decisions
 
