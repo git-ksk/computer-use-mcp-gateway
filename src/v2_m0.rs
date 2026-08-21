@@ -852,14 +852,24 @@ impl DeviceRegistry {
     pub(crate) fn from_persisted_snapshot(
         mut snapshot: DeviceRegistrySnapshot,
     ) -> Result<Self, ControlError> {
-        if snapshot.schema_version == DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION {
+        if snapshot.schema_version == DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION
+            && snapshot.devices.iter().all(|device| {
+                device.capabilities.as_ref().is_none_or(|capabilities| {
+                    capabilities.capability_schema_version == CAPABILITY_SCHEMA_VERSION
+                })
+            })
+        {
             return Self::from_snapshot(snapshot);
         }
 
+        // Registry schema 7 was already persisted while capability schema 4 was
+        // current. Treat that exact historical pairing like the older persisted
+        // formats: validate it, discard stale capability advertisements, and
+        // require the Agent to advertise the current schema after reconnect.
         let expected_capability_schema = match snapshot.schema_version {
             2 => 2,
             3 => 3,
-            4..=6 => 4,
+            4..=DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION => 4,
             got => return Err(ControlError::UnsupportedControlSchema { got }),
         };
         for device in &snapshot.devices {
@@ -2644,7 +2654,9 @@ mod tests {
         registry.connect(&device_id, capabilities(5)).unwrap();
         let current = registry.snapshot();
 
-        for (legacy_schema, legacy_capability_schema) in [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4)] {
+        for (legacy_schema, legacy_capability_schema) in
+            [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4), (7, 4)]
+        {
             let mut legacy = current.clone();
             legacy.schema_version = legacy_schema;
             legacy.devices[0]
