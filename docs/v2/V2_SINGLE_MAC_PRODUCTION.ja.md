@@ -22,7 +22,7 @@ V2 Agent (logged-in user LaunchAgent)
 Cua Driver (pinned version)
 ```
 
-Hub transport と MCP listener は loopback-only です。public TLS / origin policy は reviewed proxy/tunnel が引き続き担当します。grant private key は external signer だけが保持し、Hub が受け取るのは署名済み exact-capability grant だけです。この profile に in-process fallback はありません。
+Hub transport と MCP listener は loopback-only です。public TLS / origin policy は reviewed proxy/tunnel が引き続き担当します。Hub configuration には grant private-key path/material を渡さず、Hub が受け取るのは external signer が発行した署名済み exact-capability grant だけです。この profile に in-process fallback はありません。ただし各 LaunchAgent は同じ logged-in macOS user で動くため、これは process/configuration separation であり、侵害された same-user Hub process に対する OS 強制の key-custody boundary ではありません。別 signer user を使う Linux/systemd profile の方が強い custody boundary です。
 
 secret と durable state は repository 外の以下に置きます。
 

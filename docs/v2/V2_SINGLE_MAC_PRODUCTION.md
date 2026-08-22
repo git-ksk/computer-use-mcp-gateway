@@ -22,7 +22,7 @@ V2 Agent (logged-in user LaunchAgent)
 Cua Driver (pinned version)
 ```
 
-The Hub transport and MCP listener are loopback-only. Public TLS/origin policy remains owned by the reviewed proxy/tunnel. The external signer owns the grant private key; the Hub receives only signed exact-capability grants and has no in-process fallback in this profile.
+The Hub transport and MCP listener are loopback-only. Public TLS/origin policy remains owned by the reviewed proxy/tunnel. The Hub configuration receives no grant private-key path or material; it receives only signed exact-capability grants from the external signer and has no in-process fallback in this profile. Because these LaunchAgents run as the same logged-in macOS user, this is a process/configuration separation, **not** an OS-enforced key-custody boundary against a compromised same-user Hub process. The Linux/systemd profile with a separate signer user remains the stronger custody boundary.
 
 Secrets and durable state live outside the repository under:
 
