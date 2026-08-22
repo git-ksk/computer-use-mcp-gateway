@@ -40,6 +40,9 @@ jobs:
       - name: Python harness syntax
         run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_cua_mcp_backend.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_conformance.py
 
+      - name: Operator Handoff bridge tests
+        run: node --test scripts/tests/v2_operator_handoff_bridge.test.mjs
+
       - name: Build V1 gateway for legacy quality gate
         run: cargo build --locked --bin v1_gateway
 

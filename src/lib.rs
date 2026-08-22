@@ -36,6 +36,7 @@ pub mod v2_limits;
 pub mod v2_maintenance;
 pub mod v2_multi_device;
 pub mod v2_observability;
+pub mod v2_operator_handoff;
 pub mod v2_reference_backend;
 pub mod v2_state_lock;
 pub mod v2_tls_lifecycle;
