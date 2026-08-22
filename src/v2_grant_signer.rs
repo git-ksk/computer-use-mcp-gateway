@@ -285,22 +285,7 @@ pub fn serve_unix_grant_signer(
     authority: GrantAuthority,
     policy: GrantSigningPolicy,
 ) -> Result<(), GrantSignerError> {
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
-
-    let parent = socket_path
-        .parent()
-        .ok_or(GrantSignerError::UnsafeSocketPath)?;
-    let metadata = std::fs::symlink_metadata(parent).map_err(GrantSignerError::Io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(GrantSignerError::UnsafeSocketPath);
-    }
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(GrantSignerError::UnsafeSocketPath);
-    }
-    let listener = UnixListener::bind(socket_path).map_err(GrantSignerError::Io)?;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
-        .map_err(GrantSignerError::Io)?;
+    let (_socket_lock, listener) = bind_unix_grant_signer_listener(socket_path)?;
     for stream in listener.incoming() {
         let mut stream = stream.map_err(GrantSignerError::Io)?;
         stream
@@ -384,6 +369,96 @@ fn sign_request(
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn bind_unix_grant_signer_listener(
+    socket_path: &Path,
+) -> Result<(std::fs::File, std::os::unix::net::UnixListener), GrantSignerError> {
+    use fs2::FileExt as _;
+    use std::fs::OpenOptions;
+    use std::io::{ErrorKind, Write as _};
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let parent = socket_path
+        .parent()
+        .ok_or(GrantSignerError::UnsafeSocketPath)?;
+    let parent_metadata = std::fs::symlink_metadata(parent).map_err(GrantSignerError::Io)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(GrantSignerError::UnsafeSocketPath);
+    }
+
+    // launchd leaves Unix-domain socket pathnames behind when a process is killed.
+    // Serialize startup with a private advisory lock, then remove only a proven
+    // stale socket. A live listener is never unlinked or replaced.
+    let lock_path = parent.join(".cumg-v2-grant-signer.lock");
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.permissions().mode() & 0o077 != 0 =>
+        {
+            return Err(GrantSignerError::UnsafeSocketPath);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(GrantSignerError::Io(error)),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).mode(0o600);
+    let lock = options.open(&lock_path).map_err(GrantSignerError::Io)?;
+    let lock_metadata = lock.metadata().map_err(GrantSignerError::Io)?;
+    if !lock_metadata.is_file() || lock_metadata.permissions().mode() & 0o077 != 0 {
+        return Err(GrantSignerError::UnsafeSocketPath);
+    }
+    match lock.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            return Err(GrantSignerError::Unavailable);
+        }
+        Err(error) => return Err(GrantSignerError::Io(error)),
+    }
+
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+                return Err(GrantSignerError::UnsafeSocketPath);
+            }
+            match UnixStream::connect(socket_path) {
+                Ok(mut stream) => {
+                    // Do not simply connect-and-drop: an older signer may try to
+                    // write its bounded protocol error to the closed peer and
+                    // treat that BrokenPipe as a process-level failure. Send the
+                    // deliberately invalid zero-length frame and keep the peer
+                    // open long enough to consume the error response. This probe
+                    // cannot request or produce a grant.
+                    let probe_timeout = Duration::from_millis(250);
+                    let _ = stream.set_read_timeout(Some(probe_timeout));
+                    let _ = stream.set_write_timeout(Some(probe_timeout));
+                    let _ = stream.write_all(&0_u32.to_be_bytes());
+                    let _ = stream.flush();
+                    let _ = read_frame::<_, GrantSignResponse>(&mut stream);
+                    return Err(GrantSignerError::Unavailable);
+                }
+                Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(socket_path).map_err(GrantSignerError::Io)?;
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(GrantSignerError::Io(error)),
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(GrantSignerError::Io(error)),
+    }
+
+    let listener = UnixListener::bind(socket_path).map_err(GrantSignerError::Io)?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
+        .map_err(GrantSignerError::Io)?;
+    Ok((lock, listener))
 }
 
 #[cfg(unix)]
@@ -546,6 +621,60 @@ mod tests {
                 .await,
             Err(GrantSignerError::Unavailable)
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn signer_listener_recovers_stale_socket_but_never_replaces_live_listener() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let root = std::env::temp_dir().join(format!(
+            "cgs-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let stale_socket = root.join("stale.sock");
+        let stale = UnixListener::bind(&stale_socket).unwrap();
+        drop(stale);
+        assert!(stale_socket.exists());
+        let (lock, listener) = bind_unix_grant_signer_listener(&stale_socket).unwrap();
+        assert!(stale_socket.exists());
+        assert!(matches!(
+            bind_unix_grant_signer_listener(&stale_socket),
+            Err(GrantSignerError::Unavailable)
+        ));
+        drop(listener);
+        drop(lock);
+
+        // Simulate the pre-lock signer version. The new startup probe must send
+        // a complete invalid frame, consume the bounded error response, and then
+        // refuse to unlink the still-live listener.
+        let live_socket = root.join("live.sock");
+        let legacy_listener = UnixListener::bind(&live_socket).unwrap();
+        let legacy = std::thread::spawn(move || {
+            let (mut stream, _) = legacy_listener.accept().unwrap();
+            let error = read_frame::<_, GrantSignRequest>(&mut stream).unwrap_err();
+            assert!(matches!(error, GrantSignerError::FrameTooLarge));
+            write_frame(
+                &mut stream,
+                &GrantSignResponse {
+                    protocol_version: GRANT_SIGNER_PROTOCOL_VERSION,
+                    token: None,
+                    error_code: Some(error.safe_error_code().to_owned()),
+                },
+            )
+            .unwrap();
+        });
+        assert!(matches!(
+            bind_unix_grant_signer_listener(&live_socket),
+            Err(GrantSignerError::Unavailable)
+        ));
+        legacy.join().unwrap();
+        assert!(live_socket.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
