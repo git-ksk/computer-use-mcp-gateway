@@ -377,6 +377,16 @@ impl SingleDeviceHub {
             AgentToHub::Hello(hello) => hello,
             other => return Err(unexpected_agent_message("hello", &other)),
         };
+        if self.inner.draining.load(Ordering::Acquire) {
+            tracing::info!(
+                event = "v2_agent_session_rejected",
+                device_id = %self.inner.device_id,
+                outcome = "rejected",
+                error_code = "state_busy",
+                "Agent session rejected because Hub shutdown drain is active"
+            );
+            return Err(HubServiceError::StateBusy);
+        }
         if hello.device_id != self.inner.device_id {
             crate::v2_observability::agent_session_rejected(
                 crate::v2_observability::SessionRejectReason::WrongDevice,
@@ -1751,6 +1761,19 @@ impl HubHandle {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Close the currently authenticated Agent stream after a planned shutdown
+    /// drain has completed (or its bounded timeout has expired). The session
+    /// cleanup path remains authoritative: if work is still dispatched, closing
+    /// the stream preserves the existing fail-closed Indeterminate + quarantine
+    /// semantics instead of treating transport shutdown as terminal evidence.
+    pub async fn close_live_session_for_shutdown(&self) -> bool {
+        let supersede = {
+            let live = self.inner.live.lock().await;
+            live.as_ref().map(|session| session.supersede.clone())
+        };
+        supersede.is_some_and(|sender| sender.send(true).is_ok())
     }
 
     pub async fn is_online(&self) -> bool {
