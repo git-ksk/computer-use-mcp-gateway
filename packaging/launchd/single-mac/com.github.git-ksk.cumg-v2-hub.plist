@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.git-ksk.cumg-v2-hub</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BINARY_DIR@/v2_hub</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CUMG_V2_HUB_BIND</key><string>127.0.0.1:7443</string>
+    <key>CUMG_V2_HUB_SECRET_FILE</key><string>@ROOT@/v2/secrets/hub.key</string>
+    <key>CUMG_V2_GRANT_SIGNER_SOCKET</key><string>@RUN_ROOT@/grant-signer.sock</string>
+    <key>CUMG_V2_GRANT_PUBLIC_KEY_FILE</key><string>@ROOT@/v2/trust/grant.pub</string>
+    <key>CUMG_V2_DEVICE_PUBLIC_KEY_FILE</key><string>@ROOT@/v2/trust/device.pub</string>
+    <key>CUMG_V2_TLS_CERT_PEM_FILE</key><string>@ROOT@/v2/trust/tls-server.pem</string>
+    <key>CUMG_V2_TLS_KEY_PEM_FILE</key><string>@ROOT@/v2/secrets/tls-server.key</string>
+    <key>CUMG_V2_HUB_STATE_DIR</key><string>@ROOT@/v2/state/hub</string>
+    <key>CUMG_V2_MCP_BIND</key><string>127.0.0.1:8102</string>
+    <key>CUMG_V2_MCP_RESOURCE</key><string>https://REPLACE_WITH_PUBLIC_RESOURCE/mcp</string>
+    <key>CUMG_V2_NORTHBOUND_POLICY_FILE</key><string>@ROOT@/v2/trust/northbound-policy.json</string>
+    <key>CUMG_V2_TRUSTED_PROXY_ISSUER</key><string>REPLACE_WITH_ISSUER</string>
+    <key>CUMG_V2_TRUSTED_PROXY_SUBJECT</key><string>REPLACE_WITH_SUBJECT</string>
+    <key>CUMG_V2_TRUSTED_PROXY_SECRET_FILE</key><string>@ROOT@/v2/secrets/trusted-proxy.key</string>
+    <key>CUMG_V2_DRAIN_TIMEOUT_SECS</key><string>30</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>2</integer>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/computer-use-mcp-gateway-v2/hub.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/computer-use-mcp-gateway-v2/hub.err.log</string>
+</dict>
+</plist>

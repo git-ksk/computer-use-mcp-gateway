@@ -42,3 +42,5 @@ pub mod v2_tls_lifecycle;
 
 #[cfg(windows)]
 mod v2_windows_acl;
+
+pub mod v2_doctor;

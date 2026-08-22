@@ -545,3 +545,7 @@ V1 has no built-in:
 - cloud control plane.
 
 All MCP clients connected to one V1 gateway ultimately share one serialized physical desktop/backend state.
+
+## Reviewed single-Mac macOS deployment
+
+A trusted development Mac that intentionally co-locates Hub, external grant signer, Agent, and Cua should use the reviewed single-Mac profile rather than hand-written LaunchAgents. See [`v2/V2_SINGLE_MAC_PRODUCTION.md`](v2/V2_SINGLE_MAC_PRODUCTION.md). Its upgrade helper preserves Hub drain/quarantine semantics, archives a version-paired rollback asset, writes a payload-free runtime identity manifest, and requires a healthy read-only `v2_doctor` result after restart.

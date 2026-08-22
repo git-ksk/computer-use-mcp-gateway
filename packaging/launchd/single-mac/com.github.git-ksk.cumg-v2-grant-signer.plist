@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.git-ksk.cumg-v2-grant-signer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BINARY_DIR@/v2_grant_signer</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CUMG_V2_GRANT_SIGNER_SOCKET</key><string>@RUN_ROOT@/grant-signer.sock</string>
+    <key>CUMG_V2_GRANT_SECRET_FILE</key><string>@ROOT@/v2/secrets/grant.key</string>
+    <key>CUMG_V2_GRANT_SIGNER_POLICY_FILE</key><string>@ROOT@/v2/trust/grant-signer-policy.json</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>2</integer>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/computer-use-mcp-gateway-v2/grant-signer.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/computer-use-mcp-gateway-v2/grant-signer.err.log</string>
+</dict>
+</plist>
