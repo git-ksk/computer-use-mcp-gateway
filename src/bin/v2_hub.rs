@@ -19,6 +19,7 @@ use computer_use_mcp_gateway::{
         OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp, build_northbound_router,
         build_trusted_proxy_router,
     },
+    v2_operator_handoff::UnixOperatorHandoffAuthority,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch};
@@ -124,6 +125,10 @@ struct Args {
     /// Integrity-protected JSON principal -> device -> exact-capability mapping.
     #[arg(long, env = "CUMG_V2_NORTHBOUND_POLICY_FILE")]
     northbound_policy_file: Option<PathBuf>,
+    /// Optional local Unix socket for the mcp-execution-handoff authority bridge. When configured,
+    /// desktop/browser semantic dispatch fails closed if the authority bridge is unavailable.
+    #[arg(long, env = "CUMG_V2_OPERATOR_HANDOFF_SOCKET")]
+    operator_handoff_socket: Option<PathBuf>,
     /// Optional private key material used only to HMAC canonical shell/process requests for
     /// privacy-preserving same/different reconciliation. The raw key and fingerprint are never
     /// emitted by normal audit surfaces.
@@ -499,6 +504,11 @@ fn build_northbound_runtime(
         if let Some(secret) = audit_fingerprint_secret.clone() {
             service = service.with_request_fingerprint_secret(secret);
         }
+        if let Some(path) = args.operator_handoff_socket.as_ref() {
+            let authority = UnixOperatorHandoffAuthority::new(path.clone())
+                .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
+            service = service.with_operator_handoff_authority(Arc::new(authority));
+        }
         let router = build_trusted_proxy_router(service, proxy_config)
             .layer(axum::middleware::from_fn_with_state(
                 overload,
@@ -553,6 +563,11 @@ fn build_northbound_runtime(
         let mut service = V2NorthboundMcp::new(handle, policy);
         if let Some(secret) = audit_fingerprint_secret.clone() {
             service = service.with_request_fingerprint_secret(secret);
+        }
+        if let Some(path) = args.operator_handoff_socket.as_ref() {
+            let authority = UnixOperatorHandoffAuthority::new(path.clone())
+                .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
+            service = service.with_operator_handoff_authority(Arc::new(authority));
         }
         let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
             axum::middleware::from_fn_with_state(

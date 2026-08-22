@@ -133,6 +133,7 @@ struct PersistentHubState {
 #[derive(Clone)]
 struct LiveSession {
     generation: u64,
+    capability_revision: u64,
     command_tx: mpsc::Sender<HubRequest>,
     supersede: watch::Sender<bool>,
 }
@@ -459,6 +460,7 @@ impl SingleDeviceHub {
             let mut live = self.inner.live.lock().await;
             live.replace(LiveSession {
                 generation: session.generation,
+                capability_revision: session.capabilities.revision,
                 command_tx,
                 supersede: supersede_tx,
             })
@@ -1861,6 +1863,48 @@ impl HubHandle {
         audit: OperationAuditMetadata,
         request_fingerprint: Option<OperationRequestFingerprint>,
     ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as_with_id_and_audit_inner(
+            owner,
+            operation_id,
+            command,
+            audit,
+            request_fingerprint,
+            None,
+        )
+        .await
+    }
+
+    /// Starts only if the live session still matches the generation/revision that an external
+    /// authority gate just observed. CUMG admission and exact-capability grants remain authoritative.
+    pub async fn start_command_as_with_id_and_audit_for_session(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        audit: OperationAuditMetadata,
+        request_fingerprint: Option<OperationRequestFingerprint>,
+        expected_session: (u64, u64),
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as_with_id_and_audit_inner(
+            owner,
+            operation_id,
+            command,
+            audit,
+            request_fingerprint,
+            Some(expected_session),
+        )
+        .await
+    }
+
+    async fn start_command_as_with_id_and_audit_inner(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        audit: OperationAuditMetadata,
+        request_fingerprint: Option<OperationRequestFingerprint>,
+        expected_session: Option<(u64, u64)>,
+    ) -> Result<HubPendingCommand, HubCommandError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(HubCommandError::Busy);
         }
@@ -1870,9 +1914,13 @@ impl HubHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let tx = {
             let live = self.inner.live.lock().await;
-            live.as_ref()
-                .map(|session| session.command_tx.clone())
-                .ok_or(HubCommandError::AgentOffline)?
+            let session = live.as_ref().ok_or(HubCommandError::AgentOffline)?;
+            if expected_session.is_some_and(|(generation, revision)| {
+                session.generation != generation || session.capability_revision != revision
+            }) {
+                return Err(HubCommandError::SessionSuperseded);
+            }
+            session.command_tx.clone()
         };
         tx.send(HubRequest::Execute {
             operation_id: operation_id.clone(),
