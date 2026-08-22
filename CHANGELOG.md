@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.0 — 2026-08-16
+
+V2 production hardening.
+
+- graceful shutdown, bounded persistence, crash-loop handling, and quarantine alerting/resolution hardening;
+- trusted-proxy abuse guards plus Agent reauthentication/device rotation, enrollment/trust-anchor, and external grant-signer hardening;
+- durable process/shell operation-result recovery with caller-supplied operation IDs and read-only `get_operation`, without replay or automatic retry;
+- explicit locale environment support and stable coarse northbound environment-policy rejection codes without value leakage;
+- bounded background-process lifetime semantics, including cleanup of ordinary descendants that remain inside the supervised Unix process group / Windows Job Object;
+- atomic checkpoint publication using private pending files, fsync, and no-clobber publication so ENOSPC or mid-write failures cannot supersede the last committed checkpoint;
+- expanded restart, recovery, ownership, persistence, compatibility, and cross-platform CI regression coverage.
+
+Known follow-ups remain outside the v0.3 release scope, including retrievable references for truncated output (#83) and stronger Unix containment for deliberately detached `setsid()` descendants (#96).
+
 ## v0.2.0 — 2026-08-13
 
 V2 complete.
