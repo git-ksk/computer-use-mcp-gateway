@@ -71,7 +71,7 @@ elif [[ "$EXTERNAL_SIGNER" != "0" ]]; then
   exit 2
 fi
 
-QUARANTINE_JSON="$($BIN_DIR/v2_maint inspect-quarantine --state-dir "$HUB_STATE")" || {
+QUARANTINE_JSON="$("$BIN_DIR/v2_maint" inspect-quarantine --state-dir "$HUB_STATE")" || {
   echo "REFUSED reason=quarantine_inspection_failed" >&2; exit 2;
 }
 QUARANTINE_COUNT="$(printf '%s' "$QUARANTINE_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("quarantines", [])))')"
@@ -132,7 +132,7 @@ fi
 # Capture the old authoritative state only after Hub admission is closed and drain completed.
 cp -R "$HUB_STATE" "$ROLLBACK/state/hub"
 cp -R "$AGENT_STATE" "$ROLLBACK/state/agent"
-STOPPED_QUARANTINE_JSON="$($BIN_DIR/v2_maint inspect-quarantine --state-dir "$HUB_STATE")" || {
+STOPPED_QUARANTINE_JSON="$("$BIN_DIR/v2_maint" inspect-quarantine --state-dir "$HUB_STATE")" || {
   echo "REFUSED reason=stopped_quarantine_inspection_failed rollback=$ROLLBACK" >&2
   exit 2
 }
@@ -228,7 +228,7 @@ fi
 DOCTOR_OUTPUT=""
 DOCTOR_OK=0
 for _attempt in $(seq 1 15); do
-  if DOCTOR_OUTPUT="$($BIN_DIR/v2_doctor "${DOCTOR_ARGS[@]}" 2>/dev/null)"; then
+  if DOCTOR_OUTPUT="$("$BIN_DIR/v2_doctor" "${DOCTOR_ARGS[@]}" 2>/dev/null)"; then
     DOCTOR_OK=1
     break
   fi
