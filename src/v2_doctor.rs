@@ -462,6 +462,7 @@ unsafe fn libc_getuid() -> u32 {
     unsafe { getuid() }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn launchctl_output_is_running(output: &str) -> bool {
     output.lines().any(|line| line.trim() == "state = running")
 }
