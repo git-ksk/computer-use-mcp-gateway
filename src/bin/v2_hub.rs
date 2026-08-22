@@ -341,6 +341,14 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        let session_close_requested = shutdown_handle.close_live_session_for_shutdown().await;
+        info!(
+            event = "v2_hub_shutdown_agent_session_close",
+            signal,
+            session_close_requested,
+            outcome = "shutdown",
+            "Hub shutdown requested closure of the current Agent stream after bounded drain"
+        );
         let _ = shutdown_tx.send(true);
     });
 
