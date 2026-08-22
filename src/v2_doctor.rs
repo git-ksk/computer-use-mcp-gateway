@@ -129,8 +129,10 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         &mut checks,
     );
 
-    inspect_launchd_service(&config.hub_launchd_label, "hub_service", &mut checks);
-    inspect_launchd_service(&config.agent_launchd_label, "agent_service", &mut checks);
+    let _hub_pid = inspect_launchd_service(&config.hub_launchd_label, "hub_service", &mut checks);
+    let agent_pid =
+        inspect_launchd_service(&config.agent_launchd_label, "agent_service", &mut checks);
+    inspect_agent_hub_transport(agent_pid, &mut checks);
     if let Some(label) = &config.grant_signer_launchd_label {
         inspect_launchd_service(label, "grant_signer_service", &mut checks);
     }
@@ -425,7 +427,7 @@ fn inspect_agent(
     summary
 }
 
-fn inspect_launchd_service(label: &str, name: &str, checks: &mut Vec<DoctorCheck>) {
+fn inspect_launchd_service(label: &str, name: &str, checks: &mut Vec<DoctorCheck>) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         let uid = unsafe { libc_getuid() };
@@ -433,13 +435,18 @@ fn inspect_launchd_service(label: &str, name: &str, checks: &mut Vec<DoctorCheck
         match Command::new("launchctl").arg("print").arg(target).output() {
             Ok(output) if output.status.success() => {
                 let text = String::from_utf8_lossy(&output.stdout);
-                if launchctl_output_is_running(&text) {
+                if let Some(pid) = launchctl_output_running_pid(&text) {
                     push(checks, name, CheckStatus::Ok, "running");
+                    Some(pid)
                 } else {
                     push(checks, name, CheckStatus::Error, "loaded_but_not_running");
+                    None
                 }
             }
-            _ => push(checks, name, CheckStatus::Error, "not_loaded_or_unreadable"),
+            _ => {
+                push(checks, name, CheckStatus::Error, "not_loaded_or_unreadable");
+                None
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -451,6 +458,7 @@ fn inspect_launchd_service(label: &str, name: &str, checks: &mut Vec<DoctorCheck
             CheckStatus::Warning,
             "launchd_check_not_supported",
         );
+        None
     }
 }
 
@@ -463,8 +471,77 @@ unsafe fn libc_getuid() -> u32 {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn launchctl_output_is_running(output: &str) -> bool {
-    output.lines().any(|line| line.trim() == "state = running")
+fn launchctl_output_running_pid(output: &str) -> Option<u32> {
+    if !output.lines().any(|line| line.trim() == "state = running") {
+        return None;
+    }
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("pid = ")?.parse::<u32>().ok()
+    })
+}
+
+fn inspect_agent_hub_transport(agent_pid: Option<u32>, checks: &mut Vec<DoctorCheck>) {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(agent_pid) = agent_pid else {
+            push(
+                checks,
+                "agent_hub_transport",
+                CheckStatus::Error,
+                "agent_not_running",
+            );
+            return;
+        };
+        let output = Command::new("lsof")
+            .args([
+                "-nP",
+                "-a",
+                "-p",
+                &agent_pid.to_string(),
+                "-iTCP@127.0.0.1:7443",
+                "-sTCP:ESTABLISHED",
+            ])
+            .output();
+        match output {
+            Ok(output)
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .skip(1)
+                        .any(|line| !line.trim().is_empty()) =>
+            {
+                push(
+                    checks,
+                    "agent_hub_transport",
+                    CheckStatus::Ok,
+                    "loopback_established",
+                );
+            }
+            Ok(_) => push(
+                checks,
+                "agent_hub_transport",
+                CheckStatus::Error,
+                "loopback_not_established",
+            ),
+            Err(_) => push(
+                checks,
+                "agent_hub_transport",
+                CheckStatus::Error,
+                "lsof_unavailable",
+            ),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = agent_pid;
+        push(
+            checks,
+            "agent_hub_transport",
+            CheckStatus::Warning,
+            "macos_transport_check_not_supported",
+        );
+    }
 }
 
 fn inspect_unix_socket(path: &Path, checks: &mut Vec<DoctorCheck>) {
@@ -646,12 +723,15 @@ mod tests {
 
     #[test]
     fn launchctl_parser_requires_explicit_running_state() {
-        assert!(launchctl_output_is_running(
-            "path = /tmp/x\nstate = running\npid = 42\n"
-        ));
-        assert!(!launchctl_output_is_running(
-            "state = waiting\nlast exit code = 1\n"
-        ));
+        assert_eq!(
+            launchctl_output_running_pid("path = /tmp/x\nstate = running\npid = 42\n"),
+            Some(42)
+        );
+        assert_eq!(
+            launchctl_output_running_pid("state = waiting\npid = 42\nlast exit code = 1\n"),
+            None
+        );
+        assert_eq!(launchctl_output_running_pid("state = running\n"), None);
     }
 
     #[test]

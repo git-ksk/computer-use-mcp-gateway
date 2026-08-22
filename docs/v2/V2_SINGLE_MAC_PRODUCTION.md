@@ -101,7 +101,7 @@ For the standard profile it checks:
 - exactly one enrolled single-Mac device and current generation;
 - Agent checkpoint readability and exact Hub/Agent generation pairing;
 - live quarantine count;
-- Hub/Agent/external-signer LaunchAgent running state;
+- Hub/Agent/external-signer LaunchAgent running state and the Agent -> loopback Hub transport being established;
 - private signer socket shape/parent permissions;
 - server certificate and pinned Agent trust-root validity;
 - actual Cua Driver version against the explicit reviewed pin.

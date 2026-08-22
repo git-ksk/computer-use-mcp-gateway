@@ -101,7 +101,7 @@ standard profile では次を確認します。
 - enrolled single-Mac device が 1 台だけであることと current generation;
 - Agent checkpoint readability と exact Hub/Agent generation pairing;
 - live quarantine count;
-- Hub/Agent/external-signer LaunchAgent の running state;
+- Hub/Agent/external-signer LaunchAgent の running state と Agent -> loopback Hub transport の established 状態;
 - private signer socket と parent permission;
 - server certificate と pinned Agent trust root の validity;
 - 実 Cua Driver version と explicit reviewed pin の一致。
