@@ -478,8 +478,17 @@ export class HandoffBridge {
     if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
     const priorContextBinding = interactionContextBinding(request.prior_context_id);
     if (!priorContextBinding) return { ok: false };
+    const priorGeneration = request.prior_generation === undefined ? binding.generation : request.prior_generation;
+    const priorCapabilityRevision = request.prior_capability_revision === undefined
+      ? binding.capabilityRevision
+      : request.prior_capability_revision;
+    if (!positiveInt(priorGeneration) || binding.generation < priorGeneration
+      || !Number.isSafeInteger(priorCapabilityRevision) || priorCapabilityRevision < 0
+      || binding.capabilityRevision < priorCapabilityRevision) return { ok: false };
     const priorBinding = {
       ...binding,
+      generation: priorGeneration,
+      capabilityRevision: priorCapabilityRevision,
       exactWindow: { ...binding.exactWindow, contextBinding: priorContextBinding },
     };
     const priorOwner = this.ownerFor(priorBinding);
@@ -652,6 +661,8 @@ function control(socketPath, action, options) {
   if (options.has("intervention-id")) payload.intervention_id = options.get("intervention-id");
   if (options.has("epoch")) payload.epoch = Number(options.get("epoch"));
   if (options.has("prior-context-id")) payload.prior_context_id = options.get("prior-context-id");
+  if (options.has("prior-generation")) payload.prior_generation = Number(options.get("prior-generation"));
+  if (options.has("prior-capability-revision")) payload.prior_capability_revision = Number(options.get("prior-capability-revision"));
   const socket = net.createConnection(socketPath);
   let data = "";
   socket.setEncoding("utf8");
