@@ -308,6 +308,28 @@ test("checkpoint recovery can rebind an expired interaction context only with ex
   }
 });
 
+test("checkpoint recovery can prove the prior owner across a monotonic device generation rollover", async () => {
+  const f = fixture();
+  const priorContextId = "ctx_11111111111111111111111111111111";
+  try {
+    f.request.exact_window.context_binding = contextBinding(priorContextId);
+    f.bridge.handle(f.request);
+    const begun = ctl(f.bridge, "begin");
+    await nativeControl(f.bridge, begun.native_locator, "claim");
+
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_000_010, new FakeNativeSurface());
+    const fresh = structuredClone(f.request);
+    fresh.generation += 1;
+    fresh.exact_window.context_binding = contextBinding("ctx_22222222222222222222222222222222");
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+    assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }), { ok: false });
+    assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId, prior_generation: fresh.generation + 1 }), { ok: false });
+    const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId, prior_generation: f.request.generation });
+    assert.equal(reissued.ok, true);
+    assert.equal(reissued.status, "awaiting_human");
+  } finally { f.cleanup(); }
+});
+
 test("expired signed checkpoint stays fail-closed until explicit prior-context rebind proof", async () => {
   const f = fixture();
   const priorContextId = "ctx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
