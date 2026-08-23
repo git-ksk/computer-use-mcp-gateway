@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -49,6 +50,14 @@ function positiveInt(value) {
 
 function isBinding(value) {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function interactionContextBinding(contextId) {
+  if (typeof contextId !== "string" || !/^ctx_[0-9a-f]{32}$/.test(contextId)) return undefined;
+  return createHash("sha256")
+    .update("cumg/operator-handoff/context/v1\0", "utf8")
+    .update(contextId, "utf8")
+    .digest("hex");
 }
 
 function sameExact(left, right) {
@@ -422,14 +431,7 @@ export class HandoffBridge {
     }
   }
 
-  recoverReissue() {
-    if (!this.recovery || this.state.getActive()) return { ok: false };
-    const binding = this.latestObservation;
-    if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
-    const owner = this.ownerFor(binding);
-    if (this.recovery.adapterKind !== "cumg_os_window_dogfood"
-      || this.recovery.principalBinding !== owner.principalBinding
-      || this.recovery.actionDigest !== owner.argsDigest) return { ok: false };
+  reissueRecovery(binding, owner) {
     for (let epoch = 0; epoch <= this.recovery.epoch; epoch += 1) {
       if (epoch < this.recovery.epoch) this.state.advanceResourceEpoch();
     }
@@ -450,6 +452,34 @@ export class HandoffBridge {
     }
   }
 
+  recoverReissue() {
+    if (!this.recovery || this.state.getActive()) return { ok: false };
+    const binding = this.latestObservation;
+    if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
+    const owner = this.ownerFor(binding);
+    if (this.recovery.adapterKind !== "cumg_os_window_dogfood"
+      || this.recovery.principalBinding !== owner.principalBinding
+      || this.recovery.actionDigest !== owner.argsDigest) return { ok: false };
+    return this.reissueRecovery(binding, owner);
+  }
+
+  recoverRebind(request) {
+    if (!this.recovery || this.state.getActive()) return { ok: false };
+    const binding = this.latestObservation;
+    if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
+    const priorContextBinding = interactionContextBinding(request.prior_context_id);
+    if (!priorContextBinding) return { ok: false };
+    const priorBinding = {
+      ...binding,
+      exactWindow: { ...binding.exactWindow, contextBinding: priorContextBinding },
+    };
+    const priorOwner = this.ownerFor(priorBinding);
+    if (this.recovery.adapterKind !== "cumg_os_window_dogfood"
+      || this.recovery.principalBinding !== priorOwner.principalBinding
+      || this.recovery.actionDigest !== priorOwner.argsDigest) return { ok: false };
+    return this.reissueRecovery(binding, this.ownerFor(binding));
+  }
+
   exactActive(request, expectedStatus) {
     const active = this.state.getActive();
     return active
@@ -468,6 +498,8 @@ export class HandoffBridge {
       return this.begin();
     case "recover_reissue":
       return this.recoverReissue();
+    case "recover_rebind":
+      return this.recoverRebind(request);
     case "request_resume": {
       const active = this.exactActive(request, "ready_to_resume");
       if (!active) return { ok: false };
@@ -608,6 +640,7 @@ function control(socketPath, action, options) {
   const payload = { action };
   if (options.has("intervention-id")) payload.intervention_id = options.get("intervention-id");
   if (options.has("epoch")) payload.epoch = Number(options.get("epoch"));
+  if (options.has("prior-context-id")) payload.prior_context_id = options.get("prior-context-id");
   const socket = net.createConnection(socketPath);
   let data = "";
   socket.setEncoding("utf8");
@@ -622,7 +655,7 @@ async function main() {
   const socketPath = required(options, "socket", "CUMG_V2_OPERATOR_HANDOFF_SOCKET");
   if (command !== "serve") {
     const action = command.replaceAll("-", "_");
-    if (!["status", "begin", "recover_reissue", "request_resume", "cancel_before_human"].includes(action)) {
+    if (!["status", "begin", "recover_reissue", "recover_rebind", "request_resume", "cancel_before_human"].includes(action)) {
       throw new Error("unknown command");
     }
     control(socketPath, action, options);
