@@ -13,13 +13,19 @@ use crate::{
     v2_m0::{DeviceCommand, DeviceResult, VerificationStatus},
     v2_m0_trust::AuthenticatedClientPrincipal,
     v2_operator_handoff::{
-        AgentAuthorityDecision, AgentAuthorityRequest, ExactWindowBinding,
+        AgentAuthorityDecision, AgentAuthorityRequest, ExactWindowBinding, HandoffControlError,
+        HandoffInterventionStatus, HandoffRuntimeControl, HandoffRuntimeStatus,
         ManagedOperatorHandoffAuthority, OperatorHandoffAuthority, OperatorHandoffError,
         VerificationReport, VerificationToken, device_binding, exact_window_binding,
-        is_exact_verification_candidate, is_phase1_protected_command, principal_binding,
+        interaction_context_binding, is_exact_verification_candidate, is_phase1_protected_command,
+        principal_binding,
     },
 };
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 /// A CUMG-owned binding to one Human-controllable execution surface.
 ///
@@ -90,12 +96,86 @@ impl From<OperatorHandoffError> for HandoffCoordinatorError {
     }
 }
 
+const HANDOFF_CONTROL_SELECTION_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandoffSessionFence {
+    pub generation: u64,
+    pub capability_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffOperatorCommand {
+    Status,
+    Begin,
+    RecoverReissue,
+    RecoverRebind {
+        prior_context_id: String,
+        prior_generation: Option<u64>,
+        prior_capability_revision: Option<u64>,
+    },
+    RequestResume,
+    CancelBeforeHuman,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffOperatorControlError {
+    Unsupported,
+    NoFreshExactWindow,
+    SessionFenceMismatch,
+    InvalidRecoveryProof,
+    InvalidLifecycleState,
+    Runtime(HandoffControlError),
+}
+
+impl HandoffOperatorControlError {
+    pub const fn safe_code(self) -> &'static str {
+        match self {
+            Self::Unsupported => "handoff_control_unsupported",
+            Self::NoFreshExactWindow => "handoff_no_fresh_exact_window",
+            Self::SessionFenceMismatch => "handoff_session_fence_mismatch",
+            Self::InvalidRecoveryProof => "handoff_invalid_recovery_proof",
+            Self::InvalidLifecycleState => "handoff_invalid_lifecycle_state",
+            Self::Runtime(HandoffControlError::Unavailable) => "handoff_runtime_unavailable",
+            Self::Runtime(HandoffControlError::Rejected) => "handoff_control_rejected",
+            Self::Runtime(HandoffControlError::Protocol) => "handoff_runtime_protocol_invalid",
+        }
+    }
+}
+
+impl fmt::Display for HandoffOperatorControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.safe_code())
+    }
+}
+
+impl std::error::Error for HandoffOperatorControlError {}
+
+impl From<HandoffControlError> for HandoffOperatorControlError {
+    fn from(value: HandoffControlError) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+#[derive(Clone)]
+struct SelectedWindowAuthority {
+    authority: AgentAuthorityRequest,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct HandoffSelectionState {
+    last_observed: Option<SelectedWindowAuthority>,
+    last_admitted: Option<SelectedWindowAuthority>,
+}
+
 /// CUMG-side coordinator. The backend supplies canonical Handoff semantic decisions; this type
 /// supplies the consumer binding and validation around those decisions.
 #[derive(Clone)]
 pub struct HandoffCoordinator {
     backend: Arc<dyn OperatorHandoffAuthority>,
     managed_runtime: Option<Arc<ManagedOperatorHandoffAuthority>>,
+    selections: Arc<Mutex<HandoffSelectionState>>,
 }
 
 impl HandoffCoordinator {
@@ -104,6 +184,7 @@ impl HandoffCoordinator {
         Self {
             backend,
             managed_runtime: None,
+            selections: Arc::new(Mutex::new(HandoffSelectionState::default())),
         }
     }
 
@@ -113,12 +194,187 @@ impl HandoffCoordinator {
         Self {
             backend: runtime.clone(),
             managed_runtime: Some(runtime),
+            selections: Arc::new(Mutex::new(HandoffSelectionState::default())),
         }
     }
 
     pub async fn shutdown(&self) {
         if let Some(runtime) = self.managed_runtime.as_ref() {
             runtime.shutdown().await;
+        }
+    }
+
+    pub fn invalidate_context(&self, context_id: &str) {
+        let context_binding = interaction_context_binding(context_id);
+        let mut selections = self
+            .selections
+            .lock()
+            .expect("handoff selection lock poisoned");
+        if selections
+            .last_observed
+            .as_ref()
+            .and_then(|selected| selected.authority.exact_window.as_ref())
+            .is_some_and(|window| window.context_binding == context_binding)
+        {
+            selections.last_observed = None;
+        }
+        if selections
+            .last_admitted
+            .as_ref()
+            .and_then(|selected| selected.authority.exact_window.as_ref())
+            .is_some_and(|window| window.context_binding == context_binding)
+        {
+            selections.last_admitted = None;
+        }
+    }
+
+    fn remember_observed_window(
+        &self,
+        authority: &AgentAuthorityRequest,
+        context_valid_for: Option<Duration>,
+    ) {
+        if authority.exact_window.is_none() {
+            return;
+        }
+        self.selections
+            .lock()
+            .expect("handoff selection lock poisoned")
+            .last_observed = Some(SelectedWindowAuthority {
+            authority: control_authority(authority),
+            expires_at: selection_expiry(context_valid_for),
+        });
+    }
+
+    fn remember_admitted_window(
+        &self,
+        authority: &AgentAuthorityRequest,
+        context_valid_for: Option<Duration>,
+    ) {
+        if authority.exact_window.is_none() {
+            return;
+        }
+        self.selections
+            .lock()
+            .expect("handoff selection lock poisoned")
+            .last_admitted = Some(SelectedWindowAuthority {
+            authority: control_authority(authority),
+            expires_at: selection_expiry(context_valid_for),
+        });
+    }
+
+    fn selected_authority(
+        &self,
+        admitted: bool,
+        session: Option<HandoffSessionFence>,
+    ) -> Result<AgentAuthorityRequest, HandoffOperatorControlError> {
+        let session = session.ok_or(HandoffOperatorControlError::SessionFenceMismatch)?;
+        let selections = self
+            .selections
+            .lock()
+            .expect("handoff selection lock poisoned");
+        let selected = if admitted {
+            selections.last_admitted.as_ref()
+        } else {
+            selections.last_observed.as_ref()
+        }
+        .ok_or(HandoffOperatorControlError::NoFreshExactWindow)?;
+        if Instant::now() >= selected.expires_at {
+            return Err(HandoffOperatorControlError::NoFreshExactWindow);
+        }
+        if selected.authority.generation != session.generation
+            || selected.authority.capability_revision != session.capability_revision
+        {
+            return Err(HandoffOperatorControlError::SessionFenceMismatch);
+        }
+        Ok(selected.authority.clone())
+    }
+
+    pub async fn operator_control(
+        &self,
+        command: HandoffOperatorCommand,
+        session: Option<HandoffSessionFence>,
+    ) -> Result<HandoffRuntimeStatus, HandoffOperatorControlError> {
+        let runtime = self
+            .managed_runtime
+            .as_ref()
+            .ok_or(HandoffOperatorControlError::Unsupported)?;
+        match command {
+            HandoffOperatorCommand::Status => runtime.status().await.map_err(Into::into),
+            HandoffOperatorCommand::Begin => {
+                let authority = self.selected_authority(true, session)?;
+                runtime
+                    .control(HandoffRuntimeControl::Begin { authority })
+                    .await
+                    .map_err(Into::into)
+            }
+            HandoffOperatorCommand::RecoverReissue => {
+                let status = runtime.status().await?;
+                if !status.recovery_required || status.recovery_expired {
+                    return Err(HandoffOperatorControlError::InvalidLifecycleState);
+                }
+                let authority = self.selected_authority(false, session)?;
+                runtime
+                    .control(HandoffRuntimeControl::RecoverReissue { authority })
+                    .await
+                    .map_err(Into::into)
+            }
+            HandoffOperatorCommand::RecoverRebind {
+                prior_context_id,
+                prior_generation,
+                prior_capability_revision,
+            } => {
+                if !valid_context_id(&prior_context_id) {
+                    return Err(HandoffOperatorControlError::InvalidRecoveryProof);
+                }
+                let status = runtime.status().await?;
+                if !status.recovery_required {
+                    return Err(HandoffOperatorControlError::InvalidLifecycleState);
+                }
+                let authority = self.selected_authority(false, session)?;
+                if prior_generation.is_some_and(|value| value == 0 || value > authority.generation)
+                    || prior_capability_revision
+                        .is_some_and(|value| value > authority.capability_revision)
+                {
+                    return Err(HandoffOperatorControlError::InvalidRecoveryProof);
+                }
+                runtime
+                    .control(HandoffRuntimeControl::RecoverRebind {
+                        authority,
+                        prior_context_id,
+                        prior_generation,
+                        prior_capability_revision,
+                    })
+                    .await
+                    .map_err(Into::into)
+            }
+            HandoffOperatorCommand::RequestResume => {
+                let status = runtime.status().await?;
+                let active = status
+                    .active
+                    .filter(|active| active.status == HandoffInterventionStatus::ReadyToResume)
+                    .ok_or(HandoffOperatorControlError::InvalidLifecycleState)?;
+                runtime
+                    .control(HandoffRuntimeControl::RequestResume {
+                        intervention_id: active.intervention_id,
+                        epoch: active.epoch,
+                    })
+                    .await
+                    .map_err(Into::into)
+            }
+            HandoffOperatorCommand::CancelBeforeHuman => {
+                let status = runtime.status().await?;
+                let active = status
+                    .active
+                    .filter(|active| active.status == HandoffInterventionStatus::AwaitingHuman)
+                    .ok_or(HandoffOperatorControlError::InvalidLifecycleState)?;
+                runtime
+                    .control(HandoffRuntimeControl::CancelBeforeHuman {
+                        intervention_id: active.intervention_id,
+                        epoch: active.epoch,
+                    })
+                    .await
+                    .map_err(Into::into)
+            }
         }
     }
 
@@ -131,6 +387,7 @@ impl HandoffCoordinator {
     /// `Ok(None)` means the command is outside the current Window handoff surface (process/shell and
     /// bounded filesystem observation). A configured coordinator is fail-closed for protected
     /// commands when its canonical Handoff backend is unavailable or returns an invalid decision.
+    #[cfg(test)]
     pub(crate) async fn admit_agent(
         &self,
         principal: &AuthenticatedClientPrincipal,
@@ -138,6 +395,26 @@ impl HandoffCoordinator {
         generation: u64,
         capability_revision: u64,
         command: &DeviceCommand,
+    ) -> Result<Option<HandoffAdmission>, HandoffCoordinatorError> {
+        self.admit_agent_with_context_valid_for(
+            principal,
+            device_id,
+            generation,
+            capability_revision,
+            command,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_agent_with_context_valid_for(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        device_id: &str,
+        generation: u64,
+        capability_revision: u64,
+        command: &DeviceCommand,
+        context_valid_for: Option<Duration>,
     ) -> Result<Option<HandoffAdmission>, HandoffCoordinatorError> {
         if !is_phase1_protected_command(command) {
             return Ok(None);
@@ -153,12 +430,16 @@ impl HandoffCoordinator {
             verification_candidate: is_exact_verification_candidate(command),
         };
         let request = binding.legacy_request();
-        let decision = self.backend.admit_agent(request).await?;
+        self.remember_observed_window(&request, context_valid_for);
+        let decision = self.backend.admit_agent(request.clone()).await?;
         match decision {
-            AgentAuthorityDecision::Allow => Ok(Some(HandoffAdmission {
-                binding,
-                verification: None,
-            })),
+            AgentAuthorityDecision::Allow => {
+                self.remember_admitted_window(&request, context_valid_for);
+                Ok(Some(HandoffAdmission {
+                    binding,
+                    verification: None,
+                }))
+            }
             AgentAuthorityDecision::Deny => Err(HandoffCoordinatorError::AuthoritySuspended),
             AgentAuthorityDecision::Verification(token) => {
                 if !binding.verification_candidate
@@ -200,6 +481,27 @@ impl HandoffCoordinator {
             .await
             .map_err(HandoffCoordinatorError::Backend)
     }
+}
+
+fn selection_expiry(context_valid_for: Option<Duration>) -> Instant {
+    let valid_for = context_valid_for
+        .unwrap_or(HANDOFF_CONTROL_SELECTION_TTL)
+        .min(HANDOFF_CONTROL_SELECTION_TTL);
+    Instant::now() + valid_for
+}
+
+fn control_authority(authority: &AgentAuthorityRequest) -> AgentAuthorityRequest {
+    let mut authority = authority.clone();
+    authority.verification_candidate = false;
+    authority
+}
+
+fn valid_context_id(value: &str) -> bool {
+    value.len() == 36
+        && value.starts_with("ctx_")
+        && value[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -283,6 +585,111 @@ mod tests {
         assert_eq!(requests[0].capability_revision, 9);
         assert_eq!(requests[0].exact_window.as_ref().unwrap().process_id, 12);
         assert_eq!(requests[0].exact_window.as_ref().unwrap().window_id, 34);
+    }
+
+    #[tokio::test]
+    async fn coordinator_control_selection_is_exact_session_bound_and_context_invalidated() {
+        let backend = Arc::new(FakeAuthority::new(Ok(AgentAuthorityDecision::Allow)));
+        let coordinator = HandoffCoordinator::new(backend);
+        coordinator
+            .admit_agent_with_context_valid_for(
+                &principal(),
+                "device-1",
+                7,
+                9,
+                &verification_command(),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        let selected = coordinator
+            .selected_authority(
+                true,
+                Some(HandoffSessionFence {
+                    generation: 7,
+                    capability_revision: 9,
+                }),
+            )
+            .unwrap();
+        assert!(!selected.verification_candidate);
+        assert_eq!(selected.exact_window.as_ref().unwrap().process_id, 12);
+        assert_eq!(selected.exact_window.as_ref().unwrap().window_id, 34);
+        assert_eq!(
+            coordinator.selected_authority(
+                true,
+                Some(HandoffSessionFence {
+                    generation: 8,
+                    capability_revision: 9,
+                }),
+            ),
+            Err(HandoffOperatorControlError::SessionFenceMismatch)
+        );
+        coordinator.invalidate_context("ctx_0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            coordinator.selected_authority(
+                true,
+                Some(HandoffSessionFence {
+                    generation: 7,
+                    capability_revision: 9,
+                }),
+            ),
+            Err(HandoffOperatorControlError::NoFreshExactWindow)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_selection_uses_fresh_denied_observation_not_prior_admitted_target() {
+        let backend = Arc::new(FakeAuthority::new(Ok(AgentAuthorityDecision::Deny)));
+        let coordinator = HandoffCoordinator::new(backend);
+        assert_eq!(
+            coordinator
+                .admit_agent_with_context_valid_for(
+                    &principal(),
+                    "device-1",
+                    11,
+                    12,
+                    &verification_command(),
+                    Some(Duration::from_secs(5)),
+                )
+                .await,
+            Err(HandoffCoordinatorError::AuthoritySuspended)
+        );
+        let session = Some(HandoffSessionFence {
+            generation: 11,
+            capability_revision: 12,
+        });
+        assert!(coordinator.selected_authority(false, session).is_ok());
+        assert_eq!(
+            coordinator.selected_authority(true, session),
+            Err(HandoffOperatorControlError::NoFreshExactWindow)
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_context_lifetime_never_remains_a_begin_candidate() {
+        let backend = Arc::new(FakeAuthority::new(Ok(AgentAuthorityDecision::Allow)));
+        let coordinator = HandoffCoordinator::new(backend);
+        coordinator
+            .admit_agent_with_context_valid_for(
+                &principal(),
+                "device-1",
+                7,
+                9,
+                &verification_command(),
+                Some(Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator.selected_authority(
+                true,
+                Some(HandoffSessionFence {
+                    generation: 7,
+                    capability_revision: 9,
+                }),
+            ),
+            Err(HandoffOperatorControlError::NoFreshExactWindow)
+        );
     }
 
     #[tokio::test]

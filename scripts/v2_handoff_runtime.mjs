@@ -415,9 +415,20 @@ export class HandoffBridge {
     return { ok: true };
   }
 
-  begin() {
+  controlBinding(request) {
+    if (request.authority !== undefined) {
+      const binding = this.parseAdmission(request.authority);
+      if (!binding?.exactWindow || binding.verificationCandidate) return undefined;
+      return binding;
+    }
+    // Legacy Unix bridge compatibility only. Managed stdio control requires an explicit
+    // CUMG-selected authority binding and never delegates target selection to this cache.
+    return this.latestObservation;
+  }
+
+  begin(request = {}) {
     if (this.recovery || this.state.getActive()) return { ok: false };
-    const binding = this.latestObservation;
+    const binding = this.controlBinding(request);
     if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
     const intervention = this.state.begin({ reason: "operator_handoff", resumePolicy: "never_replay" });
     const owner = this.ownerFor(binding);
@@ -462,9 +473,9 @@ export class HandoffBridge {
     }
   }
 
-  recoverReissue() {
+  recoverReissue(request = {}) {
     if (!this.recovery || this.recoveryExpired || this.state.getActive()) return { ok: false };
-    const binding = this.latestObservation;
+    const binding = this.controlBinding(request);
     if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
     const owner = this.ownerFor(binding);
     if (this.recovery.adapterKind !== "cumg_os_window_dogfood"
@@ -475,7 +486,7 @@ export class HandoffBridge {
 
   recoverRebind(request) {
     if (!this.recovery || this.state.getActive()) return { ok: false };
-    const binding = this.latestObservation;
+    const binding = this.controlBinding(request);
     if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
     const priorContextBinding = interactionContextBinding(request.prior_context_id);
     if (!priorContextBinding) return { ok: false };
@@ -525,9 +536,9 @@ export class HandoffBridge {
     case "status":
       return safeStatus(this.state.getActive(), this.recovery, this.recoveryExpired, this.resumeRequested, this.latestObservation, this.humanSurface, this.surfaceLocator, this.faulted);
     case "begin":
-      return this.begin();
+      return this.begin(request);
     case "recover_reissue":
-      return this.recoverReissue();
+      return this.recoverReissue(request);
     case "recover_rebind":
       return this.recoverRebind(request);
     case "request_resume": {
@@ -559,6 +570,13 @@ export class HandoffBridge {
     if (request.action === "admit_agent") return this.admit(request);
     if (request.action === "report_verification") return this.reportVerification(request);
     return this.control(request);
+  }
+
+  handleManaged(request) {
+    if (!request || typeof request !== "object" || Array.isArray(request)) return { ok: false };
+    if (["begin", "recover_reissue", "recover_rebind"].includes(request.action)
+      && request.authority === undefined) return { ok: false };
+    return this.handle(request);
   }
 }
 
@@ -623,8 +641,10 @@ export async function serveStdio(bridge, input = process.stdin, output = process
   for await (const line of lines) {
     if (Buffer.byteLength(line, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime request too large");
     let response;
-    try { response = bridge.handle(JSON.parse(line)); }
-    catch { response = { ok: false }; }
+    try {
+      const request = JSON.parse(line);
+      response = typeof bridge.handleManaged === "function" ? bridge.handleManaged(request) : bridge.handle(request);
+    } catch { response = { ok: false }; }
     const encoded = JSON.stringify(response);
     if (Buffer.byteLength(encoded, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime response too large");
     if (!output.write(`${encoded}\n`)) {
