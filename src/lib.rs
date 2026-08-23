@@ -31,6 +31,7 @@ pub mod v2_m1_northbound;
 pub mod v2_enrollment;
 pub mod v2_execution_safety;
 pub mod v2_grant_signer;
+pub mod v2_handoff_coordinator;
 pub mod v2_interaction_context;
 pub mod v2_limits;
 pub mod v2_maintenance;
