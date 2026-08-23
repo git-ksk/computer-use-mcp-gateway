@@ -10,6 +10,9 @@ use crate::v2_m0::{
     CapabilityAdvertisement, CommandEnvelope, CommandResultEnvelope, ControlError, DeviceIdentity,
     DeviceRegistry, GrantToken,
 };
+use crate::v2_operator_handoff::{
+    HandoffActiveStatus, HandoffInterventionStatus, HandoffSurfaceKind,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -19,8 +22,9 @@ use std::{
     time::Instant,
 };
 
-pub const HUB_AGENT_SCHEMA_VERSION: u16 = 1;
+pub const HUB_AGENT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_HANDOFF_CONTROL_BYTES: usize = 4 * 1024;
 
 #[derive(Clone)]
 pub struct HubIdentity {
@@ -147,6 +151,33 @@ impl HubIdentity {
             signature: Vec::new(),
         };
         let transcript = remote_backend_session_end_bytes(hello, challenge, &remote)?;
+        remote.signature = self.signing_key.sign(&transcript).to_bytes().to_vec();
+        Ok(remote)
+    }
+
+    pub fn remote_handoff_request(
+        &self,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        device_id: String,
+        device_generation: u64,
+        request_id: String,
+        request: RemoteHandoffRequestKind,
+    ) -> Result<RemoteHandoffRequest, TransportError> {
+        validate_handoff_request_id(&request_id)?;
+        if device_id != hello.device_id || device_generation == 0 {
+            return Err(TransportError::InvalidHandoffControl);
+        }
+        validate_handoff_payload(&request)?;
+        let mut remote = RemoteHandoffRequest {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            device_id,
+            device_generation,
+            request_id,
+            request,
+            signature: Vec::new(),
+        };
+        let transcript = remote_handoff_request_bytes(hello, challenge, &remote)?;
         remote.signature = self.signing_key.sign(&transcript).to_bytes().to_vec();
         Ok(remote)
     }
@@ -293,6 +324,125 @@ pub struct RemoteBackendSessionEnded {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteHandoffExactWindow {
+    pub context_binding: String,
+    pub process_id: u32,
+    pub window_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteHandoffAuthority {
+    pub principal_binding: String,
+    pub device_binding: String,
+    pub generation: u64,
+    pub capability_revision: u64,
+    pub exact_window: Option<RemoteHandoffExactWindow>,
+    pub verification_candidate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum RemoteHandoffOperatorCommand {
+    Status,
+    Begin,
+    RecoverReissue,
+    RecoverRebind {
+        prior_context_id: String,
+        prior_generation: Option<u64>,
+        prior_capability_revision: Option<u64>,
+    },
+    RequestResume,
+    CancelBeforeHuman,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RemoteHandoffRequestKind {
+    Admission {
+        authority: RemoteHandoffAuthority,
+    },
+    ReportVerification {
+        authority: RemoteHandoffAuthority,
+        intervention_id: String,
+        epoch: u64,
+        satisfied: bool,
+    },
+    Operator {
+        command: RemoteHandoffOperatorCommand,
+        authority: Option<RemoteHandoffAuthority>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteHandoffRequest {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub request_id: String,
+    pub request: RemoteHandoffRequestKind,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum RemoteHandoffAdmissionDecision {
+    Allow,
+    Deny,
+    Verification { intervention_id: String, epoch: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteHandoffErrorCode {
+    Unsupported,
+    Unavailable,
+    Rejected,
+    Protocol,
+    SessionFenceMismatch,
+    InvalidRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteHandoffStatus {
+    pub active: Option<HandoffActiveStatus>,
+    pub recovery_required: bool,
+    pub recovery_status: Option<HandoffInterventionStatus>,
+    pub recovery_epoch: Option<u64>,
+    pub recovery_expired: bool,
+    pub resume_requested: bool,
+    pub faulted: bool,
+    pub human_surface: Option<HandoffSurfaceKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RemoteHandoffResponseKind {
+    Admission {
+        decision: RemoteHandoffAdmissionDecision,
+    },
+    Status {
+        status: RemoteHandoffStatus,
+    },
+    Operator {
+        status: RemoteHandoffStatus,
+        locator: Option<String>,
+    },
+    Rejected {
+        code: RemoteHandoffErrorCode,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteHandoffResponse {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub request_id: String,
+    pub response: RemoteHandoffResponseKind,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancellationDisposition {
@@ -340,6 +490,7 @@ pub enum AgentToHub {
     ReconciliationReport(RemoteReconciliationReport),
     CancellationAck(RemoteCancellationAck),
     BackendSessionEnded(RemoteBackendSessionEnded),
+    HandoffResponse(RemoteHandoffResponse),
     Heartbeat(AgentHeartbeat),
 }
 
@@ -354,6 +505,7 @@ pub enum HubToAgent {
     Command(RemoteCommand),
     Cancel(RemoteCancel),
     BackendSessionEnd(RemoteBackendSessionEnd),
+    HandoffRequest(RemoteHandoffRequest),
     HeartbeatAck(HubHeartbeatAck),
 }
 
@@ -366,6 +518,7 @@ impl AgentToHub {
             Self::ReconciliationReport(_) => "reconciliation_report",
             Self::CancellationAck(_) => "cancellation_ack",
             Self::BackendSessionEnded(_) => "backend_session_ended",
+            Self::HandoffResponse(_) => "handoff_response",
             Self::Heartbeat(_) => "heartbeat",
         }
     }
@@ -379,6 +532,7 @@ impl HubToAgent {
             Self::Command(_) => "command",
             Self::Cancel(_) => "cancel",
             Self::BackendSessionEnd(_) => "backend_session_end",
+            Self::HandoffRequest(_) => "handoff_request",
             Self::HeartbeatAck(_) => "heartbeat_ack",
         }
     }
@@ -583,6 +737,75 @@ pub fn verify_remote_cancellation_ack(
     registry
         .verify_device_signature(&hello.device_id, &transcript, &ack.signature)
         .map_err(TransportError::Control)
+}
+
+pub fn verify_remote_handoff_request(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteHandoffRequest,
+    trusted_hub: &VerifyingKey,
+) -> Result<(), TransportError> {
+    validate_schema(remote.schema_version)?;
+    validate_handoff_request_id(&remote.request_id)?;
+    validate_handoff_payload(&remote.request)?;
+    if remote.device_id != hello.device_id || remote.device_generation == 0 {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let signature =
+        signature_from_slice(&remote.signature).map_err(|_| TransportError::InvalidHubSignature)?;
+    let transcript = remote_handoff_request_bytes(hello, challenge, remote)?;
+    trusted_hub
+        .verify(&transcript, &signature)
+        .map_err(|_| TransportError::InvalidHubSignature)
+}
+
+pub fn build_remote_handoff_response(
+    identity: &DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    device_id: String,
+    device_generation: u64,
+    request_id: String,
+    response: RemoteHandoffResponseKind,
+) -> Result<RemoteHandoffResponse, TransportError> {
+    validate_handoff_request_id(&request_id)?;
+    if device_id != hello.device_id || device_generation == 0 {
+        return Err(TransportError::InvalidHandoffControl);
+    }
+    validate_handoff_payload(&response)?;
+    let mut remote = RemoteHandoffResponse {
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id,
+        device_generation,
+        request_id,
+        response,
+        signature: Vec::new(),
+    };
+    let transcript = remote_handoff_response_bytes(hello, challenge, &remote)?;
+    remote.signature = identity.sign_message(&transcript);
+    Ok(remote)
+}
+
+pub fn verify_remote_handoff_response(
+    registry: &DeviceRegistry,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteHandoffResponse,
+) -> Result<(), TransportError> {
+    validate_schema(remote.schema_version)?;
+    validate_handoff_request_id(&remote.request_id)?;
+    validate_handoff_payload(&remote.response)?;
+    if remote.device_id != hello.device_id || remote.device_generation == 0 {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let signature =
+        signature_from_slice(&remote.signature).map_err(|_| TransportError::InvalidHubSignature)?;
+    let transcript = remote_handoff_response_bytes(hello, challenge, remote)?;
+    registry
+        .device_verifier(&hello.device_id)
+        .map_err(TransportError::Control)?
+        .verify(&transcript, &signature)
+        .map_err(|_| TransportError::Control(ControlError::InvalidDeviceSignature))
 }
 
 pub fn build_agent_heartbeat(
@@ -918,6 +1141,84 @@ fn hub_heartbeat_ack_bytes(
     .map_err(TransportError::Serialization)
 }
 
+fn remote_handoff_request_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteHandoffRequest,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        request_id: &'a str,
+        request: &'a RemoteHandoffRequestKind,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-handoff-request-v1",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &remote.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: remote.device_generation,
+        request_id: &remote.request_id,
+        request: &remote.request,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn remote_handoff_response_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    remote: &RemoteHandoffResponse,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        request_id: &'a str,
+        response: &'a RemoteHandoffResponseKind,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-handoff-response-v1",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &remote.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: remote.device_generation,
+        request_id: &remote.request_id,
+        response: &remote.response,
+    })
+    .map_err(TransportError::Serialization)
+}
+
+fn validate_handoff_payload<T: Serialize>(value: &T) -> Result<(), TransportError> {
+    let encoded = serde_json::to_vec(value).map_err(TransportError::Serialization)?;
+    if encoded.len() > MAX_HANDOFF_CONTROL_BYTES {
+        return Err(TransportError::InvalidHandoffControl);
+    }
+    Ok(())
+}
+
+fn validate_handoff_request_id(value: &str) -> Result<(), TransportError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(TransportError::InvalidHandoffControl);
+    }
+    Ok(())
+}
+
 fn remote_backend_session_end_bytes(
     hello: &AgentHello,
     challenge: &HubChallenge,
@@ -1090,6 +1391,7 @@ pub enum TransportError {
     UnsupportedSchema { got: u16 },
     HubKeyMismatch,
     InvalidReconciliationReport,
+    InvalidHandoffControl,
     InvalidHubSignature,
     HandshakeMismatch,
     Control(ControlError),
@@ -1106,6 +1408,7 @@ impl fmt::Display for TransportError {
             Self::UnsupportedSchema { got } => write!(f, "unsupported Hub-Agent schema {got}"),
             Self::HubKeyMismatch => write!(f, "Hub public key does not match the pinned identity"),
             Self::InvalidReconciliationReport => write!(f, "reconciliation report is invalid"),
+            Self::InvalidHandoffControl => write!(f, "Handoff control message is invalid"),
             Self::InvalidHubSignature => write!(f, "Hub challenge signature is invalid"),
             Self::HandshakeMismatch => write!(f, "Hub-Agent handshake transcript mismatch"),
             Self::Control(error) => write!(f, "control-plane rejection: {error}"),
@@ -1452,6 +1755,143 @@ mod tests {
                 vec![evidence; MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES + 1],
             ),
             Err(TransportError::InvalidReconciliationReport)
+        ));
+    }
+
+    #[test]
+    fn handoff_control_is_signed_session_bound_and_payload_bounded() {
+        let (registry, identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id.clone(), caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let authority = RemoteHandoffAuthority {
+            principal_binding: "principal_binding_0123456789abcdef".into(),
+            device_binding: "device_binding_0123456789abcdef".into(),
+            generation: 3,
+            capability_revision: 5,
+            exact_window: Some(RemoteHandoffExactWindow {
+                context_binding: "context_binding_0123456789abcdef".into(),
+                process_id: 12,
+                window_id: 34,
+            }),
+            verification_candidate: false,
+        };
+        let request = hub
+            .remote_handoff_request(
+                &hello,
+                &challenge,
+                device_id.clone(),
+                3,
+                "handoff_req_1".into(),
+                RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Begin,
+                    authority: Some(authority),
+                },
+            )
+            .unwrap();
+        verify_remote_handoff_request(&hello, &challenge, &request, &hub.verifier()).unwrap();
+        let encoded = serde_json::to_vec(&HubToAgent::HandoffRequest(request.clone())).unwrap();
+        assert!(encoded.len() < 4 * 1024);
+        let encoded_text = String::from_utf8(encoded).unwrap();
+        for forbidden in [
+            "sdp",
+            "iceServers",
+            "credential",
+            "framebuffer",
+            "human_input",
+        ] {
+            assert!(!encoded_text.contains(forbidden));
+        }
+
+        let status = RemoteHandoffStatus {
+            active: None,
+            recovery_required: false,
+            recovery_status: None,
+            recovery_epoch: None,
+            recovery_expired: false,
+            resume_requested: false,
+            faulted: false,
+            human_surface: None,
+        };
+        let response = build_remote_handoff_response(
+            &identity,
+            &hello,
+            &challenge,
+            device_id,
+            3,
+            "handoff_req_1".into(),
+            RemoteHandoffResponseKind::Status { status },
+        )
+        .unwrap();
+        verify_remote_handoff_response(&registry, &hello, &challenge, &response).unwrap();
+
+        let mut tampered_request = request;
+        tampered_request.device_generation = 4;
+        assert!(matches!(
+            verify_remote_handoff_request(&hello, &challenge, &tampered_request, &hub.verifier()),
+            Err(TransportError::InvalidHubSignature)
+        ));
+
+        let mut tampered_response = response;
+        if let RemoteHandoffResponseKind::Status { status } = &mut tampered_response.response {
+            status.faulted = true;
+        } else {
+            panic!("expected status response");
+        }
+        assert!(matches!(
+            verify_remote_handoff_response(&registry, &hello, &challenge, &tampered_response),
+            Err(TransportError::Control(
+                ControlError::InvalidDeviceSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn handoff_control_rejects_unbounded_request_identity_before_signing() {
+        let (_registry, _identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id.clone(), caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        assert!(matches!(
+            hub.remote_handoff_request(
+                &hello,
+                &challenge,
+                device_id,
+                1,
+                "x".repeat(129),
+                RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Status,
+                    authority: None,
+                },
+            ),
+            Err(TransportError::InvalidHandoffControl)
+        ));
+    }
+
+    #[test]
+    fn handoff_control_rejects_payloads_above_dedicated_four_kib_bound() {
+        let (_registry, _identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id.clone(), caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let authority = RemoteHandoffAuthority {
+            principal_binding: "p".repeat(MAX_HANDOFF_CONTROL_BYTES),
+            device_binding: "device_binding_0123456789abcdef".into(),
+            generation: 1,
+            capability_revision: 1,
+            exact_window: None,
+            verification_candidate: false,
+        };
+        assert!(matches!(
+            hub.remote_handoff_request(
+                &hello,
+                &challenge,
+                device_id,
+                1,
+                "handoff_req_oversize".into(),
+                RemoteHandoffRequestKind::Admission { authority },
+            ),
+            Err(TransportError::InvalidHandoffControl)
         ));
     }
 
