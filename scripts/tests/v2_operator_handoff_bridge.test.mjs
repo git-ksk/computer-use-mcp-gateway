@@ -308,6 +308,32 @@ test("checkpoint recovery can rebind an expired interaction context only with ex
   }
 });
 
+test("expired signed checkpoint stays fail-closed until explicit prior-context rebind proof", async () => {
+  const f = fixture();
+  const priorContextId = "ctx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  try {
+    f.request.exact_window.context_binding = contextBinding(priorContextId);
+    f.bridge.handle(f.request);
+    const begun = ctl(f.bridge, "begin");
+    await nativeControl(f.bridge, begun.native_locator, "claim");
+    f.tick(16 * 60_000);
+
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_960_001, new FakeNativeSurface());
+    const status = recovered.handle({ action: "status" });
+    assert.equal(status.recovery_required, true);
+    assert.equal(status.recovery_expired, true);
+    assert.deepEqual(recovered.handle({ action: "recover_reissue" }), { ok: false });
+
+    const fresh = structuredClone(f.request);
+    fresh.exact_window.context_binding = contextBinding("ctx_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+    const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId });
+    assert.equal(reissued.ok, true);
+    assert.equal(reissued.status, "awaiting_human");
+    assert.equal(recovered.handle({ action: "status" }).recovery_expired, false);
+  } finally { f.cleanup(); }
+});
+
 test("wrong principal, target, intervention and stale epoch fail closed", async () => {
   const f = fixture();
   try {

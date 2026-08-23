@@ -74,7 +74,7 @@ function sameAuthority(left, right) {
     && left.capabilityRevision === right.capabilityRevision;
 }
 
-function safeStatus(active, recovery, resumeRequested, latest, surface, locator, faulted) {
+function safeStatus(active, recovery, recoveryExpired, resumeRequested, latest, surface, locator, faulted) {
   return {
     ok: true,
     active: active ? {
@@ -86,6 +86,7 @@ function safeStatus(active, recovery, resumeRequested, latest, surface, locator,
     recovery_required: !!recovery,
     recovery_status: recovery?.status ?? null,
     recovery_epoch: recovery?.epoch ?? null,
+    recovery_expired: !!recoveryExpired,
     resume_requested: resumeRequested,
     faulted: !!faulted,
     human_surface: surface?.kind ?? null,
@@ -232,7 +233,15 @@ export class HandoffBridge {
     this.resumeRequested = false;
     this.surfaceLocator = undefined;
     this.faulted = false;
-    this.recovery = checkpointStore.recover();
+    this.recoveryExpired = false;
+    try {
+      this.recovery = checkpointStore.recover();
+    } catch (error) {
+      if (error?.code !== "CHECKPOINT_EXPIRED"
+        || typeof checkpointStore.recoverForOperatorRevalidation !== "function") throw error;
+      this.recovery = checkpointStore.recoverForOperatorRevalidation();
+      this.recoveryExpired = true;
+    }
     if (this.recovery && this.recovery.epoch > MAX_RECOVERED_EPOCH) {
       throw new Error("recovered handoff epoch exceeds bridge bound");
     }
@@ -453,7 +462,7 @@ export class HandoffBridge {
   }
 
   recoverReissue() {
-    if (!this.recovery || this.state.getActive()) return { ok: false };
+    if (!this.recovery || this.recoveryExpired || this.state.getActive()) return { ok: false };
     const binding = this.latestObservation;
     if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
     const owner = this.ownerFor(binding);
@@ -477,7 +486,9 @@ export class HandoffBridge {
     if (this.recovery.adapterKind !== "cumg_os_window_dogfood"
       || this.recovery.principalBinding !== priorOwner.principalBinding
       || this.recovery.actionDigest !== priorOwner.argsDigest) return { ok: false };
-    return this.reissueRecovery(binding, this.ownerFor(binding));
+    const result = this.reissueRecovery(binding, this.ownerFor(binding));
+    if (result.ok) this.recoveryExpired = false;
+    return result;
   }
 
   exactActive(request, expectedStatus) {
@@ -493,7 +504,7 @@ export class HandoffBridge {
   control(request) {
     switch (request.action) {
     case "status":
-      return safeStatus(this.state.getActive(), this.recovery, this.resumeRequested, this.latestObservation, this.humanSurface, this.surfaceLocator, this.faulted);
+      return safeStatus(this.state.getActive(), this.recovery, this.recoveryExpired, this.resumeRequested, this.latestObservation, this.humanSurface, this.surfaceLocator, this.faulted);
     case "begin":
       return this.begin();
     case "recover_reissue":

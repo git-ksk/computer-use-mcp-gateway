@@ -77,12 +77,22 @@ export class SignedFileHandoffCheckpointStore {
     const mac = crypto.createHmac("sha256", this.signingKey).update(JSON.stringify(checkpoint)).digest("hex");
     fs.writeFileSync(this.filePath, `${JSON.stringify({ checkpoint, mac })}\n`, { mode: 0o600 });
   }
-  recover() {
+  readVerified() {
     if (!fs.existsSync(this.filePath)) return undefined;
     const envelope = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     const expected = crypto.createHmac("sha256", this.signingKey).update(JSON.stringify(envelope.checkpoint)).digest("hex");
-    if (envelope.mac !== expected || envelope.checkpoint.expiresAt <= this.now()) throw new Error("checkpoint");
-    return { ...envelope.checkpoint, recovery: "reissue_and_revalidate" };
+    if (envelope.mac !== expected) { const error = new Error("checkpoint"); error.code = "CHECKPOINT_INVALID"; throw error; }
+    return envelope.checkpoint;
+  }
+  recover() {
+    const checkpoint = this.readVerified();
+    if (!checkpoint) return undefined;
+    if (checkpoint.expiresAt <= this.now()) { const error = new Error("checkpoint expired"); error.code = "CHECKPOINT_EXPIRED"; throw error; }
+    return { ...checkpoint, recovery: "reissue_and_revalidate" };
+  }
+  recoverForOperatorRevalidation() {
+    const checkpoint = this.readVerified();
+    return checkpoint ? { ...checkpoint, recovery: "reissue_and_revalidate" } : undefined;
   }
   clear() {
     try { fs.unlinkSync(this.filePath); } catch (error) { if (error.code !== "ENOENT") throw error; }
