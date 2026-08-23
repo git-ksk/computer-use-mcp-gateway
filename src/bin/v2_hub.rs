@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use computer_use_mcp_gateway::{
     v2_grant_signer::HubGrantSigner,
+    v2_handoff_coordinator::HandoffCoordinator,
     v2_m0_trust::DeviceKeyRotation,
     v2_m1_grpc::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
@@ -507,7 +508,8 @@ fn build_northbound_runtime(
         if let Some(path) = args.operator_handoff_socket.as_ref() {
             let authority = UnixOperatorHandoffAuthority::new(path.clone())
                 .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
-            service = service.with_operator_handoff_authority(Arc::new(authority));
+            service = service
+                .with_handoff_coordinator(Arc::new(HandoffCoordinator::new(Arc::new(authority))));
         }
         let router = build_trusted_proxy_router(service, proxy_config)
             .layer(axum::middleware::from_fn_with_state(
@@ -567,7 +569,8 @@ fn build_northbound_runtime(
         if let Some(path) = args.operator_handoff_socket.as_ref() {
             let authority = UnixOperatorHandoffAuthority::new(path.clone())
                 .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
-            service = service.with_operator_handoff_authority(Arc::new(authority));
+            service = service
+                .with_handoff_coordinator(Arc::new(HandoffCoordinator::new(Arc::new(authority))));
         }
         let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
             axum::middleware::from_fn_with_state(

@@ -31,6 +31,7 @@ use crate::{
         OperationAuditMetadata, OperationOwner, OperationRequestFingerprint,
         RecoverableOperationResult, fingerprint_process_request, fingerprint_shell_request,
     },
+    v2_handoff_coordinator::{HandoffAdmission, HandoffCoordinator, HandoffCoordinatorError},
     v2_interaction_context::{
         DEFAULT_MAX_REFS_PER_CONTEXT, InteractionContextBinding, InteractionContextId,
         InteractionContextLimits, InteractionContextManager, InteractionScope,
@@ -43,16 +44,10 @@ use crate::{
         MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
         PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
         ScrollTarget, ShellRequest, UiElementAction, UiPredicate, UiRect, UiRole,
-        VerificationStatus,
     },
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
-    v2_operator_handoff::{
-        AgentAuthorityDecision, AgentAuthorityRequest, OperatorHandoffAuthority,
-        VerificationReport, VerificationToken, device_binding, exact_window_binding,
-        is_exact_verification_candidate, is_phase1_protected_command, principal_binding,
-    },
 };
 use async_trait::async_trait;
 use axum::{
@@ -1153,17 +1148,12 @@ struct NorthboundOperationCall {
     audit: OperationAuditMetadata,
 }
 
-struct OperatorHandoffAdmission {
-    request: AgentAuthorityRequest,
-    verification: Option<VerificationToken>,
-}
-
 #[derive(Clone)]
 pub struct V2NorthboundMcp {
     hub: HubHandle,
     authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
     request_fingerprint_secret: Option<Arc<[u8]>>,
-    operator_handoff_authority: Option<Arc<dyn OperatorHandoffAuthority>>,
+    handoff_coordinator: Option<Arc<HandoffCoordinator>>,
     interactions: Arc<TokioMutex<NorthboundInteractionState>>,
 }
 
@@ -1207,7 +1197,7 @@ impl V2NorthboundMcp {
             hub,
             authorizer,
             request_fingerprint_secret: None,
-            operator_handoff_authority: None,
+            handoff_coordinator: None,
             interactions: Arc::new(TokioMutex::new(NorthboundInteractionState::new())),
         }
     }
@@ -1217,11 +1207,8 @@ impl V2NorthboundMcp {
         self
     }
 
-    pub fn with_operator_handoff_authority(
-        mut self,
-        authority: Arc<dyn OperatorHandoffAuthority>,
-    ) -> Self {
-        self.operator_handoff_authority = Some(authority);
+    pub fn with_handoff_coordinator(mut self, coordinator: Arc<HandoffCoordinator>) -> Self {
+        self.handoff_coordinator = Some(coordinator);
         self
     }
 
@@ -2573,15 +2560,15 @@ impl V2NorthboundMcp {
         Ok(Some(fingerprint))
     }
 
-    async fn operator_handoff_admission(
+    async fn handoff_admission(
         &self,
         principal: &AuthenticatedClientPrincipal,
         command: &DeviceCommand,
-    ) -> Result<Option<OperatorHandoffAdmission>, McpError> {
-        let Some(authority) = self.operator_handoff_authority.as_ref() else {
+    ) -> Result<Option<HandoffAdmission>, McpError> {
+        let Some(coordinator) = self.handoff_coordinator.as_ref() else {
             return Ok(None);
         };
-        if !is_phase1_protected_command(command) {
+        if !coordinator.protects_agent_command(command) {
             return Ok(None);
         }
         let (generation, capabilities) = self
@@ -2589,39 +2576,22 @@ impl V2NorthboundMcp {
             .current_session_binding()
             .await
             .ok_or_else(|| McpError::invalid_request("Agent is offline", None))?;
-        let request = AgentAuthorityRequest {
-            principal_binding: principal_binding(principal),
-            device_binding: device_binding(self.hub.device_id()),
-            generation,
-            capability_revision: capabilities.revision,
-            exact_window: exact_window_binding(command),
-            verification_candidate: is_exact_verification_candidate(command),
-        };
-        let decision = authority.admit_agent(request.clone()).await.map_err(|_| {
-            McpError::invalid_request("Operator handoff authority unavailable", None)
-        })?;
-        match decision {
-            AgentAuthorityDecision::Allow => Ok(Some(OperatorHandoffAdmission {
-                request,
-                verification: None,
-            })),
-            AgentAuthorityDecision::Deny => Err(McpError::invalid_request(
-                "Agent authority is suspended by an active operator handoff",
-                None,
-            )),
-            AgentAuthorityDecision::Verification(token) => {
-                if !request.verification_candidate || request.exact_window.is_none() {
-                    return Err(McpError::invalid_request(
-                        "Operator handoff verification admission is invalid",
-                        None,
-                    ));
-                }
-                Ok(Some(OperatorHandoffAdmission {
-                    request,
-                    verification: Some(token),
-                }))
-            }
-        }
+        coordinator
+            .admit_agent(
+                principal,
+                self.hub.device_id(),
+                generation,
+                capabilities.revision,
+                command,
+            )
+            .await
+            .map_err(|error| match error {
+                HandoffCoordinatorError::AuthoritySuspended => McpError::invalid_request(
+                    "Agent authority is suspended by an active operator handoff",
+                    None,
+                ),
+                _ => McpError::invalid_request("Operator handoff coordinator unavailable", None),
+            })
     }
 
     async fn execute_command(
@@ -2631,7 +2601,7 @@ impl V2NorthboundMcp {
         operation: NorthboundOperationCall,
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
-        let handoff = self.operator_handoff_admission(principal, &command).await?;
+        let handoff = self.handoff_admission(principal, &command).await?;
         let request_fingerprint = self.request_fingerprint_for_command(&command)?;
         let NorthboundOperationCall {
             operation_id,
@@ -2647,8 +2617,8 @@ impl V2NorthboundMcp {
                     audit,
                     request_fingerprint,
                     (
-                        admission.request.generation,
-                        admission.request.capability_revision,
+                        admission.binding.generation,
+                        admission.binding.capability_revision,
                     ),
                 )
                 .await
@@ -2682,25 +2652,12 @@ impl V2NorthboundMcp {
         }?;
 
         if let Some(admission) = handoff
-            && let Some(token) = admission.verification
+            && admission.verification.is_some()
         {
-            let satisfied = matches!(
-                result,
-                DeviceResult::UiStateVerification {
-                    status: VerificationStatus::Satisfied,
-                    ..
-                }
-            );
-            self.operator_handoff_authority
+            self.handoff_coordinator
                 .as_ref()
-                .ok_or_else(|| {
-                    McpError::internal_error("Operator handoff authority disappeared", None)
-                })?
-                .report_verification(VerificationReport {
-                    authority: admission.request,
-                    token,
-                    satisfied,
-                })
+                .ok_or_else(|| McpError::internal_error("Handoff coordinator disappeared", None))?
+                .report_verification(admission, &result)
                 .await
                 .map_err(|_| {
                     McpError::invalid_request(
