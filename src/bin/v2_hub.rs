@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
+#[cfg(unix)]
+use computer_use_mcp_gateway::v2_handoff_control::UnixHandoffControlServer;
 use computer_use_mcp_gateway::{
     v2_grant_signer::HubGrantSigner,
     v2_handoff_coordinator::HandoffCoordinator,
@@ -147,6 +149,10 @@ struct Args {
         default_value_t = 2
     )]
     handoff_runtime_timeout_secs: u64,
+    /// Private local operator socket for typed Handoff lifecycle control. This is never MCP.
+    /// It is supported only with the first-class managed Handoff runtime.
+    #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
+    handoff_control_socket: Option<PathBuf>,
     /// Optional private key material used only to HMAC canonical shell/process requests for
     /// privacy-preserving same/different reconciliation. The raw key and fingerprint are never
     /// emitted by normal audit surfaces.
@@ -328,8 +334,27 @@ async fn main() -> Result<()> {
     let device_id = hub.device_id().to_owned();
     let shutdown_handle = handle.clone();
     let handoff_coordinator = build_handoff_coordinator(&args).await?;
-    let northbound =
-        build_northbound_runtime(&args, handle, &device_id, handoff_coordinator.clone())?;
+    let northbound = build_northbound_runtime(
+        &args,
+        handle.clone(),
+        &device_id,
+        handoff_coordinator.clone(),
+    )?;
+
+    #[cfg(unix)]
+    let handoff_control_server = if let Some(path) = args.handoff_control_socket.as_ref() {
+        Some(
+            UnixHandoffControlServer::bind(path)
+                .context("failed to bind private Handoff control socket")?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    ensure!(
+        args.handoff_control_socket.is_none(),
+        "CUMG_V2_HANDOFF_CONTROL_SOCKET is supported only on Unix hosts"
+    );
 
     info!(
         event = "v2_hub_start",
@@ -340,6 +365,42 @@ async fn main() -> Result<()> {
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    #[cfg(unix)]
+    let handoff_control_task = if let Some(server) = handoff_control_server {
+        let coordinator = handoff_coordinator
+            .as_ref()
+            .expect("validated Handoff control socket requires managed coordinator")
+            .clone();
+        let control_hub = handle.clone();
+        let control_shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            match server
+                .serve(coordinator, control_hub, control_shutdown)
+                .await
+            {
+                Ok(()) => info!(
+                    event = "v2_handoff_control_stopped",
+                    outcome = "shutdown",
+                    "private Handoff operator control socket stopped"
+                ),
+                Err(error) => tracing::error!(
+                    event = "v2_handoff_control_failed",
+                    outcome = "unavailable",
+                    error = %error,
+                    "private Handoff operator control socket failed; authority semantics remain fail-closed in the managed runtime"
+                ),
+            }
+        });
+        info!(
+            event = "v2_handoff_control_started",
+            mode = "local_unix",
+            outcome = "ready",
+            "private Handoff operator control socket started outside northbound MCP"
+        );
+        Some(task)
+    } else {
+        None
+    };
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
     let handoff_shutdown = handoff_coordinator.clone();
     tokio::spawn(async move {
@@ -433,6 +494,11 @@ async fn main() -> Result<()> {
     } else {
         grpc.await.context("V2 Hub gRPC server failed")?;
     }
+    #[cfg(unix)]
+    if let Some(task) = handoff_control_task {
+        task.await
+            .context("private Handoff control task failed during shutdown")?;
+    }
     Ok(())
 }
 
@@ -443,6 +509,11 @@ async fn build_handoff_coordinator(args: &Args) -> Result<Option<Arc<HandoffCoor
         args.handoff_runtime_env_file.is_some(),
     ];
     let managed_configured = managed_fields.into_iter().any(|configured| configured);
+    ensure!(
+        args.handoff_control_socket.is_none()
+            || managed_fields.into_iter().all(|configured| configured),
+        "CUMG_V2_HANDOFF_CONTROL_SOCKET requires the complete managed Handoff runtime configuration"
+    );
     ensure!(
         !(managed_configured && args.operator_handoff_socket.is_some()),
         "CUMG managed Handoff runtime and CUMG_V2_OPERATOR_HANDOFF_SOCKET are mutually exclusive"
