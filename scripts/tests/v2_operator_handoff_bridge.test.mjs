@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -115,6 +116,13 @@ function fixture(surface = new FakeNativeSurface()) {
     tick(ms = 1) { now += ms; },
     cleanup() { fs.rmSync(root, { recursive: true, force: true }); },
   };
+}
+
+function contextBinding(contextId) {
+  return createHash("sha256")
+    .update("cumg/operator-handoff/context/v1\0", "utf8")
+    .update(contextId, "utf8")
+    .digest("hex");
 }
 
 function ctl(bridge, action, intervention, extra = {}) {
@@ -261,6 +269,40 @@ test("checkpoint recovery never restores Agent or Human authority automatically"
     assert.ok(reissued.epoch > begun.epoch);
     assert.ok(reissued.native_locator);
     assert.deepEqual(recovered.handle(f.request), { ok: true, decision: "deny" });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("checkpoint recovery can rebind an expired interaction context only with exact prior owner proof", async () => {
+  const f = fixture();
+  const priorContextId = "ctx_0123456789abcdef0123456789abcdef";
+  try {
+    f.request.exact_window.context_binding = contextBinding(priorContextId);
+    f.bridge.handle(f.request);
+    const begun = ctl(f.bridge, "begin");
+    await nativeControl(f.bridge, begun.native_locator, "claim");
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "human_active");
+
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_000_010, new FakeNativeSurface());
+    const fresh = structuredClone(f.request);
+    fresh.exact_window.context_binding = contextBinding("ctx_fedcba9876543210fedcba9876543210");
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+
+    assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: "ctx_ffffffffffffffffffffffffffffffff" }), { ok: false });
+
+    const wrongTarget = structuredClone(fresh);
+    wrongTarget.exact_window.window_id += 1;
+    assert.deepEqual(recovered.handle(wrongTarget), { ok: true, decision: "deny" });
+    assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }), { ok: false });
+
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+    const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId });
+    assert.equal(reissued.ok, true);
+    assert.equal(reissued.status, "awaiting_human");
+    assert.ok(reissued.epoch > begun.epoch);
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, false);
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
   } finally {
     f.cleanup();
   }
