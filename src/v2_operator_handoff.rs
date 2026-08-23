@@ -1,10 +1,9 @@
-//! Optional consumer-owned bridge to `mcp-execution-handoff`.
+//! Bounded transport adapters between CUMG and canonical `mcp-execution-handoff` semantics.
 //!
-//! This module deliberately contains only bounded control-plane metadata. It does not carry CUMG
-//! grants, operation payloads/results, screenshots, clipboard data, Human input, or recovery
-//! authority. The Handoff process owns Agent/Human authority and epochs; CUMG remains authoritative
-//! for principal/device/capability authorization, dispatch, durable execution state, quarantine,
-//! replay admission, and postcondition verification.
+//! The managed runtime transport is owned by the Hub process and uses stdio, so normal Agent
+//! admission no longer depends on the acceptance-only Unix bridge. The Unix adapter remains a
+//! compatibility/regression harness. Neither transport carries CUMG grants, operation payloads or
+//! results, screenshots, clipboard data, Human input, credentials, or recovery authority.
 
 use crate::{
     v2_m0::{DeviceCommand, InputTarget, PointerTarget, ScrollTarget},
@@ -17,7 +16,14 @@ use std::{
     fmt,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
     time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
 };
 
 const PROTOCOL_VERSION: u8 = 1;
@@ -95,6 +101,216 @@ pub trait OperatorHandoffAuthority: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+pub struct ManagedHandoffRuntimeConfig {
+    command: PathBuf,
+    script: PathBuf,
+    env_file: PathBuf,
+    timeout: Duration,
+}
+
+impl ManagedHandoffRuntimeConfig {
+    pub fn new(
+        command: PathBuf,
+        script: PathBuf,
+        env_file: PathBuf,
+        timeout: Duration,
+    ) -> Result<Self, OperatorHandoffError> {
+        if !command.is_absolute()
+            || !script.is_absolute()
+            || !env_file.is_absolute()
+            || timeout.is_zero()
+        {
+            return Err(OperatorHandoffError::Protocol);
+        }
+        if !std::fs::metadata(&command).is_ok_and(|metadata| metadata.is_file())
+            || !std::fs::metadata(&script).is_ok_and(|metadata| metadata.is_file())
+        {
+            return Err(OperatorHandoffError::Unavailable);
+        }
+        let env_metadata =
+            std::fs::symlink_metadata(&env_file).map_err(|_| OperatorHandoffError::Unavailable)?;
+        if env_metadata.file_type().is_symlink() || !env_metadata.is_file() {
+            return Err(OperatorHandoffError::Protocol);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if env_metadata.permissions().mode() & 0o077 != 0 {
+                return Err(OperatorHandoffError::Protocol);
+            }
+        }
+        Ok(Self {
+            command,
+            script,
+            env_file,
+            timeout,
+        })
+    }
+}
+
+struct ManagedHandoffRuntimeState {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: TokioBufReader<ChildStdout>,
+    faulted: bool,
+}
+
+#[derive(Clone)]
+pub struct ManagedOperatorHandoffAuthority {
+    state: Arc<Mutex<ManagedHandoffRuntimeState>>,
+    timeout: Duration,
+}
+
+impl ManagedOperatorHandoffAuthority {
+    pub async fn spawn(config: ManagedHandoffRuntimeConfig) -> Result<Self, OperatorHandoffError> {
+        let mut command = Command::new(&config.command);
+        command
+            .env_clear()
+            .arg(format!("--env-file={}", config.env_file.display()))
+            .arg(&config.script)
+            .arg("serve-stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|_| OperatorHandoffError::Unavailable)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(OperatorHandoffError::Unavailable)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(OperatorHandoffError::Unavailable)?;
+        let runtime = Self {
+            state: Arc::new(Mutex::new(ManagedHandoffRuntimeState {
+                child,
+                stdin,
+                stdout: TokioBufReader::new(stdout),
+                faulted: false,
+            })),
+            timeout: config.timeout,
+        };
+        let status = runtime
+            .exchange_value(&serde_json::json!({ "action": "status" }))
+            .await?;
+        if status.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            runtime.fault().await;
+            return Err(OperatorHandoffError::Protocol);
+        }
+        Ok(runtime)
+    }
+
+    async fn stop_faulted_child(state: &mut ManagedHandoffRuntimeState, timeout: Duration) {
+        state.faulted = true;
+        // Fence Agent authority before attempting cleanup. EOF gives the runtime a bounded chance
+        // to revoke any live Human surface and preserve the signed checkpoint for explicit recovery.
+        let _ = state.stdin.shutdown().await;
+        if tokio::time::timeout(timeout, state.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = state.child.start_kill();
+            let _ = tokio::time::timeout(timeout, state.child.wait()).await;
+        }
+    }
+
+    async fn fault(&self) {
+        let mut state = self.state.lock().await;
+        if state.faulted {
+            return;
+        }
+        Self::stop_faulted_child(&mut state, self.timeout).await;
+    }
+
+    async fn exchange_value<T: Serialize + ?Sized>(
+        &self,
+        request: &T,
+    ) -> Result<serde_json::Value, OperatorHandoffError> {
+        let encoded = serde_json::to_vec(request).map_err(|_| OperatorHandoffError::Protocol)?;
+        if encoded.len() + 1 > MAX_WIRE_BYTES {
+            return Err(OperatorHandoffError::Protocol);
+        }
+
+        let mut state = self.state.lock().await;
+        if state.faulted {
+            return Err(OperatorHandoffError::Unavailable);
+        }
+        match state.child.try_wait() {
+            Ok(Some(_)) => {
+                state.faulted = true;
+                return Err(OperatorHandoffError::Unavailable);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                Self::stop_faulted_child(&mut state, self.timeout).await;
+                return Err(OperatorHandoffError::Unavailable);
+            }
+        }
+
+        let result = tokio::time::timeout(self.timeout, async {
+            state
+                .stdin
+                .write_all(&encoded)
+                .await
+                .map_err(|_| OperatorHandoffError::Unavailable)?;
+            state
+                .stdin
+                .write_all(b"\n")
+                .await
+                .map_err(|_| OperatorHandoffError::Unavailable)?;
+            state
+                .stdin
+                .flush()
+                .await
+                .map_err(|_| OperatorHandoffError::Unavailable)?;
+            let mut response = Vec::new();
+            let read = state
+                .stdout
+                .read_until(b'\n', &mut response)
+                .await
+                .map_err(|_| OperatorHandoffError::Unavailable)?;
+            if read == 0 {
+                return Err(OperatorHandoffError::Unavailable);
+            }
+            if read > MAX_WIRE_BYTES || response.last() != Some(&b'\n') {
+                return Err(OperatorHandoffError::Protocol);
+            }
+            response.pop();
+            serde_json::from_slice(&response).map_err(|_| OperatorHandoffError::Protocol)
+        })
+        .await
+        .unwrap_or(Err(OperatorHandoffError::Unavailable));
+
+        if result.is_err() {
+            Self::stop_faulted_child(&mut state, self.timeout).await;
+        }
+        result
+    }
+
+    async fn exchange(&self, request: WireRequest) -> Result<WireResponse, OperatorHandoffError> {
+        let value = self.exchange_value(&request).await?;
+        match serde_json::from_value(value) {
+            Ok(response) => Ok(response),
+            Err(_) => {
+                self.fault().await;
+                Err(OperatorHandoffError::Protocol)
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let mut state = self.state.lock().await;
+        if state.faulted {
+            return;
+        }
+        Self::stop_faulted_child(&mut state, self.timeout).await;
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct UnixOperatorHandoffAuthority {
     socket_path: PathBuf,
     timeout: Duration,
@@ -127,40 +343,18 @@ impl UnixOperatorHandoffAuthority {
 }
 
 #[async_trait]
-impl OperatorHandoffAuthority for UnixOperatorHandoffAuthority {
+impl OperatorHandoffAuthority for ManagedOperatorHandoffAuthority {
     async fn admit_agent(
         &self,
         request: AgentAuthorityRequest,
     ) -> Result<AgentAuthorityDecision, OperatorHandoffError> {
-        let response = self
-            .exchange(WireRequest::AdmitAgent {
-                protocol: PROTOCOL_VERSION,
-                principal_binding: request.principal_binding,
-                device_binding: request.device_binding,
-                generation: request.generation,
-                capability_revision: request.capability_revision,
-                exact_window: request.exact_window.map(WireExactWindow::from),
-                verification_candidate: request.verification_candidate,
-            })
-            .await?;
-        if !response.ok {
-            return Err(OperatorHandoffError::Protocol);
-        }
-        match response.decision.as_deref() {
-            Some("allow") => Ok(AgentAuthorityDecision::Allow),
-            Some("deny") => Ok(AgentAuthorityDecision::Deny),
-            Some("verification") => {
-                let intervention_id = bounded_intervention_id(response.intervention_id.as_deref())?;
-                let epoch = response.epoch.ok_or(OperatorHandoffError::Protocol)?;
-                if epoch == 0 {
-                    return Err(OperatorHandoffError::Protocol);
-                }
-                Ok(AgentAuthorityDecision::Verification(VerificationToken {
-                    intervention_id,
-                    epoch,
-                }))
+        let response = self.exchange(wire_admission_request(request)).await?;
+        match parse_admission_response(response) {
+            Ok(decision) => Ok(decision),
+            Err(error) => {
+                self.fault().await;
+                Err(error)
             }
-            _ => Err(OperatorHandoffError::Protocol),
         }
     }
 
@@ -168,24 +362,33 @@ impl OperatorHandoffAuthority for UnixOperatorHandoffAuthority {
         &self,
         report: VerificationReport,
     ) -> Result<(), OperatorHandoffError> {
-        let response = self
-            .exchange(WireRequest::ReportVerification {
-                protocol: PROTOCOL_VERSION,
-                principal_binding: report.authority.principal_binding,
-                device_binding: report.authority.device_binding,
-                generation: report.authority.generation,
-                capability_revision: report.authority.capability_revision,
-                exact_window: report.authority.exact_window.map(WireExactWindow::from),
-                intervention_id: report.token.intervention_id,
-                epoch: report.token.epoch,
-                satisfied: report.satisfied,
-            })
-            .await?;
-        if response.ok && response.decision.is_none() {
-            Ok(())
-        } else {
-            Err(OperatorHandoffError::Protocol)
+        let response = self.exchange(wire_verification_report(report)).await?;
+        match validate_verification_response(response) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.fault().await;
+                Err(error)
+            }
         }
+    }
+}
+
+#[async_trait]
+impl OperatorHandoffAuthority for UnixOperatorHandoffAuthority {
+    async fn admit_agent(
+        &self,
+        request: AgentAuthorityRequest,
+    ) -> Result<AgentAuthorityDecision, OperatorHandoffError> {
+        let response = self.exchange(wire_admission_request(request)).await?;
+        parse_admission_response(response)
+    }
+
+    async fn report_verification(
+        &self,
+        report: VerificationReport,
+    ) -> Result<(), OperatorHandoffError> {
+        let response = self.exchange(wire_verification_report(report)).await?;
+        validate_verification_response(response)
     }
 }
 
@@ -214,6 +417,64 @@ enum WireRequest {
         epoch: u64,
         satisfied: bool,
     },
+}
+
+fn wire_admission_request(request: AgentAuthorityRequest) -> WireRequest {
+    WireRequest::AdmitAgent {
+        protocol: PROTOCOL_VERSION,
+        principal_binding: request.principal_binding,
+        device_binding: request.device_binding,
+        generation: request.generation,
+        capability_revision: request.capability_revision,
+        exact_window: request.exact_window.map(WireExactWindow::from),
+        verification_candidate: request.verification_candidate,
+    }
+}
+
+fn wire_verification_report(report: VerificationReport) -> WireRequest {
+    WireRequest::ReportVerification {
+        protocol: PROTOCOL_VERSION,
+        principal_binding: report.authority.principal_binding,
+        device_binding: report.authority.device_binding,
+        generation: report.authority.generation,
+        capability_revision: report.authority.capability_revision,
+        exact_window: report.authority.exact_window.map(WireExactWindow::from),
+        intervention_id: report.token.intervention_id,
+        epoch: report.token.epoch,
+        satisfied: report.satisfied,
+    }
+}
+
+fn parse_admission_response(
+    response: WireResponse,
+) -> Result<AgentAuthorityDecision, OperatorHandoffError> {
+    if !response.ok {
+        return Err(OperatorHandoffError::Protocol);
+    }
+    match response.decision.as_deref() {
+        Some("allow") => Ok(AgentAuthorityDecision::Allow),
+        Some("deny") => Ok(AgentAuthorityDecision::Deny),
+        Some("verification") => {
+            let intervention_id = bounded_intervention_id(response.intervention_id.as_deref())?;
+            let epoch = response.epoch.ok_or(OperatorHandoffError::Protocol)?;
+            if epoch == 0 {
+                return Err(OperatorHandoffError::Protocol);
+            }
+            Ok(AgentAuthorityDecision::Verification(VerificationToken {
+                intervention_id,
+                epoch,
+            }))
+        }
+        _ => Err(OperatorHandoffError::Protocol),
+    }
+}
+
+fn validate_verification_response(response: WireResponse) -> Result<(), OperatorHandoffError> {
+    if response.ok && response.decision.is_none() {
+        Ok(())
+    } else {
+        Err(OperatorHandoffError::Protocol)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +787,158 @@ pub fn is_exact_verification_candidate(command: &DeviceCommand) -> bool {
 mod tests {
     use super::*;
     use crate::v2_m0::{UiPredicate, UiRect};
+
+    #[cfg(unix)]
+    fn managed_runtime_fixture(exit_after_status: bool) -> (ManagedHandoffRuntimeConfig, PathBuf) {
+        use rand::RngCore;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut suffix = [0_u8; 8];
+        rand::thread_rng().fill_bytes(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "cumg-handoff-runtime-test-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(suffix)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let command = root.join("fixture.sh");
+        let script = root.join("runtime.mjs");
+        let env_file = root.join("runtime.env");
+        let body = if exit_after_status {
+            r#"#!/bin/sh
+IFS= read -r line || exit 2
+printf '%s\n' '{"ok":true}'
+# Make startup handshake deterministic, then simulate child loss only after the next request arrives.
+IFS= read -r line || exit 0
+exit 0
+"#
+        } else {
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"action":"status"'*) printf '%s\n' '{"ok":true}' ;;
+    *'"action":"admit_agent"'*) printf '%s\n' '{"ok":true,"decision":"allow"}' ;;
+    *'"action":"report_verification"'*) printf '%s\n' '{"ok":true}' ;;
+    *) printf '%s\n' '{"ok":false}' ;;
+  esac
+done
+"#
+        };
+        std::fs::write(&command, body).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&script, "// fixture\n").unwrap();
+        std::fs::write(&env_file, "FIXTURE=1\n").unwrap();
+        std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config =
+            ManagedHandoffRuntimeConfig::new(command, script, env_file, Duration::from_secs(1))
+                .unwrap();
+        (config, root)
+    }
+
+    #[cfg(unix)]
+    fn fixture_authority_request() -> AgentAuthorityRequest {
+        AgentAuthorityRequest {
+            principal_binding: "a".repeat(64),
+            device_binding: "b".repeat(64),
+            generation: 1,
+            capability_revision: 1,
+            exact_window: Some(ExactWindowBinding {
+                context_binding: "c".repeat(64),
+                process_id: 12,
+                window_id: 34,
+            }),
+            verification_candidate: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_runtime_uses_stdio_and_shutdown_never_restarts_authority() {
+        let (config, root) = managed_runtime_fixture(false);
+        let runtime = ManagedOperatorHandoffAuthority::spawn(config)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .admit_agent(fixture_authority_request())
+                .await
+                .unwrap(),
+            AgentAuthorityDecision::Allow
+        );
+        runtime.shutdown().await;
+        assert_eq!(
+            runtime.admit_agent(fixture_authority_request()).await,
+            Err(OperatorHandoffError::Unavailable)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_runtime_process_loss_is_permanently_fail_closed_for_hub_generation() {
+        let (config, root) = managed_runtime_fixture(true);
+        let runtime = ManagedOperatorHandoffAuthority::spawn(config)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.admit_agent(fixture_authority_request()).await,
+            Err(OperatorHandoffError::Unavailable)
+        );
+        assert_eq!(
+            runtime.admit_agent(fixture_authority_request()).await,
+            Err(OperatorHandoffError::Unavailable)
+        );
+        runtime.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_requires_private_env_file() {
+        use rand::RngCore;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut suffix = [0_u8; 8];
+        rand::thread_rng().fill_bytes(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "cumg-handoff-env-test-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(suffix)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let command = root.join("node");
+        let script = root.join("runtime.mjs");
+        let env_file = root.join("runtime.env");
+        std::fs::write(&command, "node\n").unwrap();
+        std::fs::write(&script, "// runtime\n").unwrap();
+        std::fs::write(&env_file, "SECRET=value\n").unwrap();
+        std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ManagedHandoffRuntimeConfig::new(
+                command.clone(),
+                script.clone(),
+                env_file.clone(),
+                Duration::from_secs(1),
+            )
+            .unwrap_err(),
+            OperatorHandoffError::Protocol
+        );
+
+        std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let symlink_env_file = root.join("runtime-link.env");
+        std::os::unix::fs::symlink(&env_file, &symlink_env_file).unwrap();
+        assert_eq!(
+            ManagedHandoffRuntimeConfig::new(
+                command,
+                script,
+                symlink_env_file,
+                Duration::from_secs(1),
+            )
+            .unwrap_err(),
+            OperatorHandoffError::Protocol
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn bindings_are_fixed_length_and_domain_separated() {

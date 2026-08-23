@@ -20,7 +20,9 @@ use computer_use_mcp_gateway::{
         OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp, build_northbound_router,
         build_trusted_proxy_router,
     },
-    v2_operator_handoff::UnixOperatorHandoffAuthority,
+    v2_operator_handoff::{
+        ManagedHandoffRuntimeConfig, ManagedOperatorHandoffAuthority, UnixOperatorHandoffAuthority,
+    },
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch};
@@ -126,10 +128,25 @@ struct Args {
     /// Integrity-protected JSON principal -> device -> exact-capability mapping.
     #[arg(long, env = "CUMG_V2_NORTHBOUND_POLICY_FILE")]
     northbound_policy_file: Option<PathBuf>,
-    /// Optional local Unix socket for the mcp-execution-handoff authority bridge. When configured,
-    /// desktop/browser semantic dispatch fails closed if the authority bridge is unavailable.
+    /// Compatibility-only local Unix socket for the acceptance/regression Handoff bridge.
+    /// Mutually exclusive with the first-class managed Handoff runtime.
     #[arg(long, env = "CUMG_V2_OPERATOR_HANDOFF_SOCKET")]
     operator_handoff_socket: Option<PathBuf>,
+    /// Absolute Node.js executable used for the first-class Hub-owned Handoff runtime.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_COMMAND")]
+    handoff_runtime_command: Option<PathBuf>,
+    /// Absolute CUMG Handoff runtime host script. The normal target is scripts/v2_handoff_runtime.mjs.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_SCRIPT")]
+    handoff_runtime_script: Option<PathBuf>,
+    /// Private Node --env-file containing only Handoff/runtime configuration and transport secrets.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_ENV_FILE")]
+    handoff_runtime_env_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS",
+        default_value_t = 2
+    )]
+    handoff_runtime_timeout_secs: u64,
     /// Optional private key material used only to HMAC canonical shell/process requests for
     /// privacy-preserving same/different reconciliation. The raw key and fingerprint are never
     /// emitted by normal audit surfaces.
@@ -220,6 +237,10 @@ async fn main() -> Result<()> {
         args.oauth_introspection_timeout_secs > 0,
         "CUMG_V2_OAUTH_INTROSPECTION_TIMEOUT_SECS must be greater than zero"
     );
+    ensure!(
+        args.handoff_runtime_timeout_secs > 0,
+        "CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS must be greater than zero"
+    );
 
     // Install the OS signal handlers before secret/checkpoint loading so an
     // operator stop immediately after exec cannot hit the process-wide default
@@ -306,7 +327,9 @@ async fn main() -> Result<()> {
     .context("failed to initialize V2 Hub state")?;
     let device_id = hub.device_id().to_owned();
     let shutdown_handle = handle.clone();
-    let northbound = build_northbound_runtime(&args, handle, &device_id)?;
+    let handoff_coordinator = build_handoff_coordinator(&args).await?;
+    let northbound =
+        build_northbound_runtime(&args, handle, &device_id, handoff_coordinator.clone())?;
 
     info!(
         event = "v2_hub_start",
@@ -318,6 +341,7 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
+    let handoff_shutdown = handoff_coordinator.clone();
     tokio::spawn(async move {
         let signal = signal_rx.await.unwrap_or("signal_listener_closed");
         let first = shutdown_handle.begin_shutdown_drain();
@@ -355,6 +379,15 @@ async fn main() -> Result<()> {
             outcome = "shutdown",
             "Hub shutdown requested closure of the current Agent stream after bounded drain"
         );
+        if let Some(coordinator) = handoff_shutdown.as_ref() {
+            coordinator.shutdown().await;
+            info!(
+                event = "v2_handoff_runtime_shutdown",
+                signal,
+                outcome = "fenced",
+                "Handoff runtime stopped after admitted Agent work drained"
+            );
+        }
         let _ = shutdown_tx.send(true);
     });
 
@@ -403,10 +436,70 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn build_handoff_coordinator(args: &Args) -> Result<Option<Arc<HandoffCoordinator>>> {
+    let managed_fields = [
+        args.handoff_runtime_command.is_some(),
+        args.handoff_runtime_script.is_some(),
+        args.handoff_runtime_env_file.is_some(),
+    ];
+    let managed_configured = managed_fields.into_iter().any(|configured| configured);
+    ensure!(
+        !(managed_configured && args.operator_handoff_socket.is_some()),
+        "CUMG managed Handoff runtime and CUMG_V2_OPERATOR_HANDOFF_SOCKET are mutually exclusive"
+    );
+
+    if managed_configured {
+        ensure!(
+            managed_fields.into_iter().all(|configured| configured),
+            "CUMG_V2_HANDOFF_RUNTIME_COMMAND, CUMG_V2_HANDOFF_RUNTIME_SCRIPT, and CUMG_V2_HANDOFF_RUNTIME_ENV_FILE must be configured together"
+        );
+        let config = ManagedHandoffRuntimeConfig::new(
+            args.handoff_runtime_command
+                .clone()
+                .expect("validated managed Handoff runtime command"),
+            args.handoff_runtime_script
+                .clone()
+                .expect("validated managed Handoff runtime script"),
+            args.handoff_runtime_env_file
+                .clone()
+                .expect("validated managed Handoff runtime env file"),
+            Duration::from_secs(args.handoff_runtime_timeout_secs),
+        )
+        .context("invalid managed Handoff runtime configuration")?;
+        let runtime = Arc::new(
+            ManagedOperatorHandoffAuthority::spawn(config)
+                .await
+                .context("failed to start managed Handoff runtime")?,
+        );
+        info!(
+            event = "v2_handoff_runtime_configured",
+            mode = "managed_stdio",
+            outcome = "ready",
+            "first-class Handoff runtime configured"
+        );
+        return Ok(Some(Arc::new(HandoffCoordinator::managed(runtime))));
+    }
+
+    if let Some(path) = args.operator_handoff_socket.as_ref() {
+        warn!(
+            event = "v2_handoff_runtime_configured",
+            mode = "legacy_unix_bridge",
+            outcome = "compatibility_only",
+            "acceptance-only Unix Handoff bridge remains enabled as a compatibility backend"
+        );
+        let authority = UnixOperatorHandoffAuthority::new(path.clone())
+            .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
+        return Ok(Some(Arc::new(HandoffCoordinator::new(Arc::new(authority)))));
+    }
+
+    Ok(None)
+}
+
 fn build_northbound_runtime(
     args: &Args,
     handle: computer_use_mcp_gateway::v2_m1_hub::HubHandle,
     device_id: &str,
+    handoff_coordinator: Option<Arc<HandoffCoordinator>>,
 ) -> Result<Option<NorthboundRuntime>> {
     let oauth_configured = [
         args.oauth_authorization_server.is_some(),
@@ -505,11 +598,8 @@ fn build_northbound_runtime(
         if let Some(secret) = audit_fingerprint_secret.clone() {
             service = service.with_request_fingerprint_secret(secret);
         }
-        if let Some(path) = args.operator_handoff_socket.as_ref() {
-            let authority = UnixOperatorHandoffAuthority::new(path.clone())
-                .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
-            service = service
-                .with_handoff_coordinator(Arc::new(HandoffCoordinator::new(Arc::new(authority))));
+        if let Some(coordinator) = handoff_coordinator.as_ref() {
+            service = service.with_handoff_coordinator(coordinator.clone());
         }
         let router = build_trusted_proxy_router(service, proxy_config)
             .layer(axum::middleware::from_fn_with_state(
@@ -566,11 +656,8 @@ fn build_northbound_runtime(
         if let Some(secret) = audit_fingerprint_secret.clone() {
             service = service.with_request_fingerprint_secret(secret);
         }
-        if let Some(path) = args.operator_handoff_socket.as_ref() {
-            let authority = UnixOperatorHandoffAuthority::new(path.clone())
-                .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
-            service = service
-                .with_handoff_coordinator(Arc::new(HandoffCoordinator::new(Arc::new(authority))));
+        if let Some(coordinator) = handoff_coordinator.as_ref() {
+            service = service.with_handoff_coordinator(coordinator.clone());
         }
         let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
             axum::middleware::from_fn_with_state(

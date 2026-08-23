@@ -3,9 +3,10 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { HandoffBridge } from "../v2_operator_handoff_bridge.mjs";
+import { HandoffBridge, serveStdio } from "../v2_operator_handoff_bridge.mjs";
 
 const HANDOFF_ROOT = process.env.CUMG_V2_HANDOFF_ROOT;
 const api = HANDOFF_ROOT
@@ -166,6 +167,24 @@ async function webRtcControl(bridge, locator, operation) {
   ));
 }
 
+
+test("first-class stdio runtime keeps the compatibility bridge protocol off the Agent socket path", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let response = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk) => { response += chunk; });
+  const serving = serveStdio({
+    handle(request) {
+      assert.deepEqual(request, { action: "status" });
+      return { ok: true, runtime: "ready" };
+    },
+  }, input, output);
+  input.end('{"action":"status"}\n');
+  await serving;
+  assert.equal(response, '{"ok":true,"runtime":"ready"}\n');
+});
+
 test("Agent -> Native Human -> verifying -> explicit same-window resume preserves exclusive authority", async () => {
   const f = fixture();
   try {
@@ -242,6 +261,30 @@ test("Agent -> Native Human -> verifying -> explicit same-window resume preserve
     // Only a fresh CUMG admission for the exact same window may consume explicit resume.
     assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
     assert.equal(f.bridge.handle({ action: "status" }).active, null);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("runtime shutdown revokes live Human surface and preserves checkpoint for explicit recovery", async () => {
+  const f = fixture();
+  try {
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
+    const begun = ctl(f.bridge, "begin");
+    assert.equal(begun.ok, true);
+    const claim = await nativeControl(f.bridge, begun.native_locator, "claim");
+    assert.equal(claim.status, 200);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "human_active");
+    assert.equal(fs.existsSync(f.checkpoint), true);
+
+    await f.bridge.shutdown();
+    assert.deepEqual(f.native.revoked, [begun.intervention_id]);
+    assert.equal(f.bridge.handle({ action: "status" }).locator, null);
+    assert.equal(fs.existsSync(f.checkpoint), true);
+
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_000_010, new FakeNativeSurface());
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+    assert.deepEqual(recovered.handle(f.request), { ok: true, decision: "deny" });
   } finally {
     f.cleanup();
   }

@@ -5,18 +5,18 @@
 //! Agent/Human authority, intervention/epoch transitions, `Done -> verifying`, and resume policy.
 //! This module deliberately does not implement a second Handoff state machine.
 //!
-//! The initial backend is the accepted Unix bridge compatibility transport. Keeping that transport
-//! behind this coordinator lets Window dogfood migrate without making the bridge protocol part of
-//! the northbound execution contract, and leaves one surface-neutral seam for Terminal/PTY #48.
+//! Normal runtime integration uses a Hub-owned managed Handoff process. The accepted Unix bridge is
+//! retained only as a compatibility/regression backend. Both stay behind one surface-neutral seam
+//! so Terminal/PTY #48 can bind a new surface without duplicating authority semantics.
 
 use crate::{
     v2_m0::{DeviceCommand, DeviceResult, VerificationStatus},
     v2_m0_trust::AuthenticatedClientPrincipal,
     v2_operator_handoff::{
         AgentAuthorityDecision, AgentAuthorityRequest, ExactWindowBinding,
-        OperatorHandoffAuthority, OperatorHandoffError, VerificationReport, VerificationToken,
-        device_binding, exact_window_binding, is_exact_verification_candidate,
-        is_phase1_protected_command, principal_binding,
+        ManagedOperatorHandoffAuthority, OperatorHandoffAuthority, OperatorHandoffError,
+        VerificationReport, VerificationToken, device_binding, exact_window_binding,
+        is_exact_verification_candidate, is_phase1_protected_command, principal_binding,
     },
 };
 use std::{fmt, sync::Arc};
@@ -95,11 +95,31 @@ impl From<OperatorHandoffError> for HandoffCoordinatorError {
 #[derive(Clone)]
 pub struct HandoffCoordinator {
     backend: Arc<dyn OperatorHandoffAuthority>,
+    managed_runtime: Option<Arc<ManagedOperatorHandoffAuthority>>,
 }
 
 impl HandoffCoordinator {
+    /// Compatibility constructor for the acceptance-only Unix bridge backend.
     pub fn new(backend: Arc<dyn OperatorHandoffAuthority>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            managed_runtime: None,
+        }
+    }
+
+    /// Normal CUMG runtime constructor. The Hub owns this process for the lifetime of the
+    /// coordinator; runtime failure is fail-closed and never triggers authority-restoring restart.
+    pub fn managed(runtime: Arc<ManagedOperatorHandoffAuthority>) -> Self {
+        Self {
+            backend: runtime.clone(),
+            managed_runtime: Some(runtime),
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(runtime) = self.managed_runtime.as_ref() {
+            runtime.shutdown().await;
+        }
     }
 
     pub(crate) fn protects_agent_command(&self, command: &DeviceCommand) -> bool {
