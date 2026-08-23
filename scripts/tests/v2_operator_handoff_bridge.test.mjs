@@ -13,6 +13,7 @@ const api = HANDOFF_ROOT
 
 class FakeNativeSurface {
   constructor() {
+    this.kind = "native";
     this.sessionID = "session-12345678";
     this.revoked = [];
   }
@@ -41,16 +42,60 @@ class FakeNativeSurface {
   revokeUnclaimed(interventionId) {
     this.revoked.push(interventionId);
   }
+
+  lifecycle(pathname) {
+    const match = /^\/takeover\/api\/(claim|reconnect|done|cancel)\//.exec(pathname);
+    if (!match) return undefined;
+    if (match[1] === "claim") return "claim";
+    if (match[1] === "done" || match[1] === "cancel") return "complete";
+    return undefined;
+  }
 }
 
-function fixture() {
+class FakeWebRtcSurface {
+  constructor() {
+    this.kind = "webrtc";
+    this.sessionID = "webrtc-session-12345678";
+    this.revoked = [];
+  }
+
+  create(intervention, binding) {
+    this.intervention = { ...intervention };
+    this.binding = structuredClone(binding);
+    return `https://handoff.example/takeover/${this.sessionID}`;
+  }
+
+  async handle(request, principalBinding) {
+    assert.equal(principalBinding, this.binding.principalBinding);
+    const pathname = new URL(request.url).pathname;
+    if (pathname === `/takeover/${this.sessionID}` || pathname === "/takeover/webrtc-client.js") {
+      return new Response("ok", { status: 200 });
+    }
+    const match = /^\/takeover\/api\/(webrtc-prepare-claim|webrtc-prepare-reconnect|webrtc-connect|webrtc-suspend|done|cancel)\//.exec(pathname);
+    if (!match) return new Response("{}", { status: 404 });
+    return new Response(JSON.stringify({ ok: true, operation: match[1] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  async revoke(interventionId) { this.revoked.push(interventionId); }
+  revokeUnclaimed(interventionId) { this.revoked.push(interventionId); }
+
+  lifecycle(pathname) {
+    const match = /^\/takeover\/api\/(webrtc-connect|done|cancel)\//.exec(pathname);
+    if (!match) return undefined;
+    return match[1] === "webrtc-connect" ? "connect" : "complete";
+  }
+}
+
+function fixture(surface = new FakeNativeSurface()) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cumg-handoff-test-"));
   const checkpoint = path.join(root, "handoff.json");
   const key = Buffer.alloc(32, 7);
   let now = 1_800_000_000_000;
   const store = new api.SignedFileHandoffCheckpointStore(checkpoint, key, () => now);
-  const native = new FakeNativeSurface();
-  const bridge = new HandoffBridge(api, store, () => now, native);
+  const bridge = new HandoffBridge(api, store, () => now, surface);
   const request = {
     action: "admit_agent",
     protocol: 1,
@@ -66,7 +111,7 @@ function fixture() {
     verification_candidate: false,
   };
   return {
-    root, checkpoint, store, bridge, native, request,
+    root, checkpoint, store, bridge, surface, native: surface, request,
     tick(ms = 1) { now += ms; },
     cleanup() { fs.rmSync(root, { recursive: true, force: true }); },
   };
@@ -83,7 +128,7 @@ function ctl(bridge, action, intervention, extra = {}) {
 async function nativeControl(bridge, locator, operation) {
   const url = new URL(locator);
   const sessionID = url.pathname.split("/").at(-1);
-  return bridge.handleNative(new Request(
+  return bridge.handleSurface(new Request(
     `${url.origin}/takeover/api/${operation}/${sessionID}`,
     {
       method: "POST",
@@ -92,6 +137,23 @@ async function nativeControl(bridge, locator, operation) {
         "x-takeover-client": "dogfood-client-binding-aaaaaaaa",
         "x-mcp-takeover-capability": "a".repeat(48),
       },
+    },
+  ));
+}
+
+async function webRtcControl(bridge, locator, operation) {
+  const url = new URL(locator);
+  const sessionID = url.pathname.split("/").at(-1);
+  return bridge.handleSurface(new Request(
+    `${url.origin}/takeover/api/${operation}/${sessionID}`,
+    {
+      method: "POST",
+      headers: {
+        origin: url.origin,
+        "x-takeover-client": "dogfood-webrtc-binding-aaaaaaaa",
+        "x-mcp-takeover-capability": "b".repeat(48),
+      },
+      body: operation === "webrtc-connect" ? JSON.stringify({ type: "offer", sdp: "v=0\r\n" }) : undefined,
     },
   ));
 }
@@ -251,6 +313,51 @@ test("native Cancel after possible Human side effects enters verifying and never
     await nativeControl(f.bridge, begun.native_locator, "claim");
     const cancelled = await nativeControl(f.bridge, begun.native_locator, "cancel");
     assert.equal(cancelled.status, 200);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "verifying");
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
+  } finally {
+    f.cleanup();
+  }
+});
+
+
+test("iPhone WebRTC prepare does not claim Human authority; connect does, suspend stays fail-closed, Done verifies", async () => {
+  const surface = new FakeWebRtcSurface();
+  const f = fixture(surface);
+  try {
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
+    const begun = ctl(f.bridge, "begin");
+    assert.equal(begun.ok, true);
+    assert.equal(begun.surface, "webrtc");
+    assert.equal(begun.webrtc_locator, begun.locator);
+    assert.equal(begun.native_locator, null);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "awaiting_human");
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
+
+    const page = await f.bridge.handleSurface(new Request(begun.locator));
+    assert.equal(page.status, 200);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "awaiting_human");
+
+    const prepared = await webRtcControl(f.bridge, begun.locator, "webrtc-prepare-claim");
+    assert.equal(prepared.status, 200);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "awaiting_human");
+
+    const connected = await webRtcControl(f.bridge, begun.locator, "webrtc-connect");
+    assert.equal(connected.status, 200);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "human_active");
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
+
+    const suspended = await webRtcControl(f.bridge, begun.locator, "webrtc-suspend");
+    assert.equal(suspended.status, 200);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "human_active");
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
+
+    const reconnected = await webRtcControl(f.bridge, begun.locator, "webrtc-connect");
+    assert.equal(reconnected.status, 200);
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "human_active");
+
+    const done = await webRtcControl(f.bridge, begun.locator, "done");
+    assert.equal(done.status, 200);
     assert.equal(f.bridge.handle({ action: "status" }).active.status, "verifying");
     assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
   } finally {

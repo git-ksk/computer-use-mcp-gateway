@@ -65,7 +65,7 @@ function sameAuthority(left, right) {
     && left.capabilityRevision === right.capabilityRevision;
 }
 
-function safeStatus(active, recovery, resumeRequested, latest, nativeLocator, faulted) {
+function safeStatus(active, recovery, resumeRequested, latest, surface, locator, faulted) {
   return {
     ok: true,
     active: active ? {
@@ -79,7 +79,10 @@ function safeStatus(active, recovery, resumeRequested, latest, nativeLocator, fa
     recovery_epoch: recovery?.epoch ?? null,
     resume_requested: resumeRequested,
     faulted: !!faulted,
-    native_locator: nativeLocator ?? null,
+    human_surface: surface?.kind ?? null,
+    locator: locator ?? null,
+    native_locator: surface?.kind === "native" ? locator ?? null : null,
+    webrtc_locator: surface?.kind === "webrtc" ? locator ?? null : null,
     latest_exact_window: latest?.exactWindow ? {
       process_id: latest.exactWindow.processId,
       window_id: latest.exactWindow.windowId,
@@ -90,8 +93,8 @@ function safeStatus(active, recovery, resumeRequested, latest, nativeLocator, fa
 
 const NATIVE_TTL_MS = 5 * 60_000;
 
-function localNativeBrowserAdapter() {
-  const unavailable = async () => { throw new Error("legacy browser surface disabled for CUMG native dogfood"); };
+function disabledLegacyBrowserAdapter() {
+  const unavailable = async () => { throw new Error("legacy browser frame/input surface disabled for CUMG handoff dogfood"); };
   return {
     captureHumanTakeoverFrame: unavailable,
     tapHumanTakeover: unavailable,
@@ -122,7 +125,8 @@ export class NativeHandoffSurface {
       controlPort: 48_557,
       videoFeedbackPort: 48_558,
     });
-    this.broker = new api.TakeoverBroker(localNativeBrowserAdapter(), {
+    this.kind = "native";
+    this.broker = new api.TakeoverBroker(disabledLegacyBrowserAdapter(), {
       enabled: true,
       publicBaseUrl: baseUrl,
       ttlMs: NATIVE_TTL_MS,
@@ -149,20 +153,75 @@ export class NativeHandoffSurface {
   revokeUnclaimed(interventionId) {
     this.broker.revokeForIntervention(interventionId);
   }
+
+  lifecycle(pathname) {
+    const match = /^\/takeover\/api\/(claim|reconnect|done|cancel)\//.exec(pathname);
+    if (!match) return undefined;
+    if (match[1] === "claim") return "claim";
+    if (match[1] === "done" || match[1] === "cancel") return "complete";
+    return undefined;
+  }
+}
+
+export class WebRtcHandoffSurface {
+  constructor(api, { publicBaseUrl, hostExecutable }) {
+    const url = new URL(publicBaseUrl);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+      throw new Error("WebRTC dogfood broker requires an explicit HTTPS public origin");
+    }
+    if (!path.isAbsolute(hostExecutable) || !fs.statSync(hostExecutable).isFile()) {
+      throw new Error("WebRTC runtime executable invalid");
+    }
+    fs.accessSync(hostExecutable, fs.constants.X_OK);
+    this.kind = "webrtc";
+    this.broker = new api.TakeoverBroker(disabledLegacyBrowserAdapter(), {
+      enabled: true,
+      publicBaseUrl,
+      ttlMs: NATIVE_TTL_MS,
+      reconnectIdleMs: 2_000,
+    }, undefined, new api.SpawnedWebRtcRuntimeProvider({ hostExecutable }));
+  }
+
+  create(intervention, binding) {
+    return this.broker.createWebRtcLink(
+      { id: intervention.id, epoch: intervention.epoch },
+      binding.principalBinding,
+      { processId: binding.exactWindow.processId, windowId: binding.exactWindow.windowId },
+    );
+  }
+
+  handle(request, principalBinding) {
+    return this.broker.handle(request, principalBinding);
+  }
+
+  revoke(interventionId) {
+    return this.broker.revokeWebRtcForIntervention(interventionId);
+  }
+
+  revokeUnclaimed(interventionId) {
+    this.broker.revokeForIntervention(interventionId);
+  }
+
+  lifecycle(pathname) {
+    const match = /^\/takeover\/api\/(webrtc-connect|done|cancel)\//.exec(pathname);
+    if (!match) return undefined;
+    if (match[1] === "webrtc-connect") return "connect";
+    return "complete";
+  }
 }
 
 export class HandoffBridge {
-  constructor(api, checkpointStore, now = Date.now, nativeSurface = undefined) {
+  constructor(api, checkpointStore, now = Date.now, humanSurface = undefined) {
     this.api = api;
     this.checkpointStore = checkpointStore;
     this.now = now;
-    this.nativeSurface = nativeSurface;
+    this.humanSurface = humanSurface;
     this.state = new api.ExecutionHandoffState(now);
     this.owners = new Map();
     this.activeBinding = undefined;
     this.latestObservation = undefined;
     this.resumeRequested = false;
-    this.nativeLocator = undefined;
+    this.surfaceLocator = undefined;
     this.faulted = false;
     this.recovery = checkpointStore.recover();
     if (this.recovery && this.recovery.epoch > MAX_RECOVERED_EPOCH) {
@@ -186,45 +245,49 @@ export class HandoffBridge {
     );
   }
 
-  createNativeLocator(intervention) {
-    if (!this.nativeSurface || !this.activeBinding?.exactWindow) return undefined;
-    const locator = this.nativeSurface.create(intervention, this.activeBinding);
-    if (!locator) throw new Error("native handoff locator unavailable");
-    this.nativeLocator = locator;
+  createSurfaceLocator(intervention) {
+    if (!this.humanSurface || !this.activeBinding?.exactWindow) return undefined;
+    const locator = this.humanSurface.create(intervention, this.activeBinding);
+    if (!locator) throw new Error("Human handoff locator unavailable");
+    this.surfaceLocator = locator;
     return locator;
   }
 
-  async handleNative(request) {
+  async handleSurface(request) {
     const active = this.state.getActive();
-    if (!this.nativeSurface || !active || !this.activeBinding || !this.nativeLocator || this.faulted) {
+    if (!this.humanSurface || !active || !this.activeBinding || !this.surfaceLocator || this.faulted) {
       return new Response(JSON.stringify({ error: "takeover_unavailable" }), { status: 404, headers: { "content-type": "application/json" } });
     }
-    const match = /^\/takeover\/api\/(claim|reconnect|done|cancel)\//.exec(new URL(request.url).pathname);
-    const response = await this.nativeSurface.handle(request, this.activeBinding.principalBinding);
-    if (!match || response.status !== 200) return response;
-    const operation = match[1];
-    if (operation === "claim") {
+    const lifecycle = this.humanSurface.lifecycle(new URL(request.url).pathname);
+    const response = await this.humanSurface.handle(request, this.activeBinding.principalBinding);
+    if (!lifecycle || response.status !== 200) return response;
+
+    if (lifecycle === "claim" || lifecycle === "connect") {
       const current = this.state.getActive();
-      if (!current || current.id !== active.id || current.epoch !== active.epoch || current.status !== "awaiting_human") {
-        await this.nativeSurface.revoke(active.id).catch(() => undefined);
+      const initialClaim = current && current.id === active.id && current.epoch === active.epoch && current.status === "awaiting_human";
+      const reconnect = lifecycle === "connect" && current && current.id === active.id && current.epoch === active.epoch && current.status === "human_active";
+      if (!initialClaim && !reconnect) {
+        await this.humanSurface.revoke(active.id).catch(() => undefined);
         this.faulted = true;
         return new Response(JSON.stringify({ error: "takeover_state_changed" }), { status: 409, headers: { "content-type": "application/json" } });
       }
-      this.state.claimHuman(active.id);
-      try { this.checkpoint(); }
-      catch {
-        await this.nativeSurface.revoke(active.id).catch(() => undefined);
-        this.faulted = true;
-        return new Response(JSON.stringify({ error: "takeover_checkpoint_failed" }), { status: 503, headers: { "content-type": "application/json" } });
+      if (initialClaim) {
+        this.state.claimHuman(active.id);
+        try { this.checkpoint(); }
+        catch {
+          await this.humanSurface.revoke(active.id).catch(() => undefined);
+          this.faulted = true;
+          return new Response(JSON.stringify({ error: "takeover_checkpoint_failed" }), { status: 503, headers: { "content-type": "application/json" } });
+        }
       }
-    } else if (operation === "done" || operation === "cancel") {
+    } else if (lifecycle === "complete") {
       const current = this.state.getActive();
       if (!current || current.id !== active.id || current.status !== "human_active") {
         this.faulted = true;
         return new Response(JSON.stringify({ error: "takeover_state_changed" }), { status: 409, headers: { "content-type": "application/json" } });
       }
       this.state.markHumanComplete(active.id);
-      this.nativeLocator = undefined;
+      this.surfaceLocator = undefined;
       this.resumeRequested = false;
       try { this.checkpoint(); }
       catch {
@@ -308,7 +371,7 @@ export class HandoffBridge {
       this.state.resumeAgent(active.id);
       this.activeBinding = undefined;
       this.resumeRequested = false;
-      this.nativeLocator = undefined;
+      this.surfaceLocator = undefined;
       try { this.checkpointStore.clear(); }
       catch { this.faulted = true; return { ok: true, decision: "deny" }; }
       return { ok: true, decision: "allow" };
@@ -346,11 +409,11 @@ export class HandoffBridge {
     this.activeBinding = binding;
     this.resumeRequested = false;
     try {
-      const locator = this.createNativeLocator(intervention);
+      const locator = this.createSurfaceLocator(intervention);
       this.checkpoint();
-      return { ok: true, intervention_id: intervention.id, epoch: intervention.epoch, status: intervention.status, native_locator: locator ?? null };
+      return { ok: true, intervention_id: intervention.id, epoch: intervention.epoch, status: intervention.status, surface: this.humanSurface?.kind ?? null, locator: locator ?? null, native_locator: this.humanSurface?.kind === "native" ? locator ?? null : null, webrtc_locator: this.humanSurface?.kind === "webrtc" ? locator ?? null : null };
     } catch {
-      this.nativeLocator = undefined;
+      this.surfaceLocator = undefined;
       this.activeBinding = undefined;
       this.state.cancel(intervention.id);
       try { this.checkpointStore.clear(); }
@@ -378,9 +441,9 @@ export class HandoffBridge {
     this.activeBinding = binding;
     this.resumeRequested = false;
     try {
-      const locator = this.createNativeLocator(intervention);
+      const locator = this.createSurfaceLocator(intervention);
       this.checkpoint();
-      return { ok: true, intervention_id: intervention.id, epoch: intervention.epoch, status: intervention.status, native_locator: locator ?? null };
+      return { ok: true, intervention_id: intervention.id, epoch: intervention.epoch, status: intervention.status, surface: this.humanSurface?.kind ?? null, locator: locator ?? null, native_locator: this.humanSurface?.kind === "native" ? locator ?? null : null, webrtc_locator: this.humanSurface?.kind === "webrtc" ? locator ?? null : null };
     } catch {
       this.faulted = true;
       return { ok: false };
@@ -400,7 +463,7 @@ export class HandoffBridge {
   control(request) {
     switch (request.action) {
     case "status":
-      return safeStatus(this.state.getActive(), this.recovery, this.resumeRequested, this.latestObservation, this.nativeLocator, this.faulted);
+      return safeStatus(this.state.getActive(), this.recovery, this.resumeRequested, this.latestObservation, this.humanSurface, this.surfaceLocator, this.faulted);
     case "begin":
       return this.begin();
     case "recover_reissue":
@@ -416,8 +479,8 @@ export class HandoffBridge {
       const active = this.exactActive(request, "awaiting_human");
       if (!active) return { ok: false };
       this.state.cancel(active.id);
-      this.nativeSurface?.revokeUnclaimed(active.id);
-      this.nativeLocator = undefined;
+      this.humanSurface?.revokeUnclaimed(active.id);
+      this.surfaceLocator = undefined;
       this.activeBinding = undefined;
       this.resumeRequested = false;
       try { this.checkpointStore.clear(); }
@@ -485,22 +548,22 @@ function serve(socketPath, bridge) {
 }
 
 
-function parseLoopbackBind(value) {
+function parseLoopbackBind(value, label = "http-bind") {
   const match = /^(127\.0\.0\.1):(\d{1,5})$/.exec(value ?? "");
-  if (!match) throw new Error("native-http-bind must be 127.0.0.1:<port>");
+  if (!match) throw new Error(`${label} must be 127.0.0.1:<port>`);
   const port = Number(match[2]);
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("native-http-bind port invalid");
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error(`${label} port invalid`);
   return { host: "127.0.0.1", port, baseUrl: `http://127.0.0.1:${port}/` };
 }
 
-async function readNodeRequest(req, baseUrl) {
+async function readNodeRequest(req, baseUrl, maxBodyBytes = MAX_LINE) {
   const method = req.method ?? "GET";
   const chunks = [];
   let bytes = 0;
   if (method !== "GET" && method !== "HEAD") {
     for await (const chunk of req) {
       bytes += chunk.length;
-      if (bytes > MAX_LINE) throw new Error("native request too large");
+      if (bytes > maxBodyBytes) throw new Error("handoff request too large");
       chunks.push(chunk);
     }
   }
@@ -516,17 +579,17 @@ async function readNodeRequest(req, baseUrl) {
   });
 }
 
-function serveNative(bind, bridge) {
+function serveSurface(bind, requestBaseUrl, bridge) {
   const server = http.createServer(async (req, res) => {
     try {
-      const pathname = new URL(req.url ?? "/", bind.baseUrl).pathname;
-      if (!/^\/takeover\/api\/(claim|reconnect|done|cancel)\/[A-Za-z0-9-]{8,100}$/.test(pathname)) {
+      const pathname = new URL(req.url ?? "/", requestBaseUrl).pathname;
+      if (!pathname.startsWith("/takeover/")) {
         res.writeHead(404, { "content-type": "application/json", "cache-control": "no-store" });
         res.end('{"error":"not_found"}');
         return;
       }
-      const request = await readNodeRequest(req, bind.baseUrl);
-      const response = await bridge.handleNative(request);
+      const request = await readNodeRequest(req, requestBaseUrl, 256 * 1024);
+      const response = await bridge.handleSurface(request);
       const body = Buffer.from(await response.arrayBuffer());
       const headers = {};
       response.headers.forEach((value, key) => { headers[key] = value; });
@@ -573,13 +636,23 @@ async function main() {
   }
   const api = await loadHandoff(handoffRoot);
   const nativeBindValue = optional(options, "native-http-bind", "CUMG_V2_HANDOFF_NATIVE_HTTP_BIND");
-  let nativeSurface;
-  let nativeBind;
+  const webRtcBindValue = optional(options, "webrtc-http-bind", "CUMG_V2_HANDOFF_WEBRTC_HTTP_BIND");
+  if (nativeBindValue && webRtcBindValue) throw new Error("configure exactly one Human handoff surface");
+  let humanSurface;
+  let surfaceBind;
+  let requestBaseUrl;
   if (nativeBindValue) {
-    nativeBind = parseLoopbackBind(nativeBindValue);
+    surfaceBind = parseLoopbackBind(nativeBindValue, "native-http-bind");
     const hostExecutable = required(options, "native-host-executable", "CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE");
     const revokeExecutable = required(options, "native-revoke-executable", "CUMG_V2_HANDOFF_NATIVE_REVOKE_EXECUTABLE");
-    nativeSurface = new NativeHandoffSurface(api, { baseUrl: nativeBind.baseUrl, hostExecutable, revokeExecutable });
+    humanSurface = new NativeHandoffSurface(api, { baseUrl: surfaceBind.baseUrl, hostExecutable, revokeExecutable });
+    requestBaseUrl = surfaceBind.baseUrl;
+  } else if (webRtcBindValue) {
+    surfaceBind = parseLoopbackBind(webRtcBindValue, "webrtc-http-bind");
+    const publicBaseUrl = required(options, "webrtc-public-origin", "CUMG_V2_HANDOFF_WEBRTC_PUBLIC_ORIGIN");
+    const hostExecutable = required(options, "webrtc-host-executable", "CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE");
+    humanSurface = new WebRtcHandoffSurface(api, { publicBaseUrl, hostExecutable });
+    requestBaseUrl = new URL(publicBaseUrl).toString();
   }
   const key = privateKey(keyPath);
   // SignedFileHandoffCheckpointStore retains the supplied Buffer for future writes. Keep a
@@ -587,9 +660,9 @@ async function main() {
   const storeKey = Buffer.from(key);
   key.fill(0);
   const store = new api.SignedFileHandoffCheckpointStore(checkpointPath, storeKey);
-  const bridge = new HandoffBridge(api, store, Date.now, nativeSurface);
+  const bridge = new HandoffBridge(api, store, Date.now, humanSurface);
   serve(socketPath, bridge);
-  if (nativeBind) serveNative(nativeBind, bridge);
+  if (surfaceBind && requestBaseUrl) serveSurface(surfaceBind, requestBaseUrl, bridge);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
