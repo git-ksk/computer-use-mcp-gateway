@@ -83,6 +83,21 @@ A change that is PATCH-compatible in isolation (for example `#65` or `#69`) may 
 
 `0.3.0` is not accepted merely because every issue is closed. Before release, the resulting public/operator contract must satisfy the minor-release acceptance gate below, and any scope that cannot preserve the documented V2 safety invariants must be deferred rather than weakened to meet the milestone.
 
+### Post-acceptance candidate: first-class Human Handoff coordination
+
+Physical CUMG + `mcp-execution-handoff` acceptance has proven the bounded OS-window lifecycle through Agent -> Human -> verifying -> explicit Agent resume, including direct/TURN transport fallback, fresh exact-window verification, restart/context-expiry/generation-rollover recovery, no automatic replay, and zero residual quarantine. The acceptance-only Unix-socket bridge is therefore no longer the intended long-term runtime architecture.
+
+Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) tracks the next integration step: make Handoff a first-class internal CUMG coordination capability while retaining one canonical Handoff semantic source of truth. Its OS-window regression gate must pass before using the same coordinator for `mcp-execution-handoff#48` Terminal/PTY dogfood.
+
+Preferred dependency order:
+
+1. `#152` — first-class CUMG HandoffCoordinator and OS-window regression acceptance;
+2. `mcp-execution-handoff#48` — one bounded PTY session, Agent/Human-exclusive input, verifying, explicit resume;
+3. `mcp-execution-handoff#47` — finish remaining OS/window primitive extraction from Window + Terminal evidence;
+4. `mcp-execution-handoff#45` — converge terminology/public API only after the reusable boundary is demonstrated.
+
+This work is issue-driven and is not assigned to the `0.3.0` Production Hardening milestone merely because the Window acceptance landed during that development line. WebRTC video-quality work remains an independent Handoff concern and is not a prerequisite for the coordinator/Terminal sequence.
+
 ### Post-`0.3.0` candidate: multi-principal northbound identity
 
 Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) is deliberately **not** part of the `0.3.0` Production Hardening closeout. It is the next admitted northbound-authentication expansion candidate after that operational-readiness work is closed. The tracking milestone is `Post-v0.3 — Multi-principal Northbound Identity`; the milestone intentionally does not pre-assign a release number.
