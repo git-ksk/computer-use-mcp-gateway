@@ -67,6 +67,93 @@ pub struct VerificationReport {
     pub satisfied: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffInterventionStatus {
+    AwaitingHuman,
+    HumanActive,
+    Verifying,
+    ReadyToResume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffExecutionAuthority {
+    Human,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffSurfaceKind {
+    Native,
+    Webrtc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffActiveStatus {
+    pub intervention_id: String,
+    pub status: HandoffInterventionStatus,
+    pub epoch: u64,
+    pub authority: HandoffExecutionAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffRuntimeStatus {
+    pub active: Option<HandoffActiveStatus>,
+    pub recovery_required: bool,
+    pub recovery_status: Option<HandoffInterventionStatus>,
+    pub recovery_epoch: Option<u64>,
+    pub recovery_expired: bool,
+    pub resume_requested: bool,
+    pub faulted: bool,
+    pub human_surface: Option<HandoffSurfaceKind>,
+    pub locator: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffRuntimeControl {
+    Begin {
+        authority: AgentAuthorityRequest,
+    },
+    RecoverReissue {
+        authority: AgentAuthorityRequest,
+    },
+    RecoverRebind {
+        authority: AgentAuthorityRequest,
+        prior_context_id: String,
+        prior_generation: Option<u64>,
+        prior_capability_revision: Option<u64>,
+    },
+    RequestResume {
+        intervention_id: String,
+        epoch: u64,
+    },
+    CancelBeforeHuman {
+        intervention_id: String,
+        epoch: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffControlError {
+    Unavailable,
+    Rejected,
+    Protocol,
+}
+
+impl fmt::Display for HandoffControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "managed handoff runtime unavailable",
+            Self::Rejected => "managed handoff control transition rejected",
+            Self::Protocol => "managed handoff control protocol invalid",
+        })
+    }
+}
+
+impl std::error::Error for HandoffControlError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatorHandoffError {
     Unavailable,
@@ -301,6 +388,33 @@ impl ManagedOperatorHandoffAuthority {
         }
     }
 
+    pub async fn status(&self) -> Result<HandoffRuntimeStatus, HandoffControlError> {
+        let value = self
+            .exchange_value(&ManagedWireControlRequest::Status)
+            .await
+            .map_err(map_control_transport_error)?;
+        parse_runtime_status(value)
+    }
+
+    pub async fn control(
+        &self,
+        control: HandoffRuntimeControl,
+    ) -> Result<HandoffRuntimeStatus, HandoffControlError> {
+        let request = managed_wire_control(control)?;
+        let value = self
+            .exchange_value(&request)
+            .await
+            .map_err(map_control_transport_error)?;
+        match value.get("ok").and_then(serde_json::Value::as_bool) {
+            Some(true) => self.status().await,
+            Some(false) => Err(HandoffControlError::Rejected),
+            None => {
+                self.fault().await;
+                Err(HandoffControlError::Protocol)
+            }
+        }
+    }
+
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
         if state.faulted {
@@ -394,6 +508,59 @@ impl OperatorHandoffAuthority for UnixOperatorHandoffAuthority {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
+enum ManagedWireControlRequest {
+    Status,
+    Begin {
+        authority: ManagedWireAuthority,
+    },
+    RecoverReissue {
+        authority: ManagedWireAuthority,
+    },
+    RecoverRebind {
+        authority: ManagedWireAuthority,
+        prior_context_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prior_generation: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prior_capability_revision: Option<u64>,
+    },
+    RequestResume {
+        intervention_id: String,
+        epoch: u64,
+    },
+    CancelBeforeHuman {
+        intervention_id: String,
+        epoch: u64,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct ManagedWireAuthority {
+    protocol: u8,
+    principal_binding: String,
+    device_binding: String,
+    generation: u64,
+    capability_revision: u64,
+    exact_window: WireExactWindow,
+    verification_candidate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireRuntimeStatus {
+    ok: bool,
+    active: Option<HandoffActiveStatus>,
+    recovery_required: bool,
+    recovery_status: Option<HandoffInterventionStatus>,
+    recovery_epoch: Option<u64>,
+    recovery_expired: bool,
+    resume_requested: bool,
+    faulted: bool,
+    human_surface: Option<HandoffSurfaceKind>,
+    locator: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 enum WireRequest {
     AdmitAgent {
         protocol: u8,
@@ -417,6 +584,128 @@ enum WireRequest {
         epoch: u64,
         satisfied: bool,
     },
+}
+
+fn map_control_transport_error(error: OperatorHandoffError) -> HandoffControlError {
+    match error {
+        OperatorHandoffError::Unavailable | OperatorHandoffError::Unsupported => {
+            HandoffControlError::Unavailable
+        }
+        OperatorHandoffError::Protocol => HandoffControlError::Protocol,
+    }
+}
+
+fn managed_wire_authority(
+    authority: AgentAuthorityRequest,
+) -> Result<ManagedWireAuthority, HandoffControlError> {
+    if authority.verification_candidate {
+        return Err(HandoffControlError::Protocol);
+    }
+    let exact_window = authority
+        .exact_window
+        .ok_or(HandoffControlError::Protocol)?;
+    Ok(ManagedWireAuthority {
+        protocol: PROTOCOL_VERSION,
+        principal_binding: authority.principal_binding,
+        device_binding: authority.device_binding,
+        generation: authority.generation,
+        capability_revision: authority.capability_revision,
+        exact_window: exact_window.into(),
+        verification_candidate: false,
+    })
+}
+
+fn managed_wire_control(
+    control: HandoffRuntimeControl,
+) -> Result<ManagedWireControlRequest, HandoffControlError> {
+    Ok(match control {
+        HandoffRuntimeControl::Begin { authority } => ManagedWireControlRequest::Begin {
+            authority: managed_wire_authority(authority)?,
+        },
+        HandoffRuntimeControl::RecoverReissue { authority } => {
+            ManagedWireControlRequest::RecoverReissue {
+                authority: managed_wire_authority(authority)?,
+            }
+        }
+        HandoffRuntimeControl::RecoverRebind {
+            authority,
+            prior_context_id,
+            prior_generation,
+            prior_capability_revision,
+        } => ManagedWireControlRequest::RecoverRebind {
+            authority: managed_wire_authority(authority)?,
+            prior_context_id,
+            prior_generation,
+            prior_capability_revision,
+        },
+        HandoffRuntimeControl::RequestResume {
+            intervention_id,
+            epoch,
+        } => ManagedWireControlRequest::RequestResume {
+            intervention_id,
+            epoch,
+        },
+        HandoffRuntimeControl::CancelBeforeHuman {
+            intervention_id,
+            epoch,
+        } => ManagedWireControlRequest::CancelBeforeHuman {
+            intervention_id,
+            epoch,
+        },
+    })
+}
+
+fn parse_runtime_status(
+    value: serde_json::Value,
+) -> Result<HandoffRuntimeStatus, HandoffControlError> {
+    let status: WireRuntimeStatus =
+        serde_json::from_value(value).map_err(|_| HandoffControlError::Protocol)?;
+    if !status.ok {
+        return Err(HandoffControlError::Rejected);
+    }
+    if status.recovery_required != status.recovery_status.is_some()
+        || status.recovery_required != status.recovery_epoch.is_some()
+        || status.recovery_epoch == Some(0)
+    {
+        return Err(HandoffControlError::Protocol);
+    }
+    if let Some(active) = status.active.as_ref() {
+        let expected_authority = if active.status == HandoffInterventionStatus::HumanActive {
+            HandoffExecutionAuthority::Human
+        } else {
+            HandoffExecutionAuthority::None
+        };
+        if active.intervention_id.is_empty()
+            || active.intervention_id.len() > 160
+            || active.epoch == 0
+            || active.authority != expected_authority
+            || !active
+                .intervention_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(HandoffControlError::Protocol);
+        }
+    }
+    if let Some(locator) = status.locator.as_deref()
+        && (locator.is_empty()
+            || locator.len() > 2048
+            || locator.chars().any(char::is_control)
+            || !(locator.starts_with("http://127.0.0.1:") || locator.starts_with("https://")))
+    {
+        return Err(HandoffControlError::Protocol);
+    }
+    Ok(HandoffRuntimeStatus {
+        active: status.active,
+        recovery_required: status.recovery_required,
+        recovery_status: status.recovery_status,
+        recovery_epoch: status.recovery_epoch,
+        recovery_expired: status.recovery_expired,
+        resume_requested: status.resume_requested,
+        faulted: status.faulted,
+        human_surface: status.human_surface,
+        locator: status.locator,
+    })
 }
 
 fn wire_admission_request(request: AgentAuthorityRequest) -> WireRequest {
@@ -830,7 +1119,7 @@ done
         std::fs::write(&env_file, "FIXTURE=1\n").unwrap();
         std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         let config =
-            ManagedHandoffRuntimeConfig::new(command, script, env_file, Duration::from_secs(1))
+            ManagedHandoffRuntimeConfig::new(command, script, env_file, Duration::from_secs(5))
                 .unwrap();
         (config, root)
     }
@@ -849,6 +1138,69 @@ done
             }),
             verification_candidate: false,
         }
+    }
+
+    #[test]
+    fn managed_control_wire_carries_only_explicit_typed_authority_and_closed_status() {
+        let request = managed_wire_control(HandoffRuntimeControl::Begin {
+            authority: fixture_authority_request(),
+        })
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["action"], "begin");
+        assert_eq!(value["authority"]["protocol"], 1);
+        assert_eq!(value["authority"]["generation"], 1);
+        assert_eq!(value["authority"]["capability_revision"], 1);
+        assert_eq!(value["authority"]["exact_window"]["process_id"], 12);
+        assert_eq!(value["authority"]["exact_window"]["window_id"], 34);
+        assert_eq!(value["authority"]["verification_candidate"], false);
+        assert!(value.get("principal_binding").is_none());
+
+        let status = parse_runtime_status(serde_json::json!({
+            "ok": true,
+            "active": {
+                "intervention_id": "intervention_1",
+                "status": "awaiting_human",
+                "epoch": 1,
+                "authority": "none"
+            },
+            "recovery_required": false,
+            "recovery_status": null,
+            "recovery_epoch": null,
+            "recovery_expired": false,
+            "resume_requested": false,
+            "faulted": false,
+            "human_surface": "webrtc",
+            "locator": "https://handoff.example/takeover/session_1"
+        }))
+        .unwrap();
+        assert_eq!(
+            status.active.as_ref().unwrap().status,
+            HandoffInterventionStatus::AwaitingHuman
+        );
+        assert_eq!(status.human_surface, Some(HandoffSurfaceKind::Webrtc));
+
+        let mut invalid = fixture_authority_request();
+        invalid.exact_window = None;
+        assert!(matches!(
+            managed_wire_control(HandoffRuntimeControl::Begin { authority: invalid }),
+            Err(HandoffControlError::Protocol)
+        ));
+        assert_eq!(
+            parse_runtime_status(serde_json::json!({
+                "ok": true,
+                "active": null,
+                "recovery_required": false,
+                "recovery_status": null,
+                "recovery_epoch": null,
+                "recovery_expired": false,
+                "resume_requested": false,
+                "faulted": false,
+                "human_surface": null,
+                "locator": "file:///tmp/not-a-takeover"
+            })),
+            Err(HandoffControlError::Protocol)
+        );
     }
 
     #[cfg(unix)]

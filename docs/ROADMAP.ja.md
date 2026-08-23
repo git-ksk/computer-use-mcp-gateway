@@ -83,6 +83,21 @@ implementation は **issue-driven / PR-isolated** のまま、dependency を考�
 
 すべての issue が close しただけでは `0.3.0` accepted とはしません。release 前に、結果として得られる public / operator contract が後述の minor-release acceptance gate を満たす必要があります。documented V2 safety invariant を維持できない scope は、milestone 達成のために invariant を弱めるのではなく defer します。
 
+### post-acceptance candidate: first-class Human Handoff coordination
+
+physical CUMG + `mcp-execution-handoff` では、exact macOS Window に対する Agent -> Human -> verifying -> explicit Agent resume、direct/TURN fallback、fresh exact-window verification、restart/context-expiry/generation-rollover recovery、no-auto-replay、quarantine 0 まで受入済みです。acceptance-only Unix bridge は長期 runtime architecture にはしません。
+
+Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) では、CUMG-owned `HandoffCoordinator` と Hub-owned managed Handoff child を first-class runtime boundary とし、local operator control も normal MCP から分離します。`begin` / recovery の target authority は CUMG が検証した exact Window + current generation/capability/context fence からのみ供給し、legacy JS observation cache や operator 指定 PID/window を authority にしません。`#152` は merged-main から physical OS-window regression acceptance が成功するまで close しません。
+
+依存順は次です。
+
+1. `#152` — first-class coordinator / local control / physical Window regression acceptance;
+2. `mcp-execution-handoff#48` — bounded PTY session と Agent/Human-exclusive input;
+3. `mcp-execution-handoff#47` — Window + Terminal evidence から残り OS/window primitive を整理;
+4. `mcp-execution-handoff#45` — dogfood evidence 後に terminology / public API を収束。
+
+WebRTC quality の `mcp-execution-handoff#56` は独立課題であり、この順序の prerequisite ではありません。
+
 ### `0.3.0` 後の candidate: multi-principal northbound identity
 
 Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は `0.3.0` Production Hardening closeout には**意図的に含めません**。operational-readiness work を close した後に扱う、次の northbound authentication expansion candidate とします。追跡 milestone は `Post-v0.3 — Multi-principal Northbound Identity` とし、この milestone 自体では release number を事前固定しません。

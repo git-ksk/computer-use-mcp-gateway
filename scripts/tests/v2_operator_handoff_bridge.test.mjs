@@ -185,6 +185,24 @@ test("first-class stdio runtime keeps the compatibility bridge protocol off the 
   assert.equal(response, '{"ok":true,"runtime":"ready"}\n');
 });
 
+test("managed control requires and uses the explicit CUMG-selected exact Window binding", async () => {
+  const f = fixture();
+  try {
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
+    assert.deepEqual(f.bridge.handleManaged({ action: "begin" }), { ok: false });
+
+    const { action: _ignored, ...authority } = f.request;
+    authority.exact_window = { ...authority.exact_window, window_id: authority.exact_window.window_id + 9 };
+    const begun = f.bridge.handleManaged({ action: "begin", authority });
+    assert.equal(begun.ok, true);
+    assert.equal(begun.status, "awaiting_human");
+    assert.equal(f.bridge.activeBinding.exactWindow.windowId, authority.exact_window.window_id);
+    assert.notEqual(f.bridge.activeBinding.exactWindow.windowId, f.bridge.latestObservation.exactWindow.windowId);
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("Agent -> Native Human -> verifying -> explicit same-window resume preserves exclusive authority", async () => {
   const f = fixture();
   try {

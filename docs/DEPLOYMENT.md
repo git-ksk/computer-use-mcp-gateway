@@ -38,6 +38,24 @@ For a trusted authenticated proxy/tunnel, constrain the Hub listener to loopback
 
 After the local trust gate, trusted-proxy traffic has a separate peer ceiling: `CUMG_V2_TRUSTED_PROXY_MAX_PEER_CONCURRENCY` defaults to `4` and `CUMG_V2_TRUSTED_PROXY_MAX_PEER_REQUESTS_PER_MINUTE` defaults to `60`. Both must remain below the global defaults (`16` and `120`) so global headroom is preserved. Peer concurrency rejection is HTTP 503 and peer rate rejection is HTTP 429. The peer key is the verified loopback source IP; it is overload isolation, not user identity. The fixed CUMG principal still comes only from operator configuration, and caller `clientInfo` remains audit-only. The adapter strips common Authorization/Cloudflare identity headers before MCP dispatch. If the deployment needs per-user CUMG policy, use a signed-token/OIDC-style adapter that conveys a tamper-resistant authenticated identity. Never trust a caller-provided `X-User`/similar header merely because the listener is called a proxy mode.
 
+### First-class Handoff runtime and local operator control
+
+The normal OS-Window Handoff path is Hub-owned. Configure `CUMG_V2_HANDOFF_RUNTIME_COMMAND`, `CUMG_V2_HANDOFF_RUNTIME_SCRIPT`, and `CUMG_V2_HANDOFF_RUNTIME_ENV_FILE` together. The command and script must be absolute regular files. The env file must be an absolute private regular file, must not be a symlink, and is passed only to the managed Node Handoff child after the Hub clears the child environment. Handoff-only transport credentials such as TURN configuration therefore do not become Hub process environment variables. `CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS` bounds each stdio control exchange. The legacy `CUMG_V2_OPERATOR_HANDOFF_SOCKET` remains compatibility/regression-only and is mutually exclusive with the managed runtime.
+
+For live operator lifecycle control, configure the Unix-only `CUMG_V2_HANDOFF_CONTROL_SOCKET` in a private, non-symlink directory that is not group/world writable. The Hub creates the socket with mode `0600`; the directory/socket filesystem ownership is the authorization boundary. This endpoint is **not MCP**, is never added to normal tool discovery, and accepts only the closed commands `status`, `begin`, `recover_reissue`, `recover_rebind`, `request_resume`, and `cancel_before_human`. It does not accept principal, device, PID, window ID, generation, or capability-revision authority from the caller. `begin` uses only the last still-valid exact Window admitted by CUMG, fenced to the current Agent generation/capability revision and the remaining interaction-context lifetime. Recovery uses a fresh CUMG-observed exact Window plus the explicit prior-context/generation proof required by the signed Handoff checkpoint.
+
+The paired local CLI uses the same narrow CUMG operator protocol:
+
+```bash
+export CUMG_V2_HANDOFF_CONTROL_SOCKET=/run/user/$(id -u)/cumg-v2/handoff-control.sock
+v2_handoff_ctl status
+v2_handoff_ctl begin
+# after Human Done and fresh CUMG verification reaches ready_to_resume:
+v2_handoff_ctl request-resume
+```
+
+For restart/context/generation recovery, first produce a fresh CUMG exact-Window observation under the current session. Use `recover-reissue` only for a non-expired checkpoint with the same owner proof. Use `recover-rebind --prior-context-id ctx_...` (plus `--prior-generation` / `--prior-capability-revision` when rollover requires them) for explicit prior-owner proof. Neither command restores Agent or Human authority automatically, and neither replays the old Agent operation. The operator control response may contain the current Human takeover locator; treat it as local capability material and do not place it in logs, issues, shell history, or generic diagnostics.
+
 ### Authenticated Agent session lifetime
 
 `v2_hub` bounds every authenticated Agent transport with `CUMG_V2_MAX_AGENT_SESSION_LIFETIME_SECS` (default `3600`). `CUMG_V2_AGENT_SESSION_REAUTH_DRAIN_SECS` (default `30`) reserves the final part of that lifetime for a controlled reauthentication drain. The drain value must be non-zero and strictly smaller than the hard lifetime.
@@ -50,7 +68,7 @@ The hard lifetime is not advisory. If already-dispatched work is still unsettled
 
 `v2_hub` treats `SIGINT`, `SIGTERM`, and `SIGHUP` as planned shutdown signals. On the first signal it closes the operation-admission gate, keeps the Agent transport alive, and waits up to `CUMG_V2_DRAIN_TIMEOUT_SECS` (default `30`) for work that was already admitted to reach a durable terminal or indeterminate state. Requests that have not crossed the dispatch boundary are rejected/cancelled rather than starting new side effects during the drain.
 
-A successful drain then shuts down the gRPC and northbound HTTP servers. If the bounded drain timeout expires, shutdown continues with the existing fail-closed restart behavior: any work that had crossed the dispatch boundary without terminal proof remains eligible for `Indeterminate` + quarantine on restart. The timeout never authorizes replay or clears ambiguity.
+After the drain, the Hub requests closure of the live Agent session, gracefully closes the managed Handoff runtime (revoking any live Human surface while preserving its signed checkpoint for explicit recovery), and only then signals the gRPC, northbound HTTP, and private Handoff-control servers to stop. If the bounded drain timeout expires, the same ordering continues with the existing fail-closed restart behavior: any work that had crossed the dispatch boundary without terminal proof remains eligible for `Indeterminate` + quarantine on restart. The timeout never authorizes replay, clears ambiguity, or automatically restarts Handoff authority.
 
 Configure the service manager's stop/kill timeout to be **longer** than `CUMG_V2_DRAIN_TIMEOUT_SECS`; otherwise the supervisor can kill the Hub before its own bounded drain completes. The packaged systemd unit uses `TimeoutStopSec=45s` for the default 30-second drain. Apply the same ordering to operator-maintained launchd or other service-manager definitions.
 

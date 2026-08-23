@@ -87,7 +87,7 @@ A change that is PATCH-compatible in isolation (for example `#65` or `#69`) may 
 
 Physical CUMG + `mcp-execution-handoff` acceptance has proven the bounded OS-window lifecycle through Agent -> Human -> verifying -> explicit Agent resume, including direct/TURN transport fallback, fresh exact-window verification, restart/context-expiry/generation-rollover recovery, no automatic replay, and zero residual quarantine. The acceptance-only Unix-socket bridge is therefore no longer the intended long-term runtime architecture.
 
-Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) tracks the next integration step: make Handoff a first-class internal CUMG coordination capability while retaining one canonical Handoff semantic source of truth. Its OS-window regression gate must pass before using the same coordinator for `mcp-execution-handoff#48` Terminal/PTY dogfood.
+Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) tracks this integration. The merged path now has a CUMG-owned `HandoffCoordinator` plus a Hub-owned managed Handoff child; the next slice adds the CUMG-typed local operator control boundary so `begin`/recovery receive the exact CUMG-selected Window rather than treating the legacy JS observation cache as target authority. The legacy Unix bridge stays compatibility/regression-only. #152 remains open until the merged-main physical OS-window regression proves the full Human `Done -> verifying -> fresh stable_samples=2/no-screenshot verification -> explicit resume` lifecycle with no auto-replay and no residual quarantine. That gate must pass before `mcp-execution-handoff#48` Terminal/PTY dogfood.
 
 Preferred dependency order:
 

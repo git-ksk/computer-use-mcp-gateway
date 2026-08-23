@@ -33,6 +33,7 @@ use crate::{
     },
     v2_handoff_coordinator::{HandoffAdmission, HandoffCoordinator, HandoffCoordinatorError},
     v2_interaction_context::{
+        DEFAULT_CONTEXT_IDLE_TIMEOUT_MS, DEFAULT_CONTEXT_MAX_LIFETIME_MS,
         DEFAULT_MAX_REFS_PER_CONTEXT, InteractionContextBinding, InteractionContextId,
         InteractionContextLimits, InteractionContextManager, InteractionScope,
         ScopedBackendRefRegistry, ScopedRefError, ScopedRefKind,
@@ -534,6 +535,18 @@ fn unix_time_ms() -> Result<u64, std::time::SystemTimeError> {
         u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
             .unwrap_or(u64::MAX),
     )
+}
+
+fn handoff_context_valid_for(binding: &InteractionContextBinding) -> Option<Duration> {
+    let now_ms = unix_time_ms().ok()?;
+    let idle_deadline = binding
+        .last_used_at_ms
+        .saturating_add(DEFAULT_CONTEXT_IDLE_TIMEOUT_MS);
+    let absolute_deadline = binding
+        .created_at_ms
+        .saturating_add(DEFAULT_CONTEXT_MAX_LIFETIME_MS);
+    let deadline = idle_deadline.min(absolute_deadline);
+    Some(Duration::from_millis(deadline.saturating_sub(now_ms)))
 }
 
 #[derive(Clone)]
@@ -1265,6 +1278,9 @@ impl V2NorthboundMcp {
 
     async fn cleanup_backend_sessions(&self, contexts: Vec<InteractionContextId>) {
         for context_id in contexts {
+            if let Some(coordinator) = self.handoff_coordinator.as_ref() {
+                coordinator.invalidate_context(context_id.as_str());
+            }
             if let Err(error) = self
                 .hub
                 .end_backend_interaction_session(context_id.as_str().to_owned())
@@ -1349,6 +1365,9 @@ impl V2NorthboundMcp {
                 })?;
             state.refs.invalidate_context(&id);
             state.browser_refs.invalidate_context(id.as_str());
+        }
+        if let Some(coordinator) = self.handoff_coordinator.as_ref() {
+            coordinator.invalidate_context(id.as_str());
         }
         let backend_session_ended = match self
             .hub
@@ -1993,6 +2012,7 @@ impl V2NorthboundMcp {
                     ),
                     expected_bytes: expected_bytes as u64,
                 },
+                Some(&binding),
                 operation,
                 context,
             )
@@ -2050,7 +2070,13 @@ impl V2NorthboundMcp {
             command: prepared.command.clone(),
         };
         let result = match self
-            .execute_command(principal, command, operation, context)
+            .execute_command(
+                principal,
+                command,
+                Some(&prepared.binding),
+                operation,
+                context,
+            )
             .await
         {
             Ok(result) => result,
@@ -2564,6 +2590,7 @@ impl V2NorthboundMcp {
         &self,
         principal: &AuthenticatedClientPrincipal,
         command: &DeviceCommand,
+        interaction_binding: Option<&InteractionContextBinding>,
     ) -> Result<Option<HandoffAdmission>, McpError> {
         let Some(coordinator) = self.handoff_coordinator.as_ref() else {
             return Ok(None);
@@ -2577,12 +2604,13 @@ impl V2NorthboundMcp {
             .await
             .ok_or_else(|| McpError::invalid_request("Agent is offline", None))?;
         coordinator
-            .admit_agent(
+            .admit_agent_with_context_valid_for(
                 principal,
                 self.hub.device_id(),
                 generation,
                 capabilities.revision,
                 command,
+                interaction_binding.and_then(handoff_context_valid_for),
             )
             .await
             .map_err(|error| match error {
@@ -2598,10 +2626,13 @@ impl V2NorthboundMcp {
         &self,
         principal: &AuthenticatedClientPrincipal,
         command: DeviceCommand,
+        interaction_binding: Option<&InteractionContextBinding>,
         operation: NorthboundOperationCall,
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
-        let handoff = self.handoff_admission(principal, &command).await?;
+        let handoff = self
+            .handoff_admission(principal, &command, interaction_binding)
+            .await?;
         let request_fingerprint = self.request_fingerprint_for_command(&command)?;
         let NorthboundOperationCall {
             operation_id,
@@ -3269,6 +3300,7 @@ impl ServerHandler for V2NorthboundMcp {
             .execute_command(
                 &auth.principal,
                 command,
+                interaction_binding.as_ref(),
                 NorthboundOperationCall {
                     operation_id,
                     audit,
