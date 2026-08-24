@@ -162,7 +162,7 @@ impl<A: TerminalPtyHandoffAuthority> TerminalPtyDogfoodCoordinator<A> {
         Ok(())
     }
 
-    pub(crate) async fn begin_human(
+    pub(crate) async fn begin_human_fence(
         &self,
     ) -> Result<TerminalPtyInterventionRef, TerminalPtyDogfoodError> {
         let _operation = self.operation_gate.lock().await;
@@ -197,6 +197,33 @@ impl<A: TerminalPtyHandoffAuthority> TerminalPtyDogfoodCoordinator<A> {
                 .await?;
             return Err(TerminalPtyDogfoodError::Pty(error));
         }
+        Ok(fenced)
+    }
+
+    pub(crate) async fn claim_human(
+        &self,
+        fenced: &TerminalPtyInterventionRef,
+    ) -> Result<TerminalPtyInterventionRef, TerminalPtyDogfoodError> {
+        let _operation = self.operation_gate.lock().await;
+        let (binding, handoff) = self.bindings().await?;
+        let alive = {
+            let state = self.state.lock().await;
+            matches!(
+                state.pty.process_state(&binding),
+                Ok(TerminalPtyProcessState::Running)
+            )
+        };
+        if !alive {
+            {
+                let state = self.state.lock().await;
+                let _ = state.pty.terminate(&binding);
+            }
+            let _ = self
+                .authority
+                .terminal_pty_control(TerminalPtyHandoffControl::SessionExit(handoff))
+                .await?;
+            return Err(TerminalPtyDogfoodError::SessionUnavailable);
+        }
         expect_transition(
             self.authority
                 .terminal_pty_control(TerminalPtyHandoffControl::ClaimHuman {
@@ -207,6 +234,13 @@ impl<A: TerminalPtyHandoffAuthority> TerminalPtyDogfoodCoordinator<A> {
                 .await?,
             HandoffInterventionStatus::HumanActive,
         )
+    }
+
+    pub(crate) async fn begin_human(
+        &self,
+    ) -> Result<TerminalPtyInterventionRef, TerminalPtyDogfoodError> {
+        let fenced = self.begin_human_fence().await?;
+        self.claim_human(&fenced).await
     }
 
     pub(crate) async fn human_write(
@@ -437,11 +471,17 @@ impl<A: TerminalPtyHandoffAuthority> TerminalPtyDogfoodCoordinator<A> {
 
     /// The initial prototype does not cache cwd/env/job/prompt state. Calling this means the
     /// consumer explicitly discarded all pre-Handoff assumptions; it is not inferred from output.
+    /// Any output produced while Human/verifying/ready-to-resume authority was in effect is also
+    /// discarded before the Handoff runtime is allowed to clear the post-Human observation fence.
     pub(crate) async fn acknowledge_state_invalidated(
         &self,
     ) -> Result<(), TerminalPtyDogfoodError> {
         let _operation = self.operation_gate.lock().await;
-        let (_, handoff) = self.bindings().await?;
+        let (binding, handoff) = self.bindings().await?;
+        {
+            let state = self.state.lock().await;
+            state.pty.finish_human_output(&binding)?;
+        }
         expect_ok(
             self.authority
                 .terminal_pty_control(TerminalPtyHandoffControl::AckStateSync(handoff))
@@ -764,6 +804,7 @@ mod tests {
         assert!(receipt.session_alive);
         assert!(receipt.agent_state_sync_required);
         assert!(coordinator.agent_write(b"sync-required\n").await.is_err());
+        assert!(coordinator.agent_read(64 * 1024).await.is_err());
         coordinator.acknowledge_state_invalidated().await.unwrap();
 
         let after_resume = coordinator.agent_read(64 * 1024).await.unwrap();
@@ -784,6 +825,51 @@ mod tests {
         );
 
         coordinator.close_session().await.unwrap();
+
+        // Output caused by Human input can arrive after Done. It remains Agent-invisible through
+        // verifying/ready/resume and is discarded at explicit state resynchronization.
+        let shell = fs::canonicalize("/bin/sh").unwrap();
+        let delayed = coordinator
+            .spawn(TerminalPtySpawnConfig {
+                program: shell,
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(
+                        "while IFS= read -r line; do (/bin/sleep 0.2; printf '%s\n' \"$line\") & done",
+                    ),
+                ],
+                cwd: Path::new("/tmp").to_path_buf(),
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        assert!(delayed.generation() > binding.generation());
+        let delayed_human = coordinator.begin_human().await.unwrap();
+        coordinator
+            .human_write(&delayed_human, b"late-human-private\n")
+            .await
+            .unwrap();
+        let delayed_verifying = coordinator.human_done(&delayed_human).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let delayed_ready = coordinator
+            .report_verification(&delayed_verifying, true)
+            .await
+            .unwrap();
+        let delayed_receipt = coordinator.resume(&delayed_ready).await.unwrap();
+        assert!(delayed_receipt.agent_state_sync_required);
+        assert!(coordinator.agent_read(64 * 1024).await.is_err());
+        coordinator.acknowledge_state_invalidated().await.unwrap();
+        let after_delayed_resync = coordinator.agent_read(64 * 1024).await.unwrap();
+        assert!(
+            !after_delayed_resync
+                .as_bytes()
+                .windows(b"late-human-private".len())
+                .any(|w| w == b"late-human-private")
+        );
+        coordinator.close_session().await.unwrap();
+
         runtime.shutdown().await;
         assert!(
             !checkpoint.exists(),
