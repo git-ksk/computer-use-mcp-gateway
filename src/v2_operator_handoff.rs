@@ -148,6 +148,166 @@ pub enum HandoffRuntimeControl {
     },
 }
 
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TerminalPtyHandoffBinding {
+    pub session_id: String,
+    pub session_generation: u64,
+    pub principal_binding: String,
+}
+
+impl TerminalPtyHandoffBinding {
+    pub(crate) fn new(
+        session_id: String,
+        session_generation: u64,
+        principal_binding: String,
+    ) -> Result<Self, HandoffControlError> {
+        if session_id.len() != 32
+            || !session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || session_generation == 0
+            || principal_binding.len() != 64
+            || !principal_binding
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(HandoffControlError::Protocol);
+        }
+        Ok(Self {
+            session_id,
+            session_generation,
+            principal_binding,
+        })
+    }
+}
+
+impl fmt::Debug for TerminalPtyHandoffBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TerminalPtyHandoffBinding")
+            .field("session_id", &"[redacted]")
+            .field("session_generation", &self.session_generation)
+            .field("principal_binding", &"[redacted]")
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum TerminalPtyHandoffControl {
+    Bind(TerminalPtyHandoffBinding),
+    Status,
+    AgentInput(TerminalPtyHandoffBinding),
+    AgentObserve(TerminalPtyHandoffBinding),
+    AgentResize(TerminalPtyHandoffBinding),
+    BeginFence(TerminalPtyHandoffBinding),
+    ClaimHuman {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    HumanInput {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    HumanObserve {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    HumanResize {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    HumanDisconnect {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    DoneFence {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    ConfirmHumanDrain {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    Verify {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+        satisfied: bool,
+    },
+    Resume {
+        binding: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    AckStateSync(TerminalPtyHandoffBinding),
+    SessionExit(TerminalPtyHandoffBinding),
+    ReleaseClosed(TerminalPtyHandoffBinding),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalPtyExecutionAuthority {
+    Agent,
+    Human,
+    None,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalPtyHandoffStatus {
+    pub authority: TerminalPtyExecutionAuthority,
+    pub intervention_status: Option<HandoffInterventionStatus>,
+    pub intervention_epoch: Option<u64>,
+    pub session_generation: u64,
+    pub session_alive: bool,
+    pub human_disconnected: bool,
+    pub agent_state_synchronization_required: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TerminalPtyInterventionRef {
+    pub intervention_id: String,
+    pub epoch: u64,
+    pub status: HandoffInterventionStatus,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalPtyResumeReceipt {
+    pub epoch: u64,
+    pub session_alive: bool,
+    pub agent_state_sync_required: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum TerminalPtyHandoffResult {
+    Ok,
+    Status(Option<TerminalPtyHandoffStatus>),
+    Transition(TerminalPtyInterventionRef),
+    Resume(TerminalPtyResumeReceipt),
+}
+
+#[allow(dead_code)]
+#[async_trait]
+pub(crate) trait TerminalPtyHandoffAuthority: Send + Sync {
+    async fn terminal_pty_control(
+        &self,
+        control: TerminalPtyHandoffControl,
+    ) -> Result<TerminalPtyHandoffResult, HandoffControlError>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandoffControlError {
     Unavailable,
@@ -470,6 +630,27 @@ impl UnixOperatorHandoffAuthority {
 }
 
 #[async_trait]
+impl TerminalPtyHandoffAuthority for ManagedOperatorHandoffAuthority {
+    async fn terminal_pty_control(
+        &self,
+        control: TerminalPtyHandoffControl,
+    ) -> Result<TerminalPtyHandoffResult, HandoffControlError> {
+        let expected = control.clone();
+        let request = managed_terminal_pty_request(control)?;
+        let value = self
+            .exchange_value(&request)
+            .await
+            .map_err(map_control_transport_error)?;
+        let response: ManagedTerminalPtyResponse =
+            serde_json::from_value(value).map_err(|_| HandoffControlError::Protocol)?;
+        if !response.ok {
+            return Err(HandoffControlError::Rejected);
+        }
+        parse_terminal_pty_response(expected, response)
+    }
+}
+
+#[async_trait]
 impl OperatorHandoffAuthority for ManagedOperatorHandoffAuthority {
     async fn admit_agent(
         &self,
@@ -562,6 +743,118 @@ struct ManagedWireAuthority {
     capability_revision: u64,
     exact_window: WireExactWindow,
     verification_candidate: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize)]
+#[serde(tag = "action")]
+enum ManagedTerminalPtyRequest {
+    #[serde(rename = "terminal_bind")]
+    Bind {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_status")]
+    Status,
+    #[serde(rename = "terminal_agent_input")]
+    AgentInput {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_agent_observe")]
+    AgentObserve {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_agent_resize")]
+    AgentResize {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_begin_fence")]
+    BeginFence {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_claim_human")]
+    ClaimHuman {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_human_input")]
+    HumanInput {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_human_observe")]
+    HumanObserve {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_human_resize")]
+    HumanResize {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_human_disconnect")]
+    HumanDisconnect {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_done_fence")]
+    DoneFence {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_confirm_human_drain")]
+    ConfirmHumanDrain {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_verify")]
+    Verify {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+        satisfied: bool,
+    },
+    #[serde(rename = "terminal_resume")]
+    Resume {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_ack_state_sync")]
+    AckStateSync {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_session_exit")]
+    SessionExit {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_release_closed")]
+    ReleaseClosed {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ManagedTerminalPtyResponse {
+    ok: bool,
+    status: Option<TerminalPtyHandoffStatus>,
+    intervention_id: Option<String>,
+    epoch: Option<u64>,
+    #[serde(default)]
+    intervention_status: Option<HandoffInterventionStatus>,
+    #[serde(default)]
+    resume_policy: Option<String>,
+    #[serde(default)]
+    session_alive: Option<bool>,
+    #[serde(default)]
+    agent_state_sync_required: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -678,6 +971,251 @@ fn managed_wire_control(
             epoch,
         },
     })
+}
+
+#[allow(dead_code)]
+fn valid_terminal_intervention(intervention_id: &str, epoch: u64) -> bool {
+    epoch > 0
+        && !intervention_id.is_empty()
+        && intervention_id.len() <= 160
+        && intervention_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[allow(dead_code)]
+fn managed_terminal_pty_request(
+    control: TerminalPtyHandoffControl,
+) -> Result<ManagedTerminalPtyRequest, HandoffControlError> {
+    Ok(match control {
+        TerminalPtyHandoffControl::Bind(terminal_pty) => {
+            ManagedTerminalPtyRequest::Bind { terminal_pty }
+        }
+        TerminalPtyHandoffControl::Status => ManagedTerminalPtyRequest::Status,
+        TerminalPtyHandoffControl::AgentInput(terminal_pty) => {
+            ManagedTerminalPtyRequest::AgentInput { terminal_pty }
+        }
+        TerminalPtyHandoffControl::AgentObserve(terminal_pty) => {
+            ManagedTerminalPtyRequest::AgentObserve { terminal_pty }
+        }
+        TerminalPtyHandoffControl::AgentResize(terminal_pty) => {
+            ManagedTerminalPtyRequest::AgentResize { terminal_pty }
+        }
+        TerminalPtyHandoffControl::BeginFence(terminal_pty) => {
+            ManagedTerminalPtyRequest::BeginFence { terminal_pty }
+        }
+        TerminalPtyHandoffControl::ClaimHuman {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::ClaimHuman {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::HumanInput {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::HumanInput {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::HumanObserve {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::HumanObserve {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::HumanResize {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::HumanResize {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::HumanDisconnect {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::HumanDisconnect {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::DoneFence {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::DoneFence {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::ConfirmHumanDrain {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::ConfirmHumanDrain {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::Verify {
+            binding,
+            intervention_id,
+            epoch,
+            satisfied,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::Verify {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+                satisfied,
+            }
+        }
+        TerminalPtyHandoffControl::Resume {
+            binding,
+            intervention_id,
+            epoch,
+        } => {
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            ManagedTerminalPtyRequest::Resume {
+                terminal_pty: binding,
+                intervention_id,
+                epoch,
+            }
+        }
+        TerminalPtyHandoffControl::AckStateSync(terminal_pty) => {
+            ManagedTerminalPtyRequest::AckStateSync { terminal_pty }
+        }
+        TerminalPtyHandoffControl::SessionExit(terminal_pty) => {
+            ManagedTerminalPtyRequest::SessionExit { terminal_pty }
+        }
+        TerminalPtyHandoffControl::ReleaseClosed(terminal_pty) => {
+            ManagedTerminalPtyRequest::ReleaseClosed { terminal_pty }
+        }
+    })
+}
+
+#[allow(dead_code)]
+fn parse_terminal_pty_response(
+    control: TerminalPtyHandoffControl,
+    response: ManagedTerminalPtyResponse,
+) -> Result<TerminalPtyHandoffResult, HandoffControlError> {
+    match control {
+        TerminalPtyHandoffControl::Status
+        | TerminalPtyHandoffControl::Bind(_)
+        | TerminalPtyHandoffControl::HumanDisconnect { .. }
+        | TerminalPtyHandoffControl::SessionExit(_) => {
+            if let Some(status) = response.status.as_ref() {
+                if status.session_generation == 0
+                    || status.intervention_status.is_some() != status.intervention_epoch.is_some()
+                    || status.intervention_epoch == Some(0)
+                    || (status.authority == TerminalPtyExecutionAuthority::Human
+                        && status.intervention_status
+                            != Some(HandoffInterventionStatus::HumanActive))
+                {
+                    return Err(HandoffControlError::Protocol);
+                }
+            }
+            Ok(TerminalPtyHandoffResult::Status(response.status))
+        }
+        TerminalPtyHandoffControl::BeginFence(_)
+        | TerminalPtyHandoffControl::ClaimHuman { .. }
+        | TerminalPtyHandoffControl::DoneFence { .. }
+        | TerminalPtyHandoffControl::ConfirmHumanDrain { .. }
+        | TerminalPtyHandoffControl::Verify { .. } => {
+            let intervention_id = response
+                .intervention_id
+                .ok_or(HandoffControlError::Protocol)?;
+            let epoch = response.epoch.ok_or(HandoffControlError::Protocol)?;
+            if !valid_terminal_intervention(&intervention_id, epoch) {
+                return Err(HandoffControlError::Protocol);
+            }
+            let status = response
+                .intervention_status
+                .ok_or(HandoffControlError::Protocol)?;
+            Ok(TerminalPtyHandoffResult::Transition(
+                TerminalPtyInterventionRef {
+                    intervention_id,
+                    epoch,
+                    status,
+                },
+            ))
+        }
+        TerminalPtyHandoffControl::Resume { .. } => {
+            if response.resume_policy.as_deref() != Some("never_replay") {
+                return Err(HandoffControlError::Protocol);
+            }
+            Ok(TerminalPtyHandoffResult::Resume(TerminalPtyResumeReceipt {
+                epoch: response
+                    .epoch
+                    .filter(|value| *value > 0)
+                    .ok_or(HandoffControlError::Protocol)?,
+                session_alive: response
+                    .session_alive
+                    .ok_or(HandoffControlError::Protocol)?,
+                agent_state_sync_required: response
+                    .agent_state_sync_required
+                    .ok_or(HandoffControlError::Protocol)?,
+            }))
+        }
+        TerminalPtyHandoffControl::AgentInput(_)
+        | TerminalPtyHandoffControl::AgentObserve(_)
+        | TerminalPtyHandoffControl::AgentResize(_)
+        | TerminalPtyHandoffControl::HumanInput { .. }
+        | TerminalPtyHandoffControl::HumanObserve { .. }
+        | TerminalPtyHandoffControl::HumanResize { .. }
+        | TerminalPtyHandoffControl::AckStateSync(_)
+        | TerminalPtyHandoffControl::ReleaseClosed(_) => Ok(TerminalPtyHandoffResult::Ok),
+    }
 }
 
 fn parse_runtime_status(
@@ -1315,6 +1853,15 @@ done
             OperatorHandoffError::Protocol
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_pty_binding_debug_redacts_private_identity() {
+        let binding = TerminalPtyHandoffBinding::new("a".repeat(32), 7, "b".repeat(64)).unwrap();
+        let debug = format!("{binding:?}");
+        assert!(!debug.contains(&"a".repeat(32)));
+        assert!(!debug.contains(&"b".repeat(64)));
+        assert!(debug.contains("[redacted]"));
     }
 
     #[test]

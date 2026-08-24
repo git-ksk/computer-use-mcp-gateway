@@ -42,6 +42,8 @@ pub mod v2_observability;
 pub mod v2_operator_handoff;
 pub mod v2_reference_backend;
 pub mod v2_state_lock;
+pub(crate) mod v2_terminal_pty;
+pub(crate) mod v2_terminal_pty_handoff;
 pub mod v2_tls_lifecycle;
 
 #[cfg(windows)]
