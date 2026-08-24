@@ -46,6 +46,9 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(upgrade.contains("CUMG_V2_HANDOFF_SOURCE_ROOT"));
     assert!(upgrade.contains("handoff_source_commit"));
     assert!(upgrade.contains("runtime-generation-manifest.json"));
+    assert!(upgrade.contains("npm ci --omit=dev --ignore-scripts --no-audit --no-fund"));
+    assert!(upgrade.contains("staged_handoff_runtime_import_failed"));
+    assert!(upgrade.contains("node_modules/werift/package.json"));
     assert!(upgrade.contains("handoff_not_idle_or_status_unavailable"));
     assert!(upgrade.contains("hub_agent_schema_version"));
     assert!(upgrade.contains("\"schema_version\": 2"));

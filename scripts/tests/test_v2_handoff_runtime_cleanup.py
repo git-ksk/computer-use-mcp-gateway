@@ -99,6 +99,9 @@ class RuntimeCleanupTests(unittest.TestCase):
             archive_files = {
                 "v2_handoff_runtime.mjs": b"export {};\n",
                 "handoff-root/dist/index.js": b"export {};\n",
+                "handoff-root/package.json": b'{}\n',
+                "handoff-root/package-lock.json": b'{}\n',
+                "handoff-root/node_modules/werift/package.json": b'{}\n',
                 "takeover-webrtc-host": b"host",
             }
             manifest_files = []
@@ -126,6 +129,44 @@ class RuntimeCleanupTests(unittest.TestCase):
             self.assertFalse(archived_external.exists())
             self.assertTrue(env_file.exists())
             self.assertTrue(manifest.exists())
+
+
+    def test_archive_without_runtime_dependencies_does_not_release_rollback_reference(self):
+        temp, root, handoff, rollback, env_file, manifest, agent_plist = self.fixture()
+        with temp:
+            active = self.runtime(handoff, "runtime-aaaaaaa-bbbbbbb", 50)
+            referenced = self.runtime(handoff, "runtime-bbbbbbb-ccccccc", 10)
+            env_file.write_text(f"CUMG_V2_HANDOFF_ROOT={active / 'handoff-root'}\n", encoding="utf-8")
+            os.chmod(env_file, 0o600)
+            write_plist(agent_plist, active / "v2_handoff_runtime.mjs", env_file)
+            bundle = rollback / "runtime-upgrade-incomplete"
+            write_plist(bundle / "launchd" / "test-agent.plist", referenced / "v2_handoff_runtime.mjs", env_file)
+            archived = bundle / "handoff" / "runtime-generation"
+            (archived / "handoff-root" / "dist").mkdir(parents=True)
+            files = {
+                "v2_handoff_runtime.mjs": b"export {};\n",
+                "handoff-root/dist/index.js": b"export {};\n",
+                "takeover-webrtc-host": b"host",
+            }
+            manifest_files = []
+            for relative, payload in files.items():
+                target = archived / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+                manifest_files.append({"path": relative, "sha256": hashlib.sha256(payload).hexdigest()})
+            import json
+            (archived / "runtime-generation-manifest.json").write_text(json.dumps({
+                "schema_version": 1,
+                "archive_complete": True,
+                "handoff_source_commit": COMMIT,
+                "files": manifest_files,
+            }), encoding="utf-8")
+
+            removed, protected, retained = cleanup_module.cleanup(
+                self.args(root, rollback, manifest, agent_plist, keep_recent=0)
+            )
+            self.assertEqual((removed, protected, retained), (0, 2, 0))
+            self.assertTrue(referenced.exists())
 
     def test_symlink_in_any_candidate_refuses_before_deleting_other_runtime(self):
         temp, root, handoff, rollback, env_file, manifest, agent_plist = self.fixture()

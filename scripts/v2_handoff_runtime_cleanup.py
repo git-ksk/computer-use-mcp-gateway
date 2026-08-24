@@ -160,6 +160,9 @@ def archive_is_self_contained(bundle: Path) -> bool:
         return (
             "v2_handoff_runtime.mjs" in verified
             and "handoff-root/dist/index.js" in verified
+            and "handoff-root/package.json" in verified
+            and "handoff-root/package-lock.json" in verified
+            and "handoff-root/node_modules/werift/package.json" in verified
             and any(name.startswith("takeover-") for name in verified)
         )
     except (CleanupRefusal, OSError, ValueError, json.JSONDecodeError):
