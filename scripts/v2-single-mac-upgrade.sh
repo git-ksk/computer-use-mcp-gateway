@@ -300,9 +300,22 @@ stable_codesign "target/release/v2_agent" "com.github.git-ksk.cumg-v2-agent" || 
 }
 
 HANDOFF_RUNTIME_COMMAND="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_COMMAND' "$AGENT_PLIST" 2>/dev/null || true)"
-[[ "$HANDOFF_RUNTIME_COMMAND" == /* && -x "$HANDOFF_RUNTIME_COMMAND" && ! -L "$HANDOFF_RUNTIME_COMMAND" ]] || {
+[[ "$HANDOFF_RUNTIME_COMMAND" == /* && -x "$HANDOFF_RUNTIME_COMMAND" ]] || {
   echo "REFUSED reason=handoff_runtime_command_missing_or_unsafe" >&2; exit 2;
 }
+HANDOFF_RUNTIME_COMMAND_RESOLVED="$(python3 - "$HANDOFF_RUNTIME_COMMAND" <<'PYNODECOMMAND'
+import os, pathlib, stat, sys
+raw = pathlib.Path(sys.argv[1])
+resolved = pathlib.Path(os.path.realpath(raw))
+try:
+    mode = resolved.stat().st_mode
+except OSError:
+    raise SystemExit(2)
+if not resolved.is_absolute() or not stat.S_ISREG(mode) or not os.access(resolved, os.X_OK):
+    raise SystemExit(3)
+print(resolved)
+PYNODECOMMAND
+)" || { echo "REFUSED reason=handoff_runtime_command_resolution_failed" >&2; exit 2; }
 
 HANDOFF_DIR="$ROOT/v2/handoff"
 [[ -d "$HANDOFF_DIR" && ! -L "$HANDOFF_DIR" ]] || { echo "REFUSED reason=handoff_directory_unsafe" >&2; exit 2; }
@@ -332,7 +345,7 @@ cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" 
   cd "$STAGE_RUNTIME/handoff-root"
   npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null
 ) || { rm -rf "$STAGE_RUNTIME"; echo "REFUSED reason=handoff_runtime_dependencies_install_failed" >&2; exit 2; }
-"$HANDOFF_RUNTIME_COMMAND" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); for (const k of ["ExecutionHandoffState","InheritedFdNativeRuntimeProvider","SignedFileHandoffCheckpointStore","SpawnedWebRtcRuntimeProvider","TakeoverBroker","claimHandoffOwner","createHandoffOwner"]) if (!(k in m)) throw new Error(`missing ${k}`);' "$STAGE_RUNTIME/handoff-root/dist/index.js" || {
+"$HANDOFF_RUNTIME_COMMAND_RESOLVED" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); for (const k of ["ExecutionHandoffState","InheritedFdNativeRuntimeProvider","SignedFileHandoffCheckpointStore","SpawnedWebRtcRuntimeProvider","TakeoverBroker","claimHandoffOwner","createHandoffOwner"]) if (!(k in m)) throw new Error(`missing ${k}`);' "$STAGE_RUNTIME/handoff-root/dist/index.js" || {
   rm -rf "$STAGE_RUNTIME"
   echo "REFUSED reason=staged_handoff_runtime_import_failed" >&2
   exit 2
