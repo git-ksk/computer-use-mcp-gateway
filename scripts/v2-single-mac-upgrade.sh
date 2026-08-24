@@ -393,6 +393,18 @@ if [[ -f "$HANDOFF_SOURCE_ROOT/dist/experimental/terminal-pty.js" ]]; then
     exit 2
   }
 fi
+if [[ -f "$HANDOFF_SOURCE_ROOT/dist/experimental/terminal-webrtc.js" ]]; then
+  [[ -f "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" && ! -L "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" ]] || {
+    rm -rf "$STAGE_RUNTIME"
+    echo "REFUSED reason=staged_terminal_webrtc_runtime_missing_or_unsafe" >&2
+    exit 2
+  }
+  "$HANDOFF_RUNTIME_COMMAND_RESOLVED" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); if (typeof m.ExperimentalTerminalWebRtcTakeover !== "function") throw new Error("missing ExperimentalTerminalWebRtcTakeover");' "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" || {
+    rm -rf "$STAGE_RUNTIME"
+    echo "REFUSED reason=staged_terminal_webrtc_runtime_import_failed" >&2
+    exit 2
+  }
+fi
 NEW_HANDOFF_HELPERS=""
 while IFS=$'\t' read -r key identifier helper; do
   [[ -n "$helper" ]] || continue

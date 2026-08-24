@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { AppendOnlyAbandonmentAudit, HandoffBridge, serveStdio } from "../v2_operator_handoff_bridge.mjs";
+import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, serveStdio } from "../v2_operator_handoff_bridge.mjs";
 
 const HANDOFF_ROOT = process.env.CUMG_V2_HANDOFF_ROOT;
 const api = HANDOFF_ROOT
@@ -685,4 +685,107 @@ test("iPhone WebRTC prepare does not claim Human authority; connect does, suspen
   } finally {
     f.cleanup();
   }
+});
+
+
+class FakeTerminalPtyAuthority {
+  constructor(binding) {
+    this.binding = structuredClone(binding);
+    this.status = {
+      authority: "agent",
+      interventionStatus: null,
+      interventionEpoch: null,
+      sessionGeneration: binding.sessionGeneration,
+      sessionAlive: true,
+      humanDisconnected: false,
+      agentStateSynchronizationRequired: false,
+    };
+  }
+  getStatus() { return structuredClone(this.status); }
+  beginFence() {
+    this.status.authority = "none";
+    this.status.interventionStatus = "awaiting_human";
+    this.status.interventionEpoch = 1;
+    return { id: "terminal-intervention", epoch: 1, status: "awaiting_human" };
+  }
+  claimHumanAfterAgentDrain(_binding, id, epoch) {
+    assert.equal(id, "terminal-intervention"); assert.equal(epoch, 1);
+    this.status.authority = "human";
+    this.status.interventionStatus = "human_active";
+    return { id, epoch, status: "human_active" };
+  }
+  assertAgentInput() { if (this.status.authority !== "agent") throw new Error("fenced"); }
+  assertAgentObservation() { this.assertAgentInput(); }
+  assertAgentResize() { this.assertAgentInput(); }
+  assertHumanInput() { if (this.status.authority !== "human") throw new Error("fenced"); }
+  assertHumanObservation() { this.assertHumanInput(); }
+  assertHumanResize() { this.assertHumanInput(); }
+  noteHumanDisconnect() { this.status.humanDisconnected = true; return this.getStatus(); }
+  markHumanDoneFence(_binding, id, epoch) {
+    this.status.authority = "none"; this.status.interventionStatus = "verifying";
+    return { id, epoch, status: "verifying" };
+  }
+  confirmHumanWritesDrained(_binding, id, epoch) { return { id, epoch, status: "verifying" }; }
+  reportVerification(_binding, id, epoch, satisfied) {
+    if (satisfied) this.status.interventionStatus = "ready_to_resume";
+    return { id, epoch, status: this.status.interventionStatus };
+  }
+  resumeAgent(_binding, _id, epoch) {
+    this.status.authority = "agent"; this.status.interventionStatus = null;
+    return { resumePolicy: "never_replay", epoch: epoch + 1, sessionAlive: true, agentStateSynchronizationRequired: true };
+  }
+  acknowledgeAgentStateSynchronization() { this.status.agentStateSynchronizationRequired = false; }
+  noteSessionExit() { this.status.sessionAlive = false; this.status.authority = "none"; this.status.interventionStatus = null; return this.getStatus(); }
+}
+
+class FakeTerminalTransport {
+  constructor() {
+    this.started = false; this.activated = false; this.revoked = false;
+    this.events = [{ kind: "resize", rows: 30, cols: 100 }, { kind: "done" }];
+    this.outputs = [];
+  }
+  start(id, epoch, principal) {
+    assert.equal(id, "terminal-intervention"); assert.equal(epoch, 1); assert.equal(principal, "c".repeat(64));
+    this.started = true;
+    return "https://handoff.example/takeover/terminal/fake-session";
+  }
+  status() { return { transportReady: true, humanActive: this.activated, disconnected: false, completed: false, faulted: false, queuedEvents: this.events.length }; }
+  activateHuman() { assert.equal(this.started, true); this.activated = true; }
+  nextEvent() { return this.events.shift(); }
+  pushOutput(_id, _epoch, dataBase64) { this.outputs.push(dataBase64); }
+  async revoke() { this.revoked = true; this.activated = false; }
+  async handle() { return new Response("terminal", { status: 200 }); }
+}
+
+test("experimental Terminal transport stays subordinate to the canonical PTY authority gate", async () => {
+  const transport = new FakeTerminalTransport();
+  const terminalApi = { ExperimentalTerminalPtyAuthority: FakeTerminalPtyAuthority };
+  const bridge = new TerminalPtyHandoffBridge(terminalApi, transport);
+  const terminal_pty = { session_id: "a".repeat(32), session_generation: 7, principal_binding: "c".repeat(64) };
+
+  assert.equal((await bridge.handle({ action: "terminal_bind", terminal_pty })).ok, true);
+  const fenced = await bridge.handle({ action: "terminal_begin_fence", terminal_pty });
+  assert.equal(fenced.intervention_status, "awaiting_human");
+  assert.equal((await bridge.handle({ action: "terminal_agent_input", terminal_pty })).ok, false);
+
+  const started = await bridge.handle({ action: "terminal_transport_start", terminal_pty, intervention_id: fenced.intervention_id, epoch: fenced.epoch });
+  assert.equal(started.locator, "https://handoff.example/takeover/terminal/fake-session");
+  const transportStatus = await bridge.handle({ action: "terminal_transport_status", terminal_pty });
+  assert.equal(transportStatus.transport_status.transportReady, true);
+
+  const claimed = await bridge.handle({ action: "terminal_claim_human", terminal_pty, intervention_id: fenced.intervention_id, epoch: fenced.epoch });
+  assert.equal(claimed.intervention_status, "human_active");
+  assert.equal((await bridge.handle({ action: "terminal_transport_activate", terminal_pty, intervention_id: fenced.intervention_id, epoch: fenced.epoch })).ok, true);
+
+  const event1 = await bridge.handle({ action: "terminal_transport_next_event", terminal_pty, intervention_id: fenced.intervention_id, epoch: fenced.epoch });
+  const event2 = await bridge.handle({ action: "terminal_transport_next_event", terminal_pty, intervention_id: fenced.intervention_id, epoch: fenced.epoch });
+  assert.deepEqual(event1.event, { kind: "resize", rows: 30, cols: 100 });
+  assert.deepEqual(event2.event, { kind: "done" });
+  assert.equal((await bridge.handle({ action: "terminal_transport_output", terminal_pty, intervention_id: fenced.intervention_id, epoch: fenced.epoch, data_base64: "c2FmZQ==" })).ok, true);
+  assert.deepEqual(transport.outputs, ["c2FmZQ=="]);
+
+  const surface = await bridge.handleSurface(new Request("https://handoff.example/takeover/terminal/fake-session"));
+  assert.equal(surface.status, 200);
+  assert.equal((await bridge.handle({ action: "terminal_transport_revoke", terminal_pty, intervention_id: fenced.intervention_id, epoch: fenced.epoch })).ok, true);
+  assert.equal(transport.revoked, true);
 });

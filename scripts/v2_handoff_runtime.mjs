@@ -106,6 +106,12 @@ function terminalPtyBinding(value) {
   };
 }
 
+function validTerminalIntervention(interventionId, epoch) {
+  return typeof interventionId === "string"
+    && /^[A-Za-z0-9_-]{1,160}$/.test(interventionId)
+    && positiveInt(epoch);
+}
+
 function positiveInt(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
@@ -283,13 +289,15 @@ export class WebRtcHandoffSurface {
 }
 
 export class TerminalPtyHandoffBridge {
-  constructor(api) {
+  constructor(api, transport = undefined) {
     if (typeof api.ExperimentalTerminalPtyAuthority !== "function") {
       throw new Error("experimental Terminal PTY Handoff runtime unavailable");
     }
     this.api = api;
+    this.transport = transport;
     this.binding = undefined;
     this.gate = undefined;
+    this.transportIntervention = undefined;
   }
 
   bind(request) {
@@ -323,11 +331,17 @@ export class TerminalPtyHandoffBridge {
     return binding;
   }
 
-  handle(request) {
+  async handle(request) {
     try {
       if (request.action === "terminal_bind") return this.bind(request);
       if (request.action === "terminal_status") {
         return { ok: true, status: this.gate?.getStatus() ?? null };
+      }
+      if (request.action === "terminal_transport_status") {
+        this.require(request);
+        if (!this.transport || !this.transportIntervention) return { ok: false, code: "terminal_transport_unavailable" };
+        const status = this.transport.status(this.transportIntervention.interventionId, this.transportIntervention.epoch);
+        return { ok: true, transport_status: status };
       }
       if (request.action === "terminal_release_closed") {
         this.require(request);
@@ -335,12 +349,66 @@ export class TerminalPtyHandoffBridge {
         if (status.sessionAlive || status.interventionStatus !== null || status.authority !== "none") {
           return { ok: false, code: "terminal_release_rejected" };
         }
+        if (this.transportIntervention) return { ok: false, code: "terminal_transport_still_active" };
         this.binding = undefined;
         this.gate = undefined;
         return { ok: true, status: null };
       }
       const binding = this.require(request);
       switch (request.action) {
+      case "terminal_transport_start": {
+        if (!this.transport || !validTerminalIntervention(request.intervention_id, request.epoch)) {
+          return { ok: false, code: "terminal_transport_unavailable" };
+        }
+        const gateStatus = this.gate.getStatus();
+        if (gateStatus.interventionStatus !== "awaiting_human" || gateStatus.authority !== "none") {
+          return { ok: false, code: "terminal_transport_state_invalid" };
+        }
+        const locator = this.transport.start(request.intervention_id, request.epoch, binding.principalBinding);
+        this.transportIntervention = { interventionId: request.intervention_id, epoch: request.epoch };
+        return { ok: true, locator };
+      }
+      case "terminal_transport_activate": {
+        if (!this.transport || !this.transportIntervention
+          || request.intervention_id !== this.transportIntervention.interventionId
+          || request.epoch !== this.transportIntervention.epoch) {
+          return { ok: false, code: "terminal_transport_unavailable" };
+        }
+        const gateStatus = this.gate.getStatus();
+        if (gateStatus.interventionStatus !== "human_active" || gateStatus.authority !== "human") {
+          return { ok: false, code: "terminal_transport_state_invalid" };
+        }
+        this.transport.activateHuman(request.intervention_id, request.epoch);
+        return { ok: true };
+      }
+      case "terminal_transport_next_event": {
+        if (!this.transport || !this.transportIntervention
+          || request.intervention_id !== this.transportIntervention.interventionId
+          || request.epoch !== this.transportIntervention.epoch) {
+          return { ok: false, code: "terminal_transport_unavailable" };
+        }
+        return { ok: true, event: this.transport.nextEvent(request.intervention_id, request.epoch) ?? null };
+      }
+      case "terminal_transport_output": {
+        if (!this.transport || !this.transportIntervention
+          || request.intervention_id !== this.transportIntervention.interventionId
+          || request.epoch !== this.transportIntervention.epoch
+          || typeof request.data_base64 !== "string") {
+          return { ok: false, code: "terminal_transport_unavailable" };
+        }
+        this.transport.pushOutput(request.intervention_id, request.epoch, request.data_base64);
+        return { ok: true };
+      }
+      case "terminal_transport_revoke": {
+        if (!this.transport || !this.transportIntervention
+          || request.intervention_id !== this.transportIntervention.interventionId
+          || request.epoch !== this.transportIntervention.epoch) {
+          return { ok: false, code: "terminal_transport_unavailable" };
+        }
+        await this.transport.revoke(request.intervention_id, request.epoch);
+        this.transportIntervention = undefined;
+        return { ok: true };
+      }
       case "terminal_agent_input":
         this.gate.assertAgentInput(binding); return { ok: true };
       case "terminal_agent_observe":
@@ -399,6 +467,20 @@ export class TerminalPtyHandoffBridge {
         : "terminal_action_rejected";
       return { ok: false, code };
     }
+  }
+
+  async handleSurface(request) {
+    if (!this.transport || !this.transportIntervention) {
+      return new Response(JSON.stringify({ error: "takeover_unavailable" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    }
+    return this.transport.handle(request);
+  }
+
+  async shutdown() {
+    if (!this.transport || !this.transportIntervention) return;
+    const current = this.transportIntervention;
+    this.transportIntervention = undefined;
+    await this.transport.revoke(current.interventionId, current.epoch).catch(() => undefined);
   }
 }
 
@@ -831,13 +913,19 @@ export class HandoffBridge {
 async function loadHandoff(root) {
   const modulePath = path.join(root, "dist", "index.js");
   const terminalPath = path.join(root, "dist", "experimental", "terminal-pty.js");
+  const terminalWebRtcPath = path.join(root, "dist", "experimental", "terminal-webrtc.js");
   const core = await import(pathToFileURL(modulePath).href);
   let terminal = {};
+  let terminalWebRtc = {};
   try { terminal = await import(pathToFileURL(terminalPath).href); }
   catch (error) {
     if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
   }
-  return { ...core, ...terminal };
+  try { terminalWebRtc = await import(pathToFileURL(terminalWebRtcPath).href); }
+  catch (error) {
+    if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+  }
+  return { ...core, ...terminal, ...terminalWebRtc };
 }
 
 function privateKey(pathname) {
@@ -899,7 +987,7 @@ export async function serveStdio(bridge, input = process.stdin, output = process
     try {
       const request = JSON.parse(line);
       response = typeof request?.action === "string" && request.action.startsWith("terminal_")
-        ? (terminalBridge?.handle(request) ?? { ok: false, code: "terminal_runtime_unavailable" })
+        ? (terminalBridge ? await terminalBridge.handle(request) : { ok: false, code: "terminal_runtime_unavailable" })
         : (typeof bridge.handleManaged === "function" ? bridge.handleManaged(request) : bridge.handle(request));
     } catch { response = { ok: false }; }
     const encoded = JSON.stringify(response);
@@ -942,7 +1030,7 @@ async function readNodeRequest(req, baseUrl, maxBodyBytes = MAX_LINE) {
   });
 }
 
-function serveSurface(bind, requestBaseUrl, bridge) {
+function serveSurface(bind, requestBaseUrl, bridge, terminalBridge = undefined) {
   const server = http.createServer(async (req, res) => {
     try {
       const pathname = new URL(req.url ?? "/", requestBaseUrl).pathname;
@@ -952,7 +1040,9 @@ function serveSurface(bind, requestBaseUrl, bridge) {
         return;
       }
       const request = await readNodeRequest(req, requestBaseUrl, 256 * 1024);
-      const response = await bridge.handleSurface(request);
+      const response = pathname.startsWith("/takeover/terminal/")
+        ? await (terminalBridge?.handleSurface(request) ?? new Response(JSON.stringify({ error: "takeover_unavailable" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } }))
+        : await bridge.handleSurface(request);
       const body = Buffer.from(await response.arrayBuffer());
       const headers = {};
       response.headers.forEach((value, key) => { headers[key] = value; });
@@ -1009,6 +1099,7 @@ export async function runCli(argv = process.argv) {
   let humanSurface;
   let surfaceBind;
   let requestBaseUrl;
+  let webRtcPublicBaseUrl;
   if (nativeBindValue) {
     surfaceBind = parseLoopbackBind(nativeBindValue, "native-http-bind");
     const hostExecutable = required(options, "native-host-executable", "CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE");
@@ -1018,9 +1109,13 @@ export async function runCli(argv = process.argv) {
   } else if (webRtcBindValue) {
     surfaceBind = parseLoopbackBind(webRtcBindValue, "webrtc-http-bind");
     const publicBaseUrl = required(options, "webrtc-public-origin", "CUMG_V2_HANDOFF_WEBRTC_PUBLIC_ORIGIN");
-    const hostExecutable = required(options, "webrtc-host-executable", "CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE");
-    humanSurface = new WebRtcHandoffSurface(api, { publicBaseUrl, hostExecutable });
-    requestBaseUrl = new URL(publicBaseUrl).toString();
+    const terminalOnly = optional(options, "terminal-webrtc-only", "CUMG_V2_HANDOFF_TERMINAL_WEBRTC_ONLY") === "1";
+    webRtcPublicBaseUrl = new URL(publicBaseUrl).toString();
+    if (!terminalOnly) {
+      const hostExecutable = required(options, "webrtc-host-executable", "CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE");
+      humanSurface = new WebRtcHandoffSurface(api, { publicBaseUrl: webRtcPublicBaseUrl, hostExecutable });
+    }
+    requestBaseUrl = webRtcPublicBaseUrl;
   }
   const key = privateKey(keyPath);
   // SignedFileHandoffCheckpointStore retains the supplied Buffer for future writes. Keep a
@@ -1035,21 +1130,30 @@ export async function runCli(argv = process.argv) {
   ) ?? path.join(path.dirname(checkpointPath), "audit", "expired-recovery-abandonment.jsonl");
   const abandonmentAudit = new AppendOnlyAbandonmentAudit(abandonmentAuditPath);
   const bridge = new HandoffBridge(api, store, Date.now, humanSurface, abandonmentAudit);
+  const terminalTransport = typeof api.ExperimentalTerminalWebRtcTakeover === "function" && webRtcPublicBaseUrl
+    ? new api.ExperimentalTerminalWebRtcTakeover({
+        enabled: true,
+        publicBaseUrl: webRtcPublicBaseUrl,
+        ttlMs: 5 * 60 * 1000,
+        env: process.env,
+      })
+    : undefined;
   const terminalBridge = typeof api.ExperimentalTerminalPtyAuthority === "function"
-    ? new TerminalPtyHandoffBridge(api)
+    ? new TerminalPtyHandoffBridge(api, terminalTransport)
     : undefined;
   if (command === "serve") {
     const socketPath = required(options, "socket", "CUMG_V2_OPERATOR_HANDOFF_SOCKET");
     serve(socketPath, bridge);
-    if (surfaceBind && requestBaseUrl) serveSurface(surfaceBind, requestBaseUrl, bridge);
+    if (surfaceBind && requestBaseUrl) serveSurface(surfaceBind, requestBaseUrl, bridge, terminalBridge);
     return;
   }
 
   let surfaceServer;
-  if (surfaceBind && requestBaseUrl) surfaceServer = serveSurface(surfaceBind, requestBaseUrl, bridge);
+  if (surfaceBind && requestBaseUrl) surfaceServer = serveSurface(surfaceBind, requestBaseUrl, bridge, terminalBridge);
   try {
     await serveStdio(bridge, process.stdin, process.stdout, terminalBridge);
   } finally {
+    await terminalBridge?.shutdown();
     await bridge.shutdown();
     if (surfaceServer) await new Promise((resolve) => surfaceServer.close(resolve));
   }
