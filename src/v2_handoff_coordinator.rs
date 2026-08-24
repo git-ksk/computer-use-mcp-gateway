@@ -126,6 +126,9 @@ pub enum HandoffOperatorCommand {
         prior_capability_revision: Option<u64>,
     },
     RebindLive,
+    AbandonExpiredRecovery {
+        expected_epoch: u64,
+    },
     RequestResume,
     CancelBeforeHuman,
 }
@@ -460,6 +463,10 @@ impl HandoffCoordinator {
                 RemoteHandoffOperatorCommand::RebindLive,
                 Some(remote_authority(&self.selected_authority(false, session)?)),
             ),
+            HandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch } => (
+                RemoteHandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch },
+                None,
+            ),
             HandoffOperatorCommand::RequestResume => {
                 (RemoteHandoffOperatorCommand::RequestResume, None)
             }
@@ -574,6 +581,21 @@ impl HandoffCoordinator {
                 let authority = self.selected_authority(false, session)?;
                 runtime
                     .control(HandoffRuntimeControl::RebindLive { authority })
+                    .await
+                    .map_err(Into::into)
+            }
+            HandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch } => {
+                let status = runtime.status().await?;
+                if !status.recovery_required
+                    || !status.recovery_expired
+                    || status.recovery_epoch != Some(expected_epoch)
+                    || status.active.is_some()
+                    || status.faulted
+                {
+                    return Err(HandoffOperatorControlError::InvalidLifecycleState);
+                }
+                runtime
+                    .control(HandoffRuntimeControl::AbandonExpiredRecovery { expected_epoch })
                     .await
                     .map_err(Into::into)
             }

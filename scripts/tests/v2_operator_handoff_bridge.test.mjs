@@ -490,6 +490,61 @@ test("expired signed checkpoint stays fail-closed until explicit prior-context r
   } finally { f.cleanup(); }
 });
 
+test("expired recovery can be explicitly abandoned only with the exact epoch and never replays the prior action", async () => {
+  const f = fixture();
+  try {
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
+    const begun = ctl(f.bridge, "begin");
+    await nativeControl(f.bridge, begun.native_locator, "claim");
+    f.tick(16 * 60_000);
+
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_960_001, new FakeNativeSurface());
+    const status = recovered.handle({ action: "status" });
+    assert.equal(status.recovery_required, true);
+    assert.equal(status.recovery_expired, true);
+    assert.equal(status.recovery_epoch, begun.epoch);
+    assert.equal(status.active, null);
+
+    assert.deepEqual(recovered.handle({
+      action: "abandon_expired_recovery",
+      expected_epoch: begun.epoch + 1,
+    }), { ok: false });
+    assert.equal(fs.existsSync(f.checkpoint), true);
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+
+    assert.deepEqual(recovered.handle({
+      action: "abandon_expired_recovery",
+      expected_epoch: begun.epoch,
+    }), { ok: true });
+    const cleared = recovered.handle({ action: "status" });
+    assert.equal(cleared.recovery_required, false);
+    assert.equal(cleared.active, null);
+    assert.equal(cleared.resume_requested, false);
+    assert.equal(fs.existsSync(f.checkpoint), false);
+
+    // Abandonment does not resume/replay the old intervention. A future fresh admission is
+    // evaluated as a new Agent action under the normal authority gate.
+    assert.deepEqual(recovered.handle(f.request), { ok: true, decision: "allow" });
+  } finally { f.cleanup(); }
+});
+
+test("non-expired recovery cannot be abandoned", async () => {
+  const f = fixture();
+  try {
+    f.bridge.handle(f.request);
+    const begun = ctl(f.bridge, "begin");
+    await nativeControl(f.bridge, begun.native_locator, "claim");
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_000_010, new FakeNativeSurface());
+    assert.equal(recovered.handle({ action: "status" }).recovery_expired, false);
+    assert.deepEqual(recovered.handle({
+      action: "abandon_expired_recovery",
+      expected_epoch: begun.epoch,
+    }), { ok: false });
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+    assert.equal(fs.existsSync(f.checkpoint), true);
+  } finally { f.cleanup(); }
+});
+
 test("wrong principal, target, intervention and stale epoch fail closed", async () => {
   const f = fixture();
   try {

@@ -37,6 +37,9 @@ pub enum LocalHandoffControlRequest {
         prior_capability_revision: Option<u64>,
     },
     RebindLive,
+    AbandonExpiredRecovery {
+        expected_epoch: u64,
+    },
     RequestResume,
     CancelBeforeHuman,
 }
@@ -57,6 +60,9 @@ impl From<LocalHandoffControlRequest> for HandoffOperatorCommand {
                 prior_capability_revision,
             },
             LocalHandoffControlRequest::RebindLive => Self::RebindLive,
+            LocalHandoffControlRequest::AbandonExpiredRecovery { expected_epoch } => {
+                Self::AbandonExpiredRecovery { expected_epoch }
+            }
             LocalHandoffControlRequest::RequestResume => Self::RequestResume,
             LocalHandoffControlRequest::CancelBeforeHuman => Self::CancelBeforeHuman,
         }
@@ -151,6 +157,7 @@ fn parse_local_request(
             "prior_generation",
             "prior_capability_revision",
         ],
+        "abandon_expired_recovery" => &["action", "expected_epoch"],
         _ => return Err(HandoffLocalControlError::Protocol),
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -412,6 +419,17 @@ mod tests {
         assert_eq!(
             parse_local_request(br#"{"action":"begin"}"#).unwrap(),
             LocalHandoffControlRequest::Begin
+        );
+        assert_eq!(
+            parse_local_request(br#"{"action":"abandon_expired_recovery","expected_epoch":7}"#)
+                .unwrap(),
+            LocalHandoffControlRequest::AbandonExpiredRecovery { expected_epoch: 7 }
+        );
+        assert!(
+            parse_local_request(
+                br#"{"action":"abandon_expired_recovery","expected_epoch":7,"process_id":1}"#
+            )
+            .is_err()
         );
     }
 

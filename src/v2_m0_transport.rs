@@ -22,7 +22,7 @@ use std::{
     time::Instant,
 };
 
-pub const HUB_AGENT_SCHEMA_VERSION: u16 = 3;
+pub const HUB_AGENT_SCHEMA_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_HANDOFF_CONTROL_BYTES: usize = 4 * 1024;
 
@@ -379,6 +379,9 @@ pub enum RemoteHandoffOperatorCommand {
         prior_capability_revision: Option<u64>,
     },
     RebindLive,
+    AbandonExpiredRecovery {
+        expected_epoch: u64,
+    },
     RequestResume,
     CancelBeforeHuman,
 }
