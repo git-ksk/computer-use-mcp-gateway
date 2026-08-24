@@ -20,6 +20,11 @@ fn single_mac_handoff_is_agent_owned_and_stably_codesigned_for_tcc() {
     // cannot provide a durable TCC identity across rebuilt binaries. The reviewed
     // upgrade path requires a real Apple identity + Team ID and has no ad-hoc fallback.
     assert!(upgrade.contains("CUMG_V2_MACOS_CODESIGN_IDENTITY"));
+    // Name collisions with revoked/older certificates must not make codesign ambiguous.
+    // The helper resolves exactly one valid identity to its SHA-1 selector and otherwise fails closed.
+    assert!(upgrade.contains("MACOS_CODESIGN_SELECTOR"));
+    assert!(upgrade.contains("macos_codesign_identity_unavailable_or_ambiguous"));
+    assert!(upgrade.contains("fingerprint.upper()"));
     assert!(upgrade.contains("CUMG_V2_MACOS_TEAM_ID"));
     assert!(upgrade.contains("certificate leaf[subject.OU]"));
     assert!(upgrade.contains("anchor apple generic"));

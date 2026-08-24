@@ -64,8 +64,30 @@ MACOS_TEAM_ID="${CUMG_V2_MACOS_TEAM_ID:-}"
 [[ -n "$EXPECTED_CUA_VERSION" ]] || { echo "REFUSED reason=expected_cua_version_required" >&2; exit 2; }
 [[ -n "$MACOS_CODESIGN_IDENTITY" ]] || { echo "REFUSED reason=macos_codesign_identity_required" >&2; exit 2; }
 [[ "$MACOS_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "REFUSED reason=invalid_macos_team_id" >&2; exit 2; }
-security find-identity -v -p codesigning 2>/dev/null | grep -F -- "\"$MACOS_CODESIGN_IDENTITY\"" >/dev/null || {
-  echo "REFUSED reason=macos_codesign_identity_unavailable" >&2; exit 2;
+MACOS_CODESIGN_SELECTOR="$(python3 - "$MACOS_CODESIGN_IDENTITY" <<'PYIDENTITY'
+import re, subprocess, sys
+name = sys.argv[1]
+result = subprocess.run(
+    ["security", "find-identity", "-v", "-p", "codesigning"],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+)
+if result.returncode != 0:
+    raise SystemExit(2)
+pattern = re.compile(r'^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"([^"]+)"(?:\s+\(([^)]*)\))?\s*$')
+matches = []
+for line in result.stdout.splitlines():
+    match = pattern.match(line)
+    if not match:
+        continue
+    fingerprint, common_name, invalid_reason = match.groups()
+    if common_name == name and invalid_reason is None:
+        matches.append(fingerprint.upper())
+if len(matches) != 1:
+    raise SystemExit(3)
+print(matches[0])
+PYIDENTITY
+)" || {
+  echo "REFUSED reason=macos_codesign_identity_unavailable_or_ambiguous" >&2; exit 2;
 }
 DOMAIN="gui/$(id -u)"
 HUB_PLIST="$HOME/Library/LaunchAgents/$HUB_LABEL.plist"
@@ -137,7 +159,7 @@ stable_codesign() {
   local pathname="$1" identifier="$2" expr requirement designated
   expr="identifier \"$identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"$MACOS_TEAM_ID\""
   requirement="=designated => $expr"
-  codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --identifier "$identifier" \
+  codesign --force --sign "$MACOS_CODESIGN_SELECTOR" --identifier "$identifier" \
     --requirements "$requirement" "$pathname" >/dev/null
   codesign --verify --strict "$pathname" >/dev/null
   codesign -v -R="$expr" "$pathname" >/dev/null
