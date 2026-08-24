@@ -1484,6 +1484,31 @@ mod tests {
     }
 
     #[test]
+    fn hub_and_agent_reject_mismatched_application_schema_before_session_acceptance() {
+        let (_registry, _identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let mut hello = AgentHello::new(device_id, caps());
+        hello.schema_version = HUB_AGENT_SCHEMA_VERSION.saturating_sub(1);
+        assert!(matches!(
+            hub.challenge(&hello),
+            Err(TransportError::UnsupportedSchema { got })
+                if got != HUB_AGENT_SCHEMA_VERSION
+        ));
+
+        hello.schema_version = HUB_AGENT_SCHEMA_VERSION;
+        let challenge = hub.challenge(&hello).unwrap();
+        let mut accepted = hub
+            .accept_session(&hello, &challenge, 1, 1, 50_000)
+            .unwrap();
+        accepted.schema_version = HUB_AGENT_SCHEMA_VERSION.saturating_add(1);
+        assert!(matches!(
+            verify_session_accepted(&hello, &challenge, &accepted, &hub.verifier()),
+            Err(TransportError::UnsupportedSchema { got })
+                if got != HUB_AGENT_SCHEMA_VERSION
+        ));
+    }
+
+    #[test]
     fn agent_rejects_an_unpinned_hub_identity() {
         let (_registry, _identity, device_id) = enrolled();
         let trusted = HubIdentity::generate();

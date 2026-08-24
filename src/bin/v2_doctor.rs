@@ -35,6 +35,9 @@ struct Args {
     cua_command: Option<PathBuf>,
     #[arg(long)]
     expected_cua_version: Option<String>,
+    /// Optional private local Handoff control socket. Status is queried read-only and locator/IDs are omitted.
+    #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
+    handoff_control_socket: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -82,6 +85,7 @@ fn main() -> ExitCode {
             .cua_command
             .or_else(|| Some(home.join(".local/bin/cua-driver"))),
         expected_cua_version: args.expected_cua_version,
+        handoff_control_socket: args.handoff_control_socket,
     };
     let report = run_doctor(&config);
     if args.json {

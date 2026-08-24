@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { HandoffBridge, serveStdio } from "../v2_operator_handoff_bridge.mjs";
+import { AppendOnlyAbandonmentAudit, HandoffBridge, serveStdio } from "../v2_operator_handoff_bridge.mjs";
 
 const HANDOFF_ROOT = process.env.CUMG_V2_HANDOFF_ROOT;
 const api = HANDOFF_ROOT
@@ -97,7 +97,8 @@ function fixture(surface = new FakeNativeSurface()) {
   const key = Buffer.alloc(32, 7);
   let now = 1_800_000_000_000;
   const store = new api.SignedFileHandoffCheckpointStore(checkpoint, key, () => now);
-  const bridge = new HandoffBridge(api, store, () => now, surface);
+  const audit = new AppendOnlyAbandonmentAudit(path.join(root, "audit", "abandonment.jsonl"));
+  const bridge = new HandoffBridge(api, store, () => now, surface, audit);
   const request = {
     action: "admit_agent",
     protocol: 1,
@@ -113,7 +114,7 @@ function fixture(surface = new FakeNativeSurface()) {
     verification_candidate: false,
   };
   return {
-    root, checkpoint, store, bridge, surface, native: surface, request,
+    root, checkpoint, store, audit, bridge, surface, native: surface, request,
     tick(ms = 1) { now += ms; },
     cleanup() { fs.rmSync(root, { recursive: true, force: true }); },
   };
@@ -474,7 +475,9 @@ test("expired signed checkpoint stays fail-closed until explicit prior-context r
     await nativeControl(f.bridge, begun.native_locator, "claim");
     f.tick(16 * 60_000);
 
-    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_960_001, new FakeNativeSurface());
+    const recovered = new HandoffBridge(
+      api, f.store, () => 1_800_000_960_001, new FakeNativeSurface(), f.audit,
+    );
     const status = recovered.handle({ action: "status" });
     assert.equal(status.recovery_required, true);
     assert.equal(status.recovery_expired, true);
@@ -498,7 +501,9 @@ test("expired recovery can be explicitly abandoned only with the exact epoch and
     await nativeControl(f.bridge, begun.native_locator, "claim");
     f.tick(16 * 60_000);
 
-    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_960_001, new FakeNativeSurface());
+    const recovered = new HandoffBridge(
+      api, f.store, () => 1_800_000_960_001, new FakeNativeSurface(), f.audit,
+    );
     const status = recovered.handle({ action: "status" });
     assert.equal(status.recovery_required, true);
     assert.equal(status.recovery_expired, true);
@@ -521,10 +526,48 @@ test("expired recovery can be explicitly abandoned only with the exact epoch and
     assert.equal(cleared.active, null);
     assert.equal(cleared.resume_requested, false);
     assert.equal(fs.existsSync(f.checkpoint), false);
+    const auditRecords = fs.readFileSync(path.join(f.root, "audit", "abandonment.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(auditRecords, [{
+      timestamp_ms: 1_800_000_960_001,
+      recovery_epoch: begun.epoch,
+      prior_closed_recovery_status: "human_active",
+      result: "abandonment_authorized",
+    }]);
+    const auditText = JSON.stringify(auditRecords);
+    assert.doesNotMatch(auditText, /principal|device|context|process|window|intervention|locator|turn|credential|input/i);
 
     // Abandonment does not resume/replay the old intervention. A future fresh admission is
     // evaluated as a new Agent action under the normal authority gate.
     assert.deepEqual(recovered.handle(f.request), { ok: true, decision: "allow" });
+  } finally { f.cleanup(); }
+});
+
+test("expired recovery remains authoritative when append-only audit cannot be written", async () => {
+  const f = fixture();
+  try {
+    f.bridge.handle(f.request);
+    const begun = ctl(f.bridge, "begin");
+    await nativeControl(f.bridge, begun.native_locator, "claim");
+    f.tick(16 * 60_000);
+    const blocker = path.join(f.root, "audit-blocker");
+    fs.writeFileSync(blocker, "x");
+    const recovered = new HandoffBridge(
+      api,
+      f.store,
+      () => 1_800_000_960_001,
+      new FakeNativeSurface(),
+      new AppendOnlyAbandonmentAudit(path.join(blocker, "audit.jsonl")),
+    );
+    assert.equal(recovered.handle({ action: "status" }).recovery_expired, true);
+    assert.deepEqual(recovered.handle({
+      action: "abandon_expired_recovery",
+      expected_epoch: begun.epoch,
+    }), { ok: false });
+    const status = recovered.handle({ action: "status" });
+    assert.equal(status.recovery_required, true);
+    assert.equal(status.faulted, true);
+    assert.equal(fs.existsSync(f.checkpoint), true);
   } finally { f.cleanup(); }
 });
 

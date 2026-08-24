@@ -12,6 +12,55 @@ const MAX_LINE = 4096;
 const OBSERVATION_TTL_MS = 60_000;
 const CHECKPOINT_TTL_MS = 15 * 60_000;
 const MAX_RECOVERED_EPOCH = 1_000_000;
+const MAX_AUDIT_RECORD_BYTES = 1024;
+
+export class AppendOnlyAbandonmentAudit {
+  constructor(filePath) {
+    if (!path.isAbsolute(filePath)) throw new Error("abandonment audit path must be absolute");
+    this.filePath = filePath;
+  }
+
+  record({ timestampMs, recoveryEpoch, priorClosedRecoveryStatus, result }) {
+    if (!Number.isSafeInteger(timestampMs) || timestampMs < 0
+      || !positiveInt(recoveryEpoch)
+      || typeof priorClosedRecoveryStatus !== "string" || !priorClosedRecoveryStatus
+      || typeof result !== "string" || !/^[a-z0-9_]{1,64}$/.test(result)) {
+      throw new Error("abandonment audit record invalid");
+    }
+    const directory = path.dirname(this.filePath);
+    try { fs.mkdirSync(directory, { mode: 0o700 }); }
+    catch (error) { if (error?.code !== "EEXIST") throw error; }
+    const directoryMetadata = fs.lstatSync(directory);
+    if (directoryMetadata.isSymbolicLink() || !directoryMetadata.isDirectory()
+      || (process.platform !== "win32" && (directoryMetadata.mode & 0o077) !== 0)) {
+      throw new Error("abandonment audit directory unsafe");
+    }
+    const record = {
+      timestamp_ms: timestampMs,
+      recovery_epoch: recoveryEpoch,
+      prior_closed_recovery_status: priorClosedRecoveryStatus,
+      result,
+    };
+    const encoded = `${JSON.stringify(record)}\n`;
+    if (Buffer.byteLength(encoded, "utf8") > MAX_AUDIT_RECORD_BYTES) {
+      throw new Error("abandonment audit record too large");
+    }
+    const noFollow = process.platform === "win32" ? 0 : fs.constants.O_NOFOLLOW;
+    const fd = fs.openSync(
+      this.filePath,
+      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | noFollow,
+      0o600,
+    );
+    try {
+      const metadata = fs.fstatSync(fd);
+      if (!metadata.isFile() || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+        throw new Error("abandonment audit file unsafe");
+      }
+      fs.writeSync(fd, encoded, undefined, "utf8");
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+  }
+}
 
 function parseArgs(argv) {
   const command = argv[2] ?? "";
@@ -222,11 +271,12 @@ export class WebRtcHandoffSurface {
 }
 
 export class HandoffBridge {
-  constructor(api, checkpointStore, now = Date.now, humanSurface = undefined) {
+  constructor(api, checkpointStore, now = Date.now, humanSurface = undefined, abandonmentAudit = undefined) {
     this.api = api;
     this.checkpointStore = checkpointStore;
     this.now = now;
     this.humanSurface = humanSurface;
+    this.abandonmentAudit = abandonmentAudit;
     this.state = new api.ExecutionHandoffState(now);
     this.owners = new Map();
     this.activeBinding = undefined;
@@ -518,10 +568,31 @@ export class HandoffBridge {
       || this.activeBinding || this.surfaceLocator
       || !positiveInt(request.expected_epoch)
       || request.expected_epoch !== this.recovery.epoch) return { ok: false };
-    // This is an explicit operator abandonment, not verification success. Durable clear happens
-    // first; if it fails the recovery remains authoritative and the runtime faults closed.
+    // Persist a privacy-bounded append-only operator decision before clearing the checkpoint.
+    // If the audit cannot be durably appended, the recovery remains authoritative and faults closed.
+    if (!this.abandonmentAudit) { this.faulted = true; return { ok: false }; }
+    try {
+      this.abandonmentAudit.record({
+        timestampMs: this.now(),
+        recoveryEpoch: this.recovery.epoch,
+        priorClosedRecoveryStatus: this.recovery.status,
+        result: "abandonment_authorized",
+      });
+    } catch { this.faulted = true; return { ok: false }; }
+    // The audit proves an explicit operator abandonment decision. Checkpoint deletion still happens
+    // before the in-memory recovery lock is released; failure leaves recovery authoritative.
     try { this.checkpointStore.clear(); }
-    catch { this.faulted = true; return { ok: false }; }
+    catch {
+      try {
+        this.abandonmentAudit.record({
+          timestampMs: this.now(),
+          recoveryEpoch: this.recovery.epoch,
+          priorClosedRecoveryStatus: this.recovery.status,
+          result: "checkpoint_clear_failed",
+        });
+      } catch {}
+      this.faulted = true; return { ok: false };
+    }
     this.recovery = undefined;
     this.recoveryExpired = false;
     this.latestObservation = undefined;
@@ -816,7 +887,13 @@ export async function runCli(argv = process.argv) {
   const storeKey = Buffer.from(key);
   key.fill(0);
   const store = new api.SignedFileHandoffCheckpointStore(checkpointPath, storeKey);
-  const bridge = new HandoffBridge(api, store, Date.now, humanSurface);
+  const abandonmentAuditPath = optional(
+    options,
+    "abandonment-audit",
+    "CUMG_V2_HANDOFF_ABANDONMENT_AUDIT_FILE",
+  ) ?? path.join(path.dirname(checkpointPath), "audit", "expired-recovery-abandonment.jsonl");
+  const abandonmentAudit = new AppendOnlyAbandonmentAudit(abandonmentAuditPath);
+  const bridge = new HandoffBridge(api, store, Date.now, humanSurface, abandonmentAudit);
   if (command === "serve") {
     const socketPath = required(options, "socket", "CUMG_V2_OPERATOR_HANDOFF_SOCKET");
     serve(socketPath, bridge);

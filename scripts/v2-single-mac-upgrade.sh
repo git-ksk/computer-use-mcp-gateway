@@ -17,8 +17,11 @@ Environment overrides:
   CUMG_V2_SIGNER_LABEL       default: com.github.git-ksk.cumg-v2-grant-signer
   CUMG_V2_EXTERNAL_SIGNER    default: 1 (set 0 only for an explicitly reviewed legacy profile)
   CUMG_V2_EXPECTED_CUA_VERSION required; exact reviewed Cua version for post-upgrade v2_doctor
-  CUMG_V2_MACOS_CODESIGN_IDENTITY required; Apple code-signing identity for stable TCC attribution
-  CUMG_V2_MACOS_TEAM_ID       required; 10-character Apple Developer Team ID
+  CUMG_V2_MACOS_CODESIGN_FINGERPRINT preferred; exact 40-hex certificate fingerprint
+  CUMG_V2_MACOS_CODESIGN_IDENTITY fallback; exact Apple code-signing identity name, must resolve uniquely
+  CUMG_V2_MACOS_TEAM_ID       required; exact 10-character Apple Developer Team ID
+  CUMG_V2_HANDOFF_SOURCE_ROOT required after first pinned cutover; reviewed Handoff checkout
+  CUMG_V2_EXPECTED_HANDOFF_COMMIT required; exact reviewed mcp-execution-handoff commit
 USAGE
 }
 
@@ -38,6 +41,8 @@ command -v shasum >/dev/null || { echo "REFUSED reason=shasum_missing" >&2; exit
 command -v launchctl >/dev/null || { echo "REFUSED reason=launchctl_missing" >&2; exit 2; }
 command -v codesign >/dev/null || { echo "REFUSED reason=codesign_missing" >&2; exit 2; }
 command -v security >/dev/null || { echo "REFUSED reason=security_missing" >&2; exit 2; }
+command -v openssl >/dev/null || { echo "REFUSED reason=openssl_missing" >&2; exit 2; }
+command -v plutil >/dev/null || { echo "REFUSED reason=plutil_missing" >&2; exit 2; }
 [[ -x /usr/libexec/PlistBuddy ]] || { echo "REFUSED reason=plistbuddy_missing" >&2; exit 2; }
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "REFUSED reason=not_git_checkout" >&2; exit 2; }
@@ -59,14 +64,22 @@ AGENT_LABEL="${CUMG_V2_AGENT_LABEL:-com.github.git-ksk.cumg-v2-agent}"
 SIGNER_LABEL="${CUMG_V2_SIGNER_LABEL:-com.github.git-ksk.cumg-v2-grant-signer}"
 EXTERNAL_SIGNER="${CUMG_V2_EXTERNAL_SIGNER:-1}"
 EXPECTED_CUA_VERSION="${CUMG_V2_EXPECTED_CUA_VERSION:-}"
+MACOS_CODESIGN_FINGERPRINT="${CUMG_V2_MACOS_CODESIGN_FINGERPRINT:-}"
 MACOS_CODESIGN_IDENTITY="${CUMG_V2_MACOS_CODESIGN_IDENTITY:-}"
 MACOS_TEAM_ID="${CUMG_V2_MACOS_TEAM_ID:-}"
+EXPECTED_HANDOFF_COMMIT="${CUMG_V2_EXPECTED_HANDOFF_COMMIT:-}"
 [[ -n "$EXPECTED_CUA_VERSION" ]] || { echo "REFUSED reason=expected_cua_version_required" >&2; exit 2; }
-[[ -n "$MACOS_CODESIGN_IDENTITY" ]] || { echo "REFUSED reason=macos_codesign_identity_required" >&2; exit 2; }
+[[ -n "$MACOS_CODESIGN_FINGERPRINT" || -n "$MACOS_CODESIGN_IDENTITY" ]] || {
+  echo "REFUSED reason=macos_codesign_selector_required" >&2; exit 2;
+}
+[[ -z "$MACOS_CODESIGN_FINGERPRINT" || "$MACOS_CODESIGN_FINGERPRINT" =~ ^[0-9A-Fa-f]{40}$ ]] || {
+  echo "REFUSED reason=invalid_macos_codesign_fingerprint" >&2; exit 2;
+}
 [[ "$MACOS_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "REFUSED reason=invalid_macos_team_id" >&2; exit 2; }
-MACOS_CODESIGN_SELECTOR="$(python3 - "$MACOS_CODESIGN_IDENTITY" <<'PYIDENTITY'
+[[ "$EXPECTED_HANDOFF_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "REFUSED reason=invalid_expected_handoff_commit" >&2; exit 2; }
+MACOS_CODESIGN_SELECTOR="$(python3 - "$MACOS_CODESIGN_IDENTITY" "$MACOS_CODESIGN_FINGERPRINT" "$MACOS_TEAM_ID" <<'PYIDENTITY'
 import re, subprocess, sys
-name = sys.argv[1]
+name, requested, expected_team = sys.argv[1:]
 result = subprocess.run(
     ["security", "find-identity", "-v", "-p", "codesigning"],
     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
@@ -74,20 +87,48 @@ result = subprocess.run(
 if result.returncode != 0:
     raise SystemExit(2)
 pattern = re.compile(r'^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"([^"]+)"(?:\s+\(([^)]*)\))?\s*$')
-matches = []
+valid = []
 for line in result.stdout.splitlines():
     match = pattern.match(line)
     if not match:
         continue
     fingerprint, common_name, invalid_reason = match.groups()
-    if common_name == name and invalid_reason is None:
-        matches.append(fingerprint.upper())
+    if invalid_reason is None:
+        valid.append((fingerprint.upper(), common_name))
+if requested:
+    matches = [(fp, cn) for fp, cn in valid if fp == requested.upper() and (not name or cn == name)]
+else:
+    matches = [(fp, cn) for fp, cn in valid if cn == name]
 if len(matches) != 1:
     raise SystemExit(3)
-print(matches[0])
+selector = matches[0][0]
+certs = subprocess.run(
+    ["security", "find-certificate", "-a", "-p"],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+).stdout
+pem_pattern = re.compile(br'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', re.S)
+matched_teams = []
+for pem in pem_pattern.findall(certs):
+    detail = subprocess.run(
+        ["openssl", "x509", "-noout", "-fingerprint", "-sha1", "-subject", "-nameopt", "RFC2253"],
+        input=pem, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=False, check=False,
+    )
+    if detail.returncode != 0:
+        continue
+    text = detail.stdout.decode("utf-8", "replace")
+    fingerprint_match = re.search(r'Fingerprint=([0-9A-Fa-f:]+)', text)
+    if not fingerprint_match or fingerprint_match.group(1).replace(":", "").upper() != selector:
+        continue
+    subject = next((line.split("=", 1)[1] for line in text.splitlines() if line.startswith("subject=")), "")
+    team_match = re.search(r'(?:^|,)OU=([^,]+)', subject)
+    if team_match:
+        matched_teams.append(team_match.group(1))
+if matched_teams != [expected_team]:
+    raise SystemExit(4)
+print(selector)
 PYIDENTITY
 )" || {
-  echo "REFUSED reason=macos_codesign_identity_unavailable_or_ambiguous" >&2; exit 2;
+  echo "REFUSED reason=macos_codesign_identity_unavailable_ambiguous_or_team_mismatch" >&2; exit 2;
 }
 DOMAIN="gui/$(id -u)"
 HUB_PLIST="$HOME/Library/LaunchAgents/$HUB_LABEL.plist"
@@ -107,6 +148,7 @@ path = pathlib.Path(sys.argv[1])
 keys = {
     "CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE": "com.github.git-ksk.cumg-v2-handoff-webrtc-host",
     "CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE": "com.github.git-ksk.cumg-v2-handoff-native-host",
+    "CUMG_V2_HANDOFF_NATIVE_REVOKE_EXECUTABLE": "com.github.git-ksk.cumg-v2-handoff-native-revoke",
 }
 found = []
 for raw in path.read_text(encoding="utf-8").splitlines():
@@ -134,6 +176,77 @@ while IFS=$'\t' read -r _key _identifier helper; do
     echo "REFUSED reason=handoff_host_executable_unsafe" >&2; exit 2;
   }
 done <<< "$HANDOFF_HELPERS"
+CONFIGURED_HANDOFF_ROOT="$(python3 - "$HANDOFF_ENV_FILE" <<'PYHANDOFFROOT'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = None
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, candidate = line.split("=", 1)
+    if key.strip() != "CUMG_V2_HANDOFF_ROOT":
+        continue
+    candidate = candidate.strip()
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "\"'":
+        candidate = candidate[1:-1]
+    if value is not None or not candidate or "\x00" in candidate or "\n" in candidate or "\r" in candidate:
+        raise SystemExit(2)
+    value = candidate
+if value is None:
+    raise SystemExit(3)
+print(value)
+PYHANDOFFROOT
+)" || { echo "REFUSED reason=handoff_source_root_missing" >&2; exit 2; }
+HANDOFF_SOURCE_ROOT="${CUMG_V2_HANDOFF_SOURCE_ROOT:-$CONFIGURED_HANDOFF_ROOT}"
+[[ "$HANDOFF_SOURCE_ROOT" == /* && -d "$HANDOFF_SOURCE_ROOT" && ! -L "$HANDOFF_SOURCE_ROOT" ]] || {
+  echo "REFUSED reason=handoff_source_root_unsafe" >&2; exit 2;
+}
+[[ -f "$HANDOFF_SOURCE_ROOT/dist/index.js" && ! -L "$HANDOFF_SOURCE_ROOT/dist" ]] || {
+  echo "REFUSED reason=handoff_dist_missing_or_unsafe" >&2; exit 2;
+}
+[[ "$(git -C "$HANDOFF_SOURCE_ROOT" branch --show-current)" == "main" ]] || {
+  echo "REFUSED reason=handoff_branch_not_main" >&2; exit 2;
+}
+[[ -z "$(git -C "$HANDOFF_SOURCE_ROOT" status --porcelain=v1)" ]] || {
+  echo "REFUSED reason=handoff_dirty_checkout" >&2; exit 2;
+}
+git -C "$HANDOFF_SOURCE_ROOT" fetch --quiet origin main
+HANDOFF_HEAD="$(git -C "$HANDOFF_SOURCE_ROOT" rev-parse HEAD)"
+HANDOFF_ORIGIN_MAIN="$(git -C "$HANDOFF_SOURCE_ROOT" rev-parse origin/main)"
+[[ "$HANDOFF_HEAD" == "$HANDOFF_ORIGIN_MAIN" && "$HANDOFF_HEAD" == "$EXPECTED_HANDOFF_COMMIT" ]] || {
+  echo "REFUSED reason=handoff_source_commit_mismatch" >&2; exit 2;
+}
+HANDOFF_CONTROL_SOCKET="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_CONTROL_SOCKET' "$HUB_PLIST" 2>/dev/null || true)"
+[[ "$HANDOFF_CONTROL_SOCKET" == /* ]] || { echo "REFUSED reason=handoff_control_socket_missing" >&2; exit 2; }
+python3 - "$HANDOFF_CONTROL_SOCKET" <<'PYHANDOFFSTATUS' || {
+import json, socket, sys
+pathname = sys.argv[1]
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(2)
+try:
+    client.connect(pathname)
+    client.sendall(b'{"action":"status"}\n')
+    data = b""
+    while not data.endswith(b"\n") and len(data) <= 8192:
+        chunk = client.recv(8192 - len(data) + 1)
+        if not chunk:
+            break
+        data += chunk
+finally:
+    client.close()
+if len(data) > 8192 or not data.endswith(b"\n"):
+    raise SystemExit(2)
+response = json.loads(data)
+status = response.get("status") if response.get("ok") is True else None
+if not isinstance(status, dict):
+    raise SystemExit(3)
+if (status.get("active") is not None or status.get("recovery_required") is not False
+        or status.get("resume_requested") is not False or status.get("faulted") is not False):
+    raise SystemExit(4)
+PYHANDOFFSTATUS
+  echo "REFUSED reason=handoff_not_idle_or_status_unavailable" >&2; exit 2;
+}
 if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
   [[ -f "$SIGNER_PLIST" ]] || { echo "REFUSED reason=grant_signer_launchd_profile_missing" >&2; exit 2; }
   [[ -d "$RUN_ROOT" ]] || { echo "REFUSED reason=grant_signer_run_directory_missing" >&2; exit 2; }
@@ -181,6 +294,69 @@ stable_codesign "target/release/v2_agent" "com.github.git-ksk.cumg-v2-agent" || 
   echo "REFUSED reason=agent_stable_codesign_failed" >&2; exit 2;
 }
 
+HANDOFF_DIR="$ROOT/v2/handoff"
+[[ -d "$HANDOFF_DIR" && ! -L "$HANDOFF_DIR" ]] || { echo "REFUSED reason=handoff_directory_unsafe" >&2; exit 2; }
+CURRENT_HANDOFF_SCRIPT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_SCRIPT' "$AGENT_PLIST" 2>/dev/null || true)"
+[[ "$CURRENT_HANDOFF_SCRIPT" == "$HANDOFF_DIR"/runtime-*/* && -f "$CURRENT_HANDOFF_SCRIPT" && ! -L "$CURRENT_HANDOFF_SCRIPT" ]] || {
+  echo "REFUSED reason=current_handoff_runtime_script_unsafe" >&2; exit 2;
+}
+CURRENT_HANDOFF_RUNTIME="$(dirname "$CURRENT_HANDOFF_SCRIPT")"
+[[ "$(basename "$CURRENT_HANDOFF_RUNTIME")" =~ ^runtime-[0-9a-f]{7,40}(-[0-9a-f]{7,40})?$ && ! -L "$CURRENT_HANDOFF_RUNTIME" ]] || {
+  echo "REFUSED reason=current_handoff_runtime_generation_unsafe" >&2; exit 2;
+}
+NEW_RUNTIME_NAME="runtime-${HEAD:0:12}-${HANDOFF_HEAD:0:12}"
+NEW_HANDOFF_RUNTIME="$HANDOFF_DIR/$NEW_RUNTIME_NAME"
+[[ ! -e "$NEW_HANDOFF_RUNTIME" && ! -L "$NEW_HANDOFF_RUNTIME" ]] || {
+  echo "REFUSED reason=handoff_runtime_generation_already_exists" >&2; exit 2;
+}
+STAGE_RUNTIME="$HANDOFF_DIR/.stage-${NEW_RUNTIME_NAME}-$$"
+[[ ! -e "$STAGE_RUNTIME" ]] || { echo "REFUSED reason=handoff_runtime_stage_exists" >&2; exit 2; }
+umask 077
+mkdir -p "$STAGE_RUNTIME/handoff-root"
+chmod 700 "$STAGE_RUNTIME" "$STAGE_RUNTIME/handoff-root"
+cp "$REPO_ROOT/scripts/v2_handoff_runtime.mjs" "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
+chmod 700 "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
+cp -R "$HANDOFF_SOURCE_ROOT/dist" "$STAGE_RUNTIME/handoff-root/dist"
+NEW_HANDOFF_HELPERS=""
+while IFS=$'\t' read -r key identifier helper; do
+  [[ -n "$helper" ]] || continue
+  case "$key" in
+    CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-webrtc-host" ;;
+    CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-native-host" ;;
+    CUMG_V2_HANDOFF_NATIVE_REVOKE_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-native-revoke" ;;
+    *) echo "REFUSED reason=unsupported_handoff_helper_key" >&2; rm -rf "$STAGE_RUNTIME"; exit 2 ;;
+  esac
+  cp "$helper" "$staged"
+  chmod 700 "$staged"
+  if ! stable_codesign "$staged" "$identifier"; then
+    rm -rf "$STAGE_RUNTIME"
+    echo "REFUSED reason=staged_handoff_host_stable_codesign_failed" >&2
+    exit 2
+  fi
+  NEW_HANDOFF_HELPERS+="${key}"$'\t'"${identifier}"$'\t'"${helper}"$'\t'"${staged}"$'\n'
+done <<< "$HANDOFF_HELPERS"
+python3 - "$HEAD" "$HANDOFF_HEAD" "$STAGE_RUNTIME" > "$STAGE_RUNTIME/runtime-generation-manifest.json" <<'PYRUNTIMEGEN'
+import hashlib, json, pathlib, sys
+cumg, handoff, root = sys.argv[1:]
+root = pathlib.Path(root)
+files = []
+for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name != "runtime-generation-manifest.json"):
+    if path.is_symlink():
+        raise SystemExit(2)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    files.append({"path": path.relative_to(root).as_posix(), "sha256": digest})
+print(json.dumps({
+    "schema_version": 1,
+    "cumg_source_commit": cumg,
+    "handoff_source_commit": handoff,
+    "files": files,
+}, indent=2))
+PYRUNTIMEGEN
+chmod 600 "$STAGE_RUNTIME/runtime-generation-manifest.json"
+mv "$STAGE_RUNTIME" "$NEW_HANDOFF_RUNTIME"
+# Rewrite staged helper destinations after the atomic directory rename.
+NEW_HANDOFF_HELPERS="${NEW_HANDOFF_HELPERS//$STAGE_RUNTIME/$NEW_HANDOFF_RUNTIME}"
+
 STAMP="$(date '+%Y%m%dT%H%M%S%z')"
 ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
 umask 077
@@ -202,6 +378,35 @@ while IFS=$'\t' read -r key identifier helper; do
   cp -p "$helper" "$archived"
   printf '%s\t%s\t%s\t%s\n' "$key" "$identifier" "$helper" "$archived" >> "$ROLLBACK/handoff/paths.tsv"
 done <<< "$HANDOFF_HELPERS"
+cp -p "$HANDOFF_ENV_FILE" "$ROLLBACK/handoff/managed-runtime.env"
+chmod 600 "$ROLLBACK/handoff/managed-runtime.env"
+cp -R "$CURRENT_HANDOFF_RUNTIME" "$ROLLBACK/handoff/runtime-generation"
+if [[ ! -f "$ROLLBACK/handoff/runtime-generation/handoff-root/dist/index.js" ]]; then
+  mkdir -p "$ROLLBACK/handoff/runtime-generation/handoff-root"
+  cp -R "$HANDOFF_SOURCE_ROOT/dist" "$ROLLBACK/handoff/runtime-generation/handoff-root/dist"
+fi
+python3 - "$HEAD" "$HANDOFF_HEAD" "$ROLLBACK/handoff/runtime-generation" > "$ROLLBACK/handoff/runtime-generation/runtime-generation-manifest.json" <<'PYARCHIVE'
+import hashlib, json, pathlib, sys
+cumg, handoff, root = sys.argv[1:]
+root = pathlib.Path(root)
+files = []
+for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name != "runtime-generation-manifest.json"):
+    if path.is_symlink():
+        raise SystemExit(2)
+    files.append({
+        "path": path.relative_to(root).as_posix(),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    })
+print(json.dumps({
+    "schema_version": 1,
+    "archive_complete": True,
+    "archived_by_source_commit": cumg,
+    "handoff_source_commit": handoff,
+    "files": files,
+}, indent=2))
+PYARCHIVE
+printf '%s' "$NEW_HANDOFF_HELPERS" > "$ROLLBACK/handoff/new-paths.tsv"
+chmod 600 "$ROLLBACK/handoff/new-paths.tsv"
 printf '%s\n' "$HEAD" > "$ROLLBACK/replacement-source-commit.txt"
 
 hub_pid() {
@@ -244,6 +449,9 @@ if [[ "$STOPPED_QUARANTINE_COUNT" != "0" ]]; then
 fi
 
 restore_preinstall_profile() {
+  cp -p "$ROLLBACK/launchd/$(basename "$AGENT_PLIST")" "$AGENT_PLIST" 2>/dev/null || true
+  cp -p "$ROLLBACK/handoff/managed-runtime.env" "$HANDOFF_ENV_FILE" 2>/dev/null || true
+  chmod 600 "$HANDOFF_ENV_FILE" 2>/dev/null || true
   while IFS=$'\t' read -r _key _identifier helper archived; do
     [[ -n "$helper" && -f "$archived" ]] && cp -p "$archived" "$helper" || true
   done < "$ROLLBACK/handoff/paths.tsv"
@@ -254,16 +462,63 @@ restore_preinstall_profile() {
   launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
   sleep 1
   launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" >/dev/null 2>&1 || true
+  if [[ "$NEW_HANDOFF_RUNTIME" == "$HANDOFF_DIR"/runtime-* && -d "$NEW_HANDOFF_RUNTIME" && ! -L "$NEW_HANDOFF_RUNTIME" ]]; then
+    rm -rf "$NEW_HANDOFF_RUNTIME" || true
+  fi
 }
 
-while IFS=$'\t' read -r _key identifier helper _archived; do
-  [[ -n "$helper" ]] || continue
-  if ! stable_codesign "$helper" "$identifier"; then
-    restore_preinstall_profile
-    echo "REFUSED reason=handoff_host_stable_codesign_failed rollback=$ROLLBACK" >&2
-    exit 2
-  fi
-done < "$ROLLBACK/handoff/paths.tsv"
+if ! python3 - "$HANDOFF_ENV_FILE" "$NEW_HANDOFF_RUNTIME/handoff-root" "$ROLLBACK/handoff/new-paths.tsv" <<'PYENVREWRITE'
+import os, pathlib, sys, tempfile
+path = pathlib.Path(sys.argv[1])
+new_root = sys.argv[2]
+mapping_file = pathlib.Path(sys.argv[3])
+if path.is_symlink() or not path.is_file() or not pathlib.Path(new_root).is_absolute():
+    raise SystemExit(2)
+replacements = {"CUMG_V2_HANDOFF_ROOT": new_root}
+for raw in mapping_file.read_text(encoding="utf-8").splitlines():
+    columns = raw.split("\t")
+    if len(columns) != 4:
+        raise SystemExit(3)
+    key, _identifier, _old, new = columns
+    if key in replacements or not pathlib.Path(new).is_absolute():
+        raise SystemExit(4)
+    replacements[key] = new
+lines = path.read_text(encoding="utf-8").splitlines()
+seen = set()
+out = []
+for raw in lines:
+    stripped = raw.strip()
+    if stripped and not stripped.startswith("#") and "=" in stripped:
+        key = stripped.split("=", 1)[0].strip()
+        if key in replacements:
+            if key in seen:
+                raise SystemExit(5)
+            out.append(f"{key}={replacements[key]}")
+            seen.add(key)
+            continue
+    out.append(raw)
+if seen != set(replacements):
+    raise SystemExit(6)
+tmp = path.with_name(path.name + f".new.{os.getpid()}")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    payload = ("\n".join(out) + "\n").encode("utf-8")
+    os.write(fd, payload)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(tmp, path)
+PYENVREWRITE
+then
+  restore_preinstall_profile
+  echo "REFUSED reason=handoff_runtime_env_update_failed rollback=$ROLLBACK" >&2
+  exit 2
+fi
+if ! plutil -replace EnvironmentVariables.CUMG_V2_HANDOFF_RUNTIME_SCRIPT -string "$NEW_HANDOFF_RUNTIME/v2_handoff_runtime.mjs" "$AGENT_PLIST"; then
+  restore_preinstall_profile
+  echo "REFUSED reason=agent_handoff_runtime_script_update_failed rollback=$ROLLBACK" >&2
+  exit 2
+fi
 
 install_atomic() {
   local source="$1" destination="$2" tmp
@@ -278,10 +533,19 @@ for name in v2_hub v2_agent v2_maint v2_doctor v2_grant_signer; do
 done
 
 PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"]=="computer-use-mcp-gateway"))')"
+HUB_AGENT_SCHEMA_VERSION="$(python3 - "$REPO_ROOT/src/v2_m0_transport.rs" <<'PYSCHEMA'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r'pub const HUB_AGENT_SCHEMA_VERSION: u16 = ([0-9]+);', text)
+if not match:
+    raise SystemExit(2)
+print(match.group(1))
+PYSCHEMA
+)" || { echo "REFUSED reason=hub_agent_schema_unavailable" >&2; exit 2; }
 MANIFEST_TMP="$ROOT/runtime-manifest.json.new.$$"
-python3 - "$HEAD" "$PACKAGE_VERSION" "$BIN_DIR" > "$MANIFEST_TMP" <<'PY'
+python3 - "$HEAD" "$PACKAGE_VERSION" "$HUB_AGENT_SCHEMA_VERSION" "$BIN_DIR" > "$MANIFEST_TMP" <<'PY'
 import hashlib, json, pathlib, sys
-commit, version, bindir = sys.argv[1:]
+commit, version, hub_agent_schema, bindir = sys.argv[1:]
 bindir = pathlib.Path(bindir)
 names = ["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_grant_signer"]
 items = []
@@ -291,7 +555,13 @@ for name in names:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     items.append({"name": name, "sha256": h.hexdigest()})
-print(json.dumps({"schema_version": 1, "source_commit": commit, "package_version": version, "binaries": items}, indent=2))
+print(json.dumps({
+    "schema_version": 2,
+    "hub_agent_schema_version": int(hub_agent_schema),
+    "source_commit": commit,
+    "package_version": version,
+    "binaries": items,
+}, indent=2))
 PY
 chmod 600 "$MANIFEST_TMP"
 mv -f "$MANIFEST_TMP" "$ROOT/runtime-manifest.json"
@@ -328,6 +598,7 @@ DOCTOR_ARGS=(
   --binary-dir "$BIN_DIR"
   --hub-launchd-label "$HUB_LABEL"
   --agent-launchd-label "$AGENT_LABEL"
+  --handoff-control-socket "$HANDOFF_CONTROL_SOCKET"
   --json
 )
 if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
@@ -355,4 +626,16 @@ for _attempt in $(seq 1 15); do
 done
 [[ "$DOCTOR_OK" == "1" ]] || fail_poststart "doctor"
 printf '%s\n' "$DOCTOR_OUTPUT"
-echo "UPGRADE_OK source_commit=$HEAD rollback=$ROLLBACK"
+if ! python3 "$REPO_ROOT/scripts/v2_handoff_runtime_cleanup.py" \
+  --install-root "$ROOT" \
+  --agent-plist "$AGENT_PLIST" \
+  --rollback-root "$ROOT/rollback" \
+  --runtime-manifest "$ROOT/runtime-manifest.json" \
+  --expected-source-commit "$HEAD" \
+  --keep-recent 2 \
+  --health-confirmed \
+  --apply; then
+  echo "CLEANUP_DEFERRED reason=safety_refusal" >&2
+  exit 4
+fi
+echo "UPGRADE_OK source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD runtime_generation=$NEW_RUNTIME_NAME rollback=$ROLLBACK"

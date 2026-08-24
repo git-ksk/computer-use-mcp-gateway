@@ -56,45 +56,38 @@ signer policy example は意図的に最小です。review 済み northbound pol
 
 ## Safe runtime upgrade
 
-`scripts/v2-single-mac-upgrade.sh` は、すでに導入済み single-Mac profile 用の reviewed upgrade helper です。以下では fail closed します。
+`scripts/v2-single-mac-upgrade.sh` は導入済み single-Mac profile 用の reviewed upgrade helper です。CUMG checkout が clean な `main == origin/main` でない、review 済み Handoff checkout が clean な `main == origin/main` かつ exact `CUMG_V2_EXPECTED_HANDOFF_COMMIT` でない、live quarantine がある、Handoff が active/recovery/faulted、必須 state/service がない、Cua/signing input が不足している場合は replacement 前に拒否します。
 
-- source checkout が clean な `main == origin/main` ではない;
-- installed paired `v2_maint` で authoritative state を inspect できない;
-- live quarantine が存在する;
-- 必須 LaunchAgent / state directory がない;
-- reviewed Cua version が明示されていない;
-- 有効な Apple code-signing identity と 10 文字の Team ID が明示されていない;
-- Agent Handoff env/helper path が存在しない、または unsafe;
-- external signer profile が不完全。
+signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します。display-name の `CUMG_V2_MACOS_CODESIGN_IDENTITY` は、valid certificate が exactly one に解決できる場合だけ compatibility fallback として使えます。選択 certificate の exact Team ID を **sign 前に** 検証し、sign 後も stable identifier / Team-ID designated requirement を再検証します。ad-hoc fallback はありません。
 
-成功する upgrade は次の順序です。
+成功する upgrade の順序は次です。
 
-1. source/state/service preflight;
-2. 1 commit から `v2_hub`、`v2_agent`、`v2_maint`、`v2_doctor`、`v2_grant_signer` を build し、`v2_agent` を stable Agent identifier / Team-ID designated requirement で sign;
-3. old binary と service config を保存し、drain 後に authoritative な停止済み Hub/Agent state を rollback asset として保存;
-4. Agent 接続を維持したまま Hub に先に signal を送り、新規 admission を閉じて既存 work を drain;
-5. Hub shutdown 後に Agent と signer を unload;
-6. 停止済み authoritative state を再確認し、drain 中に quarantine が生成されていれば binary replacement 前に拒否;
-7. configured Agent-local Handoff host helper を stable Team-ID designated requirement で sign した後、version-paired runtime binaries を atomic replace;
-8. package version、source commit、binary name、SHA-256 だけを含む `runtime-manifest.json` を作成;
-9. signer -> Hub -> Agent の順で起動;
-10. `v2_doctor` を実行。post-start doctor が失敗した場合は profile を fail closed で停止し、新しい state に old binary だけを自動的に組み合わせません。
+1. CUMG/Handoff source provenance、quarantine=0、loaded service、Agent-owned Handoff idle を locator/owner data を出さずに確認;
+2. 1つの merged CUMG commit から paired binaries を build し、exact reviewed Handoff `dist` と CUMG runtime host script から private `runtime-<cumg>-<handoff>` generation を stage;
+3. Handoff host helper を新 generation へ copy して stable sign。live helper は in-place 変更しない;
+4. old binaries/config、Handoff env、helper copy、self-contained old Handoff code generation を private rollback bundle に保存。authoritative Hub/Agent state は drain 後だけ保存;
+5. Hub を先に signal して admission close/drain、Hub/Agent/signer unload 後に stopped quarantine を再確認;
+6. stopped 状態で private Handoff env と Agent plist を staged generation へ atomic retarget し、paired CUMG binaries を atomic replace;
+7. merged CUMG source commit、exact Hub/Agent application-schema version、package version、binary SHA-256 を持つ schema 2 `runtime-manifest.json` を作成;
+8. signer -> Hub -> Agent で起動し、read-only Handoff status を含む `v2_doctor` を実行;
+9. doctor healthy の後だけ、eligible な未参照 `runtime-*` code directory を prune。active runtime、legacy external rollback reference、bounded recent generations、symlink/unsafe candidate は保護または拒否。checkpoint/key/env/audit/control/rollback data は cleanup candidate 外。
 
 例:
 
 ```bash
 CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
-CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
+CUMG_V2_MACOS_CODESIGN_FINGERPRINT=0123456789ABCDEF0123456789ABCDEF01234567 \
 CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
+CUMG_V2_HANDOFF_SOURCE_ROOT="$HOME/x-code/mcp-execution-handoff" \
+CUMG_V2_EXPECTED_HANDOFF_COMMIT=<reviewed-40-hex-commit> \
   scripts/v2-single-mac-upgrade.sh --preflight-only
-
-CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
-CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
-CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
-  scripts/v2-single-mac-upgrade.sh
 ```
 
-helper は rollback asset directory を表示します。これは old-binary / old-state の明示的な pair です。new runtime が進めた state に old binary だけを戻してはいけません。recovery は常に明示的 operator action です。
+cutover は同じ reviewed environment から `--preflight-only` を外して実行します。最初の pinned cutover 後は `CUMG_V2_HANDOFF_SOURCE_ROOT` を explicit reviewed checkout として渡してください。runtime の `CUMG_V2_HANDOFF_ROOT` は immutable staged code を指し、development checkout ではありません。
+
+rollback bundle は old-binary / old-state / Handoff-code の明示的 evidence set です。new runtime が進めた state に old binary だけを戻してはいけません。post-start failure は new profile を fail closed で停止し、recovery は explicit operator action に限定します。
+
+expired-recovery abandonment は signed checkpoint を削除する前に private append-only JSONL audit を書きます。record は timestamp、recovery epoch、prior closed recovery status、bounded result code のみです。locator、process/window/context/intervention ID、principal、action digest、TURN credential、Human input、payload は保存しません。audit append が失敗した場合は abandonment を拒否し、recovery を authoritative のまま維持します。
 
 ## `v2_doctor`
 
@@ -102,7 +95,7 @@ helper は rollback asset directory を表示します。これは old-binary / 
 
 standard profile では次を確認します。
 
-- runtime manifest schema、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_grant_signer` の exact SHA-256 identity;
+- runtime manifest schema 2、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_grant_signer` の exact SHA-256 identity;
 - authoritative Hub checkpoint の readability と current registry/capability schema;
 - enrolled single-Mac device が 1 台だけであることと current generation;
 - Agent checkpoint readability と exact Hub/Agent generation pairing;
@@ -110,7 +103,8 @@ standard profile では次を確認します。
 - Hub/Agent/external-signer LaunchAgent の running state と Agent -> loopback Hub transport の established 状態;
 - private signer socket と parent permission;
 - server certificate と pinned Agent trust root の validity;
-- 実 Cua Driver version と explicit reviewed pin の一致。
+- 実 Cua Driver version と explicit reviewed pin の一致;
+- private control socket 経由の Agent-owned Handoff status。output は bounded guidance（idle / exact recover-reissue / exact recover-rebind-or-prior-surface-absent時のabandon / active / faulted）のみで、locator や owner/intervention ID は出力しない。
 
 JSON output は local operator automation に利用できます。
 
@@ -129,7 +123,8 @@ single-Mac upgrade を healthy とする前に最低限次を満たします。
 - `v2_doctor` が `overall=healthy`;
 - restart 後に fresh authenticated Agent generation がある;
 - live quarantine が 0 のまま;
-- runtime manifest が installed paired binary をすべて verify;
+- schema-2 runtime manifest が installed paired binary と exact Hub/Agent application schema を verify;
+- Handoff が recovery/resume/fault なしの idle;
 - harmless northbound semantic smoke が durable terminal `Completed` に到達;
 - operator-selected bake period が終わるまで old binary/state rollback pair を保持。
 

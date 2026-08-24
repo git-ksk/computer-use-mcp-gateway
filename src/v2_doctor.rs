@@ -1,5 +1,8 @@
+use crate::v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control};
+use crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, HubPersistentState};
 use crate::v2_maintenance::inspect_quarantines_read_only;
+use crate::v2_operator_handoff::HandoffRuntimeStatus;
 use crate::v2_tls_lifecycle::{CertificateFormat, CertificateHealth, inspect_certificate_file};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,7 @@ pub struct DoctorConfig {
     pub tls_root_certificate: Option<PathBuf>,
     pub cua_command: Option<PathBuf>,
     pub expected_cua_version: Option<String>,
+    pub handoff_control_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -101,6 +105,7 @@ impl DoctorReport {
 #[derive(Debug, Deserialize)]
 struct RuntimeManifest {
     schema_version: u16,
+    hub_agent_schema_version: u16,
     source_commit: String,
     package_version: String,
     binaries: Vec<RuntimeManifestBinary>,
@@ -158,6 +163,9 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     if let Some(command) = &config.cua_command {
         inspect_cua(command, config.expected_cua_version.as_deref(), &mut checks);
     }
+    if let Some(socket) = &config.handoff_control_socket {
+        inspect_handoff_recovery(socket, &mut checks);
+    }
 
     let overall = if checks
         .iter()
@@ -202,7 +210,8 @@ fn verify_runtime_manifest(
                 return;
             }
         };
-    if manifest.schema_version != 1
+    if manifest.schema_version != 2
+        || manifest.hub_agent_schema_version != HUB_AGENT_SCHEMA_VERSION
         || manifest.source_commit.len() != 40
         || !manifest
             .source_commit
@@ -604,6 +613,54 @@ fn inspect_tls(path: &Path, format: CertificateFormat, name: &str, checks: &mut 
     }
 }
 
+fn handoff_recovery_guidance(status: &HandoffRuntimeStatus) -> (CheckStatus, &'static str) {
+    if status.faulted {
+        return (CheckStatus::Error, "runtime_faulted_fail_closed");
+    }
+    if status.recovery_required {
+        if status.recovery_expired {
+            return (
+                CheckStatus::Warning,
+                "expired_recovery_exact_recover_rebind_or_abandon_if_prior_surface_absent",
+            );
+        }
+        return (
+            CheckStatus::Warning,
+            "non_expired_recovery_use_exact_recover_reissue",
+        );
+    }
+    if status.active.is_some() || status.resume_requested {
+        return (
+            CheckStatus::Warning,
+            "active_handoff_finish_or_cancel_before_runtime_upgrade",
+        );
+    }
+    (CheckStatus::Ok, "idle_no_recovery")
+}
+
+fn inspect_handoff_recovery(socket: &Path, checks: &mut Vec<DoctorCheck>) {
+    match exchange_unix_handoff_control(socket, &LocalHandoffControlRequest::Status) {
+        Ok(response) if response.ok => match response.status {
+            Some(status) => {
+                let (check_status, detail) = handoff_recovery_guidance(&status);
+                push(checks, "handoff_recovery", check_status, detail);
+            }
+            None => push(
+                checks,
+                "handoff_recovery",
+                CheckStatus::Error,
+                "status_missing_fail_closed",
+            ),
+        },
+        _ => push(
+            checks,
+            "handoff_recovery",
+            CheckStatus::Error,
+            "status_unavailable_fail_closed",
+        ),
+    }
+}
+
 fn inspect_cua(command: &Path, expected: Option<&str>, checks: &mut Vec<DoctorCheck>) {
     let output = Command::new(command).arg("--version").output();
     let Ok(output) = output else {
@@ -756,7 +813,8 @@ mod tests {
         std::fs::write(
             &manifest,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
+                "hub_agent_schema_version": HUB_AGENT_SCHEMA_VERSION,
                 "source_commit": "0123456789abcdef0123456789abcdef01234567",
                 "package_version": env!("CARGO_PKG_VERSION"),
                 "binaries": binaries
@@ -777,6 +835,7 @@ mod tests {
             tls_root_certificate: None,
             cua_command: None,
             expected_cua_version: None,
+            handoff_control_socket: None,
         };
         let mut runtime = RuntimeSummary {
             package_version: env!("CARGO_PKG_VERSION").into(),
@@ -795,6 +854,65 @@ mod tests {
             }]
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_recovery_guidance_is_bounded_and_never_contains_locator_or_owner_ids() {
+        use crate::v2_operator_handoff::{
+            HandoffActiveStatus, HandoffExecutionAuthority, HandoffInterventionStatus,
+            HandoffSurfaceKind,
+        };
+        let mut status = HandoffRuntimeStatus {
+            active: None,
+            recovery_required: false,
+            recovery_status: None,
+            recovery_epoch: None,
+            recovery_expired: false,
+            resume_requested: false,
+            faulted: false,
+            human_surface: Some(HandoffSurfaceKind::Webrtc),
+            locator: Some("sensitive-locator-must-not-appear".into()),
+        };
+        assert_eq!(
+            handoff_recovery_guidance(&status),
+            (CheckStatus::Ok, "idle_no_recovery")
+        );
+        status.recovery_required = true;
+        status.recovery_status = Some(HandoffInterventionStatus::HumanActive);
+        status.recovery_epoch = Some(7);
+        assert_eq!(
+            handoff_recovery_guidance(&status),
+            (
+                CheckStatus::Warning,
+                "non_expired_recovery_use_exact_recover_reissue"
+            )
+        );
+        status.recovery_expired = true;
+        let (_, detail) = handoff_recovery_guidance(&status);
+        assert_eq!(
+            detail,
+            "expired_recovery_exact_recover_rebind_or_abandon_if_prior_surface_absent"
+        );
+        assert!(!detail.contains("sensitive-locator"));
+        status.recovery_required = false;
+        status.recovery_expired = false;
+        status.active = Some(HandoffActiveStatus {
+            intervention_id: "private-intervention-id".into(),
+            status: HandoffInterventionStatus::HumanActive,
+            epoch: 9,
+            authority: HandoffExecutionAuthority::Human,
+        });
+        let (_, detail) = handoff_recovery_guidance(&status);
+        assert_eq!(
+            detail,
+            "active_handoff_finish_or_cancel_before_runtime_upgrade"
+        );
+        assert!(!detail.contains("private-intervention-id"));
+        status.faulted = true;
+        assert_eq!(
+            handoff_recovery_guidance(&status),
+            (CheckStatus::Error, "runtime_faulted_fail_closed")
+        );
     }
 
     #[test]
