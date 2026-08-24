@@ -5,6 +5,7 @@
 //! reconnect, grant validation, replay barriers, direct process execution, and
 //! cancellation. An optional external Cua MCP adapter adds typed GUI capabilities.
 
+use crate::v2_agent_handoff::{AgentHandoffCoordinator, AgentHandoffSessionFence};
 use crate::v2_browser_execute::BrowserRefusalReason;
 use crate::v2_browser_staging::{
     BrowserDownloadStagingBroker, BrowserDownloadStagingError, BrowserUploadStagingBroker,
@@ -16,16 +17,18 @@ use crate::v2_execution_safety::{
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CapabilityClass,
     CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
-    DeviceSession, GrantLedger,
+    DeviceSession, GrantLedger, VerificationStatus,
 };
 use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubToAgent,
-    RemoteBackendSessionEnd, TrustedSessionClock, build_agent_heartbeat, build_agent_proof,
-    build_remote_backend_session_ended, build_remote_cancellation_ack,
+    RemoteBackendSessionEnd, RemoteHandoffErrorCode, RemoteHandoffOperatorCommand,
+    RemoteHandoffRequestKind, RemoteHandoffResponseKind, TrustedSessionClock,
+    build_agent_heartbeat, build_agent_proof, build_remote_backend_session_ended,
+    build_remote_cancellation_ack, build_remote_handoff_response,
     build_remote_reconciliation_report, build_remote_result, verify_hub_challenge,
     verify_hub_heartbeat_ack, verify_remote_backend_session_end, verify_remote_cancel,
-    verify_remote_command, verify_session_accepted,
+    verify_remote_command, verify_remote_handoff_request, verify_session_accepted,
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
@@ -43,6 +46,9 @@ use crate::v2_m1_process::{
 };
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
+use crate::v2_operator_handoff::{
+    VerificationToken, is_exact_verification_candidate, is_phase1_protected_command,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::VecDeque;
 use std::fmt;
@@ -155,6 +161,7 @@ pub struct AgentService {
     browser_upload_staging: BrowserUploadStagingBroker,
     browser_download_staging: BrowserDownloadStagingBroker,
     computer_use: Option<Arc<dyn ComputerUseBackendAdapter>>,
+    handoff: Option<Arc<AgentHandoffCoordinator>>,
     trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
     execution: AgentExecutionGate,
@@ -286,6 +293,7 @@ impl AgentService {
             browser_upload_staging,
             browser_download_staging,
             computer_use,
+            handoff: None,
             trusted_hub,
             grants,
             execution,
@@ -295,6 +303,11 @@ impl AgentService {
         // Establish a baseline checkpoint before accepting any command.
         service.persist_state()?;
         Ok(service)
+    }
+
+    pub fn with_handoff_coordinator(mut self, coordinator: Arc<AgentHandoffCoordinator>) -> Self {
+        self.handoff = Some(coordinator);
+        self
     }
 
     fn persist_state(&self) -> Result<(), AgentServiceError> {
@@ -670,7 +683,7 @@ impl AgentService {
                         .map_err(AgentServiceError::Execution)?;
                     match completion.outcome {
                         AgentOperationOutcome::Result(result) => {
-                            let device_result = match result {
+                            let mut device_result = match result {
                                 Ok(result) => result,
                                 Err(error) => {
                                     tracing::warn!(
@@ -687,6 +700,43 @@ impl AgentService {
                                     }
                                 }
                             };
+                            if let Some(verification) = expected.handoff_verification.as_ref() {
+                                let satisfied = matches!(
+                                    device_result,
+                                    DeviceResult::UiStateVerification {
+                                        status: VerificationStatus::Satisfied,
+                                        ..
+                                    }
+                                );
+                                let reported = match self.handoff.as_ref() {
+                                    Some(coordinator) => coordinator
+                                        .report_verification_local(
+                                            verification.authority.clone(),
+                                            verification.token.clone(),
+                                            satisfied,
+                                            AgentHandoffSessionFence::for_device(
+                                                    &session.device_id,
+                                                    session.generation,
+                                                    session.capabilities.revision,
+                                                ),
+                                        )
+                                        .await
+                                        .is_ok(),
+                                    None => false,
+                                };
+                                if !reported
+                                    && !matches!(
+                                        device_result,
+                                        DeviceResult::Error {
+                                            code: DeviceErrorCode::BackendOutcomeIndeterminate
+                                        }
+                                    )
+                                {
+                                    device_result = DeviceResult::Error {
+                                        code: DeviceErrorCode::HandoffVerificationUnavailable,
+                                    };
+                                }
+                            }
                             record_terminal_evidence(
                                 &mut self.terminal_evidence,
                                 &session.device_id,
@@ -805,6 +855,55 @@ impl AgentService {
                         }
                     };
                     match decode_hub_frame(frame).map_err(AgentServiceError::Carrier)? {
+                        HubToAgent::HandoffRequest(remote) => {
+                            verify_remote_handoff_request(
+                                &hello,
+                                &challenge,
+                                &remote,
+                                &self.trusted_hub.verifier(),
+                            )
+                            .map_err(AgentServiceError::Protocol)?;
+                            if remote.device_generation != session.generation {
+                                return Err(AgentServiceError::Control(
+                                    crate::v2_m0::ControlError::StaleDeviceGeneration {
+                                        expected: session.generation,
+                                        got: remote.device_generation,
+                                    },
+                                ));
+                            }
+                            let requires_idle = handoff_request_requires_idle(&remote.request);
+                            let response = if requires_idle && active.is_some() {
+                                RemoteHandoffResponseKind::Rejected {
+                                    code: RemoteHandoffErrorCode::Rejected,
+                                }
+                            } else if let Some(coordinator) = self.handoff.as_ref() {
+                                coordinator
+                                    .handle_remote(
+                                        remote.request,
+                                        AgentHandoffSessionFence::for_device(
+                                                    &session.device_id,
+                                                    session.generation,
+                                                    session.capabilities.revision,
+                                                ),
+                                    )
+                                    .await
+                            } else {
+                                RemoteHandoffResponseKind::Rejected {
+                                    code: RemoteHandoffErrorCode::Unsupported,
+                                }
+                            };
+                            let response = build_remote_handoff_response(
+                                &self.material.device_identity,
+                                &hello,
+                                &challenge,
+                                session.device_id.clone(),
+                                session.generation,
+                                remote.request_id,
+                                response,
+                            )
+                            .map_err(AgentServiceError::Protocol)?;
+                            send_agent(&outbound_tx, AgentToHub::HandoffResponse(response)).await?;
+                        }
                         HubToAgent::HeartbeatAck(ack) => {
                             verify_hub_heartbeat_ack(&hello, &challenge, &ack, &self.trusted_hub.verifier())
                                 .map_err(AgentServiceError::Protocol)?;
@@ -871,13 +970,148 @@ impl AgentService {
                                 operation_id: remote.command.operation_id.clone(),
                             };
                             self.execution.begin(operation).map_err(AgentServiceError::Execution)?;
-                            // Persist the active operation before starting any local work. A crash
-                            // after this fsync restores the operation ID as terminal.
+                            // Persist the replay barrier before consulting Handoff. A crash or
+                            // runtime failure after this point can never make the Hub-dispatched
+                            // operation runnable again on this Agent generation.
                             self.persist_state()?;
                             let operation_id = remote.command.operation_id.clone();
                             let worker_operation_id = operation_id.clone();
                             let worker_generation = session.generation;
                             let done = operation_done_tx.clone();
+
+                            // Agent-owned final authority gate. This is intentionally after grant
+                            // consumption/replay persistence but before any local Computer Use
+                            // backend call, closing the Hub-admission -> Human-claim TOCTOU window.
+                            let protected = is_phase1_protected_command(&remote.command.command);
+                            let handoff_verification = if protected {
+                                match (self.handoff.as_ref(), remote.handoff.clone()) {
+                                    (Some(coordinator), Some(authority)) => {
+                                        match coordinator
+                                            .final_admit(
+                                                authority.clone(),
+                                                &remote.command.command,
+                                                AgentHandoffSessionFence::for_device(
+                                                    &session.device_id,
+                                                    session.generation,
+                                                    session.capabilities.revision,
+                                                ),
+                                            )
+                                            .await
+                                        {
+                                            Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Allow) => None,
+                                            Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Verification(token))
+                                                if is_exact_verification_candidate(&remote.command.command) =>
+                                            {
+                                                Some(PendingHandoffVerification { authority, token })
+                                            }
+                                            Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Deny)
+                                            | Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Verification(_)) => {
+                                                let terminal = ActiveOperation {
+                                                    operation_id: operation_id.clone(),
+                                                    device_generation: session.generation,
+                                                    capability_revision,
+                                                    capability,
+                                                    dispatch_grant_id: dispatch_grant_id.clone(),
+                                                    handoff_verification: None,
+                                                    cancellation: ActiveCancellation::None,
+                                                };
+                                                self.execution.finish(&operation_id)
+                                                    .map_err(AgentServiceError::Execution)?;
+                                                let device_result = DeviceResult::Error {
+                                                    code: DeviceErrorCode::HandoffAuthoritySuspended,
+                                                };
+                                                record_terminal_evidence(
+                                                    &mut self.terminal_evidence,
+                                                    &session.device_id,
+                                                    &terminal,
+                                                    &device_result,
+                                                )?;
+                                                self.persist_state()?;
+                                                send_terminal_result(
+                                                    &self.material.device_identity,
+                                                    &hello,
+                                                    &challenge,
+                                                    &outbound_tx,
+                                                    &session,
+                                                    operation_id,
+                                                    device_result,
+                                                ).await?;
+                                                continue;
+                                            }
+                                            Err(_) => {
+                                                let terminal = ActiveOperation {
+                                                    operation_id: operation_id.clone(),
+                                                    device_generation: session.generation,
+                                                    capability_revision,
+                                                    capability,
+                                                    dispatch_grant_id: dispatch_grant_id.clone(),
+                                                    handoff_verification: None,
+                                                    cancellation: ActiveCancellation::None,
+                                                };
+                                                self.execution.finish(&operation_id)
+                                                    .map_err(AgentServiceError::Execution)?;
+                                                let device_result = DeviceResult::Error {
+                                                    code: DeviceErrorCode::HandoffRuntimeUnavailable,
+                                                };
+                                                record_terminal_evidence(
+                                                    &mut self.terminal_evidence,
+                                                    &session.device_id,
+                                                    &terminal,
+                                                    &device_result,
+                                                )?;
+                                                self.persist_state()?;
+                                                send_terminal_result(
+                                                    &self.material.device_identity,
+                                                    &hello,
+                                                    &challenge,
+                                                    &outbound_tx,
+                                                    &session,
+                                                    operation_id,
+                                                    device_result,
+                                                ).await?;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    (Some(_), None) | (None, Some(_)) => {
+                                        let terminal = ActiveOperation {
+                                            operation_id: operation_id.clone(),
+                                            device_generation: session.generation,
+                                            capability_revision,
+                                            capability,
+                                            dispatch_grant_id: dispatch_grant_id.clone(),
+                                            handoff_verification: None,
+                                            cancellation: ActiveCancellation::None,
+                                        };
+                                        self.execution.finish(&operation_id)
+                                            .map_err(AgentServiceError::Execution)?;
+                                        let device_result = DeviceResult::Error {
+                                            code: DeviceErrorCode::HandoffRuntimeUnavailable,
+                                        };
+                                        record_terminal_evidence(
+                                            &mut self.terminal_evidence,
+                                            &session.device_id,
+                                            &terminal,
+                                            &device_result,
+                                        )?;
+                                        self.persist_state()?;
+                                        send_terminal_result(
+                                            &self.material.device_identity,
+                                            &hello,
+                                            &challenge,
+                                            &outbound_tx,
+                                            &session,
+                                            operation_id,
+                                            device_result,
+                                        ).await?;
+                                        continue;
+                                    }
+                                    (None, None) => None,
+                                }
+                            } else {
+                                None
+                            };
+
                             let cancellation = match remote.command.command {
                                 DeviceCommand::ExecuteProcess { request } => {
                                     let cancellation = ProcessCancellation::default();
@@ -1042,6 +1276,7 @@ impl AgentService {
                                 capability_revision,
                                 capability,
                                 dispatch_grant_id,
+                                handoff_verification,
                                 cancellation,
                             });
                         }
@@ -1119,17 +1354,32 @@ enum SessionExit {
     Shutdown,
 }
 
-#[derive(Debug)]
 struct ActiveOperation {
     operation_id: String,
     device_generation: u64,
     capability_revision: u64,
     capability: DeviceCapability,
     dispatch_grant_id: String,
+    handoff_verification: Option<PendingHandoffVerification>,
     cancellation: ActiveCancellation,
 }
 
-#[derive(Debug)]
+struct PendingHandoffVerification {
+    authority: crate::v2_m0_transport::RemoteHandoffAuthority,
+    token: VerificationToken,
+}
+
+fn handoff_request_requires_idle(request: &RemoteHandoffRequestKind) -> bool {
+    match request {
+        RemoteHandoffRequestKind::Admission { .. } => false,
+        RemoteHandoffRequestKind::Operator {
+            command: RemoteHandoffOperatorCommand::Status,
+            ..
+        } => false,
+        RemoteHandoffRequestKind::Operator { .. } => true,
+    }
+}
+
 enum ActiveCancellation {
     Process(ProcessCancellation),
     Backend(watch::Sender<bool>),
@@ -1691,6 +1941,28 @@ fn record_agent_persistence_failure(device_id: &str, error: &PersistenceError) {
     );
 }
 
+async fn send_terminal_result(
+    identity: &crate::v2_m0::DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    sender: &mpsc::Sender<crate::v2_m1_grpc::proto::AgentFrame>,
+    session: &DeviceSession,
+    operation_id: String,
+    device_result: DeviceResult,
+) -> Result<(), AgentServiceError> {
+    let result = CommandResultEnvelope {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        device_id: session.device_id.clone(),
+        device_generation: session.generation,
+        capability_revision: session.capabilities.revision,
+        operation_id,
+        result: device_result,
+    };
+    let signed = build_remote_result(identity, hello, challenge, result)
+        .map_err(AgentServiceError::Protocol)?;
+    send_agent(sender, AgentToHub::Result(signed)).await
+}
+
 async fn send_agent(
     sender: &mpsc::Sender<crate::v2_m1_grpc::proto::AgentFrame>,
     message: AgentToHub,
@@ -2166,6 +2438,7 @@ mod tests {
             capability_revision: 12,
             capability: DeviceCapability::Shell,
             dispatch_grant_id: "grant_journal_fence".into(),
+            handoff_verification: None,
             cancellation: ActiveCancellation::None,
         };
         let result = DeviceResult::Shell {
@@ -2196,6 +2469,7 @@ mod tests {
             capability_revision: 12,
             capability: DeviceCapability::PointerClick,
             dispatch_grant_id: "grant_no_proof".into(),
+            handoff_verification: None,
             cancellation: ActiveCancellation::None,
         };
         record_terminal_evidence(

@@ -126,6 +126,12 @@ pub enum HandoffRuntimeControl {
         prior_generation: Option<u64>,
         prior_capability_revision: Option<u64>,
     },
+    /// Explicitly rebind a still-live intervention to a strictly newer authenticated
+    /// Agent generation after a fresh exact-surface observation. This never changes
+    /// Human/Agent authority or intervention epoch by itself.
+    RebindLive {
+        authority: AgentAuthorityRequest,
+    },
     RequestResume {
         intervention_id: String,
         epoch: u64,
@@ -525,6 +531,9 @@ enum ManagedWireControlRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         prior_capability_revision: Option<u64>,
     },
+    RebindLive {
+        authority: ManagedWireAuthority,
+    },
     RequestResume {
         intervention_id: String,
         epoch: u64,
@@ -638,6 +647,9 @@ fn managed_wire_control(
             prior_context_id,
             prior_generation,
             prior_capability_revision,
+        },
+        HandoffRuntimeControl::RebindLive { authority } => ManagedWireControlRequest::RebindLive {
+            authority: managed_wire_authority(authority)?,
         },
         HandoffRuntimeControl::RequestResume {
             intervention_id,

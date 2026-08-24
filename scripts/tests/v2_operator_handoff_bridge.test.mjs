@@ -119,6 +119,12 @@ function fixture(surface = new FakeNativeSurface()) {
   };
 }
 
+
+function managedAuthority(request) {
+  const { action: _action, ...authority } = request;
+  return authority;
+}
+
 function contextBinding(contextId) {
   return createHash("sha256")
     .update("cumg/operator-handoff/context/v1\0", "utf8")
@@ -364,6 +370,73 @@ test("checkpoint recovery can rebind an expired interaction context only with ex
     assert.ok(reissued.epoch > begun.epoch);
     assert.equal(recovered.handle({ action: "status" }).recovery_required, false);
     assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+  } finally {
+    f.cleanup();
+  }
+});
+
+
+
+test("live intervention rebinds only to a strictly newer generation for the same exact OS Window", async () => {
+  const f = fixture();
+  try {
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
+    const begun = ctl(f.bridge, "begin");
+    assert.equal(begun.ok, true);
+    const claim = await nativeControl(f.bridge, begun.native_locator, "claim");
+    assert.equal(claim.status, 200);
+    const before = f.bridge.handle({ action: "status" }).active;
+    assert.equal(before.status, "human_active");
+
+    const fresh = structuredClone(f.request);
+    fresh.generation += 1;
+    fresh.exact_window.context_binding = "4".repeat(64);
+    assert.deepEqual(f.bridge.handle(fresh), { ok: true, decision: "deny" });
+
+    const wrongTarget = structuredClone(fresh);
+    wrongTarget.exact_window.window_id += 1;
+    assert.deepEqual(f.bridge.handleManaged({
+      action: "rebind_live",
+      authority: managedAuthority(wrongTarget),
+    }), { ok: false });
+
+    assert.deepEqual(f.bridge.handleManaged({
+      action: "rebind_live",
+      authority: managedAuthority(f.request),
+    }), { ok: false });
+
+    const rebound = f.bridge.handleManaged({
+      action: "rebind_live",
+      authority: managedAuthority(fresh),
+    });
+    assert.equal(rebound.ok, true);
+    assert.equal(rebound.intervention_id, begun.intervention_id);
+    assert.equal(rebound.epoch, begun.epoch);
+    assert.equal(rebound.status, "human_active");
+
+    // The old generation can never regain authority, while the fresh generation
+    // remains Human-denied until Done -> verification -> explicit resume.
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
+    assert.deepEqual(f.bridge.handle(fresh), { ok: true, decision: "deny" });
+    const done = await nativeControl(f.bridge, begun.native_locator, "done");
+    assert.equal(done.status, 200);
+    const verifying = f.bridge.handle({ action: "status" }).active;
+    assert.equal(verifying.status, "verifying");
+
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const admitted = f.bridge.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.equal(admitted.intervention_id, begun.intervention_id);
+    assert.equal(admitted.epoch, verifying.epoch);
+    assert.deepEqual(f.bridge.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+    assert.equal(f.bridge.handle({ action: "status" }).active.status, "ready_to_resume");
   } finally {
     f.cleanup();
   }

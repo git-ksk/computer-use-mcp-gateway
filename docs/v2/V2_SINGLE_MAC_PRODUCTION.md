@@ -40,7 +40,7 @@ Templates are under `packaging/launchd/single-mac/`:
 - `com.github.git-ksk.cumg-v2-hub.plist`
 - `com.github.git-ksk.cumg-v2-agent.plist`
 
-Replace `@HOME@`, `@ROOT@`, `@RUN_ROOT@`, and `@BINARY_DIR@`. Replace the explicit `REPLACE_*` values with the deployment's reviewed resource URI, trusted-proxy identity, and stable device ID. Never substitute a public Hub/MCP bind address; the single-Mac profile is intentionally loopback-only.
+Replace `@HOME@`, `@ROOT@`, `@RUN_ROOT@`, `@BINARY_DIR@`, `@HANDOFF_CONTROL_SOCKET@`, `@HANDOFF_RUNTIME_COMMAND@`, `@HANDOFF_RUNTIME_SCRIPT@`, and `@HANDOFF_RUNTIME_ENV_FILE@`. Replace the explicit `REPLACE_*` values with the deployment's reviewed resource URI, trusted-proxy identity, and stable device ID. The Hub template contains only the private operator-control relay; the Agent template owns the canonical Handoff runtime, WebRTC/capture/input surface, and its private transport env file. Never substitute a public Hub/MCP bind address; the single-Mac profile is intentionally loopback-only.
 
 Create the signer runtime directory before loading the signer:
 
@@ -50,7 +50,7 @@ RUN_ROOT="$HOME/Library/Caches/cumg-v2"
 install -d -m 700 "$RUN_ROOT"
 ```
 
-Start order is signer -> Hub -> Agent. The Agent stays in the logged-in user session so macOS TCC attribution remains explicit.
+Start order is signer -> Hub -> Agent. The Agent stays in the logged-in user session because Cua and Agent-owned Handoff capture/input require explicit macOS TCC attribution on the controlled device.
 
 The example signer policy is intentionally minimal. Expand it only with exact `DeviceCapability` values that the reviewed northbound policy requires. There is no wildcard capability and no signer fallback.
 
@@ -63,17 +63,19 @@ The example signer policy is intentionally minimal. Expand it only with exact `D
 - a live quarantine exists;
 - required LaunchAgents/state directories are absent;
 - the reviewed Cua version is not explicitly supplied;
+- a valid Apple code-signing identity and 10-character Team ID are not explicitly supplied;
+- the Agent Handoff env/helper paths are absent or unsafe;
 - the external signer profile is incomplete.
 
 A successful upgrade performs this sequence:
 
 1. preflight source/state/service health;
-2. build `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, and `v2_grant_signer` from one commit;
+2. build `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, and `v2_grant_signer` from one commit, then sign `v2_agent` with the stable Agent identifier/Team-ID designated requirement;
 3. archive old binaries, service configuration, and—after drain—the authoritative stopped Hub/Agent state;
 4. signal the Hub first so admission closes and already-admitted work can drain while the Agent is still connected;
 5. unload Agent and signer only after Hub shutdown;
 6. re-check stopped authoritative state and refuse the upgrade if drain produced a quarantine;
-7. atomically replace the version-paired runtime binaries;
+7. sign the configured Agent-local Handoff host helper(s) with stable Team-ID designated requirements, then atomically replace the version-paired runtime binaries;
 8. write `runtime-manifest.json` containing only package version, source commit, binary names, and SHA-256 digests;
 9. start signer -> Hub -> Agent;
 10. run `v2_doctor`; a failed post-start doctor stops the profile fail-closed and does not automatically combine old binaries with newer state.
@@ -82,9 +84,13 @@ Example:
 
 ```bash
 CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
+CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
+CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
   scripts/v2-single-mac-upgrade.sh --preflight-only
 
 CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
+CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
+CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
   scripts/v2-single-mac-upgrade.sh
 ```
 

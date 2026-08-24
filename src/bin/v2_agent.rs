@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use computer_use_mcp_gateway::{
+    v2_agent_handoff::AgentHandoffCoordinator,
     v2_m0_trust::HubKeyRotation,
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig, CuaAgentConfig},
@@ -8,6 +9,7 @@ use computer_use_mcp_gateway::{
     v2_operator_handoff::{ManagedHandoffRuntimeConfig, ManagedOperatorHandoffAuthority},
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
@@ -161,16 +163,18 @@ async fn main() -> Result<()> {
             Duration::from_secs(args.handoff_runtime_timeout_secs),
         )
         .context("invalid Agent-local managed Handoff runtime configuration")?;
-        let runtime = ManagedOperatorHandoffAuthority::spawn(config)
-            .await
-            .context("failed to start Agent-local managed Handoff runtime")?;
+        let runtime = Arc::new(
+            ManagedOperatorHandoffAuthority::spawn(config)
+                .await
+                .context("failed to start Agent-local managed Handoff runtime")?,
+        );
         info!(
             event = "v2_agent_handoff_runtime_configured",
             mode = "managed_stdio",
             outcome = "ready",
             "Agent-local canonical Handoff runtime configured"
         );
-        Some(runtime)
+        Some(Arc::new(AgentHandoffCoordinator::new(runtime)))
     } else {
         None
     };
@@ -190,6 +194,9 @@ async fn main() -> Result<()> {
     };
     let mut agent =
         AgentService::new(config, material).context("invalid V2 Agent configuration")?;
+    if let Some(coordinator) = handoff_runtime.as_ref() {
+        agent = agent.with_handoff_coordinator(coordinator.clone());
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
