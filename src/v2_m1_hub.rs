@@ -23,9 +23,11 @@ use crate::v2_m0_execution::{
 };
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubIdentity, HubToAgent,
-    RemoteCancellationAck, RemoteReconciliationReport, RemoteResult, TrustedSessionClock,
+    RemoteCancellationAck, RemoteHandoffAuthority, RemoteHandoffRequestKind,
+    RemoteHandoffResponseKind, RemoteReconciliationReport, RemoteResult, TrustedSessionClock,
     verify_agent_heartbeat, verify_agent_proof, verify_remote_backend_session_ended,
-    verify_remote_cancellation_ack, verify_remote_reconciliation_report, verify_remote_result,
+    verify_remote_cancellation_ack, verify_remote_handoff_response,
+    verify_remote_reconciliation_report, verify_remote_result,
 };
 use crate::v2_m0_trust::{DeviceKeyRotation, apply_device_key_rotation};
 use crate::v2_m1_grpc::{
@@ -244,7 +246,13 @@ enum HubRequest {
         command: Box<DeviceCommand>,
         audit: OperationAuditMetadata,
         request_fingerprint: Option<OperationRequestFingerprint>,
+        handoff: Option<RemoteHandoffAuthority>,
         reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
+    },
+    Handoff {
+        request_id: String,
+        request: RemoteHandoffRequestKind,
+        reply: oneshot::Sender<Result<RemoteHandoffResponseKind, HubCommandError>>,
     },
     Cancel {
         operation_id: String,
@@ -260,6 +268,7 @@ enum HubRequest {
 struct PendingOperation {
     owner: OperationOwner,
     command: DeviceCommand,
+    handoff: Option<RemoteHandoffAuthority>,
     envelope: Option<CommandEnvelope>,
     reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
 }
@@ -267,6 +276,35 @@ struct PendingOperation {
 enum DispatchOutcome {
     Sent,
     Rejected(CompletionDecision),
+}
+
+enum CommandSessionFence {
+    None,
+    Session {
+        generation: u64,
+        capability_revision: u64,
+    },
+    Handoff(RemoteHandoffAuthority),
+}
+
+impl CommandSessionFence {
+    fn expected_session(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::None => None,
+            Self::Session {
+                generation,
+                capability_revision,
+            } => Some((*generation, *capability_revision)),
+            Self::Handoff(authority) => Some((authority.generation, authority.capability_revision)),
+        }
+    }
+
+    fn handoff(self) -> Option<RemoteHandoffAuthority> {
+        match self {
+            Self::Handoff(authority) => Some(authority),
+            Self::None | Self::Session { .. } => None,
+        }
+    }
 }
 
 impl SingleDeviceHub {
@@ -516,6 +554,10 @@ impl SingleDeviceHub {
             String,
             oneshot::Sender<Result<bool, HubCommandError>>,
         > = HashMap::new();
+        let mut handoff_waiters: HashMap<
+            String,
+            oneshot::Sender<Result<RemoteHandoffResponseKind, HubCommandError>>,
+        > = HashMap::new();
         let heartbeat_deadline = tokio::time::sleep(self.inner.config.heartbeat_timeout);
         tokio::pin!(heartbeat_deadline);
         let reauth_deadline = tokio::time::sleep(
@@ -549,6 +591,7 @@ impl SingleDeviceHub {
                 && pending.is_empty()
                 && cancel_waiters.is_empty()
                 && backend_session_end_waiters.is_empty()
+                && handoff_waiters.is_empty()
             {
                 tracing::info!(
                     event = "v2_agent_session_reauth",
@@ -627,6 +670,7 @@ impl SingleDeviceHub {
                             command,
                             audit,
                             request_fingerprint,
+                            handoff,
                             reply,
                         } => {
                             if self.inner.draining.load(Ordering::Acquire) {
@@ -730,6 +774,7 @@ impl SingleDeviceHub {
                             pending.insert(operation_id.clone(), PendingOperation {
                                 owner,
                                 command: *command,
+                                handoff,
                                 envelope: None,
                                 reply,
                             });
@@ -760,6 +805,22 @@ impl SingleDeviceHub {
                                 }
                                 AdmissionDecision::Queued { .. } => queue_order.push_back(operation_id),
                             }
+                        }
+                        HubRequest::Handoff { request_id, request, reply } => {
+                            if handoff_waiters.contains_key(&request_id) {
+                                let _ = reply.send(Err(HubCommandError::Rejected));
+                                continue;
+                            }
+                            let remote = self.inner.material.hub_identity.remote_handoff_request(
+                                &hello,
+                                &challenge,
+                                self.inner.device_id.clone(),
+                                generation,
+                                request_id.clone(),
+                                request,
+                            )?;
+                            handoff_waiters.insert(request_id, reply);
+                            send_hub(&outbound, HubToAgent::HandoffRequest(remote)).await?;
                         }
                         HubRequest::Cancel { operation_id, owner, reply } => {
                             let decision = {
@@ -921,6 +982,27 @@ impl SingleDeviceHub {
                             };
                             let _ = reply.send(Ok(ack.ended));
                         }
+                        AgentToHub::HandoffResponse(response) => {
+                            {
+                                let persistent = self.inner.persistent.lock().await;
+                                verify_remote_handoff_response(
+                                    &persistent.registry,
+                                    &hello,
+                                    &challenge,
+                                    &response,
+                                )?;
+                            }
+                            if response.device_generation != generation {
+                                return Err(HubServiceError::StaleSession);
+                            }
+                            let Some(reply) = handoff_waiters.remove(&response.request_id) else {
+                                return Err(HubServiceError::UnexpectedMessage {
+                                    expected: "handoff_response",
+                                    got: "unmatched_handoff_response",
+                                });
+                            };
+                            let _ = reply.send(Ok(response.response));
+                        }
                         AgentToHub::CancellationAck(ack) => {
                             self.handle_cancellation_ack(
                                 ack,
@@ -951,11 +1033,15 @@ impl SingleDeviceHub {
         operation_id: &str,
         pending: &mut HashMap<String, PendingOperation>,
     ) -> Result<DispatchOutcome, HubServiceError> {
-        let (owner, device_command) = {
+        let (owner, device_command, handoff) = {
             let operation = pending
                 .get(operation_id)
                 .ok_or(HubServiceError::PendingOperationMissing)?;
-            (operation.owner.clone(), operation.command.clone())
+            (
+                operation.owner.clone(),
+                operation.command.clone(),
+                operation.handoff.clone(),
+            )
         };
         if self.inner.draining.load(Ordering::Acquire) {
             return self
@@ -1000,12 +1086,11 @@ impl SingleDeviceHub {
                 grant.payload.grant_id.clone(),
             )?)
         };
-        let remote = self.inner.material.hub_identity.remote_command(
-            hello,
-            challenge,
-            command.clone(),
-            grant,
-        )?;
+        let remote = self
+            .inner
+            .material
+            .hub_identity
+            .remote_command_with_handoff(hello, challenge, command.clone(), grant, handoff)?;
 
         // Re-check the drain gate immediately before the durable side-effect boundary.
         if self.inner.draining.load(Ordering::Acquire) {
@@ -1869,7 +1954,7 @@ impl HubHandle {
             command,
             audit,
             request_fingerprint,
-            None,
+            CommandSessionFence::None,
         )
         .await
     }
@@ -1891,9 +1976,54 @@ impl HubHandle {
             command,
             audit,
             request_fingerprint,
-            Some(expected_session),
+            CommandSessionFence::Session {
+                generation: expected_session.0,
+                capability_revision: expected_session.1,
+            },
         )
         .await
+    }
+
+    pub async fn start_command_as_with_id_and_audit_for_handoff(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        audit: OperationAuditMetadata,
+        request_fingerprint: Option<OperationRequestFingerprint>,
+        handoff: RemoteHandoffAuthority,
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as_with_id_and_audit_inner(
+            owner,
+            operation_id,
+            command,
+            audit,
+            request_fingerprint,
+            CommandSessionFence::Handoff(handoff),
+        )
+        .await
+    }
+
+    pub(crate) async fn handoff_request(
+        &self,
+        request: RemoteHandoffRequestKind,
+    ) -> Result<RemoteHandoffResponseKind, HubCommandError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request_id = random_handoff_request_id();
+        let tx = {
+            let live = self.inner.live.lock().await;
+            live.as_ref()
+                .map(|session| session.command_tx.clone())
+                .ok_or(HubCommandError::AgentOffline)?
+        };
+        tx.send(HubRequest::Handoff {
+            request_id,
+            request,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| HubCommandError::AgentOffline)?;
+        reply_rx.await.map_err(|_| HubCommandError::SessionClosed)?
     }
 
     async fn start_command_as_with_id_and_audit_inner(
@@ -1903,7 +2033,7 @@ impl HubHandle {
         command: DeviceCommand,
         audit: OperationAuditMetadata,
         request_fingerprint: Option<OperationRequestFingerprint>,
-        expected_session: Option<(u64, u64)>,
+        session_fence: CommandSessionFence,
     ) -> Result<HubPendingCommand, HubCommandError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(HubCommandError::Busy);
@@ -1915,19 +2045,24 @@ impl HubHandle {
         let tx = {
             let live = self.inner.live.lock().await;
             let session = live.as_ref().ok_or(HubCommandError::AgentOffline)?;
-            if expected_session.is_some_and(|(generation, revision)| {
-                session.generation != generation || session.capability_revision != revision
-            }) {
+            if session_fence
+                .expected_session()
+                .is_some_and(|(generation, revision)| {
+                    session.generation != generation || session.capability_revision != revision
+                })
+            {
                 return Err(HubCommandError::SessionSuperseded);
             }
             session.command_tx.clone()
         };
+        let handoff = session_fence.handoff();
         tx.send(HubRequest::Execute {
             operation_id: operation_id.clone(),
             owner,
             command: Box::new(command),
             audit,
             request_fingerprint,
+            handoff,
             reply: reply_tx,
         })
         .await
@@ -2333,6 +2468,17 @@ fn random_operation_id() -> String {
     let mut random = [0_u8; 16];
     OsRng.fill_bytes(&mut random);
     let mut output = String::from("op_");
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn random_handoff_request_id() -> String {
+    let mut random = [0_u8; 16];
+    OsRng.fill_bytes(&mut random);
+    let mut output = String::from("handoff_req_");
     for byte in random {
         use std::fmt::Write as _;
         let _ = write!(&mut output, "{byte:02x}");

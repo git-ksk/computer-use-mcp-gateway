@@ -2640,19 +2640,32 @@ impl V2NorthboundMcp {
         } = operation;
         let owner = OperationOwner::from_principal(principal);
         let pending = if let Some(admission) = handoff.as_ref() {
-            self.hub
-                .start_command_as_with_id_and_audit_for_session(
-                    owner.clone(),
-                    operation_id.clone(),
-                    command,
-                    audit,
-                    request_fingerprint,
-                    (
-                        admission.binding.generation,
-                        admission.binding.capability_revision,
-                    ),
-                )
-                .await
+            if admission.verification_local_to_agent {
+                self.hub
+                    .start_command_as_with_id_and_audit_for_handoff(
+                        owner.clone(),
+                        operation_id.clone(),
+                        command,
+                        audit,
+                        request_fingerprint,
+                        admission.binding.remote_authority(),
+                    )
+                    .await
+            } else {
+                self.hub
+                    .start_command_as_with_id_and_audit_for_session(
+                        owner.clone(),
+                        operation_id.clone(),
+                        command,
+                        audit,
+                        request_fingerprint,
+                        (
+                            admission.binding.generation,
+                            admission.binding.capability_revision,
+                        ),
+                    )
+                    .await
+            }
         } else {
             self.hub
                 .start_command_as_with_id_and_audit(
@@ -2684,6 +2697,7 @@ impl V2NorthboundMcp {
 
         if let Some(admission) = handoff
             && admission.verification.is_some()
+            && !admission.verification_local_to_agent
         {
             self.handoff_coordinator
                 .as_ref()

@@ -87,7 +87,7 @@ implementation は **issue-driven / PR-isolated** のまま、dependency を考�
 
 physical CUMG + `mcp-execution-handoff` では、exact macOS Window に対する Agent -> Human -> verifying -> explicit Agent resume、direct/TURN fallback、fresh exact-window verification、restart/context-expiry/generation-rollover recovery、no-auto-replay、quarantine 0 まで受入済みです。acceptance-only Unix bridge は長期 runtime architecture にはしません。
 
-Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) では、CUMG-owned `HandoffCoordinator` と Hub-owned managed Handoff child を first-class runtime boundary とし、local operator control も normal MCP から分離します。`begin` / recovery の target authority は CUMG が検証した exact Window + current generation/capability/context fence からのみ供給し、legacy JS observation cache や operator 指定 PID/window を authority にしません。`#152` は merged-main から physical OS-window regression acceptance が成功するまで close しません。
+Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) の target topology は Agent-owned です。操作対象 Agent が canonical Handoff FSM/checkpoint、WebRTC/TURN、capture、Human input、local verification を所有し、Hub は CUMG authorization / ledger / quarantine と conservative な pre-dispatch fence、signed operator-control relay のみを保持します。Hub/Agent に二重の Handoff state machine は作りません。generation rollover は fresh same-surface observation を伴う explicit `rebind_live` とし、Agent は Cua 直前に signed authority binding と実 command surface を再検証します。`#152` は merged-main から physical OS-window regression acceptance が成功するまで close しません。
 
 依存順は次です。
 

@@ -2,6 +2,7 @@ pub mod backend;
 pub mod config;
 pub mod gateway;
 pub mod policy;
+pub mod v2_agent_handoff;
 pub mod v2_browser;
 pub mod v2_browser_execute;
 pub mod v2_browser_normalize;

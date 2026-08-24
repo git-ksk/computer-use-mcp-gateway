@@ -1,4 +1,4 @@
-//! Local operator-only control plane for the Hub-owned Handoff coordinator.
+//! Local operator-only control plane for the Hub relay to the Agent-owned Handoff coordinator.
 //!
 //! This is deliberately separate from northbound MCP. The socket is a private local Unix
 //! endpoint; callers can request lifecycle transitions but cannot supply principal/device/Window
@@ -36,6 +36,7 @@ pub enum LocalHandoffControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prior_capability_revision: Option<u64>,
     },
+    RebindLive,
     RequestResume,
     CancelBeforeHuman,
 }
@@ -55,6 +56,7 @@ impl From<LocalHandoffControlRequest> for HandoffOperatorCommand {
                 prior_generation,
                 prior_capability_revision,
             },
+            LocalHandoffControlRequest::RebindLive => Self::RebindLive,
             LocalHandoffControlRequest::RequestResume => Self::RequestResume,
             LocalHandoffControlRequest::CancelBeforeHuman => Self::CancelBeforeHuman,
         }
@@ -137,9 +139,12 @@ fn parse_local_request(
         .and_then(serde_json::Value::as_str)
         .ok_or(HandoffLocalControlError::Protocol)?;
     let allowed: &[&str] = match action {
-        "status" | "begin" | "recover_reissue" | "request_resume" | "cancel_before_human" => {
-            &["action"]
-        }
+        "status"
+        | "begin"
+        | "recover_reissue"
+        | "rebind_live"
+        | "request_resume"
+        | "cancel_before_human" => &["action"],
         "recover_rebind" => &[
             "action",
             "prior_context_id",

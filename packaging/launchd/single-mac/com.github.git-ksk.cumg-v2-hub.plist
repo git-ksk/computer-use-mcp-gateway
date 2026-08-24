@@ -25,6 +25,7 @@
     <key>CUMG_V2_TRUSTED_PROXY_SUBJECT</key><string>REPLACE_WITH_SUBJECT</string>
     <key>CUMG_V2_TRUSTED_PROXY_SECRET_FILE</key><string>@ROOT@/v2/secrets/trusted-proxy.key</string>
     <key>CUMG_V2_DRAIN_TIMEOUT_SECS</key><string>30</string>
+    <key>CUMG_V2_HANDOFF_CONTROL_SOCKET</key><string>@HANDOFF_CONTROL_SOCKET@</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>

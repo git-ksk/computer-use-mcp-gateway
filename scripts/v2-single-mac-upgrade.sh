@@ -17,6 +17,8 @@ Environment overrides:
   CUMG_V2_SIGNER_LABEL       default: com.github.git-ksk.cumg-v2-grant-signer
   CUMG_V2_EXTERNAL_SIGNER    default: 1 (set 0 only for an explicitly reviewed legacy profile)
   CUMG_V2_EXPECTED_CUA_VERSION required; exact reviewed Cua version for post-upgrade v2_doctor
+  CUMG_V2_MACOS_CODESIGN_IDENTITY required; Apple code-signing identity for stable TCC attribution
+  CUMG_V2_MACOS_TEAM_ID       required; 10-character Apple Developer Team ID
 USAGE
 }
 
@@ -34,6 +36,9 @@ command -v cargo >/dev/null || { echo "REFUSED reason=cargo_missing" >&2; exit 2
 command -v python3 >/dev/null || { echo "REFUSED reason=python3_missing" >&2; exit 2; }
 command -v shasum >/dev/null || { echo "REFUSED reason=shasum_missing" >&2; exit 2; }
 command -v launchctl >/dev/null || { echo "REFUSED reason=launchctl_missing" >&2; exit 2; }
+command -v codesign >/dev/null || { echo "REFUSED reason=codesign_missing" >&2; exit 2; }
+command -v security >/dev/null || { echo "REFUSED reason=security_missing" >&2; exit 2; }
+[[ -x /usr/libexec/PlistBuddy ]] || { echo "REFUSED reason=plistbuddy_missing" >&2; exit 2; }
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "REFUSED reason=not_git_checkout" >&2; exit 2; }
 cd "$REPO_ROOT"
@@ -54,7 +59,14 @@ AGENT_LABEL="${CUMG_V2_AGENT_LABEL:-com.github.git-ksk.cumg-v2-agent}"
 SIGNER_LABEL="${CUMG_V2_SIGNER_LABEL:-com.github.git-ksk.cumg-v2-grant-signer}"
 EXTERNAL_SIGNER="${CUMG_V2_EXTERNAL_SIGNER:-1}"
 EXPECTED_CUA_VERSION="${CUMG_V2_EXPECTED_CUA_VERSION:-}"
+MACOS_CODESIGN_IDENTITY="${CUMG_V2_MACOS_CODESIGN_IDENTITY:-}"
+MACOS_TEAM_ID="${CUMG_V2_MACOS_TEAM_ID:-}"
 [[ -n "$EXPECTED_CUA_VERSION" ]] || { echo "REFUSED reason=expected_cua_version_required" >&2; exit 2; }
+[[ -n "$MACOS_CODESIGN_IDENTITY" ]] || { echo "REFUSED reason=macos_codesign_identity_required" >&2; exit 2; }
+[[ "$MACOS_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "REFUSED reason=invalid_macos_team_id" >&2; exit 2; }
+security find-identity -v -p codesigning 2>/dev/null | grep -F -- "\"$MACOS_CODESIGN_IDENTITY\"" >/dev/null || {
+  echo "REFUSED reason=macos_codesign_identity_unavailable" >&2; exit 2;
+}
 DOMAIN="gui/$(id -u)"
 HUB_PLIST="$HOME/Library/LaunchAgents/$HUB_LABEL.plist"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
@@ -63,6 +75,43 @@ SIGNER_PLIST="$HOME/Library/LaunchAgents/$SIGNER_LABEL.plist"
 [[ -x "$BIN_DIR/v2_maint" ]] || { echo "REFUSED reason=installed_maint_missing" >&2; exit 2; }
 [[ -d "$HUB_STATE" && -d "$AGENT_STATE" ]] || { echo "REFUSED reason=state_directory_missing" >&2; exit 2; }
 [[ -f "$HUB_PLIST" && -f "$AGENT_PLIST" ]] || { echo "REFUSED reason=launchd_profile_missing" >&2; exit 2; }
+HANDOFF_ENV_FILE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_ENV_FILE' "$AGENT_PLIST" 2>/dev/null || true)"
+[[ "$HANDOFF_ENV_FILE" == /* && -f "$HANDOFF_ENV_FILE" && ! -L "$HANDOFF_ENV_FILE" ]] || {
+  echo "REFUSED reason=agent_handoff_runtime_env_missing_or_unsafe" >&2; exit 2;
+}
+HANDOFF_HELPERS="$(python3 - "$HANDOFF_ENV_FILE" <<'PYHELPERS'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+keys = {
+    "CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE": "com.github.git-ksk.cumg-v2-handoff-webrtc-host",
+    "CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE": "com.github.git-ksk.cumg-v2-handoff-native-host",
+}
+found = []
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    key, value = key.strip(), value.strip()
+    if key not in keys:
+        continue
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        raise SystemExit(2)
+    found.append((key, keys[key], value))
+if not found:
+    raise SystemExit(3)
+for key, identifier, value in found:
+    print(f"{key}\t{identifier}\t{value}")
+PYHELPERS
+)" || { echo "REFUSED reason=handoff_host_executable_missing" >&2; exit 2; }
+while IFS=$'\t' read -r _key _identifier helper; do
+  [[ -n "$helper" ]] || continue
+  [[ "$helper" == "$ROOT"/v2/handoff/* && -f "$helper" && -x "$helper" && ! -L "$helper" ]] || {
+    echo "REFUSED reason=handoff_host_executable_unsafe" >&2; exit 2;
+  }
+done <<< "$HANDOFF_HELPERS"
 if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
   [[ -f "$SIGNER_PLIST" ]] || { echo "REFUSED reason=grant_signer_launchd_profile_missing" >&2; exit 2; }
   [[ -d "$RUN_ROOT" ]] || { echo "REFUSED reason=grant_signer_run_directory_missing" >&2; exit 2; }
@@ -84,7 +133,21 @@ if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
   launchctl print "$DOMAIN/$SIGNER_LABEL" >/dev/null 2>&1 || { echo "REFUSED reason=service_not_loaded label=$SIGNER_LABEL" >&2; exit 2; }
 fi
 
-echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0"
+stable_codesign() {
+  local pathname="$1" identifier="$2" expr requirement designated
+  expr="identifier \"$identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"$MACOS_TEAM_ID\""
+  requirement="=designated => $expr"
+  codesign --force --sign "$MACOS_CODESIGN_IDENTITY" --identifier "$identifier" \
+    --requirements "$requirement" "$pathname" >/dev/null
+  codesign --verify --strict "$pathname" >/dev/null
+  codesign -v -R="$expr" "$pathname" >/dev/null
+  designated="$(codesign -dr - "$pathname" 2>&1)"
+  [[ "$designated" == *"identifier \"$identifier\""* \
+      && "$designated" == *"certificate leaf[subject.OU] = \"$MACOS_TEAM_ID\""* \
+      && "$designated" != *"cdhash"* ]]
+}
+
+echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned stable_tcc_signing=required"
 [[ "$PRELIGHT_ONLY" == "1" ]] && exit 0
 
 cargo build --release --locked \
@@ -92,12 +155,15 @@ cargo build --release --locked \
 for name in v2_hub v2_agent v2_maint v2_doctor v2_grant_signer; do
   [[ -x "target/release/$name" ]] || { echo "REFUSED reason=build_output_missing binary=$name" >&2; exit 2; }
 done
+stable_codesign "target/release/v2_agent" "com.github.git-ksk.cumg-v2-agent" || {
+  echo "REFUSED reason=agent_stable_codesign_failed" >&2; exit 2;
+}
 
 STAMP="$(date '+%Y%m%dT%H%M%S%z')"
 ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
 umask 077
-mkdir -p "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd"
-chmod 700 "$ROLLBACK" "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd"
+mkdir -p "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
+chmod 700 "$ROLLBACK" "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
 for name in v2_hub v2_agent v2_maint v2_doctor v2_grant_signer; do
   [[ -f "$BIN_DIR/$name" ]] && cp -p "$BIN_DIR/$name" "$ROLLBACK/bin/$name"
 done
@@ -105,6 +171,15 @@ cp -p "$HUB_PLIST" "$ROLLBACK/launchd/"
 cp -p "$AGENT_PLIST" "$ROLLBACK/launchd/"
 [[ "$EXTERNAL_SIGNER" == "1" ]] && cp -p "$SIGNER_PLIST" "$ROLLBACK/launchd/"
 [[ -f "$ROOT/runtime-manifest.json" ]] && cp -p "$ROOT/runtime-manifest.json" "$ROLLBACK/runtime-manifest.json"
+HELPER_INDEX=0
+: > "$ROLLBACK/handoff/paths.tsv"
+while IFS=$'\t' read -r key identifier helper; do
+  [[ -n "$helper" ]] || continue
+  HELPER_INDEX=$((HELPER_INDEX + 1))
+  archived="$ROLLBACK/handoff/helper-$HELPER_INDEX"
+  cp -p "$helper" "$archived"
+  printf '%s\t%s\t%s\t%s\n' "$key" "$identifier" "$helper" "$archived" >> "$ROLLBACK/handoff/paths.tsv"
+done <<< "$HANDOFF_HELPERS"
 printf '%s\n' "$HEAD" > "$ROLLBACK/replacement-source-commit.txt"
 
 hub_pid() {
@@ -145,6 +220,28 @@ if [[ "$STOPPED_QUARANTINE_COUNT" != "0" ]]; then
   echo "REFUSED reason=quarantine_created_during_drain count=$STOPPED_QUARANTINE_COUNT rollback=$ROLLBACK" >&2
   exit 2
 fi
+
+restore_preinstall_profile() {
+  while IFS=$'\t' read -r _key _identifier helper archived; do
+    [[ -n "$helper" && -f "$archived" ]] && cp -p "$archived" "$helper" || true
+  done < "$ROLLBACK/handoff/paths.tsv"
+  if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
+    launchctl bootstrap "$DOMAIN" "$SIGNER_PLIST" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
+  sleep 1
+  launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" >/dev/null 2>&1 || true
+}
+
+while IFS=$'\t' read -r _key identifier helper _archived; do
+  [[ -n "$helper" ]] || continue
+  if ! stable_codesign "$helper" "$identifier"; then
+    restore_preinstall_profile
+    echo "REFUSED reason=handoff_host_stable_codesign_failed rollback=$ROLLBACK" >&2
+    exit 2
+  fi
+done < "$ROLLBACK/handoff/paths.tsv"
 
 install_atomic() {
   local source="$1" destination="$2" tmp

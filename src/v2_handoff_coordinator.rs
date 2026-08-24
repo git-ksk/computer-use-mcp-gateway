@@ -1,17 +1,22 @@
 //! First-class CUMG coordination boundary for Human handoff.
 //!
-//! CUMG owns authenticated principal/device/capability/generation admission and consumer-specific
-//! postcondition verification. `mcp-execution-handoff` remains the canonical owner of generic
+//! CUMG owns authenticated principal/device/capability/generation admission and the semantic
+//! postcondition contract. `mcp-execution-handoff` remains the canonical owner of generic
 //! Agent/Human authority, intervention/epoch transitions, `Done -> verifying`, and resume policy.
-//! This module deliberately does not implement a second Handoff state machine.
-//!
-//! Normal runtime integration uses a Hub-owned managed Handoff process. The accepted Unix bridge is
-//! retained only as a compatibility/regression backend. Both stay behind one surface-neutral seam
-//! so Terminal/PTY #48 can bind a new surface without duplicating authority semantics.
+//! The normal runtime/FSM is Agent-owned; this Hub-side coordinator keeps only CUMG selection,
+//! conservative pre-dispatch admission, and a signed/session-fenced relay to that Agent runtime.
+//! The compatibility Unix backend remains regression-only behind the same surface-neutral seam so
+//! Terminal/PTY #48 can add a new Agent-local surface without duplicating authority semantics.
 
 use crate::{
     v2_m0::{DeviceCommand, DeviceResult, VerificationStatus},
+    v2_m0_transport::{
+        RemoteHandoffAdmissionDecision, RemoteHandoffAuthority, RemoteHandoffErrorCode,
+        RemoteHandoffExactWindow, RemoteHandoffOperatorCommand, RemoteHandoffRequestKind,
+        RemoteHandoffResponseKind, RemoteHandoffStatus, RemoteHandoffSurfaceBinding,
+    },
     v2_m0_trust::AuthenticatedClientPrincipal,
+    v2_m1_hub::{HubCommandError, HubHandle},
     v2_operator_handoff::{
         AgentAuthorityDecision, AgentAuthorityRequest, ExactWindowBinding, HandoffControlError,
         HandoffInterventionStatus, HandoffRuntimeControl, HandoffRuntimeStatus,
@@ -21,6 +26,7 @@ use crate::{
         principal_binding,
     },
 };
+use async_trait::async_trait;
 use std::{
     fmt,
     sync::{Arc, Mutex},
@@ -59,12 +65,17 @@ impl HandoffAgentBinding {
             verification_candidate: self.verification_candidate,
         }
     }
+
+    pub(crate) fn remote_authority(&self) -> RemoteHandoffAuthority {
+        remote_authority(&self.legacy_request())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HandoffAdmission {
     pub binding: HandoffAgentBinding,
     pub verification: Option<VerificationToken>,
+    pub verification_local_to_agent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +125,7 @@ pub enum HandoffOperatorCommand {
         prior_generation: Option<u64>,
         prior_capability_revision: Option<u64>,
     },
+    RebindLive,
     RequestResume,
     CancelBeforeHuman,
 }
@@ -169,12 +181,112 @@ struct HandoffSelectionState {
     last_admitted: Option<SelectedWindowAuthority>,
 }
 
+#[derive(Clone)]
+struct RemoteAgentHandoffAuthority {
+    hub: HubHandle,
+}
+
+#[async_trait]
+impl OperatorHandoffAuthority for RemoteAgentHandoffAuthority {
+    async fn admit_agent(
+        &self,
+        request: AgentAuthorityRequest,
+    ) -> Result<AgentAuthorityDecision, OperatorHandoffError> {
+        let response = self
+            .hub
+            .handoff_request(RemoteHandoffRequestKind::Admission {
+                authority: remote_authority(&request),
+            })
+            .await
+            .map_err(map_remote_hub_error)?;
+        match response {
+            RemoteHandoffResponseKind::Admission { decision } => Ok(match decision {
+                RemoteHandoffAdmissionDecision::Allow => AgentAuthorityDecision::Allow,
+                RemoteHandoffAdmissionDecision::Deny => AgentAuthorityDecision::Deny,
+                RemoteHandoffAdmissionDecision::Verification {
+                    intervention_id,
+                    epoch,
+                } => AgentAuthorityDecision::Verification(VerificationToken {
+                    intervention_id,
+                    epoch,
+                }),
+            }),
+            RemoteHandoffResponseKind::Rejected { code } => Err(map_remote_error(code)),
+            _ => Err(OperatorHandoffError::Protocol),
+        }
+    }
+
+    async fn report_verification(
+        &self,
+        _report: VerificationReport,
+    ) -> Result<(), OperatorHandoffError> {
+        // Agent-owned mode reports verification directly to its local canonical
+        // runtime before the result returns to Hub.
+        Err(OperatorHandoffError::Unsupported)
+    }
+}
+
+fn remote_authority(request: &AgentAuthorityRequest) -> RemoteHandoffAuthority {
+    RemoteHandoffAuthority {
+        principal_binding: request.principal_binding.clone(),
+        device_binding: request.device_binding.clone(),
+        generation: request.generation,
+        capability_revision: request.capability_revision,
+        surface: request.exact_window.as_ref().map(|window| {
+            RemoteHandoffSurfaceBinding::OsWindow(RemoteHandoffExactWindow {
+                context_binding: window.context_binding.clone(),
+                process_id: window.process_id,
+                window_id: window.window_id,
+            })
+        }),
+        verification_candidate: request.verification_candidate,
+    }
+}
+
+fn map_remote_hub_error(error: HubCommandError) -> OperatorHandoffError {
+    match error {
+        HubCommandError::AgentOffline
+        | HubCommandError::SessionClosed
+        | HubCommandError::SessionSuperseded => OperatorHandoffError::Unavailable,
+        _ => OperatorHandoffError::Protocol,
+    }
+}
+
+fn map_remote_error(code: RemoteHandoffErrorCode) -> OperatorHandoffError {
+    match code {
+        RemoteHandoffErrorCode::Unsupported => OperatorHandoffError::Unsupported,
+        RemoteHandoffErrorCode::Unavailable => OperatorHandoffError::Unavailable,
+        RemoteHandoffErrorCode::Rejected
+        | RemoteHandoffErrorCode::Protocol
+        | RemoteHandoffErrorCode::SessionFenceMismatch
+        | RemoteHandoffErrorCode::InvalidRequest => OperatorHandoffError::Protocol,
+    }
+}
+
+fn local_status_from_remote(
+    status: RemoteHandoffStatus,
+    locator: Option<String>,
+) -> HandoffRuntimeStatus {
+    HandoffRuntimeStatus {
+        active: status.active,
+        recovery_required: status.recovery_required,
+        recovery_status: status.recovery_status,
+        recovery_epoch: status.recovery_epoch,
+        recovery_expired: status.recovery_expired,
+        resume_requested: status.resume_requested,
+        faulted: status.faulted,
+        human_surface: status.human_surface,
+        locator,
+    }
+}
+
 /// CUMG-side coordinator. The backend supplies canonical Handoff semantic decisions; this type
 /// supplies the consumer binding and validation around those decisions.
 #[derive(Clone)]
 pub struct HandoffCoordinator {
     backend: Arc<dyn OperatorHandoffAuthority>,
     managed_runtime: Option<Arc<ManagedOperatorHandoffAuthority>>,
+    remote_hub: Option<HubHandle>,
     selections: Arc<Mutex<HandoffSelectionState>>,
 }
 
@@ -184,6 +296,7 @@ impl HandoffCoordinator {
         Self {
             backend,
             managed_runtime: None,
+            remote_hub: None,
             selections: Arc::new(Mutex::new(HandoffSelectionState::default())),
         }
     }
@@ -194,8 +307,26 @@ impl HandoffCoordinator {
         Self {
             backend: runtime.clone(),
             managed_runtime: Some(runtime),
+            remote_hub: None,
             selections: Arc::new(Mutex::new(HandoffSelectionState::default())),
         }
+    }
+
+    /// Normal distributed CUMG runtime: the controlled Agent owns the canonical
+    /// Handoff process/FSM and this Hub-side coordinator is only a signed remote
+    /// admission/control adapter plus fresh CUMG surface selection.
+    pub fn agent_owned(hub: HubHandle) -> Self {
+        let backend = Arc::new(RemoteAgentHandoffAuthority { hub: hub.clone() });
+        Self {
+            backend,
+            managed_runtime: None,
+            remote_hub: Some(hub),
+            selections: Arc::new(Mutex::new(HandoffSelectionState::default())),
+        }
+    }
+
+    pub fn verification_local_to_agent(&self) -> bool {
+        self.remote_hub.is_some()
     }
 
     pub async fn shutdown(&self) {
@@ -289,11 +420,103 @@ impl HandoffCoordinator {
         Ok(selected.authority.clone())
     }
 
+    async fn remote_operator_control(
+        &self,
+        command: HandoffOperatorCommand,
+        session: Option<HandoffSessionFence>,
+    ) -> Result<HandoffRuntimeStatus, HandoffOperatorControlError> {
+        let hub = self
+            .remote_hub
+            .as_ref()
+            .ok_or(HandoffOperatorControlError::Unsupported)?;
+        let (command, authority) = match command {
+            HandoffOperatorCommand::Status => (RemoteHandoffOperatorCommand::Status, None),
+            HandoffOperatorCommand::Begin => (
+                RemoteHandoffOperatorCommand::Begin,
+                Some(remote_authority(&self.selected_authority(true, session)?)),
+            ),
+            HandoffOperatorCommand::RecoverReissue => (
+                RemoteHandoffOperatorCommand::RecoverReissue,
+                Some(remote_authority(&self.selected_authority(false, session)?)),
+            ),
+            HandoffOperatorCommand::RecoverRebind {
+                prior_context_id,
+                prior_generation,
+                prior_capability_revision,
+            } => {
+                if !valid_context_id(&prior_context_id) {
+                    return Err(HandoffOperatorControlError::InvalidRecoveryProof);
+                }
+                (
+                    RemoteHandoffOperatorCommand::RecoverRebind {
+                        prior_context_id,
+                        prior_generation,
+                        prior_capability_revision,
+                    },
+                    Some(remote_authority(&self.selected_authority(false, session)?)),
+                )
+            }
+            HandoffOperatorCommand::RebindLive => (
+                RemoteHandoffOperatorCommand::RebindLive,
+                Some(remote_authority(&self.selected_authority(false, session)?)),
+            ),
+            HandoffOperatorCommand::RequestResume => {
+                (RemoteHandoffOperatorCommand::RequestResume, None)
+            }
+            HandoffOperatorCommand::CancelBeforeHuman => {
+                (RemoteHandoffOperatorCommand::CancelBeforeHuman, None)
+            }
+        };
+        let response = hub
+            .handoff_request(RemoteHandoffRequestKind::Operator { command, authority })
+            .await
+            .map_err(|error| match error {
+                HubCommandError::AgentOffline
+                | HubCommandError::SessionClosed
+                | HubCommandError::SessionSuperseded => {
+                    HandoffOperatorControlError::Runtime(HandoffControlError::Unavailable)
+                }
+                _ => HandoffOperatorControlError::Runtime(HandoffControlError::Protocol),
+            })?;
+        match response {
+            RemoteHandoffResponseKind::Status { status } => {
+                Ok(local_status_from_remote(status, None))
+            }
+            RemoteHandoffResponseKind::Operator { status, locator } => {
+                Ok(local_status_from_remote(status, locator))
+            }
+            RemoteHandoffResponseKind::Rejected { code } => Err(match code {
+                RemoteHandoffErrorCode::SessionFenceMismatch => {
+                    HandoffOperatorControlError::SessionFenceMismatch
+                }
+                RemoteHandoffErrorCode::InvalidRequest => {
+                    HandoffOperatorControlError::InvalidRecoveryProof
+                }
+                RemoteHandoffErrorCode::Unsupported => HandoffOperatorControlError::Unsupported,
+                RemoteHandoffErrorCode::Unavailable => {
+                    HandoffOperatorControlError::Runtime(HandoffControlError::Unavailable)
+                }
+                RemoteHandoffErrorCode::Rejected => {
+                    HandoffOperatorControlError::InvalidLifecycleState
+                }
+                RemoteHandoffErrorCode::Protocol => {
+                    HandoffOperatorControlError::Runtime(HandoffControlError::Protocol)
+                }
+            }),
+            RemoteHandoffResponseKind::Admission { .. } => Err(
+                HandoffOperatorControlError::Runtime(HandoffControlError::Protocol),
+            ),
+        }
+    }
+
     pub async fn operator_control(
         &self,
         command: HandoffOperatorCommand,
         session: Option<HandoffSessionFence>,
     ) -> Result<HandoffRuntimeStatus, HandoffOperatorControlError> {
+        if self.remote_hub.is_some() {
+            return self.remote_operator_control(command, session).await;
+        }
         let runtime = self
             .managed_runtime
             .as_ref()
@@ -344,6 +567,13 @@ impl HandoffCoordinator {
                         prior_generation,
                         prior_capability_revision,
                     })
+                    .await
+                    .map_err(Into::into)
+            }
+            HandoffOperatorCommand::RebindLive => {
+                let authority = self.selected_authority(false, session)?;
+                runtime
+                    .control(HandoffRuntimeControl::RebindLive { authority })
                     .await
                     .map_err(Into::into)
             }
@@ -438,6 +668,7 @@ impl HandoffCoordinator {
                 Ok(Some(HandoffAdmission {
                     binding,
                     verification: None,
+                    verification_local_to_agent: self.remote_hub.is_some(),
                 }))
             }
             AgentAuthorityDecision::Deny => Err(HandoffCoordinatorError::AuthoritySuspended),
@@ -450,6 +681,7 @@ impl HandoffCoordinator {
                 Ok(Some(HandoffAdmission {
                     binding,
                     verification: Some(token),
+                    verification_local_to_agent: self.remote_hub.is_some(),
                 }))
             }
         }

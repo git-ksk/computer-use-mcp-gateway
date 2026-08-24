@@ -417,6 +417,7 @@ mod tests {
                 },
                 signature: vec![0; 64],
             },
+            handoff: None,
             signature: vec![0; 64],
         });
         let frame = encode_hub_frame(&message).expect("upload staging uses bounded large carrier");

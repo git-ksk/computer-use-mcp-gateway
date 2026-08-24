@@ -40,7 +40,7 @@ Template は `packaging/launchd/single-mac/` にあります。
 - `com.github.git-ksk.cumg-v2-hub.plist`
 - `com.github.git-ksk.cumg-v2-agent.plist`
 
-`@HOME@`、`@ROOT@`、`@RUN_ROOT@`、`@BINARY_DIR@` を置換し、明示的な `REPLACE_*` を deployment の reviewed resource URI、trusted-proxy identity、stable device ID に置換します。single-Mac profile は意図的に loopback-only なので、Hub/MCP bind を public address に変更してはいけません。
+`@HOME@`、`@ROOT@`、`@RUN_ROOT@`、`@BINARY_DIR@`、`@HANDOFF_CONTROL_SOCKET@`、`@HANDOFF_RUNTIME_COMMAND@`、`@HANDOFF_RUNTIME_SCRIPT@`、`@HANDOFF_RUNTIME_ENV_FILE@` を置換し、明示的な `REPLACE_*` を deployment の reviewed resource URI、trusted-proxy identity、stable device ID に置換します。Hub template が持つ Handoff 機能は private operator-control relay のみで、canonical Handoff runtime / WebRTC / capture / Human input / private transport env は Agent template が所有します。single-Mac profile は意図的に loopback-only なので、Hub/MCP bind を public address に変更してはいけません。
 
 signer を load する前に runtime directory を作成します。
 
@@ -50,7 +50,7 @@ RUN_ROOT="$HOME/Library/Caches/cumg-v2"
 install -d -m 700 "$RUN_ROOT"
 ```
 
-起動順は signer -> Hub -> Agent です。Agent は macOS TCC attribution を明示的に保つため、logged-in user session の LaunchAgent として動かします。
+起動順は signer -> Hub -> Agent です。Cua と Agent-owned Handoff の capture/input は操作対象端末の macOS TCC attribution を必要とするため、Agent は logged-in user session の LaunchAgent として動かします。
 
 signer policy example は意図的に最小です。review 済み northbound policy が必要とする exact `DeviceCapability` だけを追加してください。wildcard capability も signer fallback もありません。
 
@@ -63,17 +63,19 @@ signer policy example は意図的に最小です。review 済み northbound pol
 - live quarantine が存在する;
 - 必須 LaunchAgent / state directory がない;
 - reviewed Cua version が明示されていない;
+- 有効な Apple code-signing identity と 10 文字の Team ID が明示されていない;
+- Agent Handoff env/helper path が存在しない、または unsafe;
 - external signer profile が不完全。
 
 成功する upgrade は次の順序です。
 
 1. source/state/service preflight;
-2. 1 commit から `v2_hub`、`v2_agent`、`v2_maint`、`v2_doctor`、`v2_grant_signer` を build;
+2. 1 commit から `v2_hub`、`v2_agent`、`v2_maint`、`v2_doctor`、`v2_grant_signer` を build し、`v2_agent` を stable Agent identifier / Team-ID designated requirement で sign;
 3. old binary と service config を保存し、drain 後に authoritative な停止済み Hub/Agent state を rollback asset として保存;
 4. Agent 接続を維持したまま Hub に先に signal を送り、新規 admission を閉じて既存 work を drain;
 5. Hub shutdown 後に Agent と signer を unload;
 6. 停止済み authoritative state を再確認し、drain 中に quarantine が生成されていれば binary replacement 前に拒否;
-7. version-paired runtime binaries を atomic replace;
+7. configured Agent-local Handoff host helper を stable Team-ID designated requirement で sign した後、version-paired runtime binaries を atomic replace;
 8. package version、source commit、binary name、SHA-256 だけを含む `runtime-manifest.json` を作成;
 9. signer -> Hub -> Agent の順で起動;
 10. `v2_doctor` を実行。post-start doctor が失敗した場合は profile を fail closed で停止し、新しい state に old binary だけを自動的に組み合わせません。
@@ -82,9 +84,13 @@ signer policy example は意図的に最小です。review 済み northbound pol
 
 ```bash
 CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
+CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
+CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
   scripts/v2-single-mac-upgrade.sh --preflight-only
 
 CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
+CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
+CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
   scripts/v2-single-mac-upgrade.sh
 ```
 

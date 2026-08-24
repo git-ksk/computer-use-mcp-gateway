@@ -14,7 +14,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 #[derive(Debug, Parser)]
 #[command(name = "v2_handoff_ctl")]
-#[command(about = "Local operator control for the Hub-owned Handoff coordinator")]
+#[command(about = "Local operator control for the Agent-owned Handoff coordinator")]
 struct Args {
     #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
     socket: PathBuf,
@@ -40,6 +40,8 @@ enum Command {
         #[arg(long)]
         prior_capability_revision: Option<u64>,
     },
+    /// Rebind a live intervention after a fresh exact-surface observation on a newer Agent generation.
+    RebindLive,
     /// Arm explicit Agent resume after fresh CUMG verification reached ready_to_resume.
     RequestResume,
     /// Cancel only while Human authority has not yet been claimed.
@@ -62,6 +64,7 @@ impl From<Command> for LocalHandoffControlRequest {
                 prior_generation,
                 prior_capability_revision,
             },
+            Command::RebindLive => Self::RebindLive,
             Command::RequestResume => Self::RequestResume,
             Command::CancelBeforeHuman => Self::CancelBeforeHuman,
         }

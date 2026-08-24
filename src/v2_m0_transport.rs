@@ -22,7 +22,7 @@ use std::{
     time::Instant,
 };
 
-pub const HUB_AGENT_SCHEMA_VERSION: u16 = 2;
+pub const HUB_AGENT_SCHEMA_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_HANDOFF_CONTROL_BYTES: usize = 4 * 1024;
 
@@ -104,10 +104,25 @@ impl HubIdentity {
         command: CommandEnvelope,
         grant: GrantToken,
     ) -> Result<RemoteCommand, TransportError> {
+        self.remote_command_with_handoff(hello, challenge, command, grant, None)
+    }
+
+    pub fn remote_command_with_handoff(
+        &self,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        command: CommandEnvelope,
+        grant: GrantToken,
+        handoff: Option<RemoteHandoffAuthority>,
+    ) -> Result<RemoteCommand, TransportError> {
+        if let Some(authority) = handoff.as_ref() {
+            validate_handoff_payload(authority)?;
+        }
         let mut remote = RemoteCommand {
             schema_version: HUB_AGENT_SCHEMA_VERSION,
             command,
             grant,
+            handoff,
             signature: Vec::new(),
         };
         let transcript = remote_command_bytes(hello, challenge, &remote)?;
@@ -277,6 +292,8 @@ pub struct RemoteCommand {
     pub schema_version: u16,
     pub command: CommandEnvelope,
     pub grant: GrantToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<RemoteHandoffAuthority>,
     pub signature: Vec<u8>,
 }
 
@@ -331,13 +348,22 @@ pub struct RemoteHandoffExactWindow {
     pub window_id: u64,
 }
 
+/// Bounded execution surface selected by CUMG. OS Window is the only accepted
+/// surface today; Terminal/PTY can add a new tagged variant without changing
+/// the Handoff authority envelope or duplicating the state machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "binding", rename_all = "snake_case")]
+pub enum RemoteHandoffSurfaceBinding {
+    OsWindow(RemoteHandoffExactWindow),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteHandoffAuthority {
     pub principal_binding: String,
     pub device_binding: String,
     pub generation: u64,
     pub capability_revision: u64,
-    pub exact_window: Option<RemoteHandoffExactWindow>,
+    pub surface: Option<RemoteHandoffSurfaceBinding>,
     pub verification_candidate: bool,
 }
 
@@ -352,6 +378,7 @@ pub enum RemoteHandoffOperatorCommand {
         prior_generation: Option<u64>,
         prior_capability_revision: Option<u64>,
     },
+    RebindLive,
     RequestResume,
     CancelBeforeHuman,
 }
@@ -361,12 +388,6 @@ pub enum RemoteHandoffOperatorCommand {
 pub enum RemoteHandoffRequestKind {
     Admission {
         authority: RemoteHandoffAuthority,
-    },
-    ReportVerification {
-        authority: RemoteHandoffAuthority,
-        intervention_id: String,
-        epoch: u64,
-        satisfied: bool,
     },
     Operator {
         command: RemoteHandoffOperatorCommand,
@@ -1072,6 +1093,7 @@ fn remote_command_bytes(
         hub_nonce: &'a [u8; 32],
         command: &'a CommandEnvelope,
         grant: &'a GrantToken,
+        handoff: &'a Option<RemoteHandoffAuthority>,
     }
     serde_json::to_vec(&Transcript {
         domain: "cumg-v2-m0-remote-command",
@@ -1081,6 +1103,7 @@ fn remote_command_bytes(
         hub_nonce: &challenge.hub_nonce,
         command: &remote.command,
         grant: &remote.grant,
+        handoff: &remote.handoff,
     })
     .map_err(TransportError::Serialization)
 }
@@ -1769,11 +1792,13 @@ mod tests {
             device_binding: "device_binding_0123456789abcdef".into(),
             generation: 3,
             capability_revision: 5,
-            exact_window: Some(RemoteHandoffExactWindow {
-                context_binding: "context_binding_0123456789abcdef".into(),
-                process_id: 12,
-                window_id: 34,
-            }),
+            surface: Some(RemoteHandoffSurfaceBinding::OsWindow(
+                RemoteHandoffExactWindow {
+                    context_binding: "context_binding_0123456789abcdef".into(),
+                    process_id: 12,
+                    window_id: 34,
+                },
+            )),
             verification_candidate: false,
         };
         let request = hub
@@ -1793,6 +1818,9 @@ mod tests {
         let encoded = serde_json::to_vec(&HubToAgent::HandoffRequest(request.clone())).unwrap();
         assert!(encoded.len() < 4 * 1024);
         let encoded_text = String::from_utf8(encoded).unwrap();
+        assert!(encoded_text.contains("\"surface\""));
+        assert!(encoded_text.contains("\"kind\":\"os_window\""));
+        assert!(!encoded_text.contains("\"exact_window\""));
         for forbidden in [
             "sdp",
             "iceServers",
@@ -1879,7 +1907,7 @@ mod tests {
             device_binding: "device_binding_0123456789abcdef".into(),
             generation: 1,
             capability_revision: 1,
-            exact_window: None,
+            surface: None,
             verification_candidate: false,
         };
         assert!(matches!(

@@ -512,6 +512,31 @@ export class HandoffBridge {
     return result;
   }
 
+
+  rebindLive(request) {
+    if (this.recovery || this.faulted) return { ok: false };
+    const active = this.state.getActive();
+    if (!active || !this.activeBinding) return { ok: false };
+    const binding = this.controlBinding(request);
+    if (!binding?.exactWindow) return { ok: false };
+    if (binding.generation <= this.activeBinding.generation
+      || binding.capabilityRevision < this.activeBinding.capabilityRevision
+      || binding.principalBinding !== this.activeBinding.principalBinding
+      || binding.deviceBinding !== this.activeBinding.deviceBinding
+      || binding.exactWindow.processId !== this.activeBinding.exactWindow.processId
+      || binding.exactWindow.windowId !== this.activeBinding.exactWindow.windowId) {
+      return { ok: false };
+    }
+    // Context identity is intentionally fresh after generation rollover. The exact OS Window
+    // remains unchanged; no Human/Agent authority transition or intervention epoch change occurs.
+    this.activeBinding = binding;
+    this.latestObservation = binding;
+    this.owners.set(active.id, this.ownerFor(binding));
+    try { this.checkpoint(); }
+    catch { this.faulted = true; return { ok: false }; }
+    return { ok: true, intervention_id: active.id, epoch: active.epoch, status: active.status };
+  }
+
   exactActive(request, expectedStatus) {
     const active = this.state.getActive();
     return active
@@ -541,6 +566,8 @@ export class HandoffBridge {
       return this.recoverReissue(request);
     case "recover_rebind":
       return this.recoverRebind(request);
+    case "rebind_live":
+      return this.rebindLive(request);
     case "request_resume": {
       const active = this.exactActive(request, "ready_to_resume");
       if (!active) return { ok: false };
@@ -574,7 +601,7 @@ export class HandoffBridge {
 
   handleManaged(request) {
     if (!request || typeof request !== "object" || Array.isArray(request)) return { ok: false };
-    if (["begin", "recover_reissue", "recover_rebind"].includes(request.action)
+    if (["begin", "recover_reissue", "recover_rebind", "rebind_live"].includes(request.action)
       && request.authority === undefined) return { ok: false };
     return this.handle(request);
   }
@@ -731,7 +758,7 @@ export async function runCli(argv = process.argv) {
   if (!["serve", "serve-stdio"].includes(command)) {
     const socketPath = required(options, "socket", "CUMG_V2_OPERATOR_HANDOFF_SOCKET");
     const action = command.replaceAll("-", "_");
-    if (!["status", "begin", "recover_reissue", "recover_rebind", "request_resume", "cancel_before_human"].includes(action)) {
+    if (!["status", "begin", "recover_reissue", "recover_rebind", "rebind_live", "request_resume", "cancel_before_human"].includes(action)) {
       throw new Error("unknown command");
     }
     control(socketPath, action, options);

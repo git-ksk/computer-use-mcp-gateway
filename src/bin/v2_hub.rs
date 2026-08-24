@@ -22,9 +22,7 @@ use computer_use_mcp_gateway::{
         OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp, build_northbound_router,
         build_trusted_proxy_router,
     },
-    v2_operator_handoff::{
-        ManagedHandoffRuntimeConfig, ManagedOperatorHandoffAuthority, UnixOperatorHandoffAuthority,
-    },
+    v2_operator_handoff::UnixOperatorHandoffAuthority,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch};
@@ -134,7 +132,8 @@ struct Args {
     /// Mutually exclusive with the first-class managed Handoff runtime.
     #[arg(long, env = "CUMG_V2_OPERATOR_HANDOFF_SOCKET")]
     operator_handoff_socket: Option<PathBuf>,
-    /// Absolute Node.js executable used for the first-class Hub-owned Handoff runtime.
+    /// Legacy Hub-owned Handoff runtime setting. First-class Handoff now runs on the Agent;
+    /// configuring any of these Hub runtime fields is refused rather than silently spawning it here.
     #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_COMMAND")]
     handoff_runtime_command: Option<PathBuf>,
     /// Absolute CUMG Handoff runtime host script. The normal target is scripts/v2_handoff_runtime.mjs.
@@ -150,7 +149,7 @@ struct Args {
     )]
     handoff_runtime_timeout_secs: u64,
     /// Private local operator socket for typed Handoff lifecycle control. This is never MCP.
-    /// It is supported only with the first-class managed Handoff runtime.
+    /// The Hub owns only this local relay; the canonical Handoff runtime/FSM runs on the Agent.
     #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
     handoff_control_socket: Option<PathBuf>,
     /// Optional private key material used only to HMAC canonical shell/process requests for
@@ -333,7 +332,7 @@ async fn main() -> Result<()> {
     .context("failed to initialize V2 Hub state")?;
     let device_id = hub.device_id().to_owned();
     let shutdown_handle = handle.clone();
-    let handoff_coordinator = build_handoff_coordinator(&args).await?;
+    let handoff_coordinator = build_handoff_coordinator(&args, handle.clone()).await?;
     let northbound = build_northbound_runtime(
         &args,
         handle.clone(),
@@ -502,53 +501,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn build_handoff_coordinator(args: &Args) -> Result<Option<Arc<HandoffCoordinator>>> {
-    let managed_fields = [
+async fn build_handoff_coordinator(
+    args: &Args,
+    hub: computer_use_mcp_gateway::v2_m1_hub::HubHandle,
+) -> Result<Option<Arc<HandoffCoordinator>>> {
+    let legacy_managed_fields = [
         args.handoff_runtime_command.is_some(),
         args.handoff_runtime_script.is_some(),
         args.handoff_runtime_env_file.is_some(),
     ];
-    let managed_configured = managed_fields.into_iter().any(|configured| configured);
     ensure!(
-        args.handoff_control_socket.is_none()
-            || managed_fields.into_iter().all(|configured| configured),
-        "CUMG_V2_HANDOFF_CONTROL_SOCKET requires the complete managed Handoff runtime configuration"
+        !legacy_managed_fields
+            .into_iter()
+            .any(|configured| configured),
+        "Hub-owned CUMG_V2_HANDOFF_RUNTIME_* configuration is no longer supported; configure the managed Handoff runtime on v2_agent"
     );
     ensure!(
-        !(managed_configured && args.operator_handoff_socket.is_some()),
-        "CUMG managed Handoff runtime and CUMG_V2_OPERATOR_HANDOFF_SOCKET are mutually exclusive"
+        !(args.handoff_control_socket.is_some() && args.operator_handoff_socket.is_some()),
+        "first-class Agent-owned Handoff and CUMG_V2_OPERATOR_HANDOFF_SOCKET are mutually exclusive"
     );
 
-    if managed_configured {
-        ensure!(
-            managed_fields.into_iter().all(|configured| configured),
-            "CUMG_V2_HANDOFF_RUNTIME_COMMAND, CUMG_V2_HANDOFF_RUNTIME_SCRIPT, and CUMG_V2_HANDOFF_RUNTIME_ENV_FILE must be configured together"
-        );
-        let config = ManagedHandoffRuntimeConfig::new(
-            args.handoff_runtime_command
-                .clone()
-                .expect("validated managed Handoff runtime command"),
-            args.handoff_runtime_script
-                .clone()
-                .expect("validated managed Handoff runtime script"),
-            args.handoff_runtime_env_file
-                .clone()
-                .expect("validated managed Handoff runtime env file"),
-            Duration::from_secs(args.handoff_runtime_timeout_secs),
-        )
-        .context("invalid managed Handoff runtime configuration")?;
-        let runtime = Arc::new(
-            ManagedOperatorHandoffAuthority::spawn(config)
-                .await
-                .context("failed to start managed Handoff runtime")?,
-        );
+    if args.handoff_control_socket.is_some() {
         info!(
             event = "v2_handoff_runtime_configured",
-            mode = "managed_stdio",
+            mode = "agent_owned_remote",
             outcome = "ready",
-            "first-class Handoff runtime configured"
+            "first-class Handoff coordination routes to the controlled Agent"
         );
-        return Ok(Some(Arc::new(HandoffCoordinator::managed(runtime))));
+        return Ok(Some(Arc::new(HandoffCoordinator::agent_owned(hub))));
     }
 
     if let Some(path) = args.operator_handoff_socket.as_ref() {
