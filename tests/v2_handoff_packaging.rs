@@ -51,6 +51,10 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(upgrade.contains("HANDOFF_RUNTIME_COMMAND_RESOLVED"));
     assert!(upgrade.contains("os.path.realpath"));
     assert!(upgrade.contains("node_modules/werift/package.json"));
+    assert!(upgrade.contains("install_handoff_runtime_dependencies"));
+    assert!(upgrade.contains("node_modules/.bin"));
+    assert!(upgrade.contains("followlinks=False"));
+    assert!(upgrade.contains("handoff_runtime_dependencies_install_or_symlink_validation_failed"));
     assert!(upgrade.contains("handoff_not_idle_or_status_unavailable"));
     assert!(upgrade.contains("hub_agent_schema_version"));
     assert!(upgrade.contains("\"schema_version\": 2"));
