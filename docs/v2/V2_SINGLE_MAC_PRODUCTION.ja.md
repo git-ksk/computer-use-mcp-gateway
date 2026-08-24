@@ -63,7 +63,7 @@ signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します
 成功する upgrade の順序は次です。
 
 1. CUMG/Handoff source provenance、quarantine=0、loaded service、Agent-owned Handoff idle を locator/owner data を出さずに確認;
-2. 1つの merged CUMG commit から paired binaries を build し、exact reviewed Handoff `dist` / `package.json` / lockfile と CUMG runtime host script から private `runtime-<cumg>-<handoff>` generation を stage。lockfile-pinned production dependency だけを lifecycle script 無効で導入し、service を止める前に configured Node executable で staged entrypoint の import 成功を確認;
+2. 1つの merged CUMG commit から paired binaries を build し、exact reviewed Handoff `dist` / `package.json` / lockfile と CUMG runtime host script から private `runtime-<cumg>-<handoff>` generation を stage。lockfile-pinned production dependency だけを lifecycle script 無効で導入し、runtime generation を symlink-free に保つため npm command shim の `.bin` link を除去、残存 dependency symlink を拒否した上で、service を止める前に configured Node executable で staged entrypoint の import 成功を確認;
 3. Handoff host helper を新 generation へ copy して stable sign。live helper は in-place 変更しない;
 4. old binaries/config、Handoff env、helper copy、runtime dependency を含む self-contained old Handoff generation を private rollback bundle に保存。dependency が欠けた archive は external-runtime reference のまま扱い、その runtime の cleanup を許可しない。authoritative Hub/Agent state は drain 後だけ保存;
 5. Hub を先に signal して admission close/drain、Hub/Agent/signer unload 後に stopped quarantine を再確認;

@@ -317,6 +317,36 @@ print(resolved)
 PYNODECOMMAND
 )" || { echo "REFUSED reason=handoff_runtime_command_resolution_failed" >&2; exit 2; }
 
+install_handoff_runtime_dependencies() {
+  local runtime_root="$1" bin_dir
+  (
+    cd "$runtime_root"
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null
+  ) || return 2
+  # npm creates convenience command symlinks under node_modules/.bin. The managed
+  # Handoff runtime imports packages directly and never executes these shims, while
+  # runtime generations are intentionally symlink-free for manifest/cleanup safety.
+  bin_dir="$runtime_root/node_modules/.bin"
+  if [[ -L "$bin_dir" ]]; then
+    return 3
+  fi
+  if [[ -e "$bin_dir" ]]; then
+    [[ -d "$bin_dir" ]] || return 4
+    rm -rf "$bin_dir"
+  fi
+  python3 - "$runtime_root/node_modules" <<'PYRUNTIMEDEPS'
+import os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+if root.is_symlink() or not root.is_dir():
+    raise SystemExit(2)
+for base, directories, files in os.walk(root, topdown=True, followlinks=False):
+    base = pathlib.Path(base)
+    for name in [*directories, *files]:
+        if (base / name).is_symlink():
+            raise SystemExit(3)
+PYRUNTIMEDEPS
+}
+
 HANDOFF_DIR="$ROOT/v2/handoff"
 [[ -d "$HANDOFF_DIR" && ! -L "$HANDOFF_DIR" ]] || { echo "REFUSED reason=handoff_directory_unsafe" >&2; exit 2; }
 CURRENT_HANDOFF_SCRIPT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_SCRIPT' "$AGENT_PLIST" 2>/dev/null || true)"
@@ -341,10 +371,11 @@ cp "$REPO_ROOT/scripts/v2_handoff_runtime.mjs" "$STAGE_RUNTIME/v2_handoff_runtim
 chmod 700 "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
 cp -R "$HANDOFF_SOURCE_ROOT/dist" "$STAGE_RUNTIME/handoff-root/dist"
 cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" "$STAGE_RUNTIME/handoff-root/"
-(
-  cd "$STAGE_RUNTIME/handoff-root"
-  npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null
-) || { rm -rf "$STAGE_RUNTIME"; echo "REFUSED reason=handoff_runtime_dependencies_install_failed" >&2; exit 2; }
+install_handoff_runtime_dependencies "$STAGE_RUNTIME/handoff-root" || {
+  rm -rf "$STAGE_RUNTIME"
+  echo "REFUSED reason=handoff_runtime_dependencies_install_or_symlink_validation_failed" >&2
+  exit 2
+}
 "$HANDOFF_RUNTIME_COMMAND_RESOLVED" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); for (const k of ["ExecutionHandoffState","InheritedFdNativeRuntimeProvider","SignedFileHandoffCheckpointStore","SpawnedWebRtcRuntimeProvider","TakeoverBroker","claimHandoffOwner","createHandoffOwner"]) if (!(k in m)) throw new Error(`missing ${k}`);' "$STAGE_RUNTIME/handoff-root/dist/index.js" || {
   rm -rf "$STAGE_RUNTIME"
   echo "REFUSED reason=staged_handoff_runtime_import_failed" >&2
@@ -420,8 +451,8 @@ if [[ ! -f "$ROLLBACK/handoff/runtime-generation/handoff-root/dist/index.js" \
   rm -rf "$ROLLBACK/handoff/runtime-generation/handoff-root/dist" "$ROLLBACK/handoff/runtime-generation/handoff-root/node_modules"
   cp -R "$HANDOFF_SOURCE_ROOT/dist" "$ROLLBACK/handoff/runtime-generation/handoff-root/dist"
   cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" "$ROLLBACK/handoff/runtime-generation/handoff-root/"
-  (cd "$ROLLBACK/handoff/runtime-generation/handoff-root" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null) || {
-    echo "REFUSED reason=rollback_handoff_dependencies_install_failed rollback=$ROLLBACK" >&2
+  install_handoff_runtime_dependencies "$ROLLBACK/handoff/runtime-generation/handoff-root" || {
+    echo "REFUSED reason=rollback_handoff_dependencies_install_or_symlink_validation_failed rollback=$ROLLBACK" >&2
     exit 2
   }
 fi
