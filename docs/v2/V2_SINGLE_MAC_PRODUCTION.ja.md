@@ -63,9 +63,9 @@ signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します
 成功する upgrade の順序は次です。
 
 1. CUMG/Handoff source provenance、quarantine=0、loaded service、Agent-owned Handoff idle を locator/owner data を出さずに確認;
-2. 1つの merged CUMG commit から paired binaries を build し、exact reviewed Handoff `dist` と CUMG runtime host script から private `runtime-<cumg>-<handoff>` generation を stage;
+2. 1つの merged CUMG commit から paired binaries を build し、exact reviewed Handoff `dist` / `package.json` / lockfile と CUMG runtime host script から private `runtime-<cumg>-<handoff>` generation を stage。lockfile-pinned production dependency だけを lifecycle script 無効で導入し、service を止める前に configured Node executable で staged entrypoint の import 成功を確認;
 3. Handoff host helper を新 generation へ copy して stable sign。live helper は in-place 変更しない;
-4. old binaries/config、Handoff env、helper copy、self-contained old Handoff code generation を private rollback bundle に保存。authoritative Hub/Agent state は drain 後だけ保存;
+4. old binaries/config、Handoff env、helper copy、runtime dependency を含む self-contained old Handoff generation を private rollback bundle に保存。dependency が欠けた archive は external-runtime reference のまま扱い、その runtime の cleanup を許可しない。authoritative Hub/Agent state は drain 後だけ保存;
 5. Hub を先に signal して admission close/drain、Hub/Agent/signer unload 後に stopped quarantine を再確認;
 6. stopped 状態で private Handoff env と Agent plist を staged generation へ atomic retarget し、paired CUMG binaries を atomic replace;
 7. merged CUMG source commit、exact Hub/Agent application-schema version、package version、binary SHA-256 を持つ schema 2 `runtime-manifest.json` を作成;

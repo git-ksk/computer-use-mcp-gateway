@@ -43,6 +43,7 @@ command -v codesign >/dev/null || { echo "REFUSED reason=codesign_missing" >&2; 
 command -v security >/dev/null || { echo "REFUSED reason=security_missing" >&2; exit 2; }
 command -v openssl >/dev/null || { echo "REFUSED reason=openssl_missing" >&2; exit 2; }
 command -v plutil >/dev/null || { echo "REFUSED reason=plutil_missing" >&2; exit 2; }
+command -v npm >/dev/null || { echo "REFUSED reason=npm_missing" >&2; exit 2; }
 [[ -x /usr/libexec/PlistBuddy ]] || { echo "REFUSED reason=plistbuddy_missing" >&2; exit 2; }
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "REFUSED reason=not_git_checkout" >&2; exit 2; }
@@ -205,6 +206,10 @@ HANDOFF_SOURCE_ROOT="${CUMG_V2_HANDOFF_SOURCE_ROOT:-$CONFIGURED_HANDOFF_ROOT}"
 [[ -f "$HANDOFF_SOURCE_ROOT/dist/index.js" && ! -L "$HANDOFF_SOURCE_ROOT/dist" ]] || {
   echo "REFUSED reason=handoff_dist_missing_or_unsafe" >&2; exit 2;
 }
+[[ -f "$HANDOFF_SOURCE_ROOT/package.json" && ! -L "$HANDOFF_SOURCE_ROOT/package.json" \
+    && -f "$HANDOFF_SOURCE_ROOT/package-lock.json" && ! -L "$HANDOFF_SOURCE_ROOT/package-lock.json" ]] || {
+  echo "REFUSED reason=handoff_package_lock_missing_or_unsafe" >&2; exit 2;
+}
 [[ "$(git -C "$HANDOFF_SOURCE_ROOT" branch --show-current)" == "main" ]] || {
   echo "REFUSED reason=handoff_branch_not_main" >&2; exit 2;
 }
@@ -294,6 +299,11 @@ stable_codesign "target/release/v2_agent" "com.github.git-ksk.cumg-v2-agent" || 
   echo "REFUSED reason=agent_stable_codesign_failed" >&2; exit 2;
 }
 
+HANDOFF_RUNTIME_COMMAND="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_COMMAND' "$AGENT_PLIST" 2>/dev/null || true)"
+[[ "$HANDOFF_RUNTIME_COMMAND" == /* && -x "$HANDOFF_RUNTIME_COMMAND" && ! -L "$HANDOFF_RUNTIME_COMMAND" ]] || {
+  echo "REFUSED reason=handoff_runtime_command_missing_or_unsafe" >&2; exit 2;
+}
+
 HANDOFF_DIR="$ROOT/v2/handoff"
 [[ -d "$HANDOFF_DIR" && ! -L "$HANDOFF_DIR" ]] || { echo "REFUSED reason=handoff_directory_unsafe" >&2; exit 2; }
 CURRENT_HANDOFF_SCRIPT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_SCRIPT' "$AGENT_PLIST" 2>/dev/null || true)"
@@ -317,6 +327,16 @@ chmod 700 "$STAGE_RUNTIME" "$STAGE_RUNTIME/handoff-root"
 cp "$REPO_ROOT/scripts/v2_handoff_runtime.mjs" "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
 chmod 700 "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
 cp -R "$HANDOFF_SOURCE_ROOT/dist" "$STAGE_RUNTIME/handoff-root/dist"
+cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" "$STAGE_RUNTIME/handoff-root/"
+(
+  cd "$STAGE_RUNTIME/handoff-root"
+  npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null
+) || { rm -rf "$STAGE_RUNTIME"; echo "REFUSED reason=handoff_runtime_dependencies_install_failed" >&2; exit 2; }
+"$HANDOFF_RUNTIME_COMMAND" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); for (const k of ["ExecutionHandoffState","InheritedFdNativeRuntimeProvider","SignedFileHandoffCheckpointStore","SpawnedWebRtcRuntimeProvider","TakeoverBroker","claimHandoffOwner","createHandoffOwner"]) if (!(k in m)) throw new Error(`missing ${k}`);' "$STAGE_RUNTIME/handoff-root/dist/index.js" || {
+  rm -rf "$STAGE_RUNTIME"
+  echo "REFUSED reason=staged_handoff_runtime_import_failed" >&2
+  exit 2
+}
 NEW_HANDOFF_HELPERS=""
 while IFS=$'\t' read -r key identifier helper; do
   [[ -n "$helper" ]] || continue
@@ -381,10 +401,21 @@ done <<< "$HANDOFF_HELPERS"
 cp -p "$HANDOFF_ENV_FILE" "$ROLLBACK/handoff/managed-runtime.env"
 chmod 600 "$ROLLBACK/handoff/managed-runtime.env"
 cp -R "$CURRENT_HANDOFF_RUNTIME" "$ROLLBACK/handoff/runtime-generation"
-if [[ ! -f "$ROLLBACK/handoff/runtime-generation/handoff-root/dist/index.js" ]]; then
+if [[ ! -f "$ROLLBACK/handoff/runtime-generation/handoff-root/dist/index.js" \
+      || ! -f "$ROLLBACK/handoff/runtime-generation/handoff-root/node_modules/werift/package.json" ]]; then
   mkdir -p "$ROLLBACK/handoff/runtime-generation/handoff-root"
+  rm -rf "$ROLLBACK/handoff/runtime-generation/handoff-root/dist" "$ROLLBACK/handoff/runtime-generation/handoff-root/node_modules"
   cp -R "$HANDOFF_SOURCE_ROOT/dist" "$ROLLBACK/handoff/runtime-generation/handoff-root/dist"
+  cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" "$ROLLBACK/handoff/runtime-generation/handoff-root/"
+  (cd "$ROLLBACK/handoff/runtime-generation/handoff-root" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null) || {
+    echo "REFUSED reason=rollback_handoff_dependencies_install_failed rollback=$ROLLBACK" >&2
+    exit 2
+  }
 fi
+[[ -f "$ROLLBACK/handoff/runtime-generation/handoff-root/node_modules/werift/package.json" ]] || {
+  echo "REFUSED reason=rollback_handoff_runtime_not_self_contained rollback=$ROLLBACK" >&2
+  exit 2
+}
 python3 - "$HEAD" "$HANDOFF_HEAD" "$ROLLBACK/handoff/runtime-generation" > "$ROLLBACK/handoff/runtime-generation/runtime-generation-manifest.json" <<'PYARCHIVE'
 import hashlib, json, pathlib, sys
 cumg, handoff, root = sys.argv[1:]

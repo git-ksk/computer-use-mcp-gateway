@@ -63,9 +63,9 @@ For signing, prefer the exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT`. The d
 A successful upgrade performs this sequence:
 
 1. prove CUMG and Handoff source provenance, quarantine=0, loaded services, and an idle Agent-owned Handoff status without printing locator/owner data;
-2. build all paired CUMG binaries from one merged CUMG commit and stage a private `runtime-<cumg>-<handoff>` Handoff code generation from the exact reviewed Handoff `dist` plus the CUMG runtime host script;
+2. build all paired CUMG binaries from one merged CUMG commit and stage a private `runtime-<cumg>-<handoff>` Handoff generation from the exact reviewed Handoff `dist`, `package.json`, and lockfile plus the CUMG runtime host script; install only lockfile-pinned production dependencies with lifecycle scripts disabled and prove the staged entrypoint imports under the configured Node executable before any service is stopped;
 3. copy and stable-sign Handoff host helper(s) into that new generation; the live helper is not modified in place;
-4. create a private rollback bundle containing old binaries/configuration, the Handoff env file, helper copies, and a self-contained copy of the old Handoff code generation; authoritative Hub/Agent state is copied only after drain;
+4. create a private rollback bundle containing old binaries/configuration, the Handoff env file, helper copies, and a self-contained old Handoff generation including its runtime dependencies; an archive missing those dependencies remains an external-runtime reference and must not permit cleanup of that runtime; authoritative Hub/Agent state is copied only after drain;
 5. signal Hub first to close admission and drain, then unload Hub/Agent/signer and re-check stopped quarantine state;
 6. while stopped, atomically retarget the private Handoff env and Agent plist to the staged generation, then atomically replace the paired CUMG binaries;
 7. write `runtime-manifest.json` schema 2 with the merged CUMG source commit, exact Hub/Agent application-schema version, package version, and binary SHA-256 identities;
