@@ -94,6 +94,18 @@ function exactWindow(value) {
   };
 }
 
+function terminalPtyBinding(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (typeof value.session_id !== "string" || !/^[0-9a-f]{32}$/.test(value.session_id)
+    || !positiveInt(value.session_generation)
+    || !isBinding(value.principal_binding)) return undefined;
+  return {
+    sessionId: value.session_id,
+    sessionGeneration: value.session_generation,
+    principalBinding: value.principal_binding,
+  };
+}
+
 function positiveInt(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
@@ -267,6 +279,126 @@ export class WebRtcHandoffSurface {
     if (!match) return undefined;
     if (match[1] === "webrtc-connect") return "connect";
     return "complete";
+  }
+}
+
+export class TerminalPtyHandoffBridge {
+  constructor(api) {
+    if (typeof api.ExperimentalTerminalPtyAuthority !== "function") {
+      throw new Error("experimental Terminal PTY Handoff runtime unavailable");
+    }
+    this.api = api;
+    this.binding = undefined;
+    this.gate = undefined;
+  }
+
+  bind(request) {
+    const binding = terminalPtyBinding(request.terminal_pty);
+    if (!binding) return { ok: false, code: "terminal_binding_invalid" };
+    if (this.binding) {
+      if (this.binding.sessionId !== binding.sessionId
+        || this.binding.sessionGeneration !== binding.sessionGeneration
+        || this.binding.principalBinding !== binding.principalBinding) {
+        return { ok: false, code: "terminal_binding_mismatch" };
+      }
+      return { ok: true, status: this.gate.getStatus() };
+    }
+    const unavailableDrain = async () => { throw new Error("external CUMG drain handshake required"); };
+    this.binding = binding;
+    this.gate = new this.api.ExperimentalTerminalPtyAuthority(
+      binding,
+      { drainAgentWrites: unavailableDrain, drainHumanWrites: unavailableDrain },
+    );
+    return { ok: true, status: this.gate.getStatus() };
+  }
+
+  require(request) {
+    const binding = terminalPtyBinding(request.terminal_pty);
+    if (!binding || !this.binding || !this.gate
+      || binding.sessionId !== this.binding.sessionId
+      || binding.sessionGeneration !== this.binding.sessionGeneration
+      || binding.principalBinding !== this.binding.principalBinding) {
+      throw new Error("terminal binding unavailable");
+    }
+    return binding;
+  }
+
+  handle(request) {
+    try {
+      if (request.action === "terminal_bind") return this.bind(request);
+      if (request.action === "terminal_status") {
+        return { ok: true, status: this.gate?.getStatus() ?? null };
+      }
+      if (request.action === "terminal_release_closed") {
+        this.require(request);
+        const status = this.gate.getStatus();
+        if (status.sessionAlive || status.interventionStatus !== null || status.authority !== "none") {
+          return { ok: false, code: "terminal_release_rejected" };
+        }
+        this.binding = undefined;
+        this.gate = undefined;
+        return { ok: true, status: null };
+      }
+      const binding = this.require(request);
+      switch (request.action) {
+      case "terminal_agent_input":
+        this.gate.assertAgentInput(binding); return { ok: true };
+      case "terminal_agent_observe":
+        this.gate.assertAgentObservation(binding); return { ok: true };
+      case "terminal_agent_resize":
+        this.gate.assertAgentResize(binding); return { ok: true };
+      case "terminal_begin_fence": {
+        const active = this.gate.beginFence(binding);
+        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+      }
+      case "terminal_claim_human": {
+        const active = this.gate.claimHumanAfterAgentDrain(binding, request.intervention_id, request.epoch);
+        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+      }
+      case "terminal_human_input":
+        this.gate.assertHumanInput(binding, request.intervention_id, request.epoch); return { ok: true };
+      case "terminal_human_observe":
+        this.gate.assertHumanObservation(binding, request.intervention_id, request.epoch); return { ok: true };
+      case "terminal_human_resize":
+        this.gate.assertHumanResize(binding, request.intervention_id, request.epoch); return { ok: true };
+      case "terminal_human_disconnect":
+        return { ok: true, status: this.gate.noteHumanDisconnect(binding, request.intervention_id, request.epoch) };
+      case "terminal_done_fence": {
+        const active = this.gate.markHumanDoneFence(binding, request.intervention_id, request.epoch);
+        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+      }
+      case "terminal_confirm_human_drain": {
+        const active = this.gate.confirmHumanWritesDrained(binding, request.intervention_id, request.epoch);
+        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+      }
+      case "terminal_verify": {
+        if (typeof request.satisfied !== "boolean") return { ok: false, code: "terminal_verification_invalid" };
+        const active = this.gate.reportVerification(binding, request.intervention_id, request.epoch, request.satisfied);
+        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+      }
+      case "terminal_resume": {
+        const decision = this.gate.resumeAgent(binding, request.intervention_id, request.epoch);
+        return {
+          ok: true,
+          resume_policy: decision.resumePolicy,
+          epoch: decision.epoch,
+          session_alive: decision.sessionAlive,
+          agent_state_sync_required: decision.agentStateSynchronizationRequired,
+        };
+      }
+      case "terminal_ack_state_sync":
+        this.gate.acknowledgeAgentStateSynchronization(binding); return { ok: true };
+      case "terminal_session_exit":
+        return { ok: true, status: this.gate.noteSessionExit(binding) };
+      default:
+        return { ok: false, code: "terminal_action_unsupported" };
+      }
+    } catch (error) {
+      const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,80}$/.test(error.code)
+        ? error.code.toLowerCase()
+        : "terminal_action_rejected";
+      return { ok: false, code };
+    }
   }
 }
 
@@ -698,7 +830,14 @@ export class HandoffBridge {
 
 async function loadHandoff(root) {
   const modulePath = path.join(root, "dist", "index.js");
-  return import(pathToFileURL(modulePath).href);
+  const terminalPath = path.join(root, "dist", "experimental", "terminal-pty.js");
+  const core = await import(pathToFileURL(modulePath).href);
+  let terminal = {};
+  try { terminal = await import(pathToFileURL(terminalPath).href); }
+  catch (error) {
+    if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+  }
+  return { ...core, ...terminal };
 }
 
 function privateKey(pathname) {
@@ -752,14 +891,16 @@ function serve(socketPath, bridge) {
 }
 
 
-export async function serveStdio(bridge, input = process.stdin, output = process.stdout) {
+export async function serveStdio(bridge, input = process.stdin, output = process.stdout, terminalBridge = undefined) {
   const lines = createInterface({ input, crlfDelay: Infinity });
   for await (const line of lines) {
     if (Buffer.byteLength(line, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime request too large");
     let response;
     try {
       const request = JSON.parse(line);
-      response = typeof bridge.handleManaged === "function" ? bridge.handleManaged(request) : bridge.handle(request);
+      response = typeof request?.action === "string" && request.action.startsWith("terminal_")
+        ? (terminalBridge?.handle(request) ?? { ok: false, code: "terminal_runtime_unavailable" })
+        : (typeof bridge.handleManaged === "function" ? bridge.handleManaged(request) : bridge.handle(request));
     } catch { response = { ok: false }; }
     const encoded = JSON.stringify(response);
     if (Buffer.byteLength(encoded, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime response too large");
@@ -894,6 +1035,9 @@ export async function runCli(argv = process.argv) {
   ) ?? path.join(path.dirname(checkpointPath), "audit", "expired-recovery-abandonment.jsonl");
   const abandonmentAudit = new AppendOnlyAbandonmentAudit(abandonmentAuditPath);
   const bridge = new HandoffBridge(api, store, Date.now, humanSurface, abandonmentAudit);
+  const terminalBridge = typeof api.ExperimentalTerminalPtyAuthority === "function"
+    ? new TerminalPtyHandoffBridge(api)
+    : undefined;
   if (command === "serve") {
     const socketPath = required(options, "socket", "CUMG_V2_OPERATOR_HANDOFF_SOCKET");
     serve(socketPath, bridge);
@@ -904,7 +1048,7 @@ export async function runCli(argv = process.argv) {
   let surfaceServer;
   if (surfaceBind && requestBaseUrl) surfaceServer = serveSurface(surfaceBind, requestBaseUrl, bridge);
   try {
-    await serveStdio(bridge);
+    await serveStdio(bridge, process.stdin, process.stdout, terminalBridge);
   } finally {
     await bridge.shutdown();
     if (surfaceServer) await new Promise((resolve) => surfaceServer.close(resolve));
