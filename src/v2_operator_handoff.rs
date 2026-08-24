@@ -1,9 +1,10 @@
 //! Bounded transport adapters between CUMG and canonical `mcp-execution-handoff` semantics.
 //!
-//! The managed runtime transport is owned by the Hub process and uses stdio, so normal Agent
-//! admission no longer depends on the acceptance-only Unix bridge. The Unix adapter remains a
-//! compatibility/regression harness. Neither transport carries CUMG grants, operation payloads or
-//! results, screenshots, clipboard data, Human input, credentials, or recovery authority.
+//! The managed runtime transport is process-local and uses stdio. #152 is migrating normal
+//! ownership from the Hub host to the controlled Agent device so OS capture/input permissions stay
+//! with the execution surface. The Unix adapter remains a compatibility/regression harness.
+//! Neither transport carries CUMG grants, operation payloads or results, screenshots, clipboard
+//! data, Human input, credentials, or recovery authority.
 
 use crate::{
     v2_m0::{DeviceCommand, InputTarget, PointerTarget, ScrollTarget},
