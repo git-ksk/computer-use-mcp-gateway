@@ -955,7 +955,9 @@ mod tests {
     fn close_contains_nohup_background_descendant() {
         use std::fs;
 
-        let shell = Path::new("/bin/sh");
+        let Ok(shell) = fs::canonicalize("/bin/sh") else {
+            return;
+        };
         let sleep_executable = ["/bin/sleep", "/usr/bin/sleep"]
             .into_iter()
             .find(|candidate| Path::new(candidate).is_file());
@@ -980,7 +982,7 @@ mod tests {
         let pid_file = temp.join("background.pid");
         let command =
             format!("{nohup} {sleep_executable} 3 >/dev/null 2>&1 & echo $! > \"$PID_FILE\"; wait");
-        let mut spawn = config(shell, &temp);
+        let mut spawn = config(&shell, &temp);
         spawn.args = vec![OsString::from("-c"), OsString::from(command)];
         spawn.env.push((
             OsString::from("PID_FILE"),
@@ -1024,7 +1026,9 @@ mod tests {
     fn natural_root_exit_contains_remaining_session_members() {
         use std::fs;
 
-        let shell = Path::new("/bin/sh");
+        let Ok(shell) = fs::canonicalize("/bin/sh") else {
+            return;
+        };
         let sleep_executable = ["/bin/sleep", "/usr/bin/sleep"]
             .into_iter()
             .find(|candidate| Path::new(candidate).is_file());
@@ -1050,7 +1054,7 @@ mod tests {
         let command = format!(
             "{nohup} {sleep_executable} 3 >/dev/null 2>&1 & echo $! > \"$PID_FILE\"; exit 0"
         );
-        let mut spawn = config(shell, &temp);
+        let mut spawn = config(&shell, &temp);
         spawn.args = vec![OsString::from("-c"), OsString::from(command)];
         spawn.env.push((
             OsString::from("PID_FILE"),
