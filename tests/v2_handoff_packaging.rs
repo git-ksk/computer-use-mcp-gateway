@@ -51,6 +51,9 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(upgrade.contains("dist/experimental/terminal-pty.js"));
     assert!(upgrade.contains("ExperimentalTerminalPtyAuthority"));
     assert!(upgrade.contains("staged_terminal_pty_runtime_import_failed"));
+    assert!(upgrade.contains("dist/experimental/terminal-webrtc.js"));
+    assert!(upgrade.contains("ExperimentalTerminalWebRtcTakeover"));
+    assert!(upgrade.contains("staged_terminal_webrtc_runtime_import_failed"));
     assert!(upgrade.contains("HANDOFF_RUNTIME_COMMAND_RESOLVED"));
     assert!(upgrade.contains("os.path.realpath"));
     assert!(upgrade.contains("node_modules/werift/package.json"));

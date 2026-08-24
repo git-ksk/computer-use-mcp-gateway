@@ -3,14 +3,17 @@
 //! The managed runtime transport is process-local and uses stdio. #152 is migrating normal
 //! ownership from the Hub host to the controlled Agent device so OS capture/input permissions stay
 //! with the execution surface. The Unix adapter remains a compatibility/regression harness.
-//! Neither transport carries CUMG grants, operation payloads or results, screenshots, clipboard
-//! data, Human input, credentials, or recovery authority.
+//! The generic authority transport carries no CUMG grants, operation payloads/results, screenshots,
+//! clipboard data, Human input, credentials, or recovery authority. Experimental Terminal/PTY
+//! WebRTC dogfood uses a separate bounded process-local stdio lane for PTY bytes; that lane is never
+//! serialized into generic Handoff checkpoints, status, diagnostics, grants, or recovery state.
 
 use crate::{
     v2_m0::{DeviceCommand, InputTarget, PointerTarget, ScrollTarget},
     v2_m0_trust::AuthenticatedClientPrincipal,
 };
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -288,6 +291,24 @@ pub(crate) struct TerminalPtyResumeReceipt {
     pub epoch: u64,
     pub session_alive: bool,
     pub agent_state_sync_required: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalPtyTransportStatus {
+    pub transport_ready: bool,
+    pub human_active: bool,
+    pub disconnected: bool,
+    pub completed: bool,
+    pub faulted: bool,
+    pub queued_events: u32,
+}
+
+#[allow(dead_code)]
+pub(crate) enum TerminalPtyTransportEvent {
+    Input(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    Done,
 }
 
 #[allow(dead_code)]
@@ -588,6 +609,177 @@ impl ManagedOperatorHandoffAuthority {
         }
     }
 
+    #[allow(dead_code)] // #48 experimental/internal until Terminal Handoff graduates from dogfood.
+    pub(crate) async fn terminal_transport_start(
+        &self,
+        binding: TerminalPtyHandoffBinding,
+        intervention: &TerminalPtyInterventionRef,
+    ) -> Result<String, HandoffControlError> {
+        if !valid_terminal_intervention(&intervention.intervention_id, intervention.epoch) {
+            return Err(HandoffControlError::Protocol);
+        }
+        let response = self
+            .terminal_transport_exchange(&ManagedTerminalTransportRequest::Start {
+                terminal_pty: binding,
+                intervention_id: intervention.intervention_id.clone(),
+                epoch: intervention.epoch,
+            })
+            .await?;
+        let locator = response.locator.ok_or(HandoffControlError::Protocol)?;
+        if locator.len() > 2048
+            || locator
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            || !(locator.starts_with("https://") || locator.starts_with("http://127.0.0.1:"))
+        {
+            self.fault().await;
+            return Err(HandoffControlError::Protocol);
+        }
+        Ok(locator)
+    }
+
+    #[allow(dead_code)] // #48 experimental/internal until Terminal Handoff graduates from dogfood.
+    pub(crate) async fn terminal_transport_status(
+        &self,
+        binding: TerminalPtyHandoffBinding,
+    ) -> Result<TerminalPtyTransportStatus, HandoffControlError> {
+        let response = self
+            .terminal_transport_exchange(&ManagedTerminalTransportRequest::Status {
+                terminal_pty: binding,
+            })
+            .await?;
+        let status = response
+            .transport_status
+            .ok_or(HandoffControlError::Protocol)?;
+        Ok(TerminalPtyTransportStatus {
+            transport_ready: status.transport_ready,
+            human_active: status.human_active,
+            disconnected: status.disconnected,
+            completed: status.completed,
+            faulted: status.faulted,
+            queued_events: status.queued_events,
+        })
+    }
+
+    #[allow(dead_code)] // #48 experimental/internal until Terminal Handoff graduates from dogfood.
+    pub(crate) async fn terminal_transport_activate(
+        &self,
+        binding: TerminalPtyHandoffBinding,
+        intervention: &TerminalPtyInterventionRef,
+    ) -> Result<(), HandoffControlError> {
+        self.terminal_transport_exchange(&ManagedTerminalTransportRequest::Activate {
+            terminal_pty: binding,
+            intervention_id: intervention.intervention_id.clone(),
+            epoch: intervention.epoch,
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // #48 experimental/internal until Terminal Handoff graduates from dogfood.
+    pub(crate) async fn terminal_transport_next_event(
+        &self,
+        binding: TerminalPtyHandoffBinding,
+        intervention: &TerminalPtyInterventionRef,
+    ) -> Result<Option<TerminalPtyTransportEvent>, HandoffControlError> {
+        let response = self
+            .terminal_transport_exchange(&ManagedTerminalTransportRequest::NextEvent {
+                terminal_pty: binding,
+                intervention_id: intervention.intervention_id.clone(),
+                epoch: intervention.epoch,
+            })
+            .await?;
+        let Some(event) = response.event else {
+            return Ok(None);
+        };
+        match event {
+            ManagedTerminalTransportEvent::Input { data_base64 } => {
+                if data_base64.len() > 2800 {
+                    self.fault().await;
+                    return Err(HandoffControlError::Protocol);
+                }
+                let bytes = STANDARD
+                    .decode(data_base64.as_bytes())
+                    .map_err(|_| HandoffControlError::Protocol)?;
+                if bytes.is_empty()
+                    || bytes.len() > 2 * 1024
+                    || STANDARD.encode(&bytes) != data_base64
+                {
+                    self.fault().await;
+                    return Err(HandoffControlError::Protocol);
+                }
+                Ok(Some(TerminalPtyTransportEvent::Input(bytes)))
+            }
+            ManagedTerminalTransportEvent::Resize { rows, cols }
+                if (2..=200).contains(&rows) && (2..=400).contains(&cols) =>
+            {
+                Ok(Some(TerminalPtyTransportEvent::Resize { rows, cols }))
+            }
+            ManagedTerminalTransportEvent::Done => Ok(Some(TerminalPtyTransportEvent::Done)),
+            ManagedTerminalTransportEvent::Resize { .. } => {
+                self.fault().await;
+                Err(HandoffControlError::Protocol)
+            }
+        }
+    }
+
+    #[allow(dead_code)] // #48 experimental/internal until Terminal Handoff graduates from dogfood.
+    pub(crate) async fn terminal_transport_output(
+        &self,
+        binding: TerminalPtyHandoffBinding,
+        intervention: &TerminalPtyInterventionRef,
+        bytes: &[u8],
+    ) -> Result<(), HandoffControlError> {
+        if bytes.is_empty() || bytes.len() > 2 * 1024 {
+            return Err(HandoffControlError::Protocol);
+        }
+        self.terminal_transport_exchange(&ManagedTerminalTransportRequest::Output {
+            terminal_pty: binding,
+            intervention_id: intervention.intervention_id.clone(),
+            epoch: intervention.epoch,
+            data_base64: STANDARD.encode(bytes),
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // #48 experimental/internal until Terminal Handoff graduates from dogfood.
+    pub(crate) async fn terminal_transport_revoke(
+        &self,
+        binding: TerminalPtyHandoffBinding,
+        intervention: &TerminalPtyInterventionRef,
+    ) -> Result<(), HandoffControlError> {
+        self.terminal_transport_exchange(&ManagedTerminalTransportRequest::Revoke {
+            terminal_pty: binding,
+            intervention_id: intervention.intervention_id.clone(),
+            epoch: intervention.epoch,
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // #48 experimental/internal until Terminal Handoff graduates from dogfood.
+    async fn terminal_transport_exchange(
+        &self,
+        request: &ManagedTerminalTransportRequest,
+    ) -> Result<ManagedTerminalTransportResponse, HandoffControlError> {
+        let value = self
+            .exchange_value(request)
+            .await
+            .map_err(map_control_transport_error)?;
+        let response: ManagedTerminalTransportResponse = match serde_json::from_value(value) {
+            Ok(response) => response,
+            Err(_) => {
+                self.fault().await;
+                return Err(HandoffControlError::Protocol);
+            }
+        };
+        if !response.ok {
+            return Err(HandoffControlError::Rejected);
+        }
+        Ok(response)
+    }
+
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
         if state.faulted {
@@ -855,6 +1047,86 @@ struct ManagedTerminalPtyResponse {
     session_alive: Option<bool>,
     #[serde(default)]
     agent_state_sync_required: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize)]
+#[serde(tag = "action")]
+enum ManagedTerminalTransportRequest {
+    #[serde(rename = "terminal_transport_start")]
+    Start {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_transport_status")]
+    Status {
+        terminal_pty: TerminalPtyHandoffBinding,
+    },
+    #[serde(rename = "terminal_transport_activate")]
+    Activate {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_transport_next_event")]
+    NextEvent {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+    #[serde(rename = "terminal_transport_output")]
+    Output {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+        data_base64: String,
+    },
+    #[serde(rename = "terminal_transport_revoke")]
+    Revoke {
+        terminal_pty: TerminalPtyHandoffBinding,
+        intervention_id: String,
+        epoch: u64,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ManagedTerminalTransportResponse {
+    ok: bool,
+    #[serde(default)]
+    locator: Option<String>,
+    #[serde(default)]
+    transport_status: Option<ManagedTerminalTransportStatus>,
+    #[serde(default)]
+    event: Option<ManagedTerminalTransportEvent>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedTerminalTransportStatus {
+    transport_ready: bool,
+    human_active: bool,
+    disconnected: bool,
+    completed: bool,
+    faulted: bool,
+    queued_events: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(tag = "kind")]
+enum ManagedTerminalTransportEvent {
+    #[serde(rename = "input")]
+    Input {
+        #[serde(rename = "dataBase64")]
+        data_base64: String,
+    },
+    #[serde(rename = "resize")]
+    Resize { rows: u16, cols: u16 },
+    #[serde(rename = "done")]
+    Done,
 }
 
 #[derive(Debug, Deserialize)]
