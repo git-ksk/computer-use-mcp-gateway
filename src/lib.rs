@@ -43,6 +43,8 @@ pub mod v2_operator_handoff;
 pub mod v2_reference_backend;
 pub mod v2_state_lock;
 pub(crate) mod v2_terminal_pty;
+#[cfg(all(test, unix))]
+mod v2_terminal_pty_acceptance;
 pub(crate) mod v2_terminal_pty_handoff;
 pub mod v2_tls_lifecycle;
 
