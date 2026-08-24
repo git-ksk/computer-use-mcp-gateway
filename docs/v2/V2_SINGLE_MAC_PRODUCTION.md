@@ -56,45 +56,38 @@ The example signer policy is intentionally minimal. Expand it only with exact `D
 
 ## Safe runtime upgrade
 
-`scripts/v2-single-mac-upgrade.sh` is the reviewed upgrade helper for an already-installed single-Mac profile. It refuses to proceed when:
+`scripts/v2-single-mac-upgrade.sh` is the reviewed upgrade helper for an already-installed single-Mac profile. It refuses before replacement when the CUMG checkout is not clean `main == origin/main`, the reviewed Handoff checkout is not clean `main == origin/main` at the exact `CUMG_V2_EXPECTED_HANDOFF_COMMIT`, live quarantine exists, Handoff is active/recovering/faulted, required state/services are unavailable, or the Cua/signing inputs are incomplete.
 
-- the source checkout is not clean `main == origin/main`;
-- the installed paired `v2_maint` cannot inspect authoritative state;
-- a live quarantine exists;
-- required LaunchAgents/state directories are absent;
-- the reviewed Cua version is not explicitly supplied;
-- a valid Apple code-signing identity and 10-character Team ID are not explicitly supplied;
-- the Agent Handoff env/helper paths are absent or unsafe;
-- the external signer profile is incomplete.
+For signing, prefer the exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT`. The display-name `CUMG_V2_MACOS_CODESIGN_IDENTITY` remains a compatibility fallback only when it resolves to exactly one valid certificate. The helper verifies the selected certificate's exact Team ID **before signing**, then verifies the stable identifier/Team-ID designated requirement after signing. There is no ad-hoc fallback.
 
 A successful upgrade performs this sequence:
 
-1. preflight source/state/service health;
-2. build `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, and `v2_grant_signer` from one commit, then sign `v2_agent` with the stable Agent identifier/Team-ID designated requirement;
-3. archive old binaries, service configuration, and—after drain—the authoritative stopped Hub/Agent state;
-4. signal the Hub first so admission closes and already-admitted work can drain while the Agent is still connected;
-5. unload Agent and signer only after Hub shutdown;
-6. re-check stopped authoritative state and refuse the upgrade if drain produced a quarantine;
-7. sign the configured Agent-local Handoff host helper(s) with stable Team-ID designated requirements, then atomically replace the version-paired runtime binaries;
-8. write `runtime-manifest.json` containing only package version, source commit, binary names, and SHA-256 digests;
-9. start signer -> Hub -> Agent;
-10. run `v2_doctor`; a failed post-start doctor stops the profile fail-closed and does not automatically combine old binaries with newer state.
+1. prove CUMG and Handoff source provenance, quarantine=0, loaded services, and an idle Agent-owned Handoff status without printing locator/owner data;
+2. build all paired CUMG binaries from one merged CUMG commit and stage a private `runtime-<cumg>-<handoff>` Handoff code generation from the exact reviewed Handoff `dist` plus the CUMG runtime host script;
+3. copy and stable-sign Handoff host helper(s) into that new generation; the live helper is not modified in place;
+4. create a private rollback bundle containing old binaries/configuration, the Handoff env file, helper copies, and a self-contained copy of the old Handoff code generation; authoritative Hub/Agent state is copied only after drain;
+5. signal Hub first to close admission and drain, then unload Hub/Agent/signer and re-check stopped quarantine state;
+6. while stopped, atomically retarget the private Handoff env and Agent plist to the staged generation, then atomically replace the paired CUMG binaries;
+7. write `runtime-manifest.json` schema 2 with the merged CUMG source commit, exact Hub/Agent application-schema version, package version, and binary SHA-256 identities;
+8. start signer -> Hub -> Agent and run `v2_doctor`, including the read-only Handoff status check;
+9. only after doctor is healthy, prune eligible unreferenced `runtime-*` code directories. Active runtime, legacy externally referenced rollback runtime, a bounded recent set, and any unsafe/symlink-bearing candidate are protected/refused. Checkpoint/key/env/audit/control/rollback data are outside the cleanup candidate set.
 
 Example:
 
 ```bash
 CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
-CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
+CUMG_V2_MACOS_CODESIGN_FINGERPRINT=0123456789ABCDEF0123456789ABCDEF01234567 \
 CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
+CUMG_V2_HANDOFF_SOURCE_ROOT="$HOME/x-code/mcp-execution-handoff" \
+CUMG_V2_EXPECTED_HANDOFF_COMMIT=<reviewed-40-hex-commit> \
   scripts/v2-single-mac-upgrade.sh --preflight-only
-
-CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
-CUMG_V2_MACOS_CODESIGN_IDENTITY="Apple Development: Example Name (TEAMMEMBER)" \
-CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
-  scripts/v2-single-mac-upgrade.sh
 ```
 
-The helper prints the rollback asset directory. That directory is evidence and an explicit old-binary/old-state pair. Do not restore only the old binaries over state that a newer runtime has already advanced. Recovery remains an explicit operator action.
+Run the same reviewed environment without `--preflight-only` for the cutover. After the first pinned cutover, `CUMG_V2_HANDOFF_SOURCE_ROOT` must remain an explicit reviewed checkout; the runtime's `CUMG_V2_HANDOFF_ROOT` points to immutable staged code and is no longer a development source checkout.
+
+The rollback bundle is evidence and an explicit old-binary/old-state/Handoff-code set. Do not restore old binaries alone over state advanced by a newer runtime. Post-start failure stops the new profile fail-closed and requires explicit operator recovery.
+
+Expired-recovery abandonment also writes a private append-only JSONL audit record before deleting the signed checkpoint. The record contains only timestamp, recovery epoch, prior closed recovery status, and a bounded result code. It intentionally excludes locator, process/window/context/intervention IDs, principals, action digests, TURN credentials, Human input, and payloads. If the audit append fails, abandonment is refused and recovery remains authoritative.
 
 ## `v2_doctor`
 
@@ -102,7 +95,7 @@ The helper prints the rollback asset directory. That directory is evidence and a
 
 For the standard profile it checks:
 
-- runtime manifest schema, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, and `v2_grant_signer`;
+- runtime manifest schema 2, exact Hub/Agent application-schema version, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, and `v2_grant_signer`;
 - authoritative Hub checkpoint readability and current registry/capability schema;
 - exactly one enrolled single-Mac device and current generation;
 - Agent checkpoint readability and exact Hub/Agent generation pairing;
@@ -110,7 +103,8 @@ For the standard profile it checks:
 - Hub/Agent/external-signer LaunchAgent running state and the Agent -> loopback Hub transport being established;
 - private signer socket shape/parent permissions;
 - server certificate and pinned Agent trust-root validity;
-- actual Cua Driver version against the explicit reviewed pin.
+- actual Cua Driver version against the explicit reviewed pin;
+- Agent-owned Handoff status through the private control socket. Output is limited to bounded guidance (`idle`, exact recover-reissue, exact recover-rebind-or-abandon-if-prior-surface-absent, active, or faulted) and never emits the locator or owner/intervention identifiers.
 
 JSON output is suitable for local operator automation:
 
@@ -129,7 +123,8 @@ Before declaring a single-Mac upgrade healthy, require all of the following:
 - `v2_doctor` reports `overall=healthy`;
 - a fresh authenticated Agent generation is present after restart;
 - live quarantine remains zero;
-- the runtime manifest verifies every installed paired binary;
+- the schema-2 runtime manifest verifies every installed paired binary and the exact Hub/Agent application schema;
+- Handoff reports idle with no recovery/resume/fault;
 - a harmless northbound semantic smoke reaches a durable terminal `Completed` state;
 - the old binary/state rollback pair remains retained until the operator-selected bake period completes.
 
