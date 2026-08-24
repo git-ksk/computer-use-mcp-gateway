@@ -58,18 +58,20 @@ The example signer policy is intentionally minimal. Expand it only with exact `D
 
 `scripts/v2-single-mac-upgrade.sh` is the reviewed upgrade helper for an already-installed single-Mac profile. It refuses before replacement when the CUMG checkout is not clean `main == origin/main`, the reviewed Handoff checkout is not clean `main == origin/main` at the exact `CUMG_V2_EXPECTED_HANDOFF_COMMIT`, live quarantine exists, Handoff is active/recovering/faulted, required state/services are unavailable, or the Cua/signing inputs are incomplete.
 
+The known single-Mac Hub/Agent launchd label families are mutually exclusive. Preflight refuses if two Hub labels, two Agent labels, or a Hub and Agent from different known families are loaded at the same time. During a reviewed cutover, after the configured services are drained/unloaded and before they are restarted, the helper boots out and disables the alternate known Hub/Agent labels. Their plist files are deliberately preserved for rollback/forensics; the guard never deletes them and never changes quarantine or replay state.
+
 For signing, prefer the exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT`. The display-name `CUMG_V2_MACOS_CODESIGN_IDENTITY` remains a compatibility fallback only when it resolves to exactly one valid certificate. The helper verifies the selected certificate's exact Team ID **before signing**, then verifies the stable identifier/Team-ID designated requirement after signing. There is no ad-hoc fallback.
 
 A successful upgrade performs this sequence:
 
-1. prove CUMG and Handoff source provenance, quarantine=0, loaded services, and an idle Agent-owned Handoff status without printing locator/owner data;
+1. prove CUMG and Handoff source provenance, quarantine=0, loaded services, no conflicting known Hub/Agent launchd family, and an idle Agent-owned Handoff status without printing locator/owner data;
 2. build all paired CUMG binaries from one merged CUMG commit and stage a private `runtime-<cumg>-<handoff>` Handoff generation from the exact reviewed Handoff `dist`, `package.json`, and lockfile plus the CUMG runtime host script; install only lockfile-pinned production dependencies with lifecycle scripts disabled, remove npm command-shim `.bin` links because runtime generations are symlink-free, reject any remaining dependency symlink, and prove the staged entrypoint imports under the configured Node executable before any service is stopped;
 3. copy and stable-sign Handoff host helper(s) into that new generation; the live helper is not modified in place;
 4. create a private rollback bundle containing old binaries/configuration, the Handoff env file, helper copies, and a self-contained old Handoff generation including its runtime dependencies; an archive missing those dependencies remains an external-runtime reference and must not permit cleanup of that runtime; authoritative Hub/Agent state is copied only after drain;
-5. signal Hub first to close admission and drain, then unload Hub/Agent/signer and re-check stopped quarantine state;
+5. signal Hub first to close admission and drain, then unload Hub/Agent/signer, boot out and disable alternate known Hub/Agent labels without deleting their plists, and re-check stopped quarantine state;
 6. while stopped, atomically retarget the private Handoff env and Agent plist to the staged generation, then atomically replace the paired CUMG binaries;
 7. write `runtime-manifest.json` schema 2 with the merged CUMG source commit, exact Hub/Agent application-schema version, package version, and binary SHA-256 identities;
-8. start signer -> Hub -> Agent and run `v2_doctor`, including the read-only Handoff status check;
+8. start signer -> Hub -> Agent, re-check that no conflicting known launchd family is active, and run `v2_doctor`, including the read-only Handoff status check;
 9. only after doctor is healthy, prune eligible unreferenced `runtime-*` code directories. Active runtime, legacy externally referenced rollback runtime, a bounded recent set, and any unsafe/symlink-bearing candidate are protected/refused. Checkpoint/key/env/audit/control/rollback data are outside the cleanup candidate set.
 
 Example:
