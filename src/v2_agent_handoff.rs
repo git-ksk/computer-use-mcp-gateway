@@ -168,6 +168,26 @@ impl AgentHandoffCoordinator {
                     .map_err(map_control_error)?;
                 Ok(operator_status(status))
             }
+            RemoteHandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch } => {
+                if authority.is_some() || expected_epoch == 0 {
+                    return Err(RemoteHandoffErrorCode::InvalidRequest);
+                }
+                let status = self.runtime.status().await.map_err(map_control_error)?;
+                if !status.recovery_required
+                    || !status.recovery_expired
+                    || status.recovery_epoch != Some(expected_epoch)
+                    || status.active.is_some()
+                    || status.faulted
+                {
+                    return Err(RemoteHandoffErrorCode::Rejected);
+                }
+                let status = self
+                    .runtime
+                    .control(HandoffRuntimeControl::AbandonExpiredRecovery { expected_epoch })
+                    .await
+                    .map_err(map_control_error)?;
+                Ok(operator_status(status))
+            }
             RemoteHandoffOperatorCommand::RequestResume => {
                 if authority.is_some() {
                     return Err(RemoteHandoffErrorCode::InvalidRequest);

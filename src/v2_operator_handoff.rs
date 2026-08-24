@@ -132,6 +132,12 @@ pub enum HandoffRuntimeControl {
     RebindLive {
         authority: AgentAuthorityRequest,
     },
+    /// Explicitly discard an expired recovery tombstone after the local operator
+    /// chooses not to recover the prior Human intervention. This never marks the
+    /// prior semantic action successful and never replays or resumes it.
+    AbandonExpiredRecovery {
+        expected_epoch: u64,
+    },
     RequestResume {
         intervention_id: String,
         epoch: u64,
@@ -534,6 +540,9 @@ enum ManagedWireControlRequest {
     RebindLive {
         authority: ManagedWireAuthority,
     },
+    AbandonExpiredRecovery {
+        expected_epoch: u64,
+    },
     RequestResume {
         intervention_id: String,
         epoch: u64,
@@ -651,6 +660,9 @@ fn managed_wire_control(
         HandoffRuntimeControl::RebindLive { authority } => ManagedWireControlRequest::RebindLive {
             authority: managed_wire_authority(authority)?,
         },
+        HandoffRuntimeControl::AbandonExpiredRecovery { expected_epoch } => {
+            ManagedWireControlRequest::AbandonExpiredRecovery { expected_epoch }
+        }
         HandoffRuntimeControl::RequestResume {
             intervention_id,
             epoch,

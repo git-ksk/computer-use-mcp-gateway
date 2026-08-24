@@ -42,6 +42,11 @@ enum Command {
     },
     /// Rebind a live intervention after a fresh exact-surface observation on a newer Agent generation.
     RebindLive,
+    /// Explicitly discard only an expired recovery tombstone; never replay or mark the old action successful.
+    AbandonExpiredRecovery {
+        #[arg(long)]
+        expected_epoch: u64,
+    },
     /// Arm explicit Agent resume after fresh CUMG verification reached ready_to_resume.
     RequestResume,
     /// Cancel only while Human authority has not yet been claimed.
@@ -65,6 +70,9 @@ impl From<Command> for LocalHandoffControlRequest {
                 prior_capability_revision,
             },
             Command::RebindLive => Self::RebindLive,
+            Command::AbandonExpiredRecovery { expected_epoch } => {
+                Self::AbandonExpiredRecovery { expected_epoch }
+            }
             Command::RequestResume => Self::RequestResume,
             Command::CancelBeforeHuman => Self::CancelBeforeHuman,
         }

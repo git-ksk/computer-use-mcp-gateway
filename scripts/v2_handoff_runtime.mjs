@@ -513,6 +513,22 @@ export class HandoffBridge {
   }
 
 
+  abandonExpiredRecovery(request) {
+    if (!this.recovery || !this.recoveryExpired || this.state.getActive() || this.faulted
+      || this.activeBinding || this.surfaceLocator
+      || !positiveInt(request.expected_epoch)
+      || request.expected_epoch !== this.recovery.epoch) return { ok: false };
+    // This is an explicit operator abandonment, not verification success. Durable clear happens
+    // first; if it fails the recovery remains authoritative and the runtime faults closed.
+    try { this.checkpointStore.clear(); }
+    catch { this.faulted = true; return { ok: false }; }
+    this.recovery = undefined;
+    this.recoveryExpired = false;
+    this.latestObservation = undefined;
+    this.resumeRequested = false;
+    return { ok: true };
+  }
+
   rebindLive(request) {
     if (this.recovery || this.faulted) return { ok: false };
     const active = this.state.getActive();
@@ -568,6 +584,8 @@ export class HandoffBridge {
       return this.recoverRebind(request);
     case "rebind_live":
       return this.rebindLive(request);
+    case "abandon_expired_recovery":
+      return this.abandonExpiredRecovery(request);
     case "request_resume": {
       const active = this.exactActive(request, "ready_to_resume");
       if (!active) return { ok: false };
@@ -744,6 +762,7 @@ function control(socketPath, action, options) {
   if (options.has("prior-context-id")) payload.prior_context_id = options.get("prior-context-id");
   if (options.has("prior-generation")) payload.prior_generation = Number(options.get("prior-generation"));
   if (options.has("prior-capability-revision")) payload.prior_capability_revision = Number(options.get("prior-capability-revision"));
+  if (options.has("expected-epoch")) payload.expected_epoch = Number(options.get("expected-epoch"));
   const socket = net.createConnection(socketPath);
   let data = "";
   socket.setEncoding("utf8");
@@ -758,7 +777,7 @@ export async function runCli(argv = process.argv) {
   if (!["serve", "serve-stdio"].includes(command)) {
     const socketPath = required(options, "socket", "CUMG_V2_OPERATOR_HANDOFF_SOCKET");
     const action = command.replaceAll("-", "_");
-    if (!["status", "begin", "recover_reissue", "recover_rebind", "rebind_live", "request_resume", "cancel_before_human"].includes(action)) {
+    if (!["status", "begin", "recover_reissue", "recover_rebind", "rebind_live", "abandon_expired_recovery", "request_resume", "cancel_before_human"].includes(action)) {
       throw new Error("unknown command");
     }
     control(socketPath, action, options);
