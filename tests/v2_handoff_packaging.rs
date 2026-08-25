@@ -61,6 +61,12 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(preflight.contains("os.path.realpath"));
     assert!(preflight.contains("verify_import"));
     assert!(preflight.contains("subprocess.run"));
+    assert!(preflight.contains("verify_generation"));
+    assert!(upgrade.contains("verify-generation"));
+    assert!(upgrade.contains("RUNTIME_REUSE_OK"));
+    assert!(upgrade.contains("NEW_HANDOFF_RUNTIME_CREATED"));
+    assert!(upgrade.contains("existing_handoff_host_codesign_invalid"));
+    assert!(upgrade.contains("handoff_runtime_generation_existing_validation_failed"));
     assert!(upgrade.contains("node_modules/werift/package.json"));
     assert!(upgrade.contains("install_handoff_runtime_dependencies"));
     assert!(upgrade.contains("node_modules/.bin"));
