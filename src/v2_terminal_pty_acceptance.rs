@@ -313,9 +313,10 @@ async fn physical_loopback_terminal_human_acceptance() {
     let handoff_root =
         PathBuf::from(env::var_os("CUMG_V2_HANDOFF_ROOT").expect("CUMG_V2_HANDOFF_ROOT"));
     let node = PathBuf::from(env::var_os("CUMG_V2_NODE").expect("CUMG_V2_NODE"));
+    assert!(handoff_root.join("dist/index.js").is_file());
     assert!(
         handoff_root
-            .join("dist/experimental/terminal-pty.js")
+            .join("dist/terminal-takeover/index.js")
             .is_file()
     );
     assert!(node.is_absolute());
@@ -539,14 +540,10 @@ async fn physical_webrtc_terminal_human_acceptance() {
         env::var("CUMG_V2_HANDOFF_WEBRTC_HTTP_BIND").expect("CUMG_V2_HANDOFF_WEBRTC_HTTP_BIND");
     let public_origin = env::var("CUMG_V2_HANDOFF_WEBRTC_PUBLIC_ORIGIN")
         .expect("CUMG_V2_HANDOFF_WEBRTC_PUBLIC_ORIGIN");
+    assert!(handoff_root.join("dist/index.js").is_file());
     assert!(
         handoff_root
-            .join("dist/experimental/terminal-pty.js")
-            .is_file()
-    );
-    assert!(
-        handoff_root
-            .join("dist/experimental/terminal-webrtc.js")
+            .join("dist/terminal-takeover/index.js")
             .is_file()
     );
     assert!(node.is_absolute());

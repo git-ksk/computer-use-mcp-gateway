@@ -387,42 +387,13 @@ python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
   --require-export SpawnedWebRtcRuntimeProvider \
   --require-export TakeoverBroker \
   --require-export WindowHandoffAdapter \
+  --require-export TerminalHandoffAdapter \
   --require-export claimHandoffOwner \
   --require-export createHandoffOwner || {
   rm -rf "$STAGE_RUNTIME"
   echo "REFUSED reason=staged_handoff_runtime_import_failed" >&2
   exit 2
 }
-if [[ -f "$HANDOFF_SOURCE_ROOT/dist/experimental/terminal-pty.js" ]]; then
-  [[ -f "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-pty.js" && ! -L "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-pty.js" ]] || {
-    rm -rf "$STAGE_RUNTIME"
-    echo "REFUSED reason=staged_terminal_pty_runtime_missing_or_unsafe" >&2
-    exit 2
-  }
-  python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
-    --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
-    --entrypoint "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-pty.js" \
-    --require-export ExperimentalTerminalPtyAuthority || {
-    rm -rf "$STAGE_RUNTIME"
-    echo "REFUSED reason=staged_terminal_pty_runtime_import_failed" >&2
-    exit 2
-  }
-fi
-if [[ -f "$HANDOFF_SOURCE_ROOT/dist/experimental/terminal-webrtc.js" ]]; then
-  [[ -f "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" && ! -L "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" ]] || {
-    rm -rf "$STAGE_RUNTIME"
-    echo "REFUSED reason=staged_terminal_webrtc_runtime_missing_or_unsafe" >&2
-    exit 2
-  }
-  python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
-    --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
-    --entrypoint "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" \
-    --require-export ExperimentalTerminalWebRtcTakeover || {
-    rm -rf "$STAGE_RUNTIME"
-    echo "REFUSED reason=staged_terminal_webrtc_runtime_import_failed" >&2
-    exit 2
-  }
-fi
 NEW_HANDOFF_HELPERS=""
 while IFS=$'\t' read -r key identifier helper; do
   [[ -n "$helper" ]] || continue
