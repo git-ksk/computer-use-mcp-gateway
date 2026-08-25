@@ -58,18 +58,20 @@ signer policy example は意図的に最小です。review 済み northbound pol
 
 `scripts/v2-single-mac-upgrade.sh` は導入済み single-Mac profile 用の reviewed upgrade helper です。CUMG checkout が clean な `main == origin/main` でない、review 済み Handoff checkout が clean な `main == origin/main` かつ exact `CUMG_V2_EXPECTED_HANDOFF_COMMIT` でない、live quarantine がある、Handoff が active/recovery/faulted、必須 state/service がない、Cua/signing input が不足している場合は replacement 前に拒否します。
 
+既知の single-Mac Hub/Agent launchd label family は相互排他です。Hub label が2つ、Agent label が2つ、または異なる既知 family の Hub と Agent が同時に loaded なら preflight で拒否します。reviewed cutover では configured service を drain/unload した後、restart 前に alternate の既知 Hub/Agent label を bootout + disable します。rollback/forensics 用 plist は削除せず保持し、この guard は quarantine/replay state を変更しません。
+
 signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します。display-name の `CUMG_V2_MACOS_CODESIGN_IDENTITY` は、valid certificate が exactly one に解決できる場合だけ compatibility fallback として使えます。選択 certificate の exact Team ID を **sign 前に** 検証し、sign 後も stable identifier / Team-ID designated requirement を再検証します。ad-hoc fallback はありません。
 
 成功する upgrade の順序は次です。
 
-1. CUMG/Handoff source provenance、quarantine=0、loaded service、Agent-owned Handoff idle を locator/owner data を出さずに確認;
+1. CUMG/Handoff source provenance、quarantine=0、loaded service、既知 Hub/Agent launchd family の競合なし、Agent-owned Handoff idle を locator/owner data を出さずに確認;
 2. 1つの merged CUMG commit から paired binaries を build し、exact reviewed Handoff `dist` / `package.json` / lockfile と CUMG runtime host script から private `runtime-<cumg>-<handoff>` generation を stage。lockfile-pinned production dependency だけを lifecycle script 無効で導入し、runtime generation を symlink-free に保つため npm command shim の `.bin` link を除去、残存 dependency symlink を拒否した上で、service を止める前に configured Node executable で staged entrypoint の import 成功を確認;
 3. Handoff host helper を新 generation へ copy して stable sign。live helper は in-place 変更しない;
 4. old binaries/config、Handoff env、helper copy、runtime dependency を含む self-contained old Handoff generation を private rollback bundle に保存。dependency が欠けた archive は external-runtime reference のまま扱い、その runtime の cleanup を許可しない。authoritative Hub/Agent state は drain 後だけ保存;
-5. Hub を先に signal して admission close/drain、Hub/Agent/signer unload 後に stopped quarantine を再確認;
+5. Hub を先に signal して admission close/drain、Hub/Agent/signer unload 後、alternate の既知 Hub/Agent label を plist を削除せず bootout + disable し、stopped quarantine を再確認;
 6. stopped 状態で private Handoff env と Agent plist を staged generation へ atomic retarget し、paired CUMG binaries を atomic replace;
 7. merged CUMG source commit、exact Hub/Agent application-schema version、package version、binary SHA-256 を持つ schema 2 `runtime-manifest.json` を作成;
-8. signer -> Hub -> Agent で起動し、read-only Handoff status を含む `v2_doctor` を実行;
+8. signer -> Hub -> Agent で起動し、既知 launchd family の競合がないことを再確認してから read-only Handoff status を含む `v2_doctor` を実行;
 9. doctor healthy の後だけ、eligible な未参照 `runtime-*` code directory を prune。active runtime、legacy external rollback reference、bounded recent generations、symlink/unsafe candidate は保護または拒否。checkpoint/key/env/audit/control/rollback data は cleanup candidate 外。
 
 例:

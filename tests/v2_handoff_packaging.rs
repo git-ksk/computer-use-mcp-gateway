@@ -76,3 +76,30 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(cleanup.contains("checkpoint.key"));
     assert!(cleanup.contains("managed-runtime.env"));
 }
+
+#[test]
+fn single_mac_upgrade_rejects_conflicting_launchd_families_and_retires_alternates() {
+    let upgrade = include_str!("../scripts/v2-single-mac-upgrade.sh");
+    let guard = include_str!("../scripts/v2_launchd_topology_guard.py");
+
+    assert!(upgrade.contains("v2_launchd_topology_guard.py"));
+    let preflight_exit = upgrade
+        .find("[[ \"$PRELIGHT_ONLY\" == \"1\" ]] && exit 0")
+        .unwrap();
+    let topology_check = upgrade.find("\"$LAUNCHD_TOPOLOGY_GUARD\" check").unwrap();
+    let retire_alternates = upgrade.find("retire-alternates").unwrap();
+    assert!(topology_check < preflight_exit);
+    assert!(preflight_exit < retire_alternates);
+    assert!(upgrade.contains("retire-alternates"));
+    assert!(upgrade.contains("alternate_launchd_retirement_failed"));
+    assert!(upgrade.contains("conflicting_launchd_topology"));
+    assert!(guard.contains("com.github.git-ksk.cumg-v2-hub"));
+    assert!(guard.contains("com.github.git-ksk.cumg-v2-agent"));
+    assert!(guard.contains("com.sawadakousuke.cumg-v2-hub"));
+    assert!(guard.contains("com.sawadakousuke.cumg-v2-agent"));
+    assert!(guard.contains("conflicting_launchd_labels"));
+    assert!(guard.contains("mixed_launchd_families"));
+    assert!(guard.contains("alternate_launchd_disable_failed"));
+    assert!(!guard.contains("unlink("));
+    assert!(!guard.contains("remove("));
+}

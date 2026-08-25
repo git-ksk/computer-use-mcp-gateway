@@ -135,6 +135,14 @@ DOMAIN="gui/$(id -u)"
 HUB_PLIST="$HOME/Library/LaunchAgents/$HUB_LABEL.plist"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 SIGNER_PLIST="$HOME/Library/LaunchAgents/$SIGNER_LABEL.plist"
+LAUNCHCTL_BIN="$(command -v launchctl)"
+LAUNCHD_TOPOLOGY_GUARD="$REPO_ROOT/scripts/v2_launchd_topology_guard.py"
+[[ -f "$LAUNCHD_TOPOLOGY_GUARD" && ! -L "$LAUNCHD_TOPOLOGY_GUARD" ]] || {
+  echo "REFUSED reason=launchd_topology_guard_missing_or_unsafe" >&2; exit 2;
+}
+python3 "$LAUNCHD_TOPOLOGY_GUARD" check \
+  --domain "$DOMAIN" --hub-label "$HUB_LABEL" --agent-label "$AGENT_LABEL" \
+  --launchctl "$LAUNCHCTL_BIN" || exit 2
 
 [[ -x "$BIN_DIR/v2_maint" ]] || { echo "REFUSED reason=installed_maint_missing" >&2; exit 2; }
 [[ -d "$HUB_STATE" && -d "$AGENT_STATE" ]] || { echo "REFUSED reason=state_directory_missing" >&2; exit 2; }
@@ -529,6 +537,12 @@ launchctl bootout "$DOMAIN/$AGENT_LABEL" >/dev/null 2>&1 || true
 if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
   launchctl bootout "$DOMAIN/$SIGNER_LABEL" >/dev/null 2>&1 || true
 fi
+if ! python3 "$LAUNCHD_TOPOLOGY_GUARD" retire-alternates \
+  --domain "$DOMAIN" --hub-label "$HUB_LABEL" --agent-label "$AGENT_LABEL" \
+  --launchctl "$LAUNCHCTL_BIN"; then
+  echo "REFUSED reason=alternate_launchd_retirement_failed rollback=$ROLLBACK services_stopped=1" >&2
+  exit 2
+fi
 
 # Capture the old authoritative state only after Hub admission is closed and drain completed.
 cp -R "$HUB_STATE" "$ROLLBACK/state/hub"
@@ -689,6 +703,11 @@ launchctl bootstrap "$DOMAIN" "$HUB_PLIST" || fail_poststart "hub_bootstrap"
 sleep 1
 launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" || fail_poststart "agent_bootstrap"
 sleep 2
+if ! python3 "$LAUNCHD_TOPOLOGY_GUARD" check \
+  --domain "$DOMAIN" --hub-label "$HUB_LABEL" --agent-label "$AGENT_LABEL" \
+  --launchctl "$LAUNCHCTL_BIN"; then
+  fail_poststart "conflicting_launchd_topology"
+fi
 
 DOCTOR_ARGS=(
   --hub-state-dir "$HUB_STATE"
