@@ -4,7 +4,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
+from unittest import mock
 import tempfile
 import unittest
 
@@ -80,9 +82,19 @@ class HandoffRuntimeGenerationTests(unittest.TestCase):
             mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
 
     def test_non_private_generation_root_is_refused(self):
-        os.chmod(self.root, 0o755)
-        with self.assertRaises(mod.PreflightRefusal):
-            mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
+        original_stat = Path.stat
+
+        def non_private_root_stat(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == self.root:
+                fields = list(result)
+                fields[0] = result.st_mode | stat.S_IRGRP
+                return os.stat_result(fields)
+            return result
+
+        with mock.patch.object(Path, "stat", non_private_root_stat):
+            with self.assertRaises(mod.PreflightRefusal):
+                mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
 
 
 @unittest.skipUnless(shutil.which("node"), "Node is required for runtime import preflight")
