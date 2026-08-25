@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, serveStdio } from "../v2_operator_handoff_bridge.mjs";
+import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, WebRtcHandoffSurface, serveStdio } from "../v2_operator_handoff_bridge.mjs";
 
 const HANDOFF_ROOT = process.env.CUMG_V2_HANDOFF_ROOT;
 const api = HANDOFF_ROOT
@@ -640,6 +640,53 @@ test("native Cancel after possible Human side effects enters verifying and never
   } finally {
     f.cleanup();
   }
+});
+
+
+test("CUMG WebRTC surface composes the first-class WindowHandoffAdapter with exact legacy-equivalent input policy", async () => {
+  const calls = { config: undefined, start: undefined, handle: undefined, revoked: [], unclaimed: [] };
+  class FakeWindowHandoffAdapter {
+    constructor(config) { calls.config = structuredClone(config); }
+    start(request) {
+      calls.start = structuredClone(request);
+      return "https://handoff.example/takeover/window-session-12345678";
+    }
+    handle(request, principalBinding) {
+      calls.handle = { pathname: new URL(request.url).pathname, principalBinding };
+      return Promise.resolve(new Response("ok", { status: 200 }));
+    }
+    async revoke(interventionId) { calls.revoked.push(interventionId); }
+    revokeUnclaimed(interventionId) { calls.unclaimed.push(interventionId); }
+  }
+  const surface = new WebRtcHandoffSurface(
+    { WindowHandoffAdapter: FakeWindowHandoffAdapter },
+    { publicBaseUrl: "https://handoff.example/", hostExecutable: process.execPath },
+  );
+  const locator = surface.create(
+    { id: "window-int-1", epoch: 7 },
+    {
+      principalBinding: "1".repeat(64),
+      exactWindow: { processId: 1234, windowId: 5678 },
+    },
+  );
+  assert.equal(locator, "https://handoff.example/takeover/window-session-12345678");
+  assert.deepEqual(calls.config, {
+    takeover: { enabled: true, publicBaseUrl: "https://handoff.example/", ttlMs: 300_000, reconnectIdleMs: 2_000 },
+    runtime: { hostExecutable: process.execPath },
+  });
+  assert.deepEqual(calls.start, {
+    intervention: { id: "window-int-1", epoch: 7 },
+    principalBinding: "1".repeat(64),
+    target: { processId: 1234, windowId: 5678 },
+    inputPolicy: { tap: true, scroll: true, text: true, key: true },
+  });
+  const handled = await surface.handle(new Request("https://handoff.example/takeover/window-session-12345678"), "1".repeat(64));
+  assert.equal(handled.status, 200);
+  assert.deepEqual(calls.handle, { pathname: "/takeover/window-session-12345678", principalBinding: "1".repeat(64) });
+  await surface.revoke("window-int-1");
+  surface.revokeUnclaimed("window-int-2");
+  assert.deepEqual(calls.revoked, ["window-int-1"]);
+  assert.deepEqual(calls.unclaimed, ["window-int-2"]);
 });
 
 
