@@ -89,14 +89,16 @@ Physical CUMG + `mcp-execution-handoff` acceptance has proven the bounded OS-win
 
 Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) completed this integration and its merged-main physical OS-window acceptance. The topology is intentionally **first-class but optional**: ordinary CUMG capabilities do not require Handoff, but a deployment that enables Handoff must treat its authority decision as part of the execution boundary rather than as a best-effort sidecar. The controlled Agent owns the canonical Handoff FSM/checkpoint, WebRTC/TURN, capture, Human input, and local verification; the Hub retains CUMG authorization/ledger/quarantine and only a conservative pre-dispatch fence plus signed operator-control relay. Hub and Agent therefore do not run duplicate Handoff state machines. Live generation rollover uses an explicit same-surface `rebind_live`, and the final Agent gate re-validates the signed authority binding against the actual command immediately before Cua. Runtime/transport unavailability after Handoff is enabled must fail closed rather than silently bypass the coordinator. The legacy Unix bridge stays compatibility/regression-only.
 
-Preferred dependency order:
+The original dependency sequence has completed through component migration:
 
-1. `#152` — first-class CUMG HandoffCoordinator and OS-window regression acceptance;
-2. `mcp-execution-handoff#48` — one bounded PTY session, Agent/Human-exclusive input, verifying, explicit resume;
-3. `mcp-execution-handoff#47` — finish remaining OS/window primitive extraction from Window + Terminal evidence;
-4. `mcp-execution-handoff#45` — converge terminology/public API only after the reusable boundary is demonstrated.
+1. `#152` — first-class CUMG HandoffCoordinator and OS-window regression acceptance — **closed**;
+2. `mcp-execution-handoff#48` — bounded PTY semantic dogfood — **closed**;
+3. `mcp-execution-handoff#47` — reusable bounded OS/window primitives — **closed**;
+4. CUMG `#176` / `#177` — migrate Window and Terminal runtime composition to upstream `WindowHandoffAdapter` / `TerminalHandoffAdapter` — **merged**;
+5. `#157` — fail closed on legacy/current launchd coexistence — **closed**;
+6. `#168` — dependency-complete, import-proven Handoff runtime packaging before production cutover — **closed**.
 
-This work is issue-driven and is not assigned to the `0.3.0` Production Hardening milestone merely because the Window acceptance landed during that development line. WebRTC video-quality work remains an independent Handoff concern and is not a prerequisite for the coordinator/Terminal sequence.
+Remaining upstream closeout is intentionally outside CUMG authority: `mcp-execution-handoff#85` needs the first-class Window same-LAN direct physical rerun, `#91` tracks Terminal mobile connection/status presentation, and `#46`/`#45` own final Target Surface terminology/API convergence. CUMG must continue consuming the first-class components without pre-empting those upstream naming decisions. WebRTC video-quality work remains an independent Handoff concern.
 
 ### Post-`0.3.0` candidate: multi-principal northbound identity
 
