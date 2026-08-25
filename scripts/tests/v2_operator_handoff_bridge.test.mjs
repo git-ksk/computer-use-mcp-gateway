@@ -365,6 +365,50 @@ test("checkpoint recovery can rebind an expired interaction context only with ex
     assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }), { ok: false });
 
     assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+
+    // First recover-rebind proves the signed prior owner and only arms a short-lived evidence lane.
+    assert.deepEqual(
+      recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }),
+      { ok: true },
+    );
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+    // Ordinary exact-window Agent commands stay denied while recovery remains authoritative.
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const wrongVerification = structuredClone(verification);
+    wrongVerification.exact_window.window_id += 1;
+    assert.deepEqual(recovered.handle(wrongVerification), { ok: true, decision: "deny" });
+
+    let admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.equal(admitted.intervention_id, begun.intervention_id);
+    assert.equal(admitted.epoch, begun.epoch);
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: false,
+    }), { ok: true });
+    // An unsatisfied verification proves no acceptable fresh observation and cannot commit rebind.
+    assert.deepEqual(
+      recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }),
+      { ok: true },
+    );
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+
+    admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+
     const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId });
     assert.equal(reissued.ok, true);
     assert.equal(reissued.status, "awaiting_human");
@@ -459,7 +503,24 @@ test("checkpoint recovery can prove the prior owner across a monotonic device ge
     assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
     assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }), { ok: false });
     assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId, prior_generation: fresh.generation + 1 }), { ok: false });
-    const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId, prior_generation: f.request.generation });
+    const recoverRequest = {
+      action: "recover_rebind",
+      prior_context_id: priorContextId,
+      prior_generation: f.request.generation,
+    };
+    assert.deepEqual(recovered.handle(recoverRequest), { ok: true });
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+    const reissued = recovered.handle(recoverRequest);
     assert.equal(reissued.ok, true);
     assert.equal(reissued.status, "awaiting_human");
   } finally { f.cleanup(); }
@@ -486,7 +547,21 @@ test("expired signed checkpoint stays fail-closed until explicit prior-context r
     const fresh = structuredClone(f.request);
     fresh.exact_window.context_binding = contextBinding("ctx_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
-    const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId });
+    const recoverRequest = { action: "recover_rebind", prior_context_id: priorContextId };
+    assert.deepEqual(recovered.handle(recoverRequest), { ok: true });
+    assert.equal(recovered.handle({ action: "status" }).recovery_expired, true);
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+    const reissued = recovered.handle(recoverRequest);
     assert.equal(reissued.ok, true);
     assert.equal(reissued.status, "awaiting_human");
     assert.equal(recovered.handle({ action: "status" }).recovery_expired, false);
@@ -925,4 +1000,58 @@ test("managed begin without authority emits only the bounded missing-authority c
     f.cleanup();
   }
   assert.deepEqual(writes, ["handoff runtime begin rejected code=HANDOFF_BEGIN_AUTHORITY_MISSING\n"]);
+});
+
+test("managed Human-active recovery requires proof -> satisfied exact verification -> explicit rebind", async () => {
+  const f = fixture();
+  const priorContextId = "ctx_cccccccccccccccccccccccccccccccc";
+  try {
+    f.request.exact_window.context_binding = contextBinding(priorContextId);
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
+    const begun = f.bridge.handleManaged({ action: "begin", authority: managedAuthority(f.request) });
+    assert.equal(begun.ok, true);
+    const claim = await nativeControl(f.bridge, begun.native_locator, "claim");
+    assert.equal(claim.status, 200);
+
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_000_010, new FakeNativeSurface());
+    const fresh = structuredClone(f.request);
+    fresh.generation += 1;
+    fresh.exact_window.context_binding = contextBinding("ctx_dddddddddddddddddddddddddddddddd");
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+
+    const recoverRequest = {
+      action: "recover_rebind",
+      authority: managedAuthority(fresh),
+      prior_context_id: priorContextId,
+      prior_generation: f.request.generation,
+    };
+    const wrongProof = { ...recoverRequest, prior_context_id: "ctx_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" };
+    assert.deepEqual(recovered.handleManaged(wrongProof), { ok: false });
+    assert.deepEqual(recovered.handleManaged(recoverRequest), { ok: true });
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+
+    // Non-verification authority remains fenced even after the proof has armed the evidence lease.
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const admitted = recovered.handle(verification);
+    assert.deepEqual(admitted, {
+      ok: true,
+      decision: "verification",
+      intervention_id: begun.intervention_id,
+      epoch: begun.epoch,
+    });
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+
+    const reissued = recovered.handleManaged(recoverRequest);
+    assert.equal(reissued.ok, true);
+    assert.equal(reissued.status, "awaiting_human");
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, false);
+  } finally { f.cleanup(); }
 });
