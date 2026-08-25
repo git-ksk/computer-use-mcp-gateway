@@ -41,6 +41,7 @@ fn single_mac_handoff_is_agent_owned_and_stably_codesigned_for_tcc() {
 fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     let upgrade = include_str!("../scripts/v2-single-mac-upgrade.sh");
     let cleanup = include_str!("../scripts/v2_handoff_runtime_cleanup.py");
+    let preflight = include_str!("../scripts/v2_handoff_runtime_preflight.py");
 
     assert!(upgrade.contains("CUMG_V2_EXPECTED_HANDOFF_COMMIT"));
     assert!(upgrade.contains("CUMG_V2_HANDOFF_SOURCE_ROOT"));
@@ -55,7 +56,11 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(upgrade.contains("ExperimentalTerminalWebRtcTakeover"));
     assert!(upgrade.contains("staged_terminal_webrtc_runtime_import_failed"));
     assert!(upgrade.contains("HANDOFF_RUNTIME_COMMAND_RESOLVED"));
-    assert!(upgrade.contains("os.path.realpath"));
+    assert!(upgrade.contains("v2_handoff_runtime_preflight.py"));
+    assert!(upgrade.contains("verify-import"));
+    assert!(preflight.contains("os.path.realpath"));
+    assert!(preflight.contains("verify_import"));
+    assert!(preflight.contains("subprocess.run"));
     assert!(upgrade.contains("node_modules/werift/package.json"));
     assert!(upgrade.contains("install_handoff_runtime_dependencies"));
     assert!(upgrade.contains("node_modules/.bin"));
