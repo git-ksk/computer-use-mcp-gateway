@@ -912,3 +912,17 @@ test("begin failure diagnostics expose only bounded codes and never exception me
   sensitive.code = "UNBOUNDED_INTERNAL_DETAIL";
   assert.equal(handoffBeginFailureCode(sensitive), "HANDOFF_BEGIN_INTERNAL");
 });
+
+test("managed begin without authority emits only the bounded missing-authority code", () => {
+  const f = fixture();
+  const writes = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk, ..._args) => { writes.push(String(chunk)); return true; };
+  try {
+    assert.deepEqual(f.bridge.handleManaged({ action: "begin" }), { ok: false });
+  } finally {
+    process.stderr.write = original;
+    f.cleanup();
+  }
+  assert.deepEqual(writes, ["handoff runtime begin rejected code=HANDOFF_BEGIN_AUTHORITY_MISSING\n"]);
+});
