@@ -251,33 +251,41 @@ export class WebRtcHandoffSurface {
       throw new Error("WebRTC runtime executable invalid");
     }
     fs.accessSync(hostExecutable, fs.constants.X_OK);
+    if (typeof api.WindowHandoffAdapter !== "function") {
+      throw new Error("Window Handoff adapter unavailable");
+    }
     this.kind = "webrtc";
-    this.broker = new api.TakeoverBroker(disabledLegacyBrowserAdapter(), {
-      enabled: true,
-      publicBaseUrl,
-      ttlMs: NATIVE_TTL_MS,
-      reconnectIdleMs: 2_000,
-    }, undefined, new api.SpawnedWebRtcRuntimeProvider({ hostExecutable }));
+    this.adapter = new api.WindowHandoffAdapter({
+      takeover: {
+        enabled: true,
+        publicBaseUrl,
+        ttlMs: NATIVE_TTL_MS,
+        reconnectIdleMs: 2_000,
+      },
+      runtime: { hostExecutable },
+    });
   }
 
   create(intervention, binding) {
-    return this.broker.createWebRtcLink(
-      { id: intervention.id, epoch: intervention.epoch },
-      binding.principalBinding,
-      { processId: binding.exactWindow.processId, windowId: binding.exactWindow.windowId },
-    );
+    return this.adapter.start({
+      intervention: { id: intervention.id, epoch: intervention.epoch },
+      principalBinding: binding.principalBinding,
+      target: { processId: binding.exactWindow.processId, windowId: binding.exactWindow.windowId },
+      // Preserve the previous low-level createWebRtcLink() default exactly during adapter migration.
+      inputPolicy: { tap: true, scroll: true, text: true, key: true },
+    });
   }
 
   handle(request, principalBinding) {
-    return this.broker.handle(request, principalBinding);
+    return this.adapter.handle(request, principalBinding);
   }
 
   revoke(interventionId) {
-    return this.broker.revokeWebRtcForIntervention(interventionId);
+    return this.adapter.revoke(interventionId);
   }
 
   revokeUnclaimed(interventionId) {
-    this.broker.revokeForIntervention(interventionId);
+    this.adapter.revokeUnclaimed(interventionId);
   }
 
   lifecycle(pathname) {

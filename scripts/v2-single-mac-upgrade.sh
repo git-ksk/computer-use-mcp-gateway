@@ -386,6 +386,7 @@ python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
   --require-export SignedFileHandoffCheckpointStore \
   --require-export SpawnedWebRtcRuntimeProvider \
   --require-export TakeoverBroker \
+  --require-export WindowHandoffAdapter \
   --require-export claimHandoffOwner \
   --require-export createHandoffOwner || {
   rm -rf "$STAGE_RUNTIME"
