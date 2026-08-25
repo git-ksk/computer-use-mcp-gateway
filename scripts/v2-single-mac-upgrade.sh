@@ -311,19 +311,13 @@ HANDOFF_RUNTIME_COMMAND="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariabl
 [[ "$HANDOFF_RUNTIME_COMMAND" == /* && -x "$HANDOFF_RUNTIME_COMMAND" ]] || {
   echo "REFUSED reason=handoff_runtime_command_missing_or_unsafe" >&2; exit 2;
 }
-HANDOFF_RUNTIME_COMMAND_RESOLVED="$(python3 - "$HANDOFF_RUNTIME_COMMAND" <<'PYNODECOMMAND'
-import os, pathlib, stat, sys
-raw = pathlib.Path(sys.argv[1])
-resolved = pathlib.Path(os.path.realpath(raw))
-try:
-    mode = resolved.stat().st_mode
-except OSError:
-    raise SystemExit(2)
-if not resolved.is_absolute() or not stat.S_ISREG(mode) or not os.access(resolved, os.X_OK):
-    raise SystemExit(3)
-print(resolved)
-PYNODECOMMAND
-)" || { echo "REFUSED reason=handoff_runtime_command_resolution_failed" >&2; exit 2; }
+HANDOFF_RUNTIME_PREFLIGHT="$REPO_ROOT/scripts/v2_handoff_runtime_preflight.py"
+[[ -f "$HANDOFF_RUNTIME_PREFLIGHT" && ! -L "$HANDOFF_RUNTIME_PREFLIGHT" ]] || {
+  echo "REFUSED reason=handoff_runtime_preflight_missing_or_unsafe" >&2; exit 2
+}
+HANDOFF_RUNTIME_COMMAND_RESOLVED="$(python3 "$HANDOFF_RUNTIME_PREFLIGHT" resolve-executable --path "$HANDOFF_RUNTIME_COMMAND")" || {
+  echo "REFUSED reason=handoff_runtime_command_resolution_failed" >&2; exit 2
+}
 
 install_handoff_runtime_dependencies() {
   local runtime_root="$1" bin_dir
@@ -384,7 +378,16 @@ install_handoff_runtime_dependencies "$STAGE_RUNTIME/handoff-root" || {
   echo "REFUSED reason=handoff_runtime_dependencies_install_or_symlink_validation_failed" >&2
   exit 2
 }
-"$HANDOFF_RUNTIME_COMMAND_RESOLVED" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); for (const k of ["ExecutionHandoffState","InheritedFdNativeRuntimeProvider","SignedFileHandoffCheckpointStore","SpawnedWebRtcRuntimeProvider","TakeoverBroker","claimHandoffOwner","createHandoffOwner"]) if (!(k in m)) throw new Error(`missing ${k}`);' "$STAGE_RUNTIME/handoff-root/dist/index.js" || {
+python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
+  --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
+  --entrypoint "$STAGE_RUNTIME/handoff-root/dist/index.js" \
+  --require-export ExecutionHandoffState \
+  --require-export InheritedFdNativeRuntimeProvider \
+  --require-export SignedFileHandoffCheckpointStore \
+  --require-export SpawnedWebRtcRuntimeProvider \
+  --require-export TakeoverBroker \
+  --require-export claimHandoffOwner \
+  --require-export createHandoffOwner || {
   rm -rf "$STAGE_RUNTIME"
   echo "REFUSED reason=staged_handoff_runtime_import_failed" >&2
   exit 2
@@ -395,7 +398,10 @@ if [[ -f "$HANDOFF_SOURCE_ROOT/dist/experimental/terminal-pty.js" ]]; then
     echo "REFUSED reason=staged_terminal_pty_runtime_missing_or_unsafe" >&2
     exit 2
   }
-  "$HANDOFF_RUNTIME_COMMAND_RESOLVED" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); if (typeof m.ExperimentalTerminalPtyAuthority !== "function") throw new Error("missing ExperimentalTerminalPtyAuthority");' "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-pty.js" || {
+  python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
+    --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
+    --entrypoint "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-pty.js" \
+    --require-export ExperimentalTerminalPtyAuthority || {
     rm -rf "$STAGE_RUNTIME"
     echo "REFUSED reason=staged_terminal_pty_runtime_import_failed" >&2
     exit 2
@@ -407,7 +413,10 @@ if [[ -f "$HANDOFF_SOURCE_ROOT/dist/experimental/terminal-webrtc.js" ]]; then
     echo "REFUSED reason=staged_terminal_webrtc_runtime_missing_or_unsafe" >&2
     exit 2
   }
-  "$HANDOFF_RUNTIME_COMMAND_RESOLVED" --input-type=module -e 'import { pathToFileURL } from "node:url"; const m = await import(pathToFileURL(process.argv[1]).href); if (typeof m.ExperimentalTerminalWebRtcTakeover !== "function") throw new Error("missing ExperimentalTerminalWebRtcTakeover");' "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" || {
+  python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
+    --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
+    --entrypoint "$STAGE_RUNTIME/handoff-root/dist/experimental/terminal-webrtc.js" \
+    --require-export ExperimentalTerminalWebRtcTakeover || {
     rm -rf "$STAGE_RUNTIME"
     echo "REFUSED reason=staged_terminal_webrtc_runtime_import_failed" >&2
     exit 2
