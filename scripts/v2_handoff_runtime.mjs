@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 const PROTOCOL = 1;
 const MAX_LINE = 4096;
 const OBSERVATION_TTL_MS = 60_000;
+const RECOVERY_EVIDENCE_TTL_MS = 60_000;
 const CHECKPOINT_TTL_MS = 15 * 60_000;
 const MAX_RECOVERED_EPOCH = 1_000_000;
 const MAX_AUDIT_RECORD_BYTES = 1024;
@@ -611,6 +612,7 @@ export class HandoffBridge {
     this.owners = new Map();
     this.activeBinding = undefined;
     this.latestObservation = undefined;
+    this.recoveryEvidence = undefined;
     this.resumeRequested = false;
     this.surfaceLocator = undefined;
     this.faulted = false;
@@ -742,11 +744,33 @@ export class HandoffBridge {
     };
   }
 
+  recoveryEvidenceMatches(candidate) {
+    const evidence = this.recoveryEvidence;
+    if (!this.recovery || this.recovery.status !== "human_active" || this.faulted
+      || this.state.getActive() || !evidence || this.now() >= evidence.expiresAt
+      || !sameAuthority(candidate, evidence.binding)
+      || !sameExact(candidate.exactWindow, evidence.binding.exactWindow)) {
+      if (evidence && this.now() >= evidence.expiresAt) this.recoveryEvidence = undefined;
+      return false;
+    }
+    return true;
+  }
+
   admit(request) {
     const candidate = this.parseAdmission(request);
     if (!candidate) return { ok: false };
     if (candidate.exactWindow) this.latestObservation = candidate;
-    if (this.recovery || this.faulted) return { ok: true, decision: "deny" };
+    if (this.recovery || this.faulted) {
+      if (candidate.verificationCandidate && this.recoveryEvidenceMatches(candidate)) {
+        return {
+          ok: true,
+          decision: "verification",
+          intervention_id: this.recovery.interventionId,
+          epoch: this.recovery.epoch,
+        };
+      }
+      return { ok: true, decision: "deny" };
+    }
 
     const active = this.state.getActive();
     if (!active) return { ok: true, decision: "allow" };
@@ -780,6 +804,13 @@ export class HandoffBridge {
 
   reportVerification(request) {
     const candidate = this.parseAdmission({ ...request, verification_candidate: true });
+    if (candidate && this.recoveryEvidenceMatches(candidate)
+      && request.intervention_id === this.recovery.interventionId
+      && request.epoch === this.recovery.epoch
+      && typeof request.satisfied === "boolean") {
+      if (request.satisfied) this.recoveryEvidence.observedAt = this.now();
+      return { ok: true };
+    }
     const active = this.state.getActive();
     if (!candidate || !active || !this.activeBinding
       || active.status !== "verifying"
@@ -895,6 +926,34 @@ export class HandoffBridge {
     if (this.recovery.adapterKind !== "cumg_os_window_dogfood"
       || this.recovery.principalBinding !== priorOwner.principalBinding
       || this.recovery.actionDigest !== priorOwner.argsDigest) return { ok: false };
+
+    // A recovered Human-active checkpoint must not trust a denied admission attempt as fresh
+    // Window evidence. The first exact recover-rebind proof only arms a short-lived verification
+    // lease. CUMG must then execute its existing exact-window VerifyUiState path (which is the only
+    // admission shape carrying verification_candidate=true) and report a satisfied result. A second
+    // recover-rebind with the same signed prior-owner proof can then reissue the Human intervention.
+    // All non-verification commands remain denied while recovery is authoritative.
+    if (this.recovery.status === "human_active") {
+      const evidence = this.recoveryEvidence;
+      const evidenceCurrent = evidence
+        && this.now() < evidence.expiresAt
+        && sameAuthority(binding, evidence.binding)
+        && sameExact(binding.exactWindow, evidence.binding.exactWindow);
+      const observed = evidenceCurrent
+        && Number.isSafeInteger(evidence.observedAt)
+        && evidence.observedAt <= this.now()
+        && this.now() - evidence.observedAt < RECOVERY_EVIDENCE_TTL_MS;
+      if (!observed) {
+        this.recoveryEvidence = {
+          binding: structuredClone(binding),
+          expiresAt: this.now() + RECOVERY_EVIDENCE_TTL_MS,
+          observedAt: undefined,
+        };
+        return { ok: true };
+      }
+    }
+
+    this.recoveryEvidence = undefined;
     const result = this.reissueRecovery(binding, this.ownerFor(binding));
     if (result.ok) this.recoveryExpired = false;
     return result;
@@ -933,6 +992,7 @@ export class HandoffBridge {
     }
     this.recovery = undefined;
     this.recoveryExpired = false;
+    this.recoveryEvidence = undefined;
     this.latestObservation = undefined;
     this.resumeRequested = false;
     return { ok: true };
