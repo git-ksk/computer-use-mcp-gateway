@@ -1029,7 +1029,10 @@ export class HandoffBridge {
   handleManaged(request) {
     if (!request || typeof request !== "object" || Array.isArray(request)) return { ok: false };
     if (["begin", "recover_reissue", "recover_rebind", "rebind_live"].includes(request.action)
-      && request.authority === undefined) return { ok: false };
+      && request.authority === undefined) {
+      if (request.action === "begin") reportBeginFailure("HANDOFF_BEGIN_AUTHORITY_MISSING");
+      return { ok: false };
+    }
     return this.handle(request);
   }
 }
@@ -1095,12 +1098,17 @@ export async function serveStdio(bridge, input = process.stdin, output = process
   for await (const line of lines) {
     if (Buffer.byteLength(line, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime request too large");
     let response;
+    let action;
     try {
       const request = JSON.parse(line);
-      response = typeof request?.action === "string" && request.action.startsWith("terminal_")
+      action = request?.action;
+      response = typeof action === "string" && action.startsWith("terminal_")
         ? (terminalBridge ? await terminalBridge.handle(request) : { ok: false, code: "terminal_runtime_unavailable" })
         : (typeof bridge.handleManaged === "function" ? bridge.handleManaged(request) : bridge.handle(request));
-    } catch { response = { ok: false }; }
+    } catch {
+      if (action === "begin") reportBeginFailure("HANDOFF_BEGIN_HANDLER_EXCEPTION");
+      response = { ok: false };
+    }
     const encoded = JSON.stringify(response);
     if (Buffer.byteLength(encoded, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime response too large");
     if (!output.write(`${encoded}\n`)) {
