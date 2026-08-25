@@ -297,15 +297,56 @@ export class WebRtcHandoffSurface {
 }
 
 export class TerminalPtyHandoffBridge {
-  constructor(api, transport = undefined) {
-    if (typeof api.ExperimentalTerminalPtyAuthority !== "function") {
-      throw new Error("experimental Terminal PTY Handoff runtime unavailable");
+  constructor(api, takeoverConfig = undefined) {
+    if (typeof api.TerminalHandoffAdapter !== "function") {
+      throw new Error("first-class Terminal Handoff adapter unavailable");
     }
     this.api = api;
-    this.transport = transport;
+    this.takeoverConfig = takeoverConfig ?? { enabled: false, ttlMs: NATIVE_TTL_MS, env: process.env };
     this.binding = undefined;
-    this.gate = undefined;
-    this.transportIntervention = undefined;
+    this.adapter = undefined;
+    this.awaiting = undefined;
+    this.human = undefined;
+    this.verifying = undefined;
+    this.ready = undefined;
+    this.transportRef = undefined;
+    this.doneFrom = undefined;
+    this.locator = undefined;
+  }
+
+  authorityStatus(status) {
+    return {
+      authority: status.authority,
+      interventionStatus: status.interventionStatus,
+      interventionEpoch: status.interventionEpoch,
+      sessionGeneration: status.sessionGeneration,
+      sessionAlive: status.sessionAlive,
+      humanDisconnected: status.humanDisconnected,
+      agentStateSynchronizationRequired: status.agentStateSynchronizationRequired,
+    };
+  }
+
+  transition(ref) {
+    return {
+      ok: true,
+      intervention_id: ref.interventionId,
+      epoch: ref.epoch,
+      intervention_status: ref.status,
+    };
+  }
+
+  sameRef(ref, interventionId, epoch) {
+    return !!ref && ref.interventionId === interventionId && ref.epoch === epoch;
+  }
+
+  clearInterventionRefs() {
+    this.awaiting = undefined;
+    this.human = undefined;
+    this.verifying = undefined;
+    this.ready = undefined;
+    this.transportRef = undefined;
+    this.doneFrom = undefined;
+    this.locator = undefined;
   }
 
   bind(request) {
@@ -317,143 +358,178 @@ export class TerminalPtyHandoffBridge {
         || this.binding.principalBinding !== binding.principalBinding) {
         return { ok: false, code: "terminal_binding_mismatch" };
       }
-      return { ok: true, status: this.gate.getStatus() };
+      return { ok: true, status: this.authorityStatus(this.adapter.status()) };
     }
-    const unavailableDrain = async () => { throw new Error("external CUMG drain handshake required"); };
     this.binding = binding;
-    this.gate = new this.api.ExperimentalTerminalPtyAuthority(
+    this.adapter = new this.api.TerminalHandoffAdapter({
       binding,
-      { drainAgentWrites: unavailableDrain, drainHumanWrites: unavailableDrain },
-    );
-    return { ok: true, status: this.gate.getStatus() };
+      takeover: this.takeoverConfig,
+    });
+    return { ok: true, status: this.authorityStatus(this.adapter.status()) };
   }
 
   require(request) {
     const binding = terminalPtyBinding(request.terminal_pty);
-    if (!binding || !this.binding || !this.gate
+    if (!binding || !this.binding || !this.adapter
       || binding.sessionId !== this.binding.sessionId
       || binding.sessionGeneration !== this.binding.sessionGeneration
       || binding.principalBinding !== this.binding.principalBinding) {
       throw new Error("terminal binding unavailable");
     }
-    return binding;
+    return { binding, adapter: this.adapter };
+  }
+
+  outputBytes(value) {
+    if (typeof value !== "string" || value.length > 2800 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+      throw new Error("terminal output invalid");
+    }
+    const bytes = Buffer.from(value, "base64");
+    if (bytes.length < 1 || bytes.length > 2 * 1024 || bytes.toString("base64") !== value) {
+      throw new Error("terminal output invalid");
+    }
+    return bytes;
   }
 
   async handle(request) {
     try {
       if (request.action === "terminal_bind") return this.bind(request);
       if (request.action === "terminal_status") {
-        return { ok: true, status: this.gate?.getStatus() ?? null };
+        return { ok: true, status: this.adapter ? this.authorityStatus(this.adapter.status()) : null };
       }
       if (request.action === "terminal_transport_status") {
-        this.require(request);
-        if (!this.transport || !this.transportIntervention) return { ok: false, code: "terminal_transport_unavailable" };
-        const status = this.transport.status(this.transportIntervention.interventionId, this.transportIntervention.epoch);
-        return { ok: true, transport_status: status };
+        const { adapter } = this.require(request);
+        if (!this.transportRef) return { ok: false, code: "terminal_transport_unavailable" };
+        return { ok: true, transport_status: adapter.transportStatus(this.transportRef) };
       }
       if (request.action === "terminal_release_closed") {
-        this.require(request);
-        const status = this.gate.getStatus();
+        const { adapter } = this.require(request);
+        const status = adapter.status();
         if (status.sessionAlive || status.interventionStatus !== null || status.authority !== "none") {
           return { ok: false, code: "terminal_release_rejected" };
         }
-        if (this.transportIntervention) return { ok: false, code: "terminal_transport_still_active" };
+        if (status.transport !== null) return { ok: false, code: "terminal_transport_still_active" };
         this.binding = undefined;
-        this.gate = undefined;
+        this.adapter = undefined;
+        this.clearInterventionRefs();
         return { ok: true, status: null };
       }
-      const binding = this.require(request);
+      const { adapter } = this.require(request);
       switch (request.action) {
       case "terminal_transport_start": {
-        if (!this.transport || !validTerminalIntervention(request.intervention_id, request.epoch)) {
+        if (!validTerminalIntervention(request.intervention_id, request.epoch)
+          || !this.sameRef(this.awaiting, request.intervention_id, request.epoch)
+          || !this.locator) {
           return { ok: false, code: "terminal_transport_unavailable" };
         }
-        const gateStatus = this.gate.getStatus();
-        if (gateStatus.interventionStatus !== "awaiting_human" || gateStatus.authority !== "none") {
-          return { ok: false, code: "terminal_transport_state_invalid" };
-        }
-        const locator = this.transport.start(request.intervention_id, request.epoch, binding.principalBinding);
-        this.transportIntervention = { interventionId: request.intervention_id, epoch: request.epoch };
-        return { ok: true, locator };
+        return { ok: true, locator: this.locator };
       }
       case "terminal_transport_activate": {
-        if (!this.transport || !this.transportIntervention
-          || request.intervention_id !== this.transportIntervention.interventionId
-          || request.epoch !== this.transportIntervention.epoch) {
+        if (!this.sameRef(this.human, request.intervention_id, request.epoch)) {
           return { ok: false, code: "terminal_transport_unavailable" };
         }
-        const gateStatus = this.gate.getStatus();
-        if (gateStatus.interventionStatus !== "human_active" || gateStatus.authority !== "human") {
+        const status = adapter.status();
+        if (status.authority !== "human" || status.interventionStatus !== "human_active"
+          || !status.transport?.humanActive) {
           return { ok: false, code: "terminal_transport_state_invalid" };
         }
-        this.transport.activateHuman(request.intervention_id, request.epoch);
         return { ok: true };
       }
       case "terminal_transport_next_event": {
-        if (!this.transport || !this.transportIntervention
-          || request.intervention_id !== this.transportIntervention.interventionId
-          || request.epoch !== this.transportIntervention.epoch) {
+        if (!this.sameRef(this.human, request.intervention_id, request.epoch)) {
           return { ok: false, code: "terminal_transport_unavailable" };
         }
-        return { ok: true, event: this.transport.nextEvent(request.intervention_id, request.epoch) ?? null };
+        const event = adapter.nextHumanEvent(this.human);
+        if (!event) return { ok: true, event: null };
+        if (event.kind === "input") {
+          return { ok: true, event: { kind: "input", dataBase64: Buffer.from(event.data).toString("base64") } };
+        }
+        if (event.kind === "resize") {
+          return { ok: true, event: { kind: "resize", rows: event.rows, cols: event.cols } };
+        }
+        this.doneFrom = this.human;
+        this.verifying = event.verifying;
+        this.transportRef = undefined;
+        return { ok: true, event: { kind: "done" } };
       }
       case "terminal_transport_output": {
-        if (!this.transport || !this.transportIntervention
-          || request.intervention_id !== this.transportIntervention.interventionId
-          || request.epoch !== this.transportIntervention.epoch
-          || typeof request.data_base64 !== "string") {
+        if (!this.sameRef(this.human, request.intervention_id, request.epoch)) {
           return { ok: false, code: "terminal_transport_unavailable" };
         }
-        this.transport.pushOutput(request.intervention_id, request.epoch, request.data_base64);
+        adapter.pushHumanOutput(this.human, this.outputBytes(request.data_base64));
         return { ok: true };
       }
       case "terminal_transport_revoke": {
-        if (!this.transport || !this.transportIntervention
-          || request.intervention_id !== this.transportIntervention.interventionId
-          || request.epoch !== this.transportIntervention.epoch) {
+        if (!validTerminalIntervention(request.intervention_id, request.epoch)) {
           return { ok: false, code: "terminal_transport_unavailable" };
         }
-        await this.transport.revoke(request.intervention_id, request.epoch);
-        this.transportIntervention = undefined;
+        await adapter.revokeTransport();
+        this.transportRef = undefined;
+        this.locator = undefined;
         return { ok: true };
       }
       case "terminal_agent_input":
-        this.gate.assertAgentInput(binding); return { ok: true };
+        adapter.assertAgentInput(); return { ok: true };
       case "terminal_agent_observe":
-        this.gate.assertAgentObservation(binding); return { ok: true };
+        adapter.assertAgentObservation(); return { ok: true };
       case "terminal_agent_resize":
-        this.gate.assertAgentResize(binding); return { ok: true };
+        adapter.assertAgentResize(); return { ok: true };
       case "terminal_begin_fence": {
-        const active = this.gate.beginFence(binding);
-        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+        if (this.awaiting) return this.transition(this.awaiting);
+        const begun = adapter.begin();
+        this.awaiting = begun.intervention;
+        this.transportRef = begun.intervention;
+        this.locator = begun.locator;
+        return this.transition(this.awaiting);
       }
       case "terminal_claim_human": {
-        const active = this.gate.claimHumanAfterAgentDrain(binding, request.intervention_id, request.epoch);
-        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+        if (!this.sameRef(this.awaiting, request.intervention_id, request.epoch)) {
+          return { ok: false, code: "terminal_intervention_stale" };
+        }
+        this.human = adapter.claimHumanAfterAgentDrain(this.awaiting);
+        this.transportRef = this.human;
+        return this.transition(this.human);
       }
       case "terminal_human_input":
-        this.gate.assertHumanInput(binding, request.intervention_id, request.epoch); return { ok: true };
+        if (!this.sameRef(this.human, request.intervention_id, request.epoch)) return { ok: false, code: "terminal_intervention_stale" };
+        adapter.assertHumanInput(this.human); return { ok: true };
       case "terminal_human_observe":
-        this.gate.assertHumanObservation(binding, request.intervention_id, request.epoch); return { ok: true };
+        if (!this.sameRef(this.human, request.intervention_id, request.epoch)) return { ok: false, code: "terminal_intervention_stale" };
+        adapter.assertHumanObservation(this.human); return { ok: true };
       case "terminal_human_resize":
-        this.gate.assertHumanResize(binding, request.intervention_id, request.epoch); return { ok: true };
-      case "terminal_human_disconnect":
-        return { ok: true, status: this.gate.noteHumanDisconnect(binding, request.intervention_id, request.epoch) };
+        if (!this.sameRef(this.human, request.intervention_id, request.epoch)) return { ok: false, code: "terminal_intervention_stale" };
+        adapter.assertHumanResize(this.human); return { ok: true };
+      case "terminal_human_disconnect": {
+        if (!this.sameRef(this.human, request.intervention_id, request.epoch)) return { ok: false, code: "terminal_intervention_stale" };
+        return { ok: true, status: this.authorityStatus(adapter.noteHumanDisconnect(this.human)) };
+      }
       case "terminal_done_fence": {
-        const active = this.gate.markHumanDoneFence(binding, request.intervention_id, request.epoch);
-        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+        if (!this.sameRef(this.doneFrom, request.intervention_id, request.epoch) || !this.verifying) {
+          return { ok: false, code: "terminal_intervention_stale" };
+        }
+        return this.transition(this.verifying);
       }
       case "terminal_confirm_human_drain": {
-        const active = this.gate.confirmHumanWritesDrained(binding, request.intervention_id, request.epoch);
-        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+        if (!this.sameRef(this.verifying, request.intervention_id, request.epoch)) {
+          return { ok: false, code: "terminal_intervention_stale" };
+        }
+        this.verifying = adapter.confirmHumanDrain(this.verifying);
+        return this.transition(this.verifying);
       }
       case "terminal_verify": {
-        if (typeof request.satisfied !== "boolean") return { ok: false, code: "terminal_verification_invalid" };
-        const active = this.gate.reportVerification(binding, request.intervention_id, request.epoch, request.satisfied);
-        return { ok: true, intervention_id: active.id, epoch: active.epoch, intervention_status: active.status };
+        if (typeof request.satisfied !== "boolean" || !this.sameRef(this.verifying, request.intervention_id, request.epoch)) {
+          return { ok: false, code: "terminal_verification_invalid" };
+        }
+        const next = adapter.reportVerification(this.verifying, request.satisfied);
+        if (next.status === "ready_to_resume") this.ready = next;
+        else this.verifying = next;
+        return this.transition(next);
       }
       case "terminal_resume": {
-        const decision = this.gate.resumeAgent(binding, request.intervention_id, request.epoch);
+        if (!this.sameRef(this.ready, request.intervention_id, request.epoch)) {
+          return { ok: false, code: "terminal_intervention_stale" };
+        }
+        const decision = adapter.resume(this.ready);
+        this.ready = undefined;
         return {
           ok: true,
           resume_policy: decision.resumePolicy,
@@ -463,9 +539,23 @@ export class TerminalPtyHandoffBridge {
         };
       }
       case "terminal_ack_state_sync":
-        this.gate.acknowledgeAgentStateSynchronization(binding); return { ok: true };
-      case "terminal_session_exit":
-        return { ok: true, status: this.gate.noteSessionExit(binding) };
+        adapter.acknowledgeAgentStateSynchronization();
+        this.clearInterventionRefs();
+        return { ok: true };
+      case "terminal_session_exit": {
+        const status = await adapter.noteSessionExit();
+        this.locator = undefined;
+        this.transportRef = undefined;
+        if (status.interventionStatus === "verifying" && status.interventionEpoch !== null) {
+          const source = this.verifying ?? this.human;
+          if (source) {
+            this.verifying = { interventionId: source.interventionId, epoch: status.interventionEpoch, status: "verifying" };
+          }
+        } else if (status.interventionStatus === null) {
+          this.clearInterventionRefs();
+        }
+        return { ok: true, status: this.authorityStatus(status) };
+      }
       default:
         return { ok: false, code: "terminal_action_unsupported" };
       }
@@ -478,17 +568,16 @@ export class TerminalPtyHandoffBridge {
   }
 
   async handleSurface(request) {
-    if (!this.transport || !this.transportIntervention) {
+    if (!this.adapter || !this.binding) {
       return new Response(JSON.stringify({ error: "takeover_unavailable" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
     }
-    return this.transport.handle(request);
+    return this.adapter.handle(request, this.binding.principalBinding);
   }
 
   async shutdown() {
-    if (!this.transport || !this.transportIntervention) return;
-    const current = this.transportIntervention;
-    this.transportIntervention = undefined;
-    await this.transport.revoke(current.interventionId, current.epoch).catch(() => undefined);
+    await this.adapter?.revokeTransport().catch(() => undefined);
+    this.transportRef = undefined;
+    this.locator = undefined;
   }
 }
 
@@ -920,20 +1009,7 @@ export class HandoffBridge {
 
 async function loadHandoff(root) {
   const modulePath = path.join(root, "dist", "index.js");
-  const terminalPath = path.join(root, "dist", "experimental", "terminal-pty.js");
-  const terminalWebRtcPath = path.join(root, "dist", "experimental", "terminal-webrtc.js");
-  const core = await import(pathToFileURL(modulePath).href);
-  let terminal = {};
-  let terminalWebRtc = {};
-  try { terminal = await import(pathToFileURL(terminalPath).href); }
-  catch (error) {
-    if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
-  }
-  try { terminalWebRtc = await import(pathToFileURL(terminalWebRtcPath).href); }
-  catch (error) {
-    if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
-  }
-  return { ...core, ...terminal, ...terminalWebRtc };
+  return import(pathToFileURL(modulePath).href);
 }
 
 function privateKey(pathname) {
@@ -1138,16 +1214,13 @@ export async function runCli(argv = process.argv) {
   ) ?? path.join(path.dirname(checkpointPath), "audit", "expired-recovery-abandonment.jsonl");
   const abandonmentAudit = new AppendOnlyAbandonmentAudit(abandonmentAuditPath);
   const bridge = new HandoffBridge(api, store, Date.now, humanSurface, abandonmentAudit);
-  const terminalTransport = typeof api.ExperimentalTerminalWebRtcTakeover === "function" && webRtcPublicBaseUrl
-    ? new api.ExperimentalTerminalWebRtcTakeover({
-        enabled: true,
-        publicBaseUrl: webRtcPublicBaseUrl,
+  const terminalBridge = typeof api.TerminalHandoffAdapter === "function"
+    ? new TerminalPtyHandoffBridge(api, {
+        enabled: Boolean(webRtcPublicBaseUrl),
+        ...(webRtcPublicBaseUrl ? { publicBaseUrl: webRtcPublicBaseUrl } : {}),
         ttlMs: 5 * 60 * 1000,
         env: process.env,
       })
-    : undefined;
-  const terminalBridge = typeof api.ExperimentalTerminalPtyAuthority === "function"
-    ? new TerminalPtyHandoffBridge(api, terminalTransport)
     : undefined;
   if (command === "serve") {
     const socketPath = required(options, "socket", "CUMG_V2_OPERATOR_HANDOFF_SOCKET");
