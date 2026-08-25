@@ -94,9 +94,14 @@ An `InteractionContext` is CUMG workflow state, independent of HTTP or MCP trans
 bound to authenticated principal, stable device, Agent generation, and capability revision. The
 context ID is opaque state identity, not a bearer credential or authorization token.
 
-For Cua, the adapter uses the CUMG context ID as the backend session identifier. Desktop expansion
-explicitly ensures `start_session(capture_scope=auto)` and then invokes `escalate_session`. There is
-no automatic escalation after a narrower route fails.
+For Cua, the adapter uses the CUMG context ID as the backend session identifier. Cua 0.19.3's
+default backend-session idle TTL (300 seconds) is shorter than the CUMG InteractionContext idle
+lifetime, so an otherwise-valid context can outlive Cua session state during Human Handoff. A
+contextual `verify_ui_state` therefore idempotently ensures `start_session(capture_scope=auto)` after
+ordinary context/Handoff admission and before `verify_state`; refresh failure stops verification
+fail-closed. This only restores window-scoped backend lifecycle state and cannot revive a stale CUMG
+context or grant desktop scope. Desktop expansion separately ensures `start_session(capture_scope=auto)`
+and then invokes `escalate_session`. There is no automatic escalation after a narrower route fails.
 
 Cua's `start_session` and `end_session` remain backend lifecycle, not raw northbound capabilities.
 Context close, expiry, generation fencing, and capability-revision fencing invalidate CUMG refs and
