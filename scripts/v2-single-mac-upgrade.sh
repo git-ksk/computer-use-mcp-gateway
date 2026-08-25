@@ -281,18 +281,24 @@ if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
   launchctl print "$DOMAIN/$SIGNER_LABEL" >/dev/null 2>&1 || { echo "REFUSED reason=service_not_loaded label=$SIGNER_LABEL" >&2; exit 2; }
 fi
 
-stable_codesign() {
-  local pathname="$1" identifier="$2" expr requirement designated
+verify_stable_codesign() {
+  local pathname="$1" identifier="$2" expr designated
   expr="identifier \"$identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"$MACOS_TEAM_ID\""
-  requirement="=designated => $expr"
-  codesign --force --sign "$MACOS_CODESIGN_SELECTOR" --identifier "$identifier" \
-    --requirements "$requirement" "$pathname" >/dev/null
   codesign --verify --strict "$pathname" >/dev/null
   codesign -v -R="$expr" "$pathname" >/dev/null
   designated="$(codesign -dr - "$pathname" 2>&1)"
   [[ "$designated" == *"identifier \"$identifier\""* \
       && "$designated" == *"certificate leaf[subject.OU] = \"$MACOS_TEAM_ID\""* \
       && "$designated" != *"cdhash"* ]]
+}
+
+stable_codesign() {
+  local pathname="$1" identifier="$2" expr requirement
+  expr="identifier \"$identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"$MACOS_TEAM_ID\""
+  requirement="=designated => $expr"
+  codesign --force --sign "$MACOS_CODESIGN_SELECTOR" --identifier "$identifier" \
+    --requirements "$requirement" "$pathname" >/dev/null
+  verify_stable_codesign "$pathname" "$identifier"
 }
 
 echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned stable_tcc_signing=required"
@@ -361,58 +367,102 @@ CURRENT_HANDOFF_RUNTIME="$(dirname "$CURRENT_HANDOFF_SCRIPT")"
 }
 NEW_RUNTIME_NAME="runtime-${HEAD:0:12}-${HANDOFF_HEAD:0:12}"
 NEW_HANDOFF_RUNTIME="$HANDOFF_DIR/$NEW_RUNTIME_NAME"
-[[ ! -e "$NEW_HANDOFF_RUNTIME" && ! -L "$NEW_HANDOFF_RUNTIME" ]] || {
-  echo "REFUSED reason=handoff_runtime_generation_already_exists" >&2; exit 2;
-}
-STAGE_RUNTIME="$HANDOFF_DIR/.stage-${NEW_RUNTIME_NAME}-$$"
-[[ ! -e "$STAGE_RUNTIME" ]] || { echo "REFUSED reason=handoff_runtime_stage_exists" >&2; exit 2; }
-umask 077
-mkdir -p "$STAGE_RUNTIME/handoff-root"
-chmod 700 "$STAGE_RUNTIME" "$STAGE_RUNTIME/handoff-root"
-cp "$REPO_ROOT/scripts/v2_handoff_runtime.mjs" "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
-chmod 700 "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
-cp -R "$HANDOFF_SOURCE_ROOT/dist" "$STAGE_RUNTIME/handoff-root/dist"
-cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" "$STAGE_RUNTIME/handoff-root/"
-install_handoff_runtime_dependencies "$STAGE_RUNTIME/handoff-root" || {
-  rm -rf "$STAGE_RUNTIME"
-  echo "REFUSED reason=handoff_runtime_dependencies_install_or_symlink_validation_failed" >&2
-  exit 2
-}
-python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
-  --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
-  --entrypoint "$STAGE_RUNTIME/handoff-root/dist/index.js" \
-  --require-export ExecutionHandoffState \
-  --require-export InheritedFdNativeRuntimeProvider \
-  --require-export SignedFileHandoffCheckpointStore \
-  --require-export SpawnedWebRtcRuntimeProvider \
-  --require-export TakeoverBroker \
-  --require-export WindowHandoffAdapter \
-  --require-export TerminalHandoffAdapter \
-  --require-export claimHandoffOwner \
-  --require-export createHandoffOwner || {
-  rm -rf "$STAGE_RUNTIME"
-  echo "REFUSED reason=staged_handoff_runtime_import_failed" >&2
-  exit 2
-}
+NEW_HANDOFF_RUNTIME_CREATED=0
 NEW_HANDOFF_HELPERS=""
-while IFS=$'\t' read -r key identifier helper; do
-  [[ -n "$helper" ]] || continue
-  case "$key" in
-    CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-webrtc-host" ;;
-    CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-native-host" ;;
-    CUMG_V2_HANDOFF_NATIVE_REVOKE_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-native-revoke" ;;
-    *) echo "REFUSED reason=unsupported_handoff_helper_key" >&2; rm -rf "$STAGE_RUNTIME"; exit 2 ;;
-  esac
-  cp "$helper" "$staged"
-  chmod 700 "$staged"
-  if ! stable_codesign "$staged" "$identifier"; then
+
+if [[ -e "$NEW_HANDOFF_RUNTIME" || -L "$NEW_HANDOFF_RUNTIME" ]]; then
+  [[ -d "$NEW_HANDOFF_RUNTIME" && ! -L "$NEW_HANDOFF_RUNTIME" ]] || {
+    echo "REFUSED reason=handoff_runtime_generation_existing_path_unsafe" >&2; exit 2;
+  }
+  python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-generation \
+    --runtime-root "$NEW_HANDOFF_RUNTIME" \
+    --expected-cumg-commit "$HEAD" \
+    --expected-handoff-commit "$HANDOFF_HEAD" || {
+    echo "REFUSED reason=handoff_runtime_generation_existing_validation_failed" >&2; exit 2;
+  }
+  python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
+    --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
+    --entrypoint "$NEW_HANDOFF_RUNTIME/handoff-root/dist/index.js" \
+    --require-export ExecutionHandoffState \
+    --require-export InheritedFdNativeRuntimeProvider \
+    --require-export SignedFileHandoffCheckpointStore \
+    --require-export SpawnedWebRtcRuntimeProvider \
+    --require-export TakeoverBroker \
+    --require-export WindowHandoffAdapter \
+    --require-export TerminalHandoffAdapter \
+    --require-export claimHandoffOwner \
+    --require-export createHandoffOwner || {
+    echo "REFUSED reason=existing_handoff_runtime_import_failed" >&2; exit 2;
+  }
+  [[ -f "$NEW_HANDOFF_RUNTIME/handoff-root/node_modules/werift/package.json" ]] || {
+    echo "REFUSED reason=existing_handoff_runtime_not_self_contained" >&2; exit 2;
+  }
+  while IFS=$'\t' read -r key identifier helper; do
+    [[ -n "$helper" ]] || continue
+    case "$key" in
+      CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE) reusable="$NEW_HANDOFF_RUNTIME/takeover-webrtc-host" ;;
+      CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE) reusable="$NEW_HANDOFF_RUNTIME/takeover-native-host" ;;
+      CUMG_V2_HANDOFF_NATIVE_REVOKE_EXECUTABLE) reusable="$NEW_HANDOFF_RUNTIME/takeover-native-revoke" ;;
+      *) echo "REFUSED reason=unsupported_handoff_helper_key" >&2; exit 2 ;;
+    esac
+    [[ -f "$reusable" && -x "$reusable" && ! -L "$reusable" ]] || {
+      echo "REFUSED reason=existing_handoff_host_executable_unsafe" >&2; exit 2;
+    }
+    verify_stable_codesign "$reusable" "$identifier" || {
+      echo "REFUSED reason=existing_handoff_host_codesign_invalid" >&2; exit 2;
+    }
+    NEW_HANDOFF_HELPERS+="${key}"$'\t'"${identifier}"$'\t'"${helper}"$'\t'"${reusable}"$'\n'
+  done <<< "$HANDOFF_HELPERS"
+  echo "RUNTIME_REUSE_OK runtime_generation=$NEW_RUNTIME_NAME"
+else
+  STAGE_RUNTIME="$HANDOFF_DIR/.stage-${NEW_RUNTIME_NAME}-$$"
+  [[ ! -e "$STAGE_RUNTIME" ]] || { echo "REFUSED reason=handoff_runtime_stage_exists" >&2; exit 2; }
+  umask 077
+  mkdir -p "$STAGE_RUNTIME/handoff-root"
+  chmod 700 "$STAGE_RUNTIME" "$STAGE_RUNTIME/handoff-root"
+  cp "$REPO_ROOT/scripts/v2_handoff_runtime.mjs" "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
+  chmod 700 "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
+  cp -R "$HANDOFF_SOURCE_ROOT/dist" "$STAGE_RUNTIME/handoff-root/dist"
+  cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" "$STAGE_RUNTIME/handoff-root/"
+  install_handoff_runtime_dependencies "$STAGE_RUNTIME/handoff-root" || {
     rm -rf "$STAGE_RUNTIME"
-    echo "REFUSED reason=staged_handoff_host_stable_codesign_failed" >&2
+    echo "REFUSED reason=handoff_runtime_dependencies_install_or_symlink_validation_failed" >&2
     exit 2
-  fi
-  NEW_HANDOFF_HELPERS+="${key}"$'\t'"${identifier}"$'\t'"${helper}"$'\t'"${staged}"$'\n'
-done <<< "$HANDOFF_HELPERS"
-python3 - "$HEAD" "$HANDOFF_HEAD" "$STAGE_RUNTIME" > "$STAGE_RUNTIME/runtime-generation-manifest.json" <<'PYRUNTIMEGEN'
+  }
+  python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
+    --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
+    --entrypoint "$STAGE_RUNTIME/handoff-root/dist/index.js" \
+    --require-export ExecutionHandoffState \
+    --require-export InheritedFdNativeRuntimeProvider \
+    --require-export SignedFileHandoffCheckpointStore \
+    --require-export SpawnedWebRtcRuntimeProvider \
+    --require-export TakeoverBroker \
+    --require-export WindowHandoffAdapter \
+    --require-export TerminalHandoffAdapter \
+    --require-export claimHandoffOwner \
+    --require-export createHandoffOwner || {
+    rm -rf "$STAGE_RUNTIME"
+    echo "REFUSED reason=staged_handoff_runtime_import_failed" >&2
+    exit 2
+  }
+  while IFS=$'\t' read -r key identifier helper; do
+    [[ -n "$helper" ]] || continue
+    case "$key" in
+      CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-webrtc-host" ;;
+      CUMG_V2_HANDOFF_NATIVE_HOST_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-native-host" ;;
+      CUMG_V2_HANDOFF_NATIVE_REVOKE_EXECUTABLE) staged="$STAGE_RUNTIME/takeover-native-revoke" ;;
+      *) echo "REFUSED reason=unsupported_handoff_helper_key" >&2; rm -rf "$STAGE_RUNTIME"; exit 2 ;;
+    esac
+    cp "$helper" "$staged"
+    chmod 700 "$staged"
+    if ! stable_codesign "$staged" "$identifier"; then
+      rm -rf "$STAGE_RUNTIME"
+      echo "REFUSED reason=staged_handoff_host_stable_codesign_failed" >&2
+      exit 2
+    fi
+    NEW_HANDOFF_HELPERS+="${key}"$'\t'"${identifier}"$'\t'"${helper}"$'\t'"${staged}"$'\n'
+  done <<< "$HANDOFF_HELPERS"
+  python3 - "$HEAD" "$HANDOFF_HEAD" "$STAGE_RUNTIME" > "$STAGE_RUNTIME/runtime-generation-manifest.json" <<'PYRUNTIMEGEN'
 import hashlib, json, pathlib, sys
 cumg, handoff, root = sys.argv[1:]
 root = pathlib.Path(root)
@@ -429,10 +479,12 @@ print(json.dumps({
     "files": files,
 }, indent=2))
 PYRUNTIMEGEN
-chmod 600 "$STAGE_RUNTIME/runtime-generation-manifest.json"
-mv "$STAGE_RUNTIME" "$NEW_HANDOFF_RUNTIME"
-# Rewrite staged helper destinations after the atomic directory rename.
-NEW_HANDOFF_HELPERS="${NEW_HANDOFF_HELPERS//$STAGE_RUNTIME/$NEW_HANDOFF_RUNTIME}"
+  chmod 600 "$STAGE_RUNTIME/runtime-generation-manifest.json"
+  mv "$STAGE_RUNTIME" "$NEW_HANDOFF_RUNTIME"
+  NEW_HANDOFF_RUNTIME_CREATED=1
+  # Rewrite staged helper destinations after the atomic directory rename.
+  NEW_HANDOFF_HELPERS="${NEW_HANDOFF_HELPERS//$STAGE_RUNTIME/$NEW_HANDOFF_RUNTIME}"
+fi
 
 STAMP="$(date '+%Y%m%dT%H%M%S%z')"
 ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
@@ -556,7 +608,8 @@ restore_preinstall_profile() {
   launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
   sleep 1
   launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" >/dev/null 2>&1 || true
-  if [[ "$NEW_HANDOFF_RUNTIME" == "$HANDOFF_DIR"/runtime-* && -d "$NEW_HANDOFF_RUNTIME" && ! -L "$NEW_HANDOFF_RUNTIME" ]]; then
+  if [[ "$NEW_HANDOFF_RUNTIME_CREATED" == "1" && "$NEW_HANDOFF_RUNTIME" == "$HANDOFF_DIR"/runtime-* \
+      && -d "$NEW_HANDOFF_RUNTIME" && ! -L "$NEW_HANDOFF_RUNTIME" ]]; then
     rm -rf "$NEW_HANDOFF_RUNTIME" || true
   fi
 }
