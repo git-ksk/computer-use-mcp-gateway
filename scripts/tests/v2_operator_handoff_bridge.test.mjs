@@ -73,7 +73,7 @@ class FakeWebRtcSurface {
     if (pathname === `/takeover/${this.sessionID}` || pathname === "/takeover/webrtc-client.js") {
       return new Response("ok", { status: 200 });
     }
-    const match = /^\/takeover\/api\/(webrtc-prepare-claim|webrtc-prepare-reconnect|webrtc-connect|webrtc-suspend|done|cancel)\//.exec(pathname);
+    const match = /^\/takeover\/api\/(webrtc-prepare-claim|webrtc-prepare-reconnect|webrtc-connect|webrtc-suspend|complete|done|cancel)\//.exec(pathname);
     if (!match) return new Response("{}", { status: 404 });
     return new Response(JSON.stringify({ ok: true, operation: match[1] }), {
       status: 200,
@@ -85,7 +85,7 @@ class FakeWebRtcSurface {
   revokeUnclaimed(interventionId) { this.revoked.push(interventionId); }
 
   lifecycle(pathname) {
-    const match = /^\/takeover\/api\/(webrtc-connect|done|cancel)\//.exec(pathname);
+    const match = /^\/takeover\/api\/(webrtc-connect|complete|done|cancel)\//.exec(pathname);
     if (!match) return undefined;
     return match[1] === "webrtc-connect" ? "connect" : "complete";
   }
@@ -755,6 +755,10 @@ test("CUMG WebRTC surface composes the first-class WindowHandoffAdapter with exa
     target: { processId: 1234, windowId: 5678 },
     inputPolicy: { tap: true, scroll: true, text: true, key: true },
   });
+  assert.equal(surface.lifecycle("/takeover/api/webrtc-connect/window-session-12345678"), "connect");
+  assert.equal(surface.lifecycle("/takeover/api/complete/window-session-12345678"), "complete");
+  assert.equal(surface.lifecycle("/takeover/api/done/window-session-12345678"), "complete");
+  assert.equal(surface.lifecycle("/takeover/api/cancel/window-session-12345678"), "complete");
   const handled = await surface.handle(new Request("https://handoff.example/takeover/window-session-12345678"), "1".repeat(64));
   assert.equal(handled.status, 200);
   assert.deepEqual(calls.handle, { pathname: "/takeover/window-session-12345678", principalBinding: "1".repeat(64) });
@@ -765,7 +769,7 @@ test("CUMG WebRTC surface composes the first-class WindowHandoffAdapter with exa
 });
 
 
-test("iPhone WebRTC prepare does not claim Human authority; connect does, suspend stays fail-closed, Done verifies", async () => {
+test("iPhone WebRTC prepare does not claim Human authority; connect does, suspend stays fail-closed, canonical Complete verifies", async () => {
   const surface = new FakeWebRtcSurface();
   const f = fixture(surface);
   try {
@@ -800,10 +804,16 @@ test("iPhone WebRTC prepare does not claim Human authority; connect does, suspen
     assert.equal(reconnected.status, 200);
     assert.equal(f.bridge.handle({ action: "status" }).active.status, "human_active");
 
-    const done = await webRtcControl(f.bridge, begun.locator, "done");
-    assert.equal(done.status, 200);
-    assert.equal(f.bridge.handle({ action: "status" }).active.status, "verifying");
+    const completed = await webRtcControl(f.bridge, begun.locator, "complete");
+    assert.equal(completed.status, 200);
+    const verifying = f.bridge.handle({ action: "status" }).active;
+    assert.equal(verifying.status, "verifying");
     assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
+
+    const duplicate = await webRtcControl(f.bridge, begun.locator, "complete");
+    assert.equal(duplicate.status, 404);
+    assert.deepEqual(f.bridge.handle({ action: "status" }).active, verifying);
+    assert.equal(f.bridge.handle({ action: "status" }).faulted, false);
   } finally {
     f.cleanup();
   }

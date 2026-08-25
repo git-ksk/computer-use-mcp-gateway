@@ -309,7 +309,7 @@ export class WebRtcHandoffSurface {
   }
 
   lifecycle(pathname) {
-    const match = /^\/takeover\/api\/(webrtc-connect|done|cancel)\//.exec(pathname);
+    const match = /^\/takeover\/api\/(webrtc-connect|complete|done|cancel)\//.exec(pathname);
     if (!match) return undefined;
     if (match[1] === "webrtc-connect") return "connect";
     return "complete";
