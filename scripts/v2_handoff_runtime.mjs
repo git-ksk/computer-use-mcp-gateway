@@ -120,6 +120,25 @@ function isBinding(value) {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
+const SAFE_BEGIN_FAILURE_CODES = new Set([
+  "WINDOW_HANDOFF_UNAVAILABLE",
+  "WINDOW_HANDOFF_TARGET_INVALID",
+  "WINDOW_HANDOFF_INPUT_POLICY_INVALID",
+  "CHECKPOINT_INVALID",
+  "CHECKPOINT_EXPIRED",
+]);
+
+export function handoffBeginFailureCode(error) {
+  const code = error && typeof error === "object" ? error.code : undefined;
+  return typeof code === "string" && SAFE_BEGIN_FAILURE_CODES.has(code)
+    ? code
+    : "HANDOFF_BEGIN_INTERNAL";
+}
+
+function reportBeginFailure(code) {
+  process.stderr.write(`handoff runtime begin rejected code=${code}\n`);
+}
+
 function interactionContextBinding(contextId) {
   if (typeof contextId !== "string" || !/^ctx_[0-9a-f]{32}$/.test(contextId)) return undefined;
   return createHash("sha256")
@@ -788,13 +807,20 @@ export class HandoffBridge {
   }
 
   begin(request = {}) {
-    if (this.recovery || this.state.getActive()) return { ok: false };
+    if (this.recovery || this.state.getActive()) {
+      reportBeginFailure("HANDOFF_BEGIN_ACTIVE_OR_RECOVERY");
+      return { ok: false };
+    }
     const binding = this.controlBinding(request);
-    if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
+    if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) {
+      reportBeginFailure("HANDOFF_BEGIN_BINDING_INVALID");
+      return { ok: false };
+    }
     const intervention = this.state.begin({ reason: "operator_handoff", resumePolicy: "never_replay" });
     const owner = this.ownerFor(binding);
     if (!this.api.claimHandoffOwner(this.owners, intervention.id, intervention.status, owner)) {
       this.state.cancel(intervention.id);
+      reportBeginFailure("HANDOFF_BEGIN_OWNER_REJECTED");
       return { ok: false };
     }
     this.activeBinding = binding;
@@ -803,7 +829,8 @@ export class HandoffBridge {
       const locator = this.createSurfaceLocator(intervention);
       this.checkpoint();
       return { ok: true, intervention_id: intervention.id, epoch: intervention.epoch, status: intervention.status, surface: this.humanSurface?.kind ?? null, locator: locator ?? null, native_locator: this.humanSurface?.kind === "native" ? locator ?? null : null, webrtc_locator: this.humanSurface?.kind === "webrtc" ? locator ?? null : null };
-    } catch {
+    } catch (error) {
+      reportBeginFailure(handoffBeginFailureCode(error));
       this.surfaceLocator = undefined;
       this.activeBinding = undefined;
       this.state.cancel(intervention.id);

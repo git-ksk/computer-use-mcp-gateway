@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, WebRtcHandoffSurface, serveStdio } from "../v2_operator_handoff_bridge.mjs";
+import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, WebRtcHandoffSurface, handoffBeginFailureCode, serveStdio } from "../v2_operator_handoff_bridge.mjs";
 
 const HANDOFF_ROOT = process.env.CUMG_V2_HANDOFF_ROOT;
 const api = HANDOFF_ROOT
@@ -903,4 +903,12 @@ test("actual Handoff root exposes the first-class Terminal adapter and pre-claim
   assert.equal(status.status.authority, "agent");
   assert.equal(status.status.interventionStatus, null);
   assert.equal((await bridge.handle({ action: "terminal_agent_input", terminal_pty })).ok, true);
+});
+
+test("begin failure diagnostics expose only bounded codes and never exception messages", () => {
+  const sensitive = new Error("secret-token=do-not-log");
+  sensitive.code = "WINDOW_HANDOFF_UNAVAILABLE";
+  assert.equal(handoffBeginFailureCode(sensitive), "WINDOW_HANDOFF_UNAVAILABLE");
+  sensitive.code = "UNBOUNDED_INTERNAL_DETAIL";
+  assert.equal(handoffBeginFailureCode(sensitive), "HANDOFF_BEGIN_INTERNAL");
 });
