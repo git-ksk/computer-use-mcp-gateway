@@ -114,3 +114,26 @@ fn single_mac_upgrade_rejects_conflicting_launchd_families_and_retires_alternate
     assert!(!guard.contains("unlink("));
     assert!(!guard.contains("remove("));
 }
+
+#[test]
+fn single_mac_upgrade_uses_explicit_one_shot_launchd_maintenance_jobs() {
+    let upgrade = include_str!("../scripts/v2-single-mac-upgrade.sh");
+    let runner = include_str!("../scripts/v2_launchd_maintenance_job.py");
+
+    assert!(upgrade.contains("v2_launchd_maintenance_job.py"));
+    assert!(upgrade.contains("assert-clear"));
+    assert!(upgrade.contains("CUMG_V2_MAINTENANCE_JOB_LABEL"));
+    assert!(upgrade.contains("current_maintenance_job_pid_mismatch"));
+    assert!(runner.contains("unsafe_maintenance_job_dir"));
+    assert!(runner.contains("unsafe_maintenance_plist"));
+    assert!(runner.contains("O_NOFOLLOW"));
+    assert!(runner.contains("\"RunAtLoad\": True"));
+    assert!(runner.contains("\"KeepAlive\": False"));
+    assert!(runner.contains("launchctl, \"bootstrap\""));
+    assert!(runner.contains("launchctl, \"bootout\""));
+    assert!(runner.contains("automatic_maintenance_relaunch_detected"));
+    assert!(runner.contains("stale_maintenance_jobs"));
+    assert!(runner.contains("com.git-ksk.cumg-v2-upgrade-"));
+    assert!(!runner.contains("[launchctl, \"submit\""));
+    assert!(!upgrade.contains("launchctl submit "));
+}

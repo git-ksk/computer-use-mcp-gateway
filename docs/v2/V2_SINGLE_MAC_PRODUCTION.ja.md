@@ -62,11 +62,15 @@ exact target の `runtime-<cumg>-<handoff>` generation がすでに存在する�
 
 既知の single-Mac Hub/Agent launchd label family は相互排他です。Hub label が2つ、Agent label が2つ、または異なる既知 family の Hub と Agent が同時に loaded なら preflight で拒否します。reviewed cutover では configured service を drain/unload した後、restart 前に alternate の既知 Hub/Agent label を bootout + disable します。rollback/forensics 用 plist は削除せず保持し、この guard は quarantine/replay state を変更しません。
 
+single-Mac maintenance は明示的な one-shot に限定します。upgrade/recovery command に `launchctl submit` を使ってはいけません。underspecified な submitted job では launchd が persistence/relaunch behavior を推論する場合があります。upgrade helper の reviewed launchd wrapper は `scripts/v2_launchd_maintenance_job.py run-upgrade` です。owner-private な temporary plist に `RunAtLoad=true` / `KeepAlive=false` を明記し、upgrade helper が必要とする closed な non-secret environment allowlist だけを渡します。upgrade が non-zero で終了した場合も launchd の `runs` が1を超えないことを検証し、return 前に必ず job を bootout して temporary plist を削除します。failed upgrade の retry は行いません。
+
+upgrade 前には wrapper と `v2-single-mac-upgrade.sh` の両方が current GUI launchd domain から known current/legacy CUMG maintenance label を検査します。wrapper 自身の exact current label 以外に loaded job があれば `stale_maintenance_jobs` で拒否し、active job は自動停止しません。privacy-bounded な state/runs/last-exit の確認には `scripts/v2_launchd_maintenance_job.py inspect` を使います。stale job が running でないことを確認した後だけ `cleanup-stale` で bootout し、matching private temporary plist のみ削除できます。matching maintenance job が active の間は cleanup 自体を拒否します。
+
 signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します。display-name の `CUMG_V2_MACOS_CODESIGN_IDENTITY` は、valid certificate が exactly one に解決できる場合だけ compatibility fallback として使えます。選択 certificate の exact Team ID を **sign 前に** 検証し、sign 後も stable identifier / Team-ID designated requirement を再検証します。ad-hoc fallback はありません。
 
 成功する upgrade の順序は次です。
 
-1. CUMG/Handoff source provenance、quarantine=0、loaded service、既知 Hub/Agent launchd family の競合なし、Agent-owned Handoff idle を locator/owner data を出さずに確認;
+1. CUMG/Handoff source provenance、quarantine=0、loaded service、既知 Hub/Agent launchd family の競合なし、exact current one-shot wrapper 以外の stale CUMG maintenance job がないこと、Agent-owned Handoff idle を locator/owner data を出さずに確認;
 2. 1つの merged CUMG commit から paired binaries を build し、exact reviewed Handoff `dist` / `package.json` / lockfile と CUMG runtime host script から private `runtime-<cumg>-<handoff>` generation を stage。lockfile-pinned production dependency だけを lifecycle script 無効で導入し、runtime generation を symlink-free に保つため npm command shim の `.bin` link を除去、残存 dependency symlink を拒否した上で、service を止める前に configured Node executable で staged entrypoint の import 成功を確認;
 3. Handoff host helper を新 generation へ copy して stable sign。live helper は in-place 変更しない;
 4. old binaries/config、Handoff env、helper copy、runtime dependency を含む self-contained old Handoff generation を private rollback bundle に保存。dependency が欠けた archive は external-runtime reference のまま扱い、その runtime の cleanup を許可しない。authoritative Hub/Agent state は drain 後だけ保存;
@@ -79,15 +83,17 @@ signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します
 例:
 
 ```bash
-CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
-CUMG_V2_MACOS_CODESIGN_FINGERPRINT=0123456789ABCDEF0123456789ABCDEF01234567 \
-CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
-CUMG_V2_HANDOFF_SOURCE_ROOT="$HOME/x-code/mcp-execution-handoff" \
-CUMG_V2_EXPECTED_HANDOFF_COMMIT=<reviewed-40-hex-commit> \
-  scripts/v2-single-mac-upgrade.sh --preflight-only
+export CUMG_V2_EXPECTED_CUA_VERSION=0.19.3
+export CUMG_V2_MACOS_CODESIGN_FINGERPRINT=0123456789ABCDEF0123456789ABCDEF01234567
+export CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ
+export CUMG_V2_HANDOFF_SOURCE_ROOT="$HOME/x-code/mcp-execution-handoff"
+export CUMG_V2_EXPECTED_HANDOFF_COMMIT=<reviewed-40-hex-commit>
+
+scripts/v2-single-mac-upgrade.sh --preflight-only
+python3 scripts/v2_launchd_maintenance_job.py run-upgrade
 ```
 
-cutover は同じ reviewed environment から `--preflight-only` を外して実行します。最初の pinned cutover 後は `CUMG_V2_HANDOFF_SOURCE_ROOT` を explicit reviewed checkout として渡してください。runtime の `CUMG_V2_HANDOFF_ROOT` は immutable staged code を指し、development checkout ではありません。
+preflight は service stop/restart を行わないため direct 実行で構いません。actual cutover は ad-hoc launchd job ではなく reviewed one-shot wrapper を必ず使います。upgrade が non-zero でも temporary job の bootout/plist cleanup 後にその exit を返し、retry はしません。最初の pinned cutover 後は `CUMG_V2_HANDOFF_SOURCE_ROOT` を explicit reviewed checkout として渡してください。runtime の `CUMG_V2_HANDOFF_ROOT` は immutable staged code を指し、development checkout ではありません。
 
 rollback bundle は old-binary / old-state / Handoff-code の明示的 evidence set です。new runtime が進めた state に old binary だけを戻してはいけません。post-start failure は new profile を fail closed で停止し、recovery は explicit operator action に限定します。
 
@@ -104,7 +110,7 @@ standard profile では次を確認します。
 - enrolled single-Mac device が 1 台だけであることと current generation;
 - Agent checkpoint readability と exact Hub/Agent generation pairing;
 - live quarantine count;
-- Hub/Agent/external-signer LaunchAgent の running state と Agent -> loopback Hub transport の established 状態;
+- Hub/Agent/external-signer LaunchAgent の running state、privacy-bounded な current/legacy CUMG maintenance-job presence、Agent -> loopback Hub transport の established 状態;
 - private signer socket と parent permission;
 - server certificate と pinned Agent trust root の validity;
 - 実 Cua Driver version と explicit reviewed pin の一致;

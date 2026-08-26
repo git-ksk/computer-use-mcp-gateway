@@ -15,6 +15,12 @@ use std::process::Command;
 const MAX_HASHED_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const DEFAULT_TLS_WARN_BEFORE_SECS: u64 = 30 * 24 * 60 * 60;
+const MAINTENANCE_LABEL_PREFIX: &str = "com.github.git-ksk.cumg-v2-maintenance.";
+const LEGACY_MAINTENANCE_LABEL_PREFIXES: [&str; 2] = [
+    "com.git-ksk.cumg-v2-upgrade-",
+    "com.github.git-ksk.cumg-v2-upgrade-",
+];
+const MAX_MAINTENANCE_JOBS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct DoctorConfig {
@@ -31,6 +37,7 @@ pub struct DoctorConfig {
     pub cua_command: Option<PathBuf>,
     pub expected_cua_version: Option<String>,
     pub handoff_control_socket: Option<PathBuf>,
+    pub maintenance_job_exclude_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -141,6 +148,7 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     if let Some(label) = &config.grant_signer_launchd_label {
         inspect_launchd_service(label, "grant_signer_service", &mut checks);
     }
+    inspect_launchd_maintenance_jobs(config.maintenance_job_exclude_label.as_deref(), &mut checks);
     if let Some(socket) = &config.grant_signer_socket {
         inspect_unix_socket(socket, &mut checks);
     }
@@ -436,6 +444,146 @@ fn inspect_agent(
     summary
 }
 
+fn is_launchd_maintenance_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 180
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && (label.starts_with(MAINTENANCE_LABEL_PREFIX)
+            || LEGACY_MAINTENANCE_LABEL_PREFIXES
+                .iter()
+                .any(|prefix| label.starts_with(prefix)))
+}
+
+fn launchctl_domain_maintenance_labels(output: &str) -> Vec<String> {
+    let mut labels = output
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '-')
+            });
+            is_launchd_maintenance_label(token).then(|| token.to_owned())
+        })
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn inspect_launchd_maintenance_jobs(exclude_label: Option<&str>, checks: &mut Vec<DoctorCheck>) {
+    #[cfg(target_os = "macos")]
+    {
+        if exclude_label.is_some_and(|label| {
+            !is_launchd_maintenance_label(label) || !label.starts_with(MAINTENANCE_LABEL_PREFIX)
+        }) {
+            push(
+                checks,
+                "maintenance_jobs",
+                CheckStatus::Error,
+                "invalid_current_maintenance_job_label",
+            );
+            return;
+        }
+        let uid = unsafe { libc_getuid() };
+        let domain = format!("gui/{uid}");
+        if let Some(label) = exclude_label {
+            let target = format!("{domain}/{label}");
+            let current = match Command::new("launchctl").arg("print").arg(target).output() {
+                Ok(current) if current.status.success() => current,
+                _ => {
+                    push(
+                        checks,
+                        "maintenance_jobs",
+                        CheckStatus::Error,
+                        "current_maintenance_job_not_loaded",
+                    );
+                    return;
+                }
+            };
+            let text = String::from_utf8_lossy(&current.stdout);
+            if launchctl_output_running_pid(&text).is_none()
+                || launchctl_output_runs(&text) != Some(1)
+            {
+                push(
+                    checks,
+                    "maintenance_jobs",
+                    CheckStatus::Error,
+                    "current_maintenance_job_not_one_shot_running",
+                );
+                return;
+            }
+        }
+        let output = match Command::new("launchctl").arg("print").arg(&domain).output() {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                push(
+                    checks,
+                    "maintenance_jobs",
+                    CheckStatus::Warning,
+                    "launchd_domain_unreadable",
+                );
+                return;
+            }
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let labels = launchctl_domain_maintenance_labels(&text)
+            .into_iter()
+            .filter(|label| Some(label.as_str()) != exclude_label)
+            .collect::<Vec<_>>();
+        if labels.len() > MAX_MAINTENANCE_JOBS {
+            push(
+                checks,
+                "maintenance_jobs",
+                CheckStatus::Error,
+                "maintenance_job_count_exceeded",
+            );
+            return;
+        }
+        let mut loaded = 0usize;
+        let mut active = 0usize;
+        for label in labels {
+            let target = format!("{domain}/{label}");
+            let result = match Command::new("launchctl").arg("print").arg(target).output() {
+                Ok(result) if result.status.success() => result,
+                _ => continue,
+            };
+            loaded += 1;
+            let text = String::from_utf8_lossy(&result.stdout);
+            if launchctl_output_running_pid(&text).is_some() {
+                active += 1;
+            }
+        }
+        if loaded == 0 {
+            push(checks, "maintenance_jobs", CheckStatus::Ok, "none");
+        } else if active > 0 {
+            push(
+                checks,
+                "maintenance_jobs",
+                CheckStatus::Warning,
+                &format!("active_stale_jobs count={active} loaded={loaded}"),
+            );
+        } else {
+            push(
+                checks,
+                "maintenance_jobs",
+                CheckStatus::Warning,
+                &format!("stale_jobs_loaded count={loaded}"),
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exclude_label;
+        push(
+            checks,
+            "maintenance_jobs",
+            CheckStatus::Warning,
+            "launchd_check_not_supported",
+        );
+    }
+}
+
 fn inspect_launchd_service(label: &str, name: &str, checks: &mut Vec<DoctorCheck>) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
@@ -487,6 +635,14 @@ fn launchctl_output_running_pid(output: &str) -> Option<u32> {
     output.lines().find_map(|line| {
         let line = line.trim();
         line.strip_prefix("pid = ")?.parse::<u32>().ok()
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchctl_output_runs(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("runs = ")?.parse::<u64>().ok()
     })
 }
 
@@ -789,6 +945,32 @@ mod tests {
             None
         );
         assert_eq!(launchctl_output_running_pid("state = running\n"), None);
+        assert_eq!(
+            launchctl_output_runs("state = running\nruns = 1\n"),
+            Some(1)
+        );
+        assert_eq!(
+            launchctl_output_runs("state = running\nruns = nope\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn maintenance_label_parser_accepts_only_bounded_known_job_families() {
+        let current = "com.github.git-ksk.cumg-v2-maintenance.upgrade.1.2.deadbeef";
+        let legacy = "com.git-ksk.cumg-v2-upgrade-once.1787651265";
+        let labels = launchctl_domain_maintenance_labels(&format!(
+            "0 0 {legacy}\n0 0 {current}\n0 0 com.github.git-ksk.cumg-v2-hub\n"
+        ));
+        assert_eq!(labels, vec![legacy.to_owned(), current.to_owned()]);
+        assert!(is_launchd_maintenance_label(current));
+        assert!(is_launchd_maintenance_label(legacy));
+        assert!(!is_launchd_maintenance_label(
+            "com.github.git-ksk.cumg-v2-hub"
+        ));
+        assert!(!is_launchd_maintenance_label(
+            "com.github.git-ksk.cumg-v2-maintenance.bad/secret"
+        ));
     }
 
     #[test]
@@ -836,6 +1018,7 @@ mod tests {
             cua_command: None,
             expected_cua_version: None,
             handoff_control_socket: None,
+            maintenance_job_exclude_label: None,
         };
         let mut runtime = RuntimeSummary {
             package_version: env!("CARGO_PKG_VERSION").into(),

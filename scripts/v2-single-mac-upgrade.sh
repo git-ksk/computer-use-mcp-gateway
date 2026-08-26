@@ -144,6 +144,30 @@ python3 "$LAUNCHD_TOPOLOGY_GUARD" check \
   --domain "$DOMAIN" --hub-label "$HUB_LABEL" --agent-label "$AGENT_LABEL" \
   --launchctl "$LAUNCHCTL_BIN" || exit 2
 
+MAINTENANCE_JOB_GUARD="$REPO_ROOT/scripts/v2_launchd_maintenance_job.py"
+[[ -f "$MAINTENANCE_JOB_GUARD" && ! -L "$MAINTENANCE_JOB_GUARD" ]] || {
+  echo "REFUSED reason=maintenance_job_guard_missing_or_unsafe" >&2; exit 2;
+}
+MAINTENANCE_JOB_LABEL="${CUMG_V2_MAINTENANCE_JOB_LABEL:-}"
+MAINTENANCE_GUARD_ARGS=(
+  --domain "$DOMAIN" --launchctl "$LAUNCHCTL_BIN" assert-clear
+)
+if [[ -n "$MAINTENANCE_JOB_LABEL" ]]; then
+  case "$MAINTENANCE_JOB_LABEL" in
+    com.github.git-ksk.cumg-v2-maintenance.*) ;;
+    *) echo "REFUSED reason=invalid_current_maintenance_job_label" >&2; exit 2 ;;
+  esac
+  CURRENT_MAINTENANCE_JOB="$(launchctl print "$DOMAIN/$MAINTENANCE_JOB_LABEL" 2>/dev/null)" || {
+    echo "REFUSED reason=current_maintenance_job_not_loaded" >&2; exit 2
+  }
+  CURRENT_MAINTENANCE_PID="$(printf '%s\n' "$CURRENT_MAINTENANCE_JOB" | awk '/^[[:space:]]*pid = / {print $3; exit}')"
+  [[ "$CURRENT_MAINTENANCE_PID" == "$$" ]] || {
+    echo "REFUSED reason=current_maintenance_job_pid_mismatch" >&2; exit 2
+  }
+  MAINTENANCE_GUARD_ARGS+=(--exclude-label "$MAINTENANCE_JOB_LABEL")
+fi
+python3 "$MAINTENANCE_JOB_GUARD" "${MAINTENANCE_GUARD_ARGS[@]}" || exit 2
+
 [[ -x "$BIN_DIR/v2_maint" ]] || { echo "REFUSED reason=installed_maint_missing" >&2; exit 2; }
 [[ -d "$HUB_STATE" && -d "$AGENT_STATE" ]] || { echo "REFUSED reason=state_directory_missing" >&2; exit 2; }
 [[ -f "$HUB_PLIST" && -f "$AGENT_PLIST" ]] || { echo "REFUSED reason=launchd_profile_missing" >&2; exit 2; }
