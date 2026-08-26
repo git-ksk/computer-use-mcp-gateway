@@ -41,7 +41,7 @@ completion provable?
 現在の priority:
 
 - authoritative operation / quarantine / resolution / no-auto-replay state machine を維持する;
-- control schema v8 と capability-advertisement schema v5 の behavior を明示した状態で維持する。v5 は signed / payload-free reconciliation-report boundary を追加する reviewed change で、mixed version は fail closed する;
+- live control schema v9 と capability-advertisement schema v5 の behavior を明示した状態で維持する。capability schema v5 は signed / payload-free reconciliation-report boundary を追加する reviewed change で、mixed version は fail closed する;
 - Cua Driver upgrade を pinned / repeatable evidence を伴う reviewed compatibility change として扱う;
 - security、dependency、documentation、packaging、CI、conformance、soak、resource-regression quality を維持する;
 - V1 固有で残る compatibility observation（#14 / #15）は active CUMG release blocker とせず、対応する upstream Cua issue に blocked された状態を明示する;
@@ -114,6 +114,20 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 - 各 issue は独立した severity、compatibility、test、acceptance boundary を維持する。follow-up は PATCH-compatible、将来 minor への admission、または defer のいずれもあり得るが、backlog を減らすために quarantine/no-replay semantics を弱めない。
 
 この queue は、#100 が既知の `0.3.0` blocker として残る間にも Handoff integration / physical dogfood を進めた結果を roadmap に反映するものです。
+
+### 現在の open issue inventory
+
+2026-08-26 時点で repository には **18件の open issue** があります。issue が roadmap の可視性から黙って抜け落ちないよう、すべての open issue をここで明示的に追跡します。この inventory は次 release への全件投入を約束するものではなく、tracking snapshot です。issue の close/open 時には、この section または近接する roadmap section を同じ documentation pass で更新します。
+
+- **`0.3.0` release gate / closeout:** `#100` local-user-authorized online quarantine recovery が唯一の明示的 runtime release blocker で、trusted physical macOS acceptance が残っています。`#120` は release-document closeout で、現在残るのは tag 直前の version/reference 最終再確認だけです。
+- **Recovery / indeterminate-state UX:** `#103` は effectful Desktop/Browser call の durable operation recovery、`#109` は online-recovery CLI からの durable Hub completion 確認、`#115` は unsafe replay を伴わない actionable indeterminate UX、`#136` は permanent replay tombstone と bounded retirement audit history の分離、`#137` は low-impact indeterminate GUI operation に対する local-human current-state acceptance を追跡します。quarantine、replay fence、persistence-gated settlement を弱めてはいけません。
+- **Runtime/process/filesystem hardening:** `#96` は deliberate Unix session-detachment による process-group supervision escape、`#104` は filesystem observation root と process working-directory root の分離を追跡します。どちらも hardening follow-up で、現在の `0.3.0` blocker ではありません。
+- **Bounded workspace/developer capability:** `#83` は truncated shell/process output の retrievable reference、`#105` は ranged file read / deterministic directory continuation、`#106` は explicitly managed long-running development job、`#107` は shell を要求しない bounded atomic workspace mutation、`#114` は sandboxed Playwright/E2E execution を追跡します。いずれも unrestricted shell authority を暗黙継承せず、explicit capability boundary を必要とします。
+- **Performance / repeatability:** `#111` は再現可能な Gateway latency/concurrency benchmark を追加します。measurement infrastructure であり execution authority は変更しません。
+- **`0.3.0` 後の identity expansion:** `#139` は multi-principal authorization 向け generic OIDC/JWT northbound identity を追加し、production-hardening closeout 後に進める順序を維持します。
+- **Upstream-blocked V1 compatibility:** `#14`（`get_screen_size` session/escalation）と `#15`（`list_apps` live-process discovery mismatch）は upstream Cua 待ちです。active CUMG release blocker ではなく、V1 を deliberate に retire する場合は no-longer-applicable になる可能性があります。
+
+上記分類は ordering/admission guidance であり、severity と acceptance requirement は各 issue 本文を authoritative とします。open issue がこの inventory または他の明示的 roadmap section のどちらにも存在しない場合、roadmap は stale とみなし、documentation closeout を宣言する前に修正します。
 
 ### `0.3.0` 後の candidate: multi-principal northbound identity
 
