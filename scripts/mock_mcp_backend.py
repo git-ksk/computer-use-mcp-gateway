@@ -25,6 +25,9 @@ CANCEL_MARKER: str | None = None
 ARGS_MARKER: str | None = None
 SLOW_LIST_APPS = False
 SLOW_TYPE_TEXT = False
+FAIL_START_SESSION = False
+VERIFY_MARKER: str | None = None
+ENDED_SESSIONS: set[str] = set()
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--args-marker")
     parser.add_argument("--slow-list-apps", action="store_true")
     parser.add_argument("--slow-type-text", action="store_true")
+    parser.add_argument("--fail-start-session", action="store_true")
+    parser.add_argument("--verify-marker")
     return parser.parse_args()
 
 
@@ -409,6 +414,17 @@ def handle_request(message: dict) -> None:
             return
         if name == "verify_state":
             arguments = params.get("arguments") or {}
+            touch(VERIFY_MARKER, "verify_state")
+            session = arguments.get("session")
+            if session in ENDED_SESSIONS:
+                result(
+                    request_id,
+                    {
+                        "content": [{"type": "text", "text": "session ended"}],
+                        "isError": True,
+                    },
+                )
+                return
             content = []
             if arguments.get("include_screenshot", False):
                 content.append({"type": "image", "data": "iVBORw0KGgoAAAANSUhEUgAAAOYAAAGY", "mimeType": "image/png"})
@@ -446,6 +462,20 @@ def handle_request(message: dict) -> None:
             "end_session",
         }:
             arguments = params.get("arguments") or {}
+            session = arguments.get("session")
+            if name == "start_session" and FAIL_START_SESSION:
+                result(
+                    request_id,
+                    {
+                        "content": [{"type": "text", "text": "start session failed"}],
+                        "isError": True,
+                    },
+                )
+                return
+            if name == "end_session" and isinstance(session, str):
+                ENDED_SESSIONS.add(session)
+            elif name == "start_session" and isinstance(session, str):
+                ENDED_SESSIONS.discard(session)
             touch(
                 ARGS_MARKER,
                 json.dumps({"tool": name, "arguments": arguments}, sort_keys=True, separators=(",", ":")),
@@ -579,12 +609,15 @@ def handle_notification(message: dict) -> None:
 
 def main() -> None:
     global CALL_MARKER, CANCEL_MARKER, ARGS_MARKER, SLOW_LIST_APPS, SLOW_TYPE_TEXT
+    global FAIL_START_SESSION, VERIFY_MARKER
     args = parse_args()
     CALL_MARKER = args.call_marker
     CANCEL_MARKER = args.cancel_marker
     ARGS_MARKER = args.args_marker
     SLOW_LIST_APPS = args.slow_list_apps
     SLOW_TYPE_TEXT = args.slow_type_text
+    FAIL_START_SESSION = args.fail_start_session
+    VERIFY_MARKER = args.verify_marker
 
     for line in sys.stdin:
         line = line.strip()

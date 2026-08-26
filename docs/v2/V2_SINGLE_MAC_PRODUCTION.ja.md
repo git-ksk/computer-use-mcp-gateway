@@ -58,6 +58,8 @@ signer policy example は意図的に最小です。review 済み northbound pol
 
 `scripts/v2-single-mac-upgrade.sh` は導入済み single-Mac profile 用の reviewed upgrade helper です。CUMG checkout が clean な `main == origin/main` でない、review 済み Handoff checkout が clean な `main == origin/main` かつ exact `CUMG_V2_EXPECTED_HANDOFF_COMMIT` でない、live quarantine がある、Handoff が active/recovery/faulted、必須 state/service がない、Cua/signing input が不足している場合は replacement 前に拒否します。
 
+exact target の `runtime-<cumg>-<handoff>` generation がすでに存在する場合、helper はそれを上書きしたり in-place repair したりしません。owner-private path、exact source commit pair、manifest schema と完全な file set、記録済み SHA-256 の全一致、symlink 不在、必須 runtime import/dependency、Handoff helper の stable code signature をすべて検証できた場合に限り、その既存 generation を再利用できます。1つでも不一致なら service shutdown 前に拒否します。failure cleanup が削除できるのは現在の invocation が新規作成した generation だけで、既存の verified generation は削除しません。この bounded reuse path は、generation staging だけが先に完了した状態から paired binary/manifest cutover を再開するためのもので、state edit、replay、quarantine 変更を許可するものではありません。
+
 既知の single-Mac Hub/Agent launchd label family は相互排他です。Hub label が2つ、Agent label が2つ、または異なる既知 family の Hub と Agent が同時に loaded なら preflight で拒否します。reviewed cutover では configured service を drain/unload した後、restart 前に alternate の既知 Hub/Agent label を bootout + disable します。rollback/forensics 用 plist は削除せず保持し、この guard は quarantine/replay state を変更しません。
 
 signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します。display-name の `CUMG_V2_MACOS_CODESIGN_IDENTITY` は、valid certificate が exactly one に解決できる場合だけ compatibility fallback として使えます。選択 certificate の exact Team ID を **sign 前に** 検証し、sign 後も stable identifier / Team-ID designated requirement を再検証します。ad-hoc fallback はありません。

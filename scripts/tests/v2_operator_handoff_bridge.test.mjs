@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, WebRtcHandoffSurface, serveStdio } from "../v2_operator_handoff_bridge.mjs";
+import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, WebRtcHandoffSurface, handoffBeginFailureCode, serveStdio } from "../v2_operator_handoff_bridge.mjs";
 
 const HANDOFF_ROOT = process.env.CUMG_V2_HANDOFF_ROOT;
 const api = HANDOFF_ROOT
@@ -73,7 +73,7 @@ class FakeWebRtcSurface {
     if (pathname === `/takeover/${this.sessionID}` || pathname === "/takeover/webrtc-client.js") {
       return new Response("ok", { status: 200 });
     }
-    const match = /^\/takeover\/api\/(webrtc-prepare-claim|webrtc-prepare-reconnect|webrtc-connect|webrtc-suspend|done|cancel)\//.exec(pathname);
+    const match = /^\/takeover\/api\/(webrtc-prepare-claim|webrtc-prepare-reconnect|webrtc-connect|webrtc-suspend|complete|done|cancel)\//.exec(pathname);
     if (!match) return new Response("{}", { status: 404 });
     return new Response(JSON.stringify({ ok: true, operation: match[1] }), {
       status: 200,
@@ -85,7 +85,7 @@ class FakeWebRtcSurface {
   revokeUnclaimed(interventionId) { this.revoked.push(interventionId); }
 
   lifecycle(pathname) {
-    const match = /^\/takeover\/api\/(webrtc-connect|done|cancel)\//.exec(pathname);
+    const match = /^\/takeover\/api\/(webrtc-connect|complete|done|cancel)\//.exec(pathname);
     if (!match) return undefined;
     return match[1] === "webrtc-connect" ? "connect" : "complete";
   }
@@ -365,6 +365,50 @@ test("checkpoint recovery can rebind an expired interaction context only with ex
     assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }), { ok: false });
 
     assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+
+    // First recover-rebind proves the signed prior owner and only arms a short-lived evidence lane.
+    assert.deepEqual(
+      recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }),
+      { ok: true },
+    );
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+    // Ordinary exact-window Agent commands stay denied while recovery remains authoritative.
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const wrongVerification = structuredClone(verification);
+    wrongVerification.exact_window.window_id += 1;
+    assert.deepEqual(recovered.handle(wrongVerification), { ok: true, decision: "deny" });
+
+    let admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.equal(admitted.intervention_id, begun.intervention_id);
+    assert.equal(admitted.epoch, begun.epoch);
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: false,
+    }), { ok: true });
+    // An unsatisfied verification proves no acceptable fresh observation and cannot commit rebind.
+    assert.deepEqual(
+      recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }),
+      { ok: true },
+    );
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+
+    admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+
     const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId });
     assert.equal(reissued.ok, true);
     assert.equal(reissued.status, "awaiting_human");
@@ -459,7 +503,24 @@ test("checkpoint recovery can prove the prior owner across a monotonic device ge
     assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
     assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId }), { ok: false });
     assert.deepEqual(recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId, prior_generation: fresh.generation + 1 }), { ok: false });
-    const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId, prior_generation: f.request.generation });
+    const recoverRequest = {
+      action: "recover_rebind",
+      prior_context_id: priorContextId,
+      prior_generation: f.request.generation,
+    };
+    assert.deepEqual(recovered.handle(recoverRequest), { ok: true });
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+    const reissued = recovered.handle(recoverRequest);
     assert.equal(reissued.ok, true);
     assert.equal(reissued.status, "awaiting_human");
   } finally { f.cleanup(); }
@@ -486,7 +547,21 @@ test("expired signed checkpoint stays fail-closed until explicit prior-context r
     const fresh = structuredClone(f.request);
     fresh.exact_window.context_binding = contextBinding("ctx_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
-    const reissued = recovered.handle({ action: "recover_rebind", prior_context_id: priorContextId });
+    const recoverRequest = { action: "recover_rebind", prior_context_id: priorContextId };
+    assert.deepEqual(recovered.handle(recoverRequest), { ok: true });
+    assert.equal(recovered.handle({ action: "status" }).recovery_expired, true);
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const admitted = recovered.handle(verification);
+    assert.equal(admitted.decision, "verification");
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+    const reissued = recovered.handle(recoverRequest);
     assert.equal(reissued.ok, true);
     assert.equal(reissued.status, "awaiting_human");
     assert.equal(recovered.handle({ action: "status" }).recovery_expired, false);
@@ -680,6 +755,10 @@ test("CUMG WebRTC surface composes the first-class WindowHandoffAdapter with exa
     target: { processId: 1234, windowId: 5678 },
     inputPolicy: { tap: true, scroll: true, text: true, key: true },
   });
+  assert.equal(surface.lifecycle("/takeover/api/webrtc-connect/window-session-12345678"), "connect");
+  assert.equal(surface.lifecycle("/takeover/api/complete/window-session-12345678"), "complete");
+  assert.equal(surface.lifecycle("/takeover/api/done/window-session-12345678"), "complete");
+  assert.equal(surface.lifecycle("/takeover/api/cancel/window-session-12345678"), "complete");
   const handled = await surface.handle(new Request("https://handoff.example/takeover/window-session-12345678"), "1".repeat(64));
   assert.equal(handled.status, 200);
   assert.deepEqual(calls.handle, { pathname: "/takeover/window-session-12345678", principalBinding: "1".repeat(64) });
@@ -690,7 +769,7 @@ test("CUMG WebRTC surface composes the first-class WindowHandoffAdapter with exa
 });
 
 
-test("iPhone WebRTC prepare does not claim Human authority; connect does, suspend stays fail-closed, Done verifies", async () => {
+test("iPhone WebRTC prepare does not claim Human authority; connect does, suspend stays fail-closed, canonical Complete verifies", async () => {
   const surface = new FakeWebRtcSurface();
   const f = fixture(surface);
   try {
@@ -725,10 +804,16 @@ test("iPhone WebRTC prepare does not claim Human authority; connect does, suspen
     assert.equal(reconnected.status, 200);
     assert.equal(f.bridge.handle({ action: "status" }).active.status, "human_active");
 
-    const done = await webRtcControl(f.bridge, begun.locator, "done");
-    assert.equal(done.status, 200);
-    assert.equal(f.bridge.handle({ action: "status" }).active.status, "verifying");
+    const completed = await webRtcControl(f.bridge, begun.locator, "complete");
+    assert.equal(completed.status, 200);
+    const verifying = f.bridge.handle({ action: "status" }).active;
+    assert.equal(verifying.status, "verifying");
     assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "deny" });
+
+    const duplicate = await webRtcControl(f.bridge, begun.locator, "complete");
+    assert.equal(duplicate.status, 404);
+    assert.deepEqual(f.bridge.handle({ action: "status" }).active, verifying);
+    assert.equal(f.bridge.handle({ action: "status" }).faulted, false);
   } finally {
     f.cleanup();
   }
@@ -903,4 +988,80 @@ test("actual Handoff root exposes the first-class Terminal adapter and pre-claim
   assert.equal(status.status.authority, "agent");
   assert.equal(status.status.interventionStatus, null);
   assert.equal((await bridge.handle({ action: "terminal_agent_input", terminal_pty })).ok, true);
+});
+
+test("begin failure diagnostics expose only bounded codes and never exception messages", () => {
+  const sensitive = new Error("secret-token=do-not-log");
+  sensitive.code = "WINDOW_HANDOFF_UNAVAILABLE";
+  assert.equal(handoffBeginFailureCode(sensitive), "WINDOW_HANDOFF_UNAVAILABLE");
+  sensitive.code = "UNBOUNDED_INTERNAL_DETAIL";
+  assert.equal(handoffBeginFailureCode(sensitive), "HANDOFF_BEGIN_INTERNAL");
+});
+
+test("managed begin without authority emits only the bounded missing-authority code", () => {
+  const f = fixture();
+  const writes = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk, ..._args) => { writes.push(String(chunk)); return true; };
+  try {
+    assert.deepEqual(f.bridge.handleManaged({ action: "begin" }), { ok: false });
+  } finally {
+    process.stderr.write = original;
+    f.cleanup();
+  }
+  assert.deepEqual(writes, ["handoff runtime begin rejected code=HANDOFF_BEGIN_AUTHORITY_MISSING\n"]);
+});
+
+test("managed Human-active recovery requires proof -> satisfied exact verification -> explicit rebind", async () => {
+  const f = fixture();
+  const priorContextId = "ctx_cccccccccccccccccccccccccccccccc";
+  try {
+    f.request.exact_window.context_binding = contextBinding(priorContextId);
+    assert.deepEqual(f.bridge.handle(f.request), { ok: true, decision: "allow" });
+    const begun = f.bridge.handleManaged({ action: "begin", authority: managedAuthority(f.request) });
+    assert.equal(begun.ok, true);
+    const claim = await nativeControl(f.bridge, begun.native_locator, "claim");
+    assert.equal(claim.status, 200);
+
+    const recovered = new HandoffBridge(api, f.store, () => 1_800_000_000_010, new FakeNativeSurface());
+    const fresh = structuredClone(f.request);
+    fresh.generation += 1;
+    fresh.exact_window.context_binding = contextBinding("ctx_dddddddddddddddddddddddddddddddd");
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+
+    const recoverRequest = {
+      action: "recover_rebind",
+      authority: managedAuthority(fresh),
+      prior_context_id: priorContextId,
+      prior_generation: f.request.generation,
+    };
+    const wrongProof = { ...recoverRequest, prior_context_id: "ctx_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" };
+    assert.deepEqual(recovered.handleManaged(wrongProof), { ok: false });
+    assert.deepEqual(recovered.handleManaged(recoverRequest), { ok: true });
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, true);
+
+    // Non-verification authority remains fenced even after the proof has armed the evidence lease.
+    assert.deepEqual(recovered.handle(fresh), { ok: true, decision: "deny" });
+    const verification = structuredClone(fresh);
+    verification.verification_candidate = true;
+    const admitted = recovered.handle(verification);
+    assert.deepEqual(admitted, {
+      ok: true,
+      decision: "verification",
+      intervention_id: begun.intervention_id,
+      epoch: begun.epoch,
+    });
+    assert.deepEqual(recovered.handle({
+      ...verification,
+      action: "report_verification",
+      intervention_id: admitted.intervention_id,
+      epoch: admitted.epoch,
+      satisfied: true,
+    }), { ok: true });
+
+    const reissued = recovered.handleManaged(recoverRequest);
+    assert.equal(reissued.ok, true);
+    assert.equal(reissued.status, "awaiting_human");
+    assert.equal(recovered.handle({ action: "status" }).recovery_required, false);
+  } finally { f.cleanup(); }
 });

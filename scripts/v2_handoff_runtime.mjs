@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 const PROTOCOL = 1;
 const MAX_LINE = 4096;
 const OBSERVATION_TTL_MS = 60_000;
+const RECOVERY_EVIDENCE_TTL_MS = 60_000;
 const CHECKPOINT_TTL_MS = 15 * 60_000;
 const MAX_RECOVERED_EPOCH = 1_000_000;
 const MAX_AUDIT_RECORD_BYTES = 1024;
@@ -118,6 +119,25 @@ function positiveInt(value) {
 
 function isBinding(value) {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+const SAFE_BEGIN_FAILURE_CODES = new Set([
+  "WINDOW_HANDOFF_UNAVAILABLE",
+  "WINDOW_HANDOFF_TARGET_INVALID",
+  "WINDOW_HANDOFF_INPUT_POLICY_INVALID",
+  "CHECKPOINT_INVALID",
+  "CHECKPOINT_EXPIRED",
+]);
+
+export function handoffBeginFailureCode(error) {
+  const code = error && typeof error === "object" ? error.code : undefined;
+  return typeof code === "string" && SAFE_BEGIN_FAILURE_CODES.has(code)
+    ? code
+    : "HANDOFF_BEGIN_INTERNAL";
+}
+
+function reportBeginFailure(code) {
+  process.stderr.write(`handoff runtime begin rejected code=${code}\n`);
 }
 
 function interactionContextBinding(contextId) {
@@ -289,7 +309,7 @@ export class WebRtcHandoffSurface {
   }
 
   lifecycle(pathname) {
-    const match = /^\/takeover\/api\/(webrtc-connect|done|cancel)\//.exec(pathname);
+    const match = /^\/takeover\/api\/(webrtc-connect|complete|done|cancel)\//.exec(pathname);
     if (!match) return undefined;
     if (match[1] === "webrtc-connect") return "connect";
     return "complete";
@@ -592,6 +612,7 @@ export class HandoffBridge {
     this.owners = new Map();
     this.activeBinding = undefined;
     this.latestObservation = undefined;
+    this.recoveryEvidence = undefined;
     this.resumeRequested = false;
     this.surfaceLocator = undefined;
     this.faulted = false;
@@ -723,11 +744,33 @@ export class HandoffBridge {
     };
   }
 
+  recoveryEvidenceMatches(candidate) {
+    const evidence = this.recoveryEvidence;
+    if (!this.recovery || this.recovery.status !== "human_active" || this.faulted
+      || this.state.getActive() || !evidence || this.now() >= evidence.expiresAt
+      || !sameAuthority(candidate, evidence.binding)
+      || !sameExact(candidate.exactWindow, evidence.binding.exactWindow)) {
+      if (evidence && this.now() >= evidence.expiresAt) this.recoveryEvidence = undefined;
+      return false;
+    }
+    return true;
+  }
+
   admit(request) {
     const candidate = this.parseAdmission(request);
     if (!candidate) return { ok: false };
     if (candidate.exactWindow) this.latestObservation = candidate;
-    if (this.recovery || this.faulted) return { ok: true, decision: "deny" };
+    if (this.recovery || this.faulted) {
+      if (candidate.verificationCandidate && this.recoveryEvidenceMatches(candidate)) {
+        return {
+          ok: true,
+          decision: "verification",
+          intervention_id: this.recovery.interventionId,
+          epoch: this.recovery.epoch,
+        };
+      }
+      return { ok: true, decision: "deny" };
+    }
 
     const active = this.state.getActive();
     if (!active) return { ok: true, decision: "allow" };
@@ -761,6 +804,13 @@ export class HandoffBridge {
 
   reportVerification(request) {
     const candidate = this.parseAdmission({ ...request, verification_candidate: true });
+    if (candidate && this.recoveryEvidenceMatches(candidate)
+      && request.intervention_id === this.recovery.interventionId
+      && request.epoch === this.recovery.epoch
+      && typeof request.satisfied === "boolean") {
+      if (request.satisfied) this.recoveryEvidence.observedAt = this.now();
+      return { ok: true };
+    }
     const active = this.state.getActive();
     if (!candidate || !active || !this.activeBinding
       || active.status !== "verifying"
@@ -788,13 +838,20 @@ export class HandoffBridge {
   }
 
   begin(request = {}) {
-    if (this.recovery || this.state.getActive()) return { ok: false };
+    if (this.recovery || this.state.getActive()) {
+      reportBeginFailure("HANDOFF_BEGIN_ACTIVE_OR_RECOVERY");
+      return { ok: false };
+    }
     const binding = this.controlBinding(request);
-    if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) return { ok: false };
+    if (!binding?.exactWindow || this.now() - binding.observedAt > OBSERVATION_TTL_MS) {
+      reportBeginFailure("HANDOFF_BEGIN_BINDING_INVALID");
+      return { ok: false };
+    }
     const intervention = this.state.begin({ reason: "operator_handoff", resumePolicy: "never_replay" });
     const owner = this.ownerFor(binding);
     if (!this.api.claimHandoffOwner(this.owners, intervention.id, intervention.status, owner)) {
       this.state.cancel(intervention.id);
+      reportBeginFailure("HANDOFF_BEGIN_OWNER_REJECTED");
       return { ok: false };
     }
     this.activeBinding = binding;
@@ -803,7 +860,8 @@ export class HandoffBridge {
       const locator = this.createSurfaceLocator(intervention);
       this.checkpoint();
       return { ok: true, intervention_id: intervention.id, epoch: intervention.epoch, status: intervention.status, surface: this.humanSurface?.kind ?? null, locator: locator ?? null, native_locator: this.humanSurface?.kind === "native" ? locator ?? null : null, webrtc_locator: this.humanSurface?.kind === "webrtc" ? locator ?? null : null };
-    } catch {
+    } catch (error) {
+      reportBeginFailure(handoffBeginFailureCode(error));
       this.surfaceLocator = undefined;
       this.activeBinding = undefined;
       this.state.cancel(intervention.id);
@@ -868,6 +926,34 @@ export class HandoffBridge {
     if (this.recovery.adapterKind !== "cumg_os_window_dogfood"
       || this.recovery.principalBinding !== priorOwner.principalBinding
       || this.recovery.actionDigest !== priorOwner.argsDigest) return { ok: false };
+
+    // A recovered Human-active checkpoint must not trust a denied admission attempt as fresh
+    // Window evidence. The first exact recover-rebind proof only arms a short-lived verification
+    // lease. CUMG must then execute its existing exact-window VerifyUiState path (which is the only
+    // admission shape carrying verification_candidate=true) and report a satisfied result. A second
+    // recover-rebind with the same signed prior-owner proof can then reissue the Human intervention.
+    // All non-verification commands remain denied while recovery is authoritative.
+    if (this.recovery.status === "human_active") {
+      const evidence = this.recoveryEvidence;
+      const evidenceCurrent = evidence
+        && this.now() < evidence.expiresAt
+        && sameAuthority(binding, evidence.binding)
+        && sameExact(binding.exactWindow, evidence.binding.exactWindow);
+      const observed = evidenceCurrent
+        && Number.isSafeInteger(evidence.observedAt)
+        && evidence.observedAt <= this.now()
+        && this.now() - evidence.observedAt < RECOVERY_EVIDENCE_TTL_MS;
+      if (!observed) {
+        this.recoveryEvidence = {
+          binding: structuredClone(binding),
+          expiresAt: this.now() + RECOVERY_EVIDENCE_TTL_MS,
+          observedAt: undefined,
+        };
+        return { ok: true };
+      }
+    }
+
+    this.recoveryEvidence = undefined;
     const result = this.reissueRecovery(binding, this.ownerFor(binding));
     if (result.ok) this.recoveryExpired = false;
     return result;
@@ -906,6 +992,7 @@ export class HandoffBridge {
     }
     this.recovery = undefined;
     this.recoveryExpired = false;
+    this.recoveryEvidence = undefined;
     this.latestObservation = undefined;
     this.resumeRequested = false;
     return { ok: true };
@@ -1002,7 +1089,10 @@ export class HandoffBridge {
   handleManaged(request) {
     if (!request || typeof request !== "object" || Array.isArray(request)) return { ok: false };
     if (["begin", "recover_reissue", "recover_rebind", "rebind_live"].includes(request.action)
-      && request.authority === undefined) return { ok: false };
+      && request.authority === undefined) {
+      if (request.action === "begin") reportBeginFailure("HANDOFF_BEGIN_AUTHORITY_MISSING");
+      return { ok: false };
+    }
     return this.handle(request);
   }
 }
@@ -1068,12 +1158,17 @@ export async function serveStdio(bridge, input = process.stdin, output = process
   for await (const line of lines) {
     if (Buffer.byteLength(line, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime request too large");
     let response;
+    let action;
     try {
       const request = JSON.parse(line);
-      response = typeof request?.action === "string" && request.action.startsWith("terminal_")
+      action = request?.action;
+      response = typeof action === "string" && action.startsWith("terminal_")
         ? (terminalBridge ? await terminalBridge.handle(request) : { ok: false, code: "terminal_runtime_unavailable" })
         : (typeof bridge.handleManaged === "function" ? bridge.handleManaged(request) : bridge.handle(request));
-    } catch { response = { ok: false }; }
+    } catch {
+      if (action === "begin") reportBeginFailure("HANDOFF_BEGIN_HANDLER_EXCEPTION");
+      response = { ok: false };
+    }
     const encoded = JSON.stringify(response);
     if (Buffer.byteLength(encoded, "utf8") + 1 > MAX_LINE) throw new Error("handoff runtime response too large");
     if (!output.write(`${encoded}\n`)) {

@@ -1,9 +1,12 @@
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
+from unittest import mock
 import tempfile
 import unittest
 
@@ -13,6 +16,85 @@ mod = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = mod
 SPEC.loader.exec_module(mod)
+
+
+class HandoffRuntimeGenerationTests(unittest.TestCase):
+    CUMG = "a" * 40
+    HANDOFF = "b" * 40
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="cumg-handoff-generation-")
+        self.root = Path(self.temp.name) / "runtime-aaaaaaaaaaaa-bbbbbbbbbbbb"
+        self.root.mkdir(mode=0o700)
+        files = {
+            "v2_handoff_runtime.mjs": "export {};\n",
+            "handoff-root/dist/index.js": "export const ExecutionHandoffState = 1;\n",
+            "handoff-root/package.json": '{"type":"module"}\n',
+            "handoff-root/package-lock.json": '{"lockfileVersion":3}\n',
+            "takeover-webrtc-host": "fixture-host\n",
+        }
+        for relative, payload in files.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, encoding="utf-8")
+        self.write_manifest()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_manifest(self):
+        records = []
+        for path in sorted(p for p in self.root.rglob("*") if p.is_file() and p.name != "runtime-generation-manifest.json"):
+            records.append({
+                "path": path.relative_to(self.root).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        (self.root / "runtime-generation-manifest.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "cumg_source_commit": self.CUMG,
+                "handoff_source_commit": self.HANDOFF,
+                "files": records,
+            }),
+            encoding="utf-8",
+        )
+
+    def test_exact_generation_manifest_is_accepted(self):
+        mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
+
+    def test_wrong_commit_is_refused(self):
+        with self.assertRaises(mod.PreflightRefusal):
+            mod.verify_generation(self.root, "c" * 40, self.HANDOFF)
+
+    def test_hash_mismatch_is_refused(self):
+        (self.root / "v2_handoff_runtime.mjs").write_text("changed\n", encoding="utf-8")
+        with self.assertRaises(mod.PreflightRefusal):
+            mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
+
+    def test_extra_file_is_refused(self):
+        (self.root / "unexpected.txt").write_text("extra\n", encoding="utf-8")
+        with self.assertRaises(mod.PreflightRefusal):
+            mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
+
+    def test_symlink_is_refused_even_when_not_manifested(self):
+        (self.root / "unsafe-link").symlink_to(self.root / "v2_handoff_runtime.mjs")
+        with self.assertRaises(mod.PreflightRefusal):
+            mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
+
+    def test_non_private_generation_root_is_refused(self):
+        original_stat = Path.stat
+
+        def non_private_root_stat(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == self.root:
+                fields = list(result)
+                fields[0] = result.st_mode | stat.S_IRGRP
+                return os.stat_result(fields)
+            return result
+
+        with mock.patch.object(Path, "stat", non_private_root_stat):
+            with self.assertRaises(mod.PreflightRefusal):
+                mod.verify_generation(self.root, self.CUMG, self.HANDOFF)
 
 
 @unittest.skipUnless(shutil.which("node"), "Node is required for runtime import preflight")

@@ -58,7 +58,18 @@ new context may be opened against the new generation, but the old context/ref se
 ## Cua lifecycle mapping
 
 For Cua, the context ID is used as the backend session identifier for contextual desktop commands.
-The adapter keeps Cua tool names and lifecycle payloads south of the CUMG semantic boundary.
+The adapter keeps Cua tool names and lifecycle payloads south of the CUMG semantic boundary. Backend
+session lifetime is not authority: the reviewed Cua 0.19.3 runtime reclaims an idle session after 300
+seconds by default, which is shorter than CUMG's InteractionContext idle lifetime. A valid CUMG
+context can therefore outlive its current Cua session state, especially while Human Handoff owns the
+surface and Agent Computer Use is intentionally idle.
+
+Before a contextual `VerifyUiState` reaches Cua, the adapter idempotently ensures
+`start_session(session=context_id, capture_scope=auto)`. This refreshes a live Cua session or revives
+an idle-reclaimed label at window scope only after the CUMG context and Handoff verification request
+have passed their normal validation/admission boundaries. Refresh failure prevents `verify_state`
+from dispatching and remains fail closed. It does not extend the CUMG context lifetime, authorize a
+stale/closed context, restore Agent authority, replay work, or escalate the session to desktop scope.
 
 The desktop expansion path is explicit:
 
