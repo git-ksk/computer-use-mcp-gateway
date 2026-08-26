@@ -45,7 +45,7 @@ The production V1 route is not changed by this work.
     quarantine/no-auto-replay boundary as desktop operations.
 11. Browser provider refusal messages are not returned or logged verbatim. Only reviewed semantic
     refusal codes may cross the adapter boundary.
-12. Control schema version 8 and capability-advertisement schema version 5 are exact fail-closed boundaries; capability v5 includes the signed payload-free reconciliation-report frame, and incompatible peers are rejected rather than mixed.
+12. Control schema version 9 and capability-advertisement schema version 5 are exact fail-closed boundaries; capability v5 includes the signed payload-free reconciliation-report frame, and incompatible peers are rejected rather than mixed.
 13. Browser core requires a fresh `WindowScoped` InteractionContext. A context monotonically expanded
     to `DesktopScoped` cannot be silently downgraded for browser use.
 14. Browser bind/snapshot observations and the explicitly bounded 16 MiB transfer carriers may use the reviewed bounded-large result allowance; ordinary Browser core mutations retain the ordinary carrier bound.

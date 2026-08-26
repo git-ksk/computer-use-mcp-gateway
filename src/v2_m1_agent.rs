@@ -1564,10 +1564,12 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         }
         AgentOperationError::Filesystem(FilesystemError::Io(_))
         | AgentOperationError::Process(ProcessError::Io(_))
-        | AgentOperationError::Process(ProcessError::Spawn(_))
-        | AgentOperationError::Shell(ShellError::Process(ProcessError::Io(_)))
-        | AgentOperationError::Shell(ShellError::Process(ProcessError::Spawn(_))) => {
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Io(_))) => {
             DeviceErrorCode::IoFailure
+        }
+        AgentOperationError::Process(ProcessError::Spawn(_))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Spawn(_))) => {
+            DeviceErrorCode::ProcessSpawnFailed
         }
         AgentOperationError::Process(ProcessError::EnvironmentKeyDenied(_))
         | AgentOperationError::Shell(ShellError::Process(ProcessError::EnvironmentKeyDenied(_))) => {
@@ -1581,9 +1583,50 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         | AgentOperationError::Shell(ShellError::Process(
             ProcessError::TooManyEnvironmentEntries,
         )) => DeviceErrorCode::TooManyEnvironmentEntries,
-        AgentOperationError::Filesystem(_)
-        | AgentOperationError::Process(_)
-        | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Process(ProcessError::WorkingDirectoryDenied)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::WorkingDirectoryDenied)) => {
+            DeviceErrorCode::WorkingDirectoryDenied
+        }
+        AgentOperationError::Process(ProcessError::WorkingDirectoryNotDirectory)
+        | AgentOperationError::Shell(ShellError::Process(
+            ProcessError::WorkingDirectoryNotDirectory,
+        )) => DeviceErrorCode::WorkingDirectoryInvalid,
+        AgentOperationError::Process(ProcessError::InvalidTimeout)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidTimeout)) => {
+            DeviceErrorCode::InvalidTimeout
+        }
+        AgentOperationError::Process(ProcessError::InvalidProgram)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidProgram)) => {
+            DeviceErrorCode::InvalidProgram
+        }
+        AgentOperationError::Process(ProcessError::ShellProgramDenied)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::ShellProgramDenied)) => {
+            DeviceErrorCode::ProgramDenied
+        }
+        AgentOperationError::Process(ProcessError::TooManyArguments)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::TooManyArguments)) => {
+            DeviceErrorCode::TooManyArguments
+        }
+        AgentOperationError::Process(ProcessError::InvalidRequest)
+        | AgentOperationError::Shell(ShellError::InvalidCommand | ShellError::CommandTooLarge)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidRequest))
+        | AgentOperationError::Filesystem(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Process(
+            ProcessError::NoAllowedWorkingDirectories
+            | ProcessError::InvalidPolicyLimit
+            | ProcessError::ShellUnsupportedPlatform
+            | ProcessError::PipeUnavailable
+            | ProcessError::ReaderPanicked
+            | ProcessError::Execution(_),
+        )
+        | AgentOperationError::Shell(ShellError::Process(
+            ProcessError::NoAllowedWorkingDirectories
+            | ProcessError::InvalidPolicyLimit
+            | ProcessError::ShellUnsupportedPlatform
+            | ProcessError::PipeUnavailable
+            | ProcessError::ReaderPanicked
+            | ProcessError::Execution(_),
+        )) => DeviceErrorCode::InternalFailure,
         AgentOperationError::BrowserUploadStaging(
             BrowserUploadStagingError::UnknownHandle
             | BrowserUploadStagingError::ContextMismatch
@@ -2150,6 +2193,56 @@ mod tests {
                 ProcessUnprovenStage::Worker
             ))
         ));
+    }
+
+    #[test]
+    fn process_policy_errors_preserve_safe_categories_through_shell_wrapping() {
+        let cases = [
+            (
+                AgentOperationError::Process(ProcessError::WorkingDirectoryDenied),
+                DeviceErrorCode::WorkingDirectoryDenied,
+            ),
+            (
+                AgentOperationError::Shell(ShellError::Process(
+                    ProcessError::WorkingDirectoryDenied,
+                )),
+                DeviceErrorCode::WorkingDirectoryDenied,
+            ),
+            (
+                AgentOperationError::Process(ProcessError::InvalidTimeout),
+                DeviceErrorCode::InvalidTimeout,
+            ),
+            (
+                AgentOperationError::Process(ProcessError::ShellProgramDenied),
+                DeviceErrorCode::ProgramDenied,
+            ),
+            (
+                AgentOperationError::Process(ProcessError::Spawn(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "PRIVATE_HOST_PATH",
+                ))),
+                DeviceErrorCode::ProcessSpawnFailed,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(operation_error_code(&error), expected);
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("PRIVATE_HOST_PATH"));
+        }
+    }
+
+    #[test]
+    fn executor_internal_failures_remain_generic_fail_closed() {
+        for error in [
+            AgentOperationError::Process(ProcessError::PipeUnavailable),
+            AgentOperationError::Process(ProcessError::ReaderPanicked),
+            AgentOperationError::Process(ProcessError::InvalidPolicyLimit),
+        ] {
+            assert_eq!(
+                operation_error_code(&error),
+                DeviceErrorCode::InternalFailure
+            );
+        }
     }
 
     #[test]
