@@ -81,6 +81,8 @@ CUMG は、デスクトップを変更できる capability について fail-clo
 
 これらの制御は OS 権限、endpoint hardening、secret custody、network control、deployment 固有の監視を代替するものではありません。機密性の高い desktop をリモート公開する前に、[`docs/SECURITY.ja.md`](docs/SECURITY.ja.md) と [`docs/v2/V2_THREAT_MODEL.ja.md`](docs/v2/V2_THREAT_MODEL.ja.md) を確認してください。
 
+V2 caller が `device_indeterminate` を受け取った場合は、**old operation を retry しないでください**。response の `blocking_operation_id` は、すでに device を quarantine している以前の ambiguous operation を示します。authority-bearing recovery の前に [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) の read-only inspection / reconciliation flow に従ってください。offline resolution では version-paired な `v2_hub` / `v2_maint` を使い、Hub を停止するのは mutation step だけです。
+
 ## V2 の状況
 
 現在の実装状況は、内部 milestone 名ではなく capability 単位で追跡します:

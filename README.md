@@ -81,6 +81,8 @@ CUMG is fail-closed around the capabilities that can change a desktop. In partic
 
 These controls do not replace OS permissions, endpoint hardening, secret custody, network controls, or deployment-specific monitoring. Read [`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/v2/V2_THREAT_MODEL.md`](docs/v2/V2_THREAT_MODEL.md) before exposing a sensitive desktop remotely.
 
+If a V2 caller receives `device_indeterminate`, **do not retry the old operation**. The response's `blocking_operation_id` identifies the earlier ambiguous operation already quarantining the device. Follow the read-only inspection/reconciliation flow in [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) before any authority-bearing recovery; offline resolution uses a version-paired `v2_hub` / `v2_maint` set and stops the Hub only for the mutation step.
+
 ## V2 status
 
 The active implementation is tracked by capability rather than by internal milestone names:
