@@ -15,11 +15,14 @@ use std::process::Command;
 const MAX_HASHED_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const DEFAULT_TLS_WARN_BEFORE_SECS: u64 = 30 * 24 * 60 * 60;
+#[cfg(any(target_os = "macos", test))]
 const MAINTENANCE_LABEL_PREFIX: &str = "com.github.git-ksk.cumg-v2-maintenance.";
+#[cfg(any(target_os = "macos", test))]
 const LEGACY_MAINTENANCE_LABEL_PREFIXES: [&str; 2] = [
     "com.git-ksk.cumg-v2-upgrade-",
     "com.github.git-ksk.cumg-v2-upgrade-",
 ];
+#[cfg(any(target_os = "macos", test))]
 const MAX_MAINTENANCE_JOBS: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -444,6 +447,7 @@ fn inspect_agent(
     summary
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_launchd_maintenance_label(label: &str) -> bool {
     !label.is_empty()
         && label.len() <= 180
@@ -456,6 +460,7 @@ fn is_launchd_maintenance_label(label: &str) -> bool {
                 .any(|prefix| label.starts_with(prefix)))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn launchctl_domain_maintenance_labels(output: &str) -> Vec<String> {
     let mut labels = output
         .split_whitespace()
