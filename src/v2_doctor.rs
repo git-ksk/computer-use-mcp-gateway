@@ -136,7 +136,14 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     };
     verify_runtime_manifest(config, &mut runtime, &mut checks);
 
-    let (hub, hub_device_id) = inspect_hub(config, &mut checks);
+    let agent_pid =
+        inspect_launchd_service(&config.agent_launchd_label, "agent_service", &mut checks);
+    let transport_established = inspect_agent_hub_transport(agent_pid, &mut checks);
+    // Process ancestry is local OS evidence that this doctor was actually spawned by the
+    // configured Agent. A caller-provided operation ID or environment marker is never trusted.
+    let in_band_live_agent_path =
+        transport_established && agent_pid.is_some_and(current_process_descends_from);
+    let (hub, hub_device_id) = inspect_hub(config, in_band_live_agent_path, &mut checks);
     let agent = inspect_agent(
         config,
         hub_device_id.as_deref(),
@@ -145,9 +152,6 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     );
 
     let _hub_pid = inspect_launchd_service(&config.hub_launchd_label, "hub_service", &mut checks);
-    let agent_pid =
-        inspect_launchd_service(&config.agent_launchd_label, "agent_service", &mut checks);
-    inspect_agent_hub_transport(agent_pid, &mut checks);
     if let Some(label) = &config.grant_signer_launchd_label {
         inspect_launchd_service(label, "grant_signer_service", &mut checks);
     }
@@ -299,6 +303,7 @@ fn verify_runtime_manifest(
 
 fn inspect_hub(
     config: &DoctorConfig,
+    in_band_agent_descendant: bool,
     checks: &mut Vec<DoctorCheck>,
 ) -> (HubSummary, Option<String>) {
     let mut summary = HubSummary {
@@ -371,11 +376,21 @@ fn inspect_hub(
     }
     match inspect_quarantines_read_only(&config.hub_state_dir, None) {
         Ok(report) => {
-            summary.live_quarantine_count = Some(report.quarantines.len());
-            if report.quarantines.is_empty() {
+            let (persistent_count, diagnostic_caller_count) =
+                classify_quarantine_report(&report, summary.device_count, in_band_agent_descendant);
+            summary.live_quarantine_count = Some(persistent_count);
+            if persistent_count == 0 {
                 push(checks, "live_quarantine", CheckStatus::Ok, "none");
             } else {
                 push(checks, "live_quarantine", CheckStatus::Error, "present");
+            }
+            if diagnostic_caller_count == 1 {
+                push(
+                    checks,
+                    "diagnostic_self_observation",
+                    CheckStatus::Ok,
+                    "restart_safe_active_caller",
+                );
             }
         }
         Err(_) => push(
@@ -386,6 +401,36 @@ fn inspect_hub(
         ),
     }
     (summary, device_id)
+}
+
+fn classify_quarantine_report(
+    report: &crate::v2_maintenance::QuarantineInspectionReport,
+    device_count: usize,
+    in_band_agent_descendant: bool,
+) -> (usize, usize) {
+    // The single-Mac Agent executes only one operation at a time. Therefore an in-band
+    // doctor can suppress only the one exact restart-safe entry for its current process/shell
+    // generation. Multiple devices/entries or an out-of-band caller remain fail-closed.
+    if !in_band_agent_descendant || device_count != 1 || report.quarantines.len() != 1 {
+        return (report.quarantines.len(), 0);
+    }
+    let quarantine = &report.quarantines[0];
+    // A real Hub restart tears down the Agent transport; reconnecting necessarily advances the
+    // registry generation. With a currently established transport, a same-generation
+    // HubRestartAfterDispatch entry is the serialization of live dispatched work, not a
+    // persisted post-restart quarantine. This changes only the diagnostic taxonomy.
+    let is_current_generation_restart_snapshot = quarantine.indeterminate_reason
+        == "hub_restart_after_dispatch"
+        && quarantine.current_device_generation == Some(quarantine.device_generation)
+        && matches!(quarantine.capability.as_str(), "execute_process" | "shell")
+        && quarantine.dispatch_recorded
+        && quarantine.dispatch_binding_present
+        && quarantine.reconciliation_status == "auto_reconciling";
+    if is_current_generation_restart_snapshot {
+        (0, 1)
+    } else {
+        (1, 0)
+    }
 }
 
 fn inspect_agent(
@@ -624,6 +669,50 @@ fn inspect_launchd_service(label: &str, name: &str, checks: &mut Vec<DoctorCheck
     }
 }
 
+fn current_process_descends_from(ancestor_pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if ancestor_pid <= 1 {
+            return false;
+        }
+        let mut current = std::process::id();
+        for _ in 0..32 {
+            let Some(parent) = macos_parent_pid(current) else {
+                return false;
+            };
+            if parent == ancestor_pid {
+                return true;
+            }
+            if parent <= 1 || parent == current {
+                return false;
+            }
+            current = parent;
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ancestor_pid;
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parent_pid(pid: u32) -> Option<u32> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parent = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    (parent != 0).then_some(parent)
+}
+
 #[cfg(target_os = "macos")]
 unsafe fn libc_getuid() -> u32 {
     unsafe extern "C" {
@@ -651,7 +740,7 @@ fn launchctl_output_runs(output: &str) -> Option<u64> {
     })
 }
 
-fn inspect_agent_hub_transport(agent_pid: Option<u32>, checks: &mut Vec<DoctorCheck>) {
+fn inspect_agent_hub_transport(agent_pid: Option<u32>, checks: &mut Vec<DoctorCheck>) -> bool {
     #[cfg(target_os = "macos")]
     {
         let Some(agent_pid) = agent_pid else {
@@ -661,7 +750,7 @@ fn inspect_agent_hub_transport(agent_pid: Option<u32>, checks: &mut Vec<DoctorCh
                 CheckStatus::Error,
                 "agent_not_running",
             );
-            return;
+            return false;
         };
         let output = Command::new("lsof")
             .args([
@@ -687,19 +776,26 @@ fn inspect_agent_hub_transport(agent_pid: Option<u32>, checks: &mut Vec<DoctorCh
                     CheckStatus::Ok,
                     "loopback_established",
                 );
+                true
             }
-            Ok(_) => push(
-                checks,
-                "agent_hub_transport",
-                CheckStatus::Error,
-                "loopback_not_established",
-            ),
-            Err(_) => push(
-                checks,
-                "agent_hub_transport",
-                CheckStatus::Error,
-                "lsof_unavailable",
-            ),
+            Ok(_) => {
+                push(
+                    checks,
+                    "agent_hub_transport",
+                    CheckStatus::Error,
+                    "loopback_not_established",
+                );
+                false
+            }
+            Err(_) => {
+                push(
+                    checks,
+                    "agent_hub_transport",
+                    CheckStatus::Error,
+                    "lsof_unavailable",
+                );
+                false
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -711,6 +807,7 @@ fn inspect_agent_hub_transport(agent_pid: Option<u32>, checks: &mut Vec<DoctorCh
             CheckStatus::Warning,
             "macos_transport_check_not_supported",
         );
+        false
     }
 }
 
@@ -937,6 +1034,217 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("cumg-doctor-{label}-{unique}"))
+    }
+
+    fn quarantine_inspection(
+        reason: &str,
+        capability: &str,
+        device_generation: u64,
+        current_device_generation: Option<u64>,
+        dispatch_binding_present: bool,
+    ) -> crate::v2_maintenance::QuarantineInspection {
+        crate::v2_maintenance::QuarantineInspection {
+            blocking_operation_id: "op_test".into(),
+            device_id: "dev_test".into(),
+            device_generation,
+            current_device_generation,
+            capability: capability.into(),
+            workflow_id: None,
+            workflow_step_id: None,
+            client_correlation_id: None,
+            request_fingerprint_present: false,
+            dispatch_binding_present,
+            semantic_operation_class: capability.into(),
+            effect_class: "effectful".into(),
+            target_class: "process".into(),
+            effect_kind: "process".into(),
+            verification_kind: "terminal_result".into(),
+            dispatch_recorded: true,
+            prepared_at_ms: 10,
+            dispatched_at_ms: Some(11),
+            indeterminate_at_ms: 11,
+            indeterminate_reason: reason.into(),
+            evidence_class: None,
+            evidence_status: "missing".into(),
+            reconciliation_status: "auto_reconciling".into(),
+            recovery_disposition: "await_authoritative_evidence".into(),
+            manual_audit_required: false,
+            retry_safe: false,
+            execution_outcome: "indeterminate".into(),
+            retirement_eligibility: "ineligible_policy".into(),
+            retirement_policy: None,
+            recommended_action: "keep_quarantine".into(),
+        }
+    }
+
+    fn quarantine_report(
+        quarantines: Vec<crate::v2_maintenance::QuarantineInspection>,
+    ) -> crate::v2_maintenance::QuarantineInspectionReport {
+        crate::v2_maintenance::QuarantineInspectionReport {
+            quarantines,
+            recovery_guidance: crate::v2_maintenance::QuarantineRecoveryGuidance {
+                confirmed_not_executed: "independent evidence".into(),
+                confirmed_completed: "independent evidence".into(),
+                otherwise: "keep quarantine".into(),
+                replay_old_operation: false,
+            },
+        }
+    }
+
+    #[test]
+    fn dispatched_checkpoint_regression_preserves_restart_quarantine_but_classifies_live_caller() {
+        use crate::v2_execution_safety::{
+            AuthoritativeOperationController, OperationDispatchBinding, OperationOwner,
+        };
+        use crate::v2_m0::{DeviceCapability, DeviceIdentity, DeviceRegistry};
+        use crate::v2_m0_execution::{AdmissionLimits, OperationRef};
+        use crate::v2_m1_persistence::M1_STATE_SCHEMA_VERSION;
+
+        let root = temp_dir("self-observation-checkpoint");
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let mut registry_snapshot = registry.snapshot();
+        registry_snapshot.devices[0].generation = 7;
+
+        let owner = OperationOwner::new("https://issuer.example", "doctor").unwrap();
+        let operation_id = "op_doctor_self_observation";
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 1,
+        })
+        .unwrap();
+        execution
+            .prepare(
+                OperationRef {
+                    device_id,
+                    device_generation: 7,
+                    operation_id: operation_id.into(),
+                },
+                owner.clone(),
+                DeviceCapability::ExecuteProcess,
+                10,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched_with_binding(
+                operation_id,
+                &owner,
+                7,
+                Some(OperationDispatchBinding::new(3, "grant_self_observation").unwrap()),
+                11,
+            )
+            .unwrap();
+        let state = HubPersistentState {
+            schema_version: M1_STATE_SCHEMA_VERSION,
+            registry: registry_snapshot,
+            execution: execution.snapshot_for_restart(),
+        };
+        CheckpointStore::new(root.clone(), "hub")
+            .unwrap()
+            .save(&state)
+            .unwrap();
+
+        let report = inspect_quarantines_read_only(&root, None).unwrap();
+        assert_eq!(report.quarantines.len(), 1);
+        assert_eq!(
+            report.quarantines[0].indeterminate_reason,
+            "hub_restart_after_dispatch"
+        );
+        assert_eq!(report.quarantines[0].current_device_generation, Some(7));
+        assert_eq!(classify_quarantine_report(&report, 1, true), (0, 1));
+
+        let (_, restored) = state
+            .restore(AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 1,
+            })
+            .unwrap();
+        assert!(
+            restored
+                .quarantine(&report.quarantines[0].device_id)
+                .is_some()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn in_band_current_generation_restart_snapshot_is_not_persistent_quarantine() {
+        let report = quarantine_report(vec![quarantine_inspection(
+            "hub_restart_after_dispatch",
+            "execute_process",
+            7,
+            Some(7),
+            true,
+        )]);
+        assert_eq!(classify_quarantine_report(&report, 1, true), (0, 1));
+
+        let shell = quarantine_report(vec![quarantine_inspection(
+            "hub_restart_after_dispatch",
+            "shell",
+            7,
+            Some(7),
+            true,
+        )]);
+        assert_eq!(classify_quarantine_report(&shell, 1, true), (0, 1));
+    }
+
+    #[test]
+    fn quarantine_self_observation_classification_fails_closed() {
+        let exact = quarantine_inspection(
+            "hub_restart_after_dispatch",
+            "execute_process",
+            7,
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            classify_quarantine_report(&quarantine_report(vec![exact.clone()]), 1, false),
+            (1, 0)
+        );
+
+        let real = quarantine_inspection("connection_lost", "execute_process", 7, Some(7), true);
+        assert_eq!(
+            classify_quarantine_report(&quarantine_report(vec![real]), 1, true),
+            (1, 0)
+        );
+
+        let stale_generation = quarantine_inspection(
+            "hub_restart_after_dispatch",
+            "execute_process",
+            6,
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            classify_quarantine_report(&quarantine_report(vec![stale_generation]), 1, true),
+            (1, 0)
+        );
+
+        let no_binding = quarantine_inspection(
+            "hub_restart_after_dispatch",
+            "execute_process",
+            7,
+            Some(7),
+            false,
+        );
+        assert_eq!(
+            classify_quarantine_report(&quarantine_report(vec![no_binding]), 1, true),
+            (1, 0)
+        );
+
+        let unrelated = quarantine_inspection("connection_lost", "pointer_click", 5, Some(7), true);
+        assert_eq!(
+            classify_quarantine_report(&quarantine_report(vec![exact, unrelated]), 1, true,),
+            (2, 0)
+        );
     }
 
     #[test]

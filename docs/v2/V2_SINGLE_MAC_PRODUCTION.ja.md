@@ -103,6 +103,8 @@ expired-recovery abandonment は signed checkpoint を削除する前に private
 
 `v2_doctor` は read-only です。quarantine resolve、work dispatch、secret content read、raw command/result/desktop data 出力は行いません。
 
+`v2_doctor` 自身を live single-Mac Agent の `execute_process` / `shell` 経由で起動すると、live Hub では quarantine されていない実行中operationでも、restart-safe Hub checkpoint上では `HubRestartAfterDispatch` として見えます。doctor がこれを `diagnostic_self_observation=restart_safe_active_caller` と分類できるのは、doctor process が現在launchdでrunningなAgent processの子孫であること、Agent -> Hub loopback transportがestablishedであること、checkpointがenrolled device 1台かつquarantine-shaped entry 1件だけであること、そのentryがregistryのcurrent generationに属するprocess/shell operationであること、durable dispatch bindingが存在して`auto_reconciling`であることをすべて満たす場合だけです。caller-supplied operation IDは判定に使いません。条件欠落/不一致、複数entry、older generation、実際のindeterminate reasonは従来どおりblocking `live_quarantine` errorのままです。この分類はdiagnostic表示だけを変え、restart restore時の Dispatched -> durable `Indeterminate` 変換、quarantine、no-replay、state mutationのsemanticsは一切変更しません。
+
 standard profile では次を確認します。
 
 - runtime manifest schema 2、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_grant_signer` の exact SHA-256 identity;
