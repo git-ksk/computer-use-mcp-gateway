@@ -95,6 +95,8 @@ Each unresolved entry identifies the exact `blocking_operation_id`, stable devic
 
 A northbound tool request rejected by an existing quarantine returns `code=device_indeterminate`, `blocking_operation_id=op_...`, and `retry_safe=false`. `blocking_operation_id` always names the **earlier ambiguous operation that is already quarantining the device**, not a newly generated ID for the rejected request. Do not replay that operation. `confirmed_not_executed` is valid only with independent evidence that no side effect occurred; `confirmed_completed` is valid only with independent evidence that the intended side effect completed; otherwise leave quarantine intact.
 
+For text-input ambiguity, `confirmed_effect_applied_uncommitted` is a third explicit offline decision: use it only when independent evidence proves the input was delivered but a distinct submit/commit action did not occur. It is not equivalent to `confirmed_not_executed`, and it never makes the old operation retry-safe. `v2_maint resolve --decision confirmed_effect_applied_uncommitted` rejects capabilities outside the bounded text-input set. Execution-safety schema v6 persists this distinction and refuses downgrade to v5 when such a record exists.
+
 For shell/process deployments that want privacy-preserving candidate matching, provision one private file of at least 32 bytes and configure the Hub with `CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE`. The file must be readable only by the Hub/operator account and must not be committed or copied into logs. The Hub HMACs the canonical request before dispatch; no raw request is persisted for this purpose. To compare a locally-held candidate request, place that candidate JSON in a private file and run:
 
 ```bash
@@ -127,7 +129,7 @@ v2_maint inspect-reconciliation-history \
 
 Add `--device-id DEVICE_ID` to filter by stable device. Auto-resolution history and retired-indeterminate history are each bounded to 64 entries and report only safe fields such as operation/device/generation, capability, terminal/evidence or retirement class, resolution/retirement timestamp, and `replayed=false`.
 
-This feature requires capability schema v5 on both Hub and Agent. Upgrade the pair together. Mixed old/new peers fail the capability-schema handshake closed rather than attempting a partially compatible session. Execution-safety checkpoint restore remains compatible with schemas v1/v2/v3/v4 when those checkpoints stay within their representational limits; downgrading a state that already contains v4 dispatch/reconciliation metadata or v5 retirement state is intentionally rejected.
+This feature requires capability schema v5 on both Hub and Agent. Upgrade the pair together. Mixed old/new peers fail the capability-schema handshake closed rather than attempting a partially compatible session. Execution-safety checkpoint restore remains compatible with schemas v1/v2/v3/v4/v5 when those checkpoints stay within their representational limits; downgrading a state that already contains v4 dispatch/reconciliation metadata, v5 retirement state, or v6 partial-input resolution state is intentionally rejected.
 
 ### Unknown-outcome retirement for permanently unknowable legacy ambiguity
 

@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 5;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 6;
+const RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 5;
 const RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 4;
 const AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 3;
 const RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 2;
@@ -1165,11 +1166,23 @@ impl AuthoritativeOperationController {
             return Err(ExecutionError::InvalidTransition);
         }
 
+        if decision == IndeterminateResolution::ConfirmedEffectAppliedUncommitted
+            && !matches!(
+                record.capability,
+                DeviceCapability::TypeText | DeviceCapability::BrowserType
+            )
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+
         let next = self
             .admission
             .resolve_indeterminate(operation_id, decision.clone())?;
         let terminal = match decision {
-            IndeterminateResolution::ConfirmedCompleted => HubOperationState::Completed,
+            IndeterminateResolution::ConfirmedCompleted
+            | IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+                HubOperationState::Completed
+            }
             IndeterminateResolution::ConfirmedNotExecuted => HubOperationState::Cancelled,
         };
         let record = self
@@ -1644,10 +1657,28 @@ impl AuthoritativeOperationController {
                 .admission
                 .retired_indeterminate_operation_ids
                 .is_empty();
+        let has_v6_state = snapshot.resolutions.iter().any(|resolution| {
+            resolution.decision == IndeterminateResolution::ConfirmedEffectAppliedUncommitted
+        });
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v6_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version = RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v5_state {
+                if has_v5_state || has_v6_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.retirements.clear();
@@ -1668,7 +1699,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v4_state || has_v5_state {
+                if has_v4_state || has_v5_state || has_v6_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.auto_resolutions.clear();
@@ -1693,6 +1724,7 @@ impl AuthoritativeOperationController {
             RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION => {
                 if has_v4_state
                     || has_v5_state
+                    || has_v6_state
                     || snapshot.operations.iter().any(|record| {
                         !record.audit.is_empty() || record.request_fingerprint.is_some()
                     })
@@ -1721,6 +1753,7 @@ impl AuthoritativeOperationController {
             LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION => {
                 if has_v4_state
                     || has_v5_state
+                    || has_v6_state
                     || !snapshot.recoveries.is_empty()
                     || snapshot.operations.iter().any(|record| {
                         record.recoverable_result.is_some()
@@ -1760,6 +1793,7 @@ impl AuthoritativeOperationController {
                 | RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
                 | AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION
+                | RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -1779,12 +1813,19 @@ impl AuthoritativeOperationController {
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION
             && (!snapshot.retirements.is_empty()
                 || !snapshot
                     .admission
                     .retired_indeterminate_operation_ids
                     .is_empty())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && snapshot.resolutions.iter().any(|resolution| {
+                resolution.decision == IndeterminateResolution::ConfirmedEffectAppliedUncommitted
+            })
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -3918,6 +3959,137 @@ mod tests {
             ),
             Err(ExecutionError::InvalidSnapshot)
         ));
+    }
+
+    #[test]
+    fn type_text_reconciliation_distinguishes_no_effect_uncommitted_and_committed() {
+        fn indeterminate_type_text(operation_id: &str) -> AuthoritativeOperationController {
+            let mut ledger = controller();
+            ledger
+                .prepare(op(operation_id, 4), alice(), DeviceCapability::TypeText, 1)
+                .unwrap();
+            ledger
+                .mark_dispatched(operation_id, &alice(), 4, 2)
+                .unwrap();
+            ledger
+                .mark_indeterminate(
+                    operation_id,
+                    &alice(),
+                    4,
+                    IndeterminateReason::ConnectionLost,
+                    3,
+                )
+                .unwrap();
+            ledger
+        }
+
+        let mut before_delivery = indeterminate_type_text("op-before-delivery");
+        let (_, no_effect_receipt) = before_delivery
+            .resolve_indeterminate(
+                "op-before-delivery",
+                alice(),
+                IndeterminateResolution::ConfirmedNotExecuted,
+                "independent evidence proved input was not delivered",
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            no_effect_receipt.terminal_state,
+            HubOperationState::Cancelled
+        );
+
+        let mut after_delivery = indeterminate_type_text("op-after-delivery");
+        let (_, partial_receipt) = after_delivery
+            .resolve_indeterminate(
+                "op-after-delivery",
+                alice(),
+                IndeterminateResolution::ConfirmedEffectAppliedUncommitted,
+                "independent evidence proved text was present without submit",
+                4,
+            )
+            .unwrap();
+        assert_eq!(partial_receipt.terminal_state, HubOperationState::Completed);
+        assert_eq!(
+            after_delivery.resolutions()[0].decision,
+            IndeterminateResolution::ConfirmedEffectAppliedUncommitted
+        );
+        assert!(matches!(
+            after_delivery
+                .snapshot_for_restart_compatible_with(RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+        let snapshot = after_delivery.snapshot_for_restart();
+        let mut restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.prepare(
+                op("op-after-delivery", 5),
+                alice(),
+                DeviceCapability::TypeText,
+                5,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+
+        let mut after_submit = indeterminate_type_text("op-after-submit");
+        let (_, committed_receipt) = after_submit
+            .resolve_indeterminate(
+                "op-after-submit",
+                alice(),
+                IndeterminateResolution::ConfirmedCompleted,
+                "independent evidence proved submit committed the intended effect",
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            committed_receipt.terminal_state,
+            HubOperationState::Completed
+        );
+    }
+
+    #[test]
+    fn partial_effect_resolution_is_restricted_to_text_input_capabilities() {
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-click", 4),
+                alice(),
+                DeviceCapability::PointerClick,
+                1,
+            )
+            .unwrap();
+        ledger.mark_dispatched("op-click", &alice(), 4, 2).unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-click",
+                &alice(),
+                4,
+                IndeterminateReason::ConnectionLost,
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.resolve_indeterminate(
+                "op-click",
+                alice(),
+                IndeterminateResolution::ConfirmedEffectAppliedUncommitted,
+                "not a valid commit model for pointer click",
+                4,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert_eq!(
+            ledger.state("op-click"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(ledger.quarantine("desktop-a").is_some());
     }
 
     proptest! {
