@@ -22,7 +22,7 @@ const LEGACY_MAINTENANCE_LABEL_PREFIXES: [&str; 2] = [
     "com.git-ksk.cumg-v2-upgrade-",
     "com.github.git-ksk.cumg-v2-upgrade-",
 ];
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const MAX_MAINTENANCE_JOBS: usize = 64;
 
 #[derive(Debug, Clone)]
