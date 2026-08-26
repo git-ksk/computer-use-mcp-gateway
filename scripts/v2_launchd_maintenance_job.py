@@ -369,7 +369,7 @@ def wait_for_one_shot_completion(
         if last.runs > 1:
             raise MaintenanceError("automatic_maintenance_relaunch_detected")
         observed_run = observed_run or last.runs == 1 or last.running
-        if observed_run and not last.running and last.runs == 1:
+        if observed_run and last.state == "not running" and last.runs == 1:
             break
         sleep(POLL_INTERVAL_SECS)
     else:

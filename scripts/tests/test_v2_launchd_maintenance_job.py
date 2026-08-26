@@ -179,6 +179,29 @@ class LaunchdMaintenanceTests(unittest.TestCase):
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
         self.assertNotIn("GITHUB_TOKEN", environment)
 
+    def test_xpcproxy_transition_is_not_mistaken_for_completed_job(self):
+        label = "com.github.git-ksk.cumg-v2-maintenance.upgrade.1.2.deadbeef"
+        outputs = iter([
+            "state = xpcproxy\nruns = 1\npid = 42\nlast exit code = (never exited)\n",
+            "state = running\nruns = 1\npid = 43\nlast exit code = (never exited)\n",
+            "state = not running\nruns = 1\nlast exit code = 0\n",
+            "state = not running\nruns = 1\nlast exit code = 0\n",
+        ])
+
+        def runner(argv, *, stdout, stderr, text, check):
+            self.assertEqual(argv[1], "print")
+            return subprocess.CompletedProcess(argv, 0, next(outputs), "")
+
+        exit_code = mod.wait_for_one_shot_completion(
+            domain=DOMAIN,
+            label=label,
+            launchctl="/bin/launchctl",
+            timeout_secs=5,
+            runner=runner,
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(exit_code, 0)
+
     def test_nonzero_upgrade_exit_runs_once_and_cleanup_always_boots_out_and_unlinks_plist(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
