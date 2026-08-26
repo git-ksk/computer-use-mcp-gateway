@@ -137,10 +137,14 @@ def parse_job_status(label: str, output: str) -> MaintenanceJobStatus:
             except ValueError:
                 raise MaintenanceError("invalid_maintenance_job_status") from None
         elif line.startswith("last exit code = "):
-            try:
-                last_exit_code = int(line.removeprefix("last exit code = ").strip())
-            except ValueError:
-                raise MaintenanceError("invalid_maintenance_job_status") from None
+            value = line.removeprefix("last exit code = ").strip()
+            if value == "(never exited)":
+                last_exit_code = None
+            else:
+                try:
+                    last_exit_code = int(value)
+                except ValueError:
+                    raise MaintenanceError("invalid_maintenance_job_status") from None
         elif line.startswith("pid = "):
             try:
                 pid = int(line.removeprefix("pid = ").strip())
