@@ -15,6 +15,7 @@ use std::process::Command;
 const MAX_HASHED_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const DEFAULT_TLS_WARN_BEFORE_SECS: u64 = 30 * 24 * 60 * 60;
+const CRITICAL_AVAILABLE_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(any(target_os = "macos", test))]
 const MAINTENANCE_LABEL_PREFIX: &str = "com.github.git-ksk.cumg-v2-maintenance.";
 #[cfg(any(target_os = "macos", test))]
@@ -136,6 +137,8 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         manifest_verified: false,
     };
     verify_runtime_manifest(config, &mut runtime, &mut checks);
+    inspect_storage_capacity(&config.agent_state_dir, "agent_state_capacity", &mut checks);
+    inspect_storage_capacity(&std::env::temp_dir(), "temp_capacity", &mut checks);
 
     let agent_pid =
         inspect_launchd_service(&config.agent_launchd_label, "agent_service", &mut checks);
@@ -982,6 +985,37 @@ fn inspect_cua(command: &Path, expected: Option<&str>, checks: &mut Vec<DoctorCh
     }
 }
 
+fn inspect_storage_capacity(path: &Path, name: &str, checks: &mut Vec<DoctorCheck>) {
+    let Some(existing) = nearest_existing_ancestor(path) else {
+        push(checks, name, CheckStatus::Warning, "capacity_unavailable");
+        return;
+    };
+    let result = fs2::available_space(existing).map_err(|_| ());
+    let (status, detail) = storage_capacity_status(result);
+    push(checks, name, status, detail);
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut candidate = Some(path);
+    while let Some(path) = candidate {
+        if path.exists() {
+            return Some(path);
+        }
+        candidate = path.parent();
+    }
+    None
+}
+
+fn storage_capacity_status(available: Result<u64, ()>) -> (CheckStatus, &'static str) {
+    match available {
+        Ok(bytes) if bytes < CRITICAL_AVAILABLE_STORAGE_BYTES => {
+            (CheckStatus::Warning, "critical_lt_64_mib")
+        }
+        Ok(_) => (CheckStatus::Ok, "available_ge_64_mib"),
+        Err(()) => (CheckStatus::Warning, "capacity_unavailable"),
+    }
+}
+
 fn push(checks: &mut Vec<DoctorCheck>, name: &str, status: CheckStatus, detail: &str) {
     checks.push(DoctorCheck {
         name: name.to_owned(),
@@ -1381,6 +1415,48 @@ mod tests {
                 detail: "verified".into(),
             }]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_capacity_signal_is_read_only_bounded_and_low_cardinality() {
+        assert_eq!(
+            storage_capacity_status(Ok(CRITICAL_AVAILABLE_STORAGE_BYTES - 1)),
+            (CheckStatus::Warning, "critical_lt_64_mib")
+        );
+        assert_eq!(
+            storage_capacity_status(Ok(CRITICAL_AVAILABLE_STORAGE_BYTES)),
+            (CheckStatus::Ok, "available_ge_64_mib")
+        );
+        assert_eq!(
+            storage_capacity_status(Err(())),
+            (CheckStatus::Warning, "capacity_unavailable")
+        );
+    }
+
+    #[test]
+    fn storage_capacity_uses_existing_ancestor_without_creating_state_directory() {
+        let root = temp_dir("capacity-ancestor");
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = root.join("agent").join("future");
+        let ancestor = nearest_existing_ancestor(&missing).unwrap();
+        assert_eq!(ancestor, root.as_path());
+        let mut checks = Vec::new();
+        inspect_storage_capacity(&missing, "agent_state_capacity", &mut checks);
+        assert!(
+            !missing.exists(),
+            "doctor capacity inspection must stay read-only"
+        );
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "agent_state_capacity");
+        assert!(matches!(
+            checks[0].status,
+            CheckStatus::Ok | CheckStatus::Warning
+        ));
+        assert!(matches!(
+            checks[0].detail.as_str(),
+            "available_ge_64_mib" | "critical_lt_64_mib" | "capacity_unavailable"
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
