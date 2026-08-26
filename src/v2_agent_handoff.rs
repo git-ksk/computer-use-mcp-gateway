@@ -446,6 +446,59 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn managed_runtime_fixture() -> (
+        crate::v2_operator_handoff::ManagedHandoffRuntimeConfig,
+        std::path::PathBuf,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cumg-agent-handoff-begin-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let command = root.join("runtime-fixture.sh");
+        let script = root.join("runtime.mjs");
+        let env_file = root.join("runtime.env");
+        std::fs::write(
+            &command,
+            r#"#!/bin/sh
+active=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"action":"begin"'*)
+      active=1
+      printf '%s\n' '{"ok":true}'
+      ;;
+    *'"action":"status"'*)
+      if [ "$active" -eq 1 ]; then
+        printf '%s\n' '{"ok":true,"active":{"intervention_id":"intervention_1","status":"awaiting_human","epoch":1,"authority":"none"},"recovery_required":false,"recovery_status":null,"recovery_epoch":null,"recovery_expired":false,"resume_requested":false,"faulted":false,"human_surface":"webrtc","locator":"https://handoff.example/takeover/session_1"}'
+      else
+        printf '%s\n' '{"ok":true,"active":null,"recovery_required":false,"recovery_status":null,"recovery_epoch":null,"recovery_expired":false,"resume_requested":false,"faulted":false,"human_surface":null}'
+      fi
+      ;;
+    *) printf '%s\n' '{"ok":false}' ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&script, "// fixture\n").unwrap();
+        std::fs::write(&env_file, "FIXTURE=1\n").unwrap();
+        std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = crate::v2_operator_handoff::ManagedHandoffRuntimeConfig::new(
+            command,
+            script,
+            env_file,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        (config, root)
+    }
+
     fn authority_for(
         command: &DeviceCommand,
         device_id: &str,
@@ -466,6 +519,48 @@ mod tests {
             )),
             verification_candidate,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_begin_reaches_agent_owned_managed_runtime_when_idle() {
+        let (config, root) = managed_runtime_fixture();
+        let runtime = Arc::new(
+            ManagedOperatorHandoffAuthority::spawn(config)
+                .await
+                .expect("managed runtime should start"),
+        );
+        let coordinator = AgentHandoffCoordinator::new(runtime.clone());
+        let command = inspect_command(34);
+        let authority = authority_for(&command, "device-a", false);
+        let response = coordinator
+            .handle_remote(
+                RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Begin,
+                    authority: Some(authority),
+                },
+                AgentHandoffSessionFence::for_device("device-a", 7, 3),
+            )
+            .await;
+        match response {
+            RemoteHandoffResponseKind::Operator { status, locator } => {
+                assert_eq!(
+                    status.active.as_ref().map(|active| active.status),
+                    Some(HandoffInterventionStatus::AwaitingHuman)
+                );
+                assert_eq!(
+                    status.human_surface,
+                    Some(crate::v2_operator_handoff::HandoffSurfaceKind::Webrtc)
+                );
+                assert!(
+                    locator.is_some(),
+                    "begin should issue a bounded takeover locator"
+                );
+            }
+            other => panic!("expected operator status, got {other:?}"),
+        }
+        runtime.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

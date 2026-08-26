@@ -405,6 +405,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_response_preserves_only_privacy_safe_operator_failure_code() {
+        let response =
+            LocalHandoffControlResponse::rejected(HandoffOperatorControlError::AgentNotIdle);
+        assert!(!response.ok);
+        assert!(response.status.is_none());
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some("handoff_agent_not_idle")
+        );
+    }
+
+    #[test]
     fn local_request_surface_never_accepts_target_or_principal_authority() {
         for field in [
             "principal_binding",

@@ -2008,6 +2008,22 @@ impl HubHandle {
         &self,
         request: RemoteHandoffRequestKind,
     ) -> Result<RemoteHandoffResponseKind, HubCommandError> {
+        if request.requires_agent_idle() {
+            let persistent = self.inner.persistent.lock().await;
+            if request.starts_human_control()
+                && let Some(quarantine) = persistent.execution.quarantine(&self.inner.device_id)
+            {
+                return Err(HubCommandError::DeviceIndeterminate {
+                    operation_id: quarantine.operation_id.clone(),
+                });
+            }
+            if persistent
+                .execution
+                .has_unsettled_work(&self.inner.device_id)
+            {
+                return Err(HubCommandError::Busy);
+            }
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let request_id = random_handoff_request_id();
         let tx = {
@@ -2649,6 +2665,7 @@ mod tests {
     use super::*;
     use crate::v2_m0::DeviceIdentity;
     use crate::v2_m0::GrantAuthority;
+    use crate::v2_m0_transport::RemoteHandoffOperatorCommand;
     use crate::v2_m0_trust::build_device_key_rotation;
 
     fn test_state_dir(name: &str) -> std::path::PathBuf {
@@ -2793,6 +2810,123 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restarted.device_id(), stable_device_id);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn handoff_begin_never_bypasses_desktop_quarantine() {
+        let state_dir = test_state_dir("handoff-operator-quarantine");
+        let device = DeviceIdentity::generate();
+        let (_hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let owner = OperationOwner::local_hub();
+        let operation_id = "op-handoff-quarantine".to_owned();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    crate::v2_m0::DeviceCapability::Shell,
+                    1,
+                )
+                .unwrap();
+            persistent
+                .execution
+                .mark_dispatched(&operation_id, &owner, 1, 2)
+                .unwrap();
+            persistent
+                .execution
+                .mark_connection_lost(&operation_id, 3)
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+
+        assert_eq!(
+            handle
+                .handoff_request(RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Begin,
+                    authority: None,
+                })
+                .await,
+            Err(HubCommandError::DeviceIndeterminate { operation_id })
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn handoff_lifecycle_control_is_rejected_while_device_work_is_active() {
+        let state_dir = test_state_dir("handoff-operator-busy");
+        let device = DeviceIdentity::generate();
+        let (_hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let owner = OperationOwner::local_hub();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: "op-handoff-operator-busy".into(),
+                    },
+                    owner,
+                    crate::v2_m0::DeviceCapability::Shell,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+
+        assert_eq!(
+            handle
+                .handoff_request(RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Begin,
+                    authority: None,
+                })
+                .await,
+            Err(HubCommandError::Busy)
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 

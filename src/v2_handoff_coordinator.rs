@@ -139,6 +139,8 @@ pub enum HandoffOperatorControlError {
     NoFreshExactWindow,
     SessionFenceMismatch,
     InvalidRecoveryProof,
+    AgentNotIdle,
+    DeviceQuarantined,
     InvalidLifecycleState,
     Runtime(HandoffControlError),
 }
@@ -150,6 +152,8 @@ impl HandoffOperatorControlError {
             Self::NoFreshExactWindow => "handoff_no_fresh_exact_window",
             Self::SessionFenceMismatch => "handoff_session_fence_mismatch",
             Self::InvalidRecoveryProof => "handoff_invalid_recovery_proof",
+            Self::AgentNotIdle => "handoff_agent_not_idle",
+            Self::DeviceQuarantined => "handoff_device_quarantined",
             Self::InvalidLifecycleState => "handoff_invalid_lifecycle_state",
             Self::Runtime(HandoffControlError::Unavailable) => "handoff_runtime_unavailable",
             Self::Runtime(HandoffControlError::Rejected) => "handoff_control_rejected",
@@ -483,6 +487,10 @@ impl HandoffCoordinator {
                 | HubCommandError::SessionSuperseded => {
                     HandoffOperatorControlError::Runtime(HandoffControlError::Unavailable)
                 }
+                HubCommandError::Busy => HandoffOperatorControlError::AgentNotIdle,
+                HubCommandError::DeviceIndeterminate { .. } => {
+                    HandoffOperatorControlError::DeviceQuarantined
+                }
                 _ => HandoffOperatorControlError::Runtime(HandoffControlError::Protocol),
             })?;
         match response {
@@ -814,6 +822,18 @@ mod tests {
             stable_samples: 2,
             include_screenshot: false,
         }
+    }
+
+    #[test]
+    fn operator_preflight_has_distinct_privacy_safe_codes() {
+        assert_eq!(
+            HandoffOperatorControlError::AgentNotIdle.safe_code(),
+            "handoff_agent_not_idle"
+        );
+        assert_eq!(
+            HandoffOperatorControlError::DeviceQuarantined.safe_code(),
+            "handoff_device_quarantined"
+        );
     }
 
     #[tokio::test]

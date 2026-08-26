@@ -398,6 +398,29 @@ pub enum RemoteHandoffRequestKind {
     },
 }
 
+impl RemoteHandoffRequestKind {
+    pub fn requires_agent_idle(&self) -> bool {
+        !matches!(
+            self,
+            Self::Admission { .. }
+                | Self::Operator {
+                    command: RemoteHandoffOperatorCommand::Status,
+                    ..
+                }
+        )
+    }
+
+    pub fn starts_human_control(&self) -> bool {
+        matches!(
+            self,
+            Self::Operator {
+                command: RemoteHandoffOperatorCommand::Begin,
+                ..
+            }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteHandoffRequest {
     pub schema_version: u16,
@@ -1807,6 +1830,44 @@ mod tests {
             ),
             Err(TransportError::InvalidReconciliationReport)
         ));
+    }
+
+    #[test]
+    fn handoff_operator_idle_requirement_is_closed_and_status_remains_observational() {
+        let authority = RemoteHandoffAuthority {
+            principal_binding: "principal_binding_0123456789abcdef".into(),
+            device_binding: "device_binding_0123456789abcdef".into(),
+            generation: 3,
+            capability_revision: 5,
+            surface: None,
+            verification_candidate: false,
+        };
+        assert!(
+            !RemoteHandoffRequestKind::Admission {
+                authority: authority.clone(),
+            }
+            .requires_agent_idle()
+        );
+        assert!(
+            !RemoteHandoffRequestKind::Operator {
+                command: RemoteHandoffOperatorCommand::Status,
+                authority: None,
+            }
+            .requires_agent_idle()
+        );
+        let begin = RemoteHandoffRequestKind::Operator {
+            command: RemoteHandoffOperatorCommand::Begin,
+            authority: Some(authority),
+        };
+        assert!(begin.requires_agent_idle());
+        assert!(begin.starts_human_control());
+        assert!(
+            !RemoteHandoffRequestKind::Operator {
+                command: RemoteHandoffOperatorCommand::CancelBeforeHuman,
+                authority: None,
+            }
+            .starts_human_control()
+        );
     }
 
     #[test]
