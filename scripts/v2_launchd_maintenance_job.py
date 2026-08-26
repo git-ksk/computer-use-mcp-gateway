@@ -369,7 +369,11 @@ def wait_for_one_shot_completion(
         if last.runs > 1:
             raise MaintenanceError("automatic_maintenance_relaunch_detected")
         observed_run = observed_run or last.runs == 1 or last.running
-        if observed_run and not last.running and last.runs == 1:
+        # launchd can briefly report state=xpcproxy with runs=1 and a pid before the
+        # target process reaches state=running. Only the exact terminal state proves
+        # that the one-shot has completed; treating any non-running state as terminal
+        # creates a false relaunch signal for long-running maintenance jobs.
+        if observed_run and last.state == "not running" and last.runs == 1:
             break
         sleep(POLL_INTERVAL_SECS)
     else:
@@ -380,7 +384,7 @@ def wait_for_one_shot_completion(
     if stable.returncode != 0:
         raise MaintenanceError("maintenance_job_disappeared")
     final = parse_job_status(label, stable.stdout)
-    if final.running or final.runs != 1:
+    if final.state != "not running" or final.runs != 1:
         raise MaintenanceError("automatic_maintenance_relaunch_detected")
     if final.last_exit_code is None:
         raise MaintenanceError("maintenance_exit_status_missing")
