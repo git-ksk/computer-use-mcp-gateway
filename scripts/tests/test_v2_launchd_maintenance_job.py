@@ -33,11 +33,12 @@ class FakeLaunchctl:
         record = self.loaded[label]
         state = "running" if label in self.running else "not running"
         pid = "\tpid = 4242\n" if label in self.running else ""
+        last_exit = "(never exited)" if label in self.running else str(record["exit"])
         return (
             f"state = {state}\n"
             f"\truns = {record['runs']}\n"
             f"{pid}"
-            f"\tlast exit code = {record['exit']}\n"
+            f"\tlast exit code = {last_exit}\n"
             "\tproperties = runatload\n"
         )
 
@@ -83,6 +84,19 @@ class LaunchdMaintenanceTests(unittest.TestCase):
         self.assertEqual(status.runs, 7)
         self.assertEqual(status.last_exit_code, 2)
         self.assertFalse(hasattr(status, "path"))
+
+    def test_running_job_accepts_launchd_never_exited_sentinel_only(self):
+        status = mod.parse_job_status(
+            LEGACY,
+            "state = running\nruns = 1\npid = 42\nlast exit code = (never exited)\n",
+        )
+        self.assertTrue(status.running)
+        self.assertIsNone(status.last_exit_code)
+        with self.assertRaisesRegex(mod.MaintenanceError, "invalid_maintenance_job_status"):
+            mod.parse_job_status(
+                LEGACY,
+                "state = running\nruns = 1\npid = 42\nlast exit code = unknown\n",
+            )
 
     def test_assert_clear_rejects_stale_job_and_can_exclude_current_one_shot(self):
         fake = FakeLaunchctl(loaded={LEGACY: {"runs": 1, "exit": 0}})
