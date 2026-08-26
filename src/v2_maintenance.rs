@@ -80,6 +80,7 @@ pub struct QuarantineInspection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuarantineRecoveryGuidance {
     pub confirmed_not_executed: String,
+    pub confirmed_effect_applied_uncommitted: String,
     pub confirmed_completed: String,
     pub otherwise: String,
     pub replay_old_operation: bool,
@@ -239,8 +240,10 @@ pub fn inspect_quarantines_read_only(
         recovery_guidance: QuarantineRecoveryGuidance {
             confirmed_not_executed:
                 "requires independent evidence that the side effect did not occur".into(),
+            confirmed_effect_applied_uncommitted:
+                "input capabilities only: requires independent evidence that input was applied but a distinct submit/commit action did not occur".into(),
             confirmed_completed:
-                "requires independent evidence that the intended side effect completed".into(),
+                "requires independent evidence that the intended side effect completed or committed".into(),
             otherwise: "keep quarantine intact unless an eligible unknown-outcome retirement is explicitly authorized".into(),
             replay_old_operation: false,
         },

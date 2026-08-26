@@ -1084,6 +1084,7 @@ mod tests {
             quarantines,
             recovery_guidance: crate::v2_maintenance::QuarantineRecoveryGuidance {
                 confirmed_not_executed: "independent evidence".into(),
+                confirmed_effect_applied_uncommitted: "independent evidence".into(),
                 confirmed_completed: "independent evidence".into(),
                 otherwise: "keep quarantine".into(),
                 replay_old_operation: false,

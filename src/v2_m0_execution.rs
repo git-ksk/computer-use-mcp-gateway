@@ -59,6 +59,10 @@ pub enum CompletionDecision {
 pub enum IndeterminateResolution {
     ConfirmedCompleted,
     ConfirmedNotExecuted,
+    /// Independent evidence proves the input side effect was applied, but a
+    /// distinct submit/commit action did not occur. This is terminal for the
+    /// original input operation and never authorizes replay.
+    ConfirmedEffectAppliedUncommitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,7 +416,10 @@ impl HubAdmissionController {
             return Err(ExecutionError::InvalidTransition);
         }
         operation.state = match resolution {
-            IndeterminateResolution::ConfirmedCompleted => HubOperationState::Completed,
+            IndeterminateResolution::ConfirmedCompleted
+            | IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+                HubOperationState::Completed
+            }
             IndeterminateResolution::ConfirmedNotExecuted => HubOperationState::Cancelled,
         };
         self.blocked_by_indeterminate.remove(&device_id);

@@ -119,16 +119,19 @@ impl From<RetirementPolicyArg> for RetirementPolicy {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ResolutionDecision {
     #[value(name = "confirmed_completed")]
-    ConfirmedCompleted,
+    Completed,
     #[value(name = "confirmed_not_executed")]
-    ConfirmedNotExecuted,
+    NotExecuted,
+    #[value(name = "confirmed_effect_applied_uncommitted")]
+    EffectAppliedUncommitted,
 }
 
 impl From<ResolutionDecision> for IndeterminateResolution {
     fn from(value: ResolutionDecision) -> Self {
         match value {
-            ResolutionDecision::ConfirmedCompleted => Self::ConfirmedCompleted,
-            ResolutionDecision::ConfirmedNotExecuted => Self::ConfirmedNotExecuted,
+            ResolutionDecision::Completed => Self::ConfirmedCompleted,
+            ResolutionDecision::NotExecuted => Self::ConfirmedNotExecuted,
+            ResolutionDecision::EffectAppliedUncommitted => Self::ConfirmedEffectAppliedUncommitted,
         }
     }
 }
