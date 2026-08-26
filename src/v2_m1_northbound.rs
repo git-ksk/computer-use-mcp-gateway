@@ -1255,7 +1255,7 @@ impl V2NorthboundMcp {
                     error_code = "capability_not_authorized",
                     "northbound principal is not authorized for device capability"
                 );
-                McpError::invalid_request("Device capability is not authorized", None)
+                capability_not_authorized_error()
             })
     }
 
@@ -2691,7 +2691,7 @@ impl V2NorthboundMcp {
                         "CUMG cancellation request failed; execution safety state remains authoritative"
                     );
                 }
-                Err(McpError::invalid_request("Tool call was cancelled", None))
+                Err(operation_cancelled_error())
             }
         }?;
 
@@ -3795,10 +3795,31 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
             );
         }
         HubCommandError::Remote(code) => {
-            let message = if code.is_browser_refusal() {
-                "Browser operation was refused"
-            } else {
-                "Device operation was rejected or could not be completed"
+            let message = match code {
+                crate::v2_m0::DeviceErrorCode::WorkingDirectoryDenied => {
+                    "Working directory is outside the allowed roots"
+                }
+                crate::v2_m0::DeviceErrorCode::WorkingDirectoryInvalid => {
+                    "Working directory is invalid"
+                }
+                crate::v2_m0::DeviceErrorCode::InvalidTimeout => {
+                    "Timeout is outside the allowed range"
+                }
+                crate::v2_m0::DeviceErrorCode::InvalidProgram => "Program is invalid",
+                crate::v2_m0::DeviceErrorCode::ProgramDenied => "Program is not allowed",
+                crate::v2_m0::DeviceErrorCode::TooManyArguments => {
+                    "Process argument limit was exceeded"
+                }
+                crate::v2_m0::DeviceErrorCode::EnvironmentKeyDenied => {
+                    "Environment variable is not allowed"
+                }
+                crate::v2_m0::DeviceErrorCode::InvalidEnvironment => "Environment is invalid",
+                crate::v2_m0::DeviceErrorCode::TooManyEnvironmentEntries => {
+                    "Environment entry limit was exceeded"
+                }
+                crate::v2_m0::DeviceErrorCode::ProcessSpawnFailed => "Process could not be started",
+                code if code.is_browser_refusal() => "Browser operation was refused",
+                _ => "Device operation was rejected or could not be completed",
             };
             return McpError::invalid_request(message, Some(json!({"code": code.safe_code()})));
         }
@@ -3826,6 +3847,20 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         data["blocking_operation_id"] = json!(operation_id);
     }
     McpError::invalid_request(message, Some(data))
+}
+
+fn capability_not_authorized_error() -> McpError {
+    McpError::invalid_request(
+        "Device capability is not authorized",
+        Some(json!({"code": "capability_not_authorized"})),
+    )
+}
+
+fn operation_cancelled_error() -> McpError {
+    McpError::invalid_request(
+        "Tool call was cancelled",
+        Some(json!({"code": "operation_cancelled"})),
+    )
 }
 
 fn execution_error_response(error: McpError) -> CallToolResponse {
@@ -7105,6 +7140,89 @@ mod tests {
         };
         assert!(serialized.contains("browser_consent_required"));
         assert!(!serialized.contains("provider"));
+    }
+
+    #[test]
+    fn process_policy_failures_are_stable_privacy_safe_northbound_codes() {
+        let cases = [
+            (
+                crate::v2_m0::DeviceErrorCode::WorkingDirectoryDenied,
+                "working_directory_denied",
+                "Working directory is outside the allowed roots",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::InvalidTimeout,
+                "invalid_timeout",
+                "Timeout is outside the allowed range",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::ProgramDenied,
+                "program_denied",
+                "Program is not allowed",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::ProcessSpawnFailed,
+                "process_spawn_failed",
+                "Process could not be started",
+            ),
+        ];
+        for (code, expected_code, expected_message) in cases {
+            let response =
+                execution_error_response(hub_error_to_mcp(HubCommandError::Remote(code)));
+            let serialized = match response {
+                CallToolResponse::Complete(result) => {
+                    assert_eq!(result.is_error, Some(true));
+                    serde_json::to_string(&result).unwrap()
+                }
+                other => panic!("unexpected tool response: {other:?}"),
+            };
+            assert!(serialized.contains(expected_code));
+            assert!(serialized.contains(expected_message));
+            assert!(!serialized.contains("/Users/"));
+            assert!(!serialized.contains("C:\\Users\\"));
+            assert!(!serialized.contains("secret-value"));
+        }
+    }
+
+    #[test]
+    fn authorization_denial_remains_distinct_from_execution_policy() {
+        let authorization = serde_json::to_string(&capability_not_authorized_error()).unwrap();
+        let policy = serde_json::to_string(&hub_error_to_mcp(HubCommandError::Remote(
+            crate::v2_m0::DeviceErrorCode::WorkingDirectoryDenied,
+        )))
+        .unwrap();
+        assert!(authorization.contains("capability_not_authorized"));
+        assert!(!authorization.contains("working_directory_denied"));
+        assert!(policy.contains("working_directory_denied"));
+        assert!(!policy.contains("capability_not_authorized"));
+    }
+
+    #[test]
+    fn agent_offline_and_indeterminate_remain_distinct_from_execution_policy() {
+        let offline =
+            serde_json::to_string(&hub_error_to_mcp(HubCommandError::AgentOffline)).unwrap();
+        let indeterminate =
+            serde_json::to_string(&hub_error_to_mcp(HubCommandError::Indeterminate)).unwrap();
+        let policy = serde_json::to_string(&hub_error_to_mcp(HubCommandError::Remote(
+            crate::v2_m0::DeviceErrorCode::WorkingDirectoryDenied,
+        )))
+        .unwrap();
+        assert!(offline.contains("agent_offline"));
+        assert!(indeterminate.contains("device_indeterminate"));
+        assert!(policy.contains("working_directory_denied"));
+    }
+
+    #[test]
+    fn cancellation_and_indeterminate_have_deliberate_safe_codes() {
+        let cancelled = serde_json::to_string(&operation_cancelled_error()).unwrap();
+        let cancelled_before_dispatch =
+            serde_json::to_string(&hub_error_to_mcp(HubCommandError::CancelledBeforeDispatch))
+                .unwrap();
+        let indeterminate =
+            serde_json::to_string(&hub_error_to_mcp(HubCommandError::Indeterminate)).unwrap();
+        assert!(cancelled.contains("operation_cancelled"));
+        assert!(cancelled_before_dispatch.contains("cancelled_before_dispatch"));
+        assert!(indeterminate.contains("device_indeterminate"));
     }
 
     #[test]

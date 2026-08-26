@@ -52,7 +52,7 @@ V2 Desktop surface には、既存 runtime capability に加えて desktop parit
 
 process、shell、bounded filesystem tool は独立した non-GUI V2 capability のままです。Browser と file-transfer parity はこの Desktop phase とは分離されています。
 
-process/shell の environment policy failure は、stable かつ coarse な code のみで Hub/Agent boundary を通過します。`environment_key_denied`、`invalid_environment`、`too_many_environment_entries` は northbound caller が remediation に利用できる public reason ですが、environment value は error に返しません。unknown/internal executor failure は引き続き coarse かつ fail closed です。この reviewed error-contract addition により live control schema は version 8 とし、persisted registry / grant-ledger schema は独立 versioning のままです。
+process/shell の policy failure は stable かつ coarse な code のみで Hub/Agent boundary を通過します。`environment_key_denied`、`invalid_environment`、`too_many_environment_entries` に加え、`working_directory_denied`、`working_directory_invalid`、`invalid_timeout`、`invalid_program`、`program_denied`、`too_many_arguments`、`process_spawn_failed` を northbound remediation reason として返せます。Shell も wrapped process error の safe category を保持します。path、program/argv、environment key/value、raw OS error は返さず、unknown/internal executor failure は引き続き coarse かつ fail closed です。この reviewed wire-contract addition により live control schema は version 9 とし、persisted registry / grant-ledger schema は独立 versioning のままです。
 
 ## Capability advertisement と discovery
 
@@ -66,7 +66,7 @@ current live Agent CapabilityAdvertisement
 
 Agent が offline の場合は live advertisement がないため、semantic device tool は公開されません。reconnect によって新しい device generation または capability revision になる場合があります。stateful request は両方に対して fence されるため、discovery/dispatch race は fail closed します。
 
-control schema は version 8、capability-advertisement schema は version 5 です。capability schema v5 は fresh authenticated generation 後の signed / payload-free reconciliation-report frame を coordinated boundary として追加します。Hub と Agent の control-schema mismatch は fail closed し、別 version の capability advertisement も曖昧な rolling-upgrade compatibility と解釈せず拒否します。
+control schema は version 9、capability-advertisement schema は version 5 です。capability schema v5 は fresh authenticated generation 後の signed / payload-free reconciliation-report frame を coordinated boundary として追加します。Hub と Agent の control-schema mismatch は fail closed し、別 version の capability advertisement も曖昧な rolling-upgrade compatibility と解釈せず拒否します。
 
 ## Interaction context と backend lifecycle
 

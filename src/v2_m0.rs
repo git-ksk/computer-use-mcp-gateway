@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 8;
+pub const CONTROL_SCHEMA_VERSION: u16 = 9;
 pub const CAPABILITY_SCHEMA_VERSION: u16 = 5;
 /// First dedicated persisted registry schema. The numeric value intentionally
 /// matches the last historical control schema that was written into this field,
@@ -1478,6 +1478,13 @@ pub enum DeviceErrorCode {
     EnvironmentKeyDenied,
     InvalidEnvironment,
     TooManyEnvironmentEntries,
+    WorkingDirectoryDenied,
+    WorkingDirectoryInvalid,
+    InvalidTimeout,
+    InvalidProgram,
+    ProgramDenied,
+    TooManyArguments,
+    ProcessSpawnFailed,
     BrowserRouteUnavailable,
     BrowserRequiresSetup,
     BrowserBindingAmbiguous,
@@ -1512,6 +1519,13 @@ impl DeviceErrorCode {
             Self::EnvironmentKeyDenied => "environment_key_denied",
             Self::InvalidEnvironment => "invalid_environment",
             Self::TooManyEnvironmentEntries => "too_many_environment_entries",
+            Self::WorkingDirectoryDenied => "working_directory_denied",
+            Self::WorkingDirectoryInvalid => "working_directory_invalid",
+            Self::InvalidTimeout => "invalid_timeout",
+            Self::InvalidProgram => "invalid_program",
+            Self::ProgramDenied => "program_denied",
+            Self::TooManyArguments => "too_many_arguments",
+            Self::ProcessSpawnFailed => "process_spawn_failed",
             Self::BrowserRouteUnavailable => "browser_route_unavailable",
             Self::BrowserRequiresSetup => "browser_requires_setup",
             Self::BrowserBindingAmbiguous => "browser_binding_ambiguous",
@@ -2193,6 +2207,29 @@ mod tests {
             DeviceCommand::TypeText { text: "x".into() }.capability(),
             DeviceCapability::TypeText
         );
+    }
+
+    #[test]
+    fn process_policy_codes_have_closed_safe_wire_names() {
+        let cases = [
+            (
+                DeviceErrorCode::WorkingDirectoryDenied,
+                "working_directory_denied",
+            ),
+            (
+                DeviceErrorCode::WorkingDirectoryInvalid,
+                "working_directory_invalid",
+            ),
+            (DeviceErrorCode::InvalidTimeout, "invalid_timeout"),
+            (DeviceErrorCode::InvalidProgram, "invalid_program"),
+            (DeviceErrorCode::ProgramDenied, "program_denied"),
+            (DeviceErrorCode::TooManyArguments, "too_many_arguments"),
+            (DeviceErrorCode::ProcessSpawnFailed, "process_spawn_failed"),
+        ];
+        for (code, wire) in cases {
+            assert_eq!(code.safe_code(), wire);
+            assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(wire));
+        }
     }
 
     #[test]

@@ -3033,6 +3033,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
+    #[test]
+    fn process_policy_error_code_survives_hub_recovery_boundary() {
+        for capability in [DeviceCapability::ExecuteProcess, DeviceCapability::Shell] {
+            let result = DeviceResult::Error {
+                code: DeviceErrorCode::WorkingDirectoryDenied,
+            };
+            assert_eq!(
+                recoverable_result_for(capability, &result),
+                Some(RecoverableOperationResult::Error {
+                    code: DeviceErrorCode::WorkingDirectoryDenied,
+                })
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
