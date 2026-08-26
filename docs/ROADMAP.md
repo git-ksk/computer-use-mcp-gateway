@@ -47,7 +47,6 @@ Current priorities:
 - investigate and close or explicitly document the remaining V1 compatibility/quality issues:
   - issue #14 — read-only `get_screen_size` session/escalation semantics;
   - issue #15 — inconsistent Cua Driver application/process discovery identity;
-  - issue #20 — portable behavior for the V1 idle resource quality gate without weakening Linux enforcement;
 - fix compatible runtime/security/reliability defects as PATCH candidates;
 - keep docs-only/editorial work version-neutral unless an immutable corrected release snapshot is operationally necessary.
 
