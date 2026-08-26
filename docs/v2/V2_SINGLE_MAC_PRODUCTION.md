@@ -103,6 +103,8 @@ Expired-recovery abandonment also writes a private append-only JSONL audit recor
 
 `v2_doctor` is read-only. It never resolves quarantine, dispatches work, reads secret contents, or prints raw command/result/desktop data.
 
+When the doctor itself is launched through the live single-Mac Agent using `execute_process` or `shell`, its own already-dispatched operation appears in the restart-safe Hub checkpoint as `HubRestartAfterDispatch` even though the live Hub has not quarantined it. The doctor classifies that one entry as `diagnostic_self_observation=restart_safe_active_caller` only when all authoritative runtime fences agree: the doctor is a descendant of the currently loaded Agent process, the Agent-to-Hub loopback transport is established, the checkpoint contains exactly one enrolled device and one quarantine-shaped entry, that entry is process/shell work in the registry's current generation, and its durable dispatch binding is present with `auto_reconciling`. No caller-supplied operation ID participates. Any missing/mismatched condition, multiple entries, older generation, or real indeterminate reason stays a normal blocking `live_quarantine` error. This classification changes diagnostics only; restart restoration still converts dispatched work to durable `Indeterminate` and no state is resolved, cleared, replayed, or rewritten.
+
 For the standard profile it checks:
 
 - runtime manifest schema 2, exact Hub/Agent application-schema version, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, and `v2_grant_signer`;
