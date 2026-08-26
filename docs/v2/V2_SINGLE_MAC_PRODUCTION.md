@@ -62,11 +62,15 @@ If the exact target `runtime-<cumg>-<handoff>` generation already exists, the he
 
 The known single-Mac Hub/Agent launchd label families are mutually exclusive. Preflight refuses if two Hub labels, two Agent labels, or a Hub and Agent from different known families are loaded at the same time. During a reviewed cutover, after the configured services are drained/unloaded and before they are restarted, the helper boots out and disables the alternate known Hub/Agent labels. Their plist files are deliberately preserved for rollback/forensics; the guard never deletes them and never changes quarantine or replay state.
 
+Single-Mac maintenance is explicitly one-shot. Do **not** use `launchctl submit` for an upgrade/recovery command: launchd can infer persistence/relaunch behavior from an underspecified submitted job. `scripts/v2_launchd_maintenance_job.py run-upgrade` is the reviewed launchd wrapper for the upgrade helper. It writes an owner-private temporary plist with `RunAtLoad=true` and `KeepAlive=false`, forwards only the closed non-secret environment allowlist needed by the upgrade helper, verifies the job's launchd `runs` count never exceeds one even when the upgrade exits non-zero, and always boots the job out and deletes its temporary plist before returning. It never retries a failed upgrade.
+
+Before any upgrade, both the wrapper and `v2-single-mac-upgrade.sh` inspect the current GUI launchd domain for known current/legacy CUMG maintenance labels. Any loaded job other than the wrapper's exact current label fails preflight with `stale_maintenance_jobs`; an active job is never auto-terminated. Use `scripts/v2_launchd_maintenance_job.py inspect` for privacy-bounded state/runs/last-exit diagnostics. After confirming a stale job is not running, `cleanup-stale` may boot it out and remove only a matching private temporary plist. The cleanup path refuses while any matching maintenance job is active.
+
 For signing, prefer the exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT`. The display-name `CUMG_V2_MACOS_CODESIGN_IDENTITY` remains a compatibility fallback only when it resolves to exactly one valid certificate. The helper verifies the selected certificate's exact Team ID **before signing**, then verifies the stable identifier/Team-ID designated requirement after signing. There is no ad-hoc fallback.
 
 A successful upgrade performs this sequence:
 
-1. prove CUMG and Handoff source provenance, quarantine=0, loaded services, no conflicting known Hub/Agent launchd family, and an idle Agent-owned Handoff status without printing locator/owner data;
+1. prove CUMG and Handoff source provenance, quarantine=0, loaded services, no conflicting known Hub/Agent launchd family, no stale CUMG maintenance job other than the exact current one-shot wrapper, and an idle Agent-owned Handoff status without printing locator/owner data;
 2. build all paired CUMG binaries from one merged CUMG commit and stage a private `runtime-<cumg>-<handoff>` Handoff generation from the exact reviewed Handoff `dist`, `package.json`, and lockfile plus the CUMG runtime host script; install only lockfile-pinned production dependencies with lifecycle scripts disabled, remove npm command-shim `.bin` links because runtime generations are symlink-free, reject any remaining dependency symlink, and prove the staged entrypoint imports under the configured Node executable before any service is stopped;
 3. copy and stable-sign Handoff host helper(s) into that new generation; the live helper is not modified in place;
 4. create a private rollback bundle containing old binaries/configuration, the Handoff env file, helper copies, and a self-contained old Handoff generation including its runtime dependencies; an archive missing those dependencies remains an external-runtime reference and must not permit cleanup of that runtime; authoritative Hub/Agent state is copied only after drain;
@@ -79,15 +83,17 @@ A successful upgrade performs this sequence:
 Example:
 
 ```bash
-CUMG_V2_EXPECTED_CUA_VERSION=0.19.3 \
-CUMG_V2_MACOS_CODESIGN_FINGERPRINT=0123456789ABCDEF0123456789ABCDEF01234567 \
-CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ \
-CUMG_V2_HANDOFF_SOURCE_ROOT="$HOME/x-code/mcp-execution-handoff" \
-CUMG_V2_EXPECTED_HANDOFF_COMMIT=<reviewed-40-hex-commit> \
-  scripts/v2-single-mac-upgrade.sh --preflight-only
+export CUMG_V2_EXPECTED_CUA_VERSION=0.19.3
+export CUMG_V2_MACOS_CODESIGN_FINGERPRINT=0123456789ABCDEF0123456789ABCDEF01234567
+export CUMG_V2_MACOS_TEAM_ID=ABCDEFGHIJ
+export CUMG_V2_HANDOFF_SOURCE_ROOT="$HOME/x-code/mcp-execution-handoff"
+export CUMG_V2_EXPECTED_HANDOFF_COMMIT=<reviewed-40-hex-commit>
+
+scripts/v2-single-mac-upgrade.sh --preflight-only
+python3 scripts/v2_launchd_maintenance_job.py run-upgrade
 ```
 
-Run the same reviewed environment without `--preflight-only` for the cutover. After the first pinned cutover, `CUMG_V2_HANDOFF_SOURCE_ROOT` must remain an explicit reviewed checkout; the runtime's `CUMG_V2_HANDOFF_ROOT` points to immutable staged code and is no longer a development source checkout.
+The preflight may be run directly because it does not stop/restart services. The actual cutover must use the reviewed one-shot wrapper rather than an ad-hoc launchd job. A non-zero upgrade exit is returned after the temporary job has been booted out and its plist cleaned; it is not retried. After the first pinned cutover, `CUMG_V2_HANDOFF_SOURCE_ROOT` must remain an explicit reviewed checkout; the runtime's `CUMG_V2_HANDOFF_ROOT` points to immutable staged code and is no longer a development source checkout.
 
 The rollback bundle is evidence and an explicit old-binary/old-state/Handoff-code set. Do not restore old binaries alone over state advanced by a newer runtime. Post-start failure stops the new profile fail-closed and requires explicit operator recovery.
 
@@ -104,7 +110,7 @@ For the standard profile it checks:
 - exactly one enrolled single-Mac device and current generation;
 - Agent checkpoint readability and exact Hub/Agent generation pairing;
 - live quarantine count;
-- Hub/Agent/external-signer LaunchAgent running state and the Agent -> loopback Hub transport being established;
+- Hub/Agent/external-signer LaunchAgent running state, privacy-bounded current/legacy CUMG maintenance-job presence, and the Agent -> loopback Hub transport being established;
 - private signer socket shape/parent permissions;
 - server certificate and pinned Agent trust-root validity;
 - actual Cua Driver version against the explicit reviewed pin;

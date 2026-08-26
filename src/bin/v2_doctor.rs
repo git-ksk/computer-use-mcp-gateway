@@ -38,6 +38,9 @@ struct Args {
     /// Optional private local Handoff control socket. Status is queried read-only and locator/IDs are omitted.
     #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
     handoff_control_socket: Option<PathBuf>,
+    /// Current reviewed one-shot maintenance label. Only this exact label is excluded from stale-job diagnostics.
+    #[arg(long, env = "CUMG_V2_MAINTENANCE_JOB_LABEL")]
+    maintenance_job_exclude_label: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -86,6 +89,7 @@ fn main() -> ExitCode {
             .or_else(|| Some(home.join(".local/bin/cua-driver"))),
         expected_cua_version: args.expected_cua_version,
         handoff_control_socket: args.handoff_control_socket,
+        maintenance_job_exclude_label: args.maintenance_job_exclude_label,
     };
     let report = run_doctor(&config);
     if args.json {
