@@ -1053,6 +1053,7 @@ mod tests {
             workflow_step_id: None,
             client_correlation_id: None,
             request_fingerprint_present: false,
+            evidence_envelope: None,
             dispatch_binding_present,
             semantic_operation_class: capability.into(),
             effect_class: "effectful".into(),

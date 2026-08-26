@@ -67,7 +67,7 @@ enum Command {
         #[arg(long)]
         device_id: Option<String>,
     },
-    /// Compare one local candidate shell/process request to a quarantined request.
+    /// Compare one local candidate shell/process/text-input request to a quarantined request.
     /// Output is only same_request, different_request, or unavailable; request content
     /// and the keyed fingerprint are never printed.
     CompareQuarantineRequest {
@@ -91,6 +91,8 @@ enum CandidateTool {
     Shell,
     #[value(name = "execute_process")]
     ExecuteProcess,
+    #[value(name = "type_text")]
+    TypeText,
 }
 
 impl CandidateTool {
@@ -98,6 +100,7 @@ impl CandidateTool {
         match self {
             Self::Shell => "shell",
             Self::ExecuteProcess => "execute_process",
+            Self::TypeText => "type_text",
         }
     }
 }

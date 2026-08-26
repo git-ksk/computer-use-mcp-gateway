@@ -7,9 +7,9 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
-    OperationAuditMetadata, OperationDispatchBinding, OperationOwner, OperationRecoverySnapshot,
-    OperationRequestFingerprint, ReconciliationStatus, RecoverableOperationResult,
-    ResolutionRecord, terminal_evidence_for_device_result,
+    OperationAdmissionMetadata, OperationDispatchBinding, OperationOwner,
+    OperationRecoverySnapshot, ReconciliationStatus, RecoverableOperationResult, ResolutionRecord,
+    terminal_evidence_for_device_result,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -244,8 +244,7 @@ enum HubRequest {
         operation_id: String,
         owner: OperationOwner,
         command: Box<DeviceCommand>,
-        audit: OperationAuditMetadata,
-        request_fingerprint: Option<OperationRequestFingerprint>,
+        metadata: Box<OperationAdmissionMetadata>,
         handoff: Option<RemoteHandoffAuthority>,
         reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
     },
@@ -668,8 +667,7 @@ impl SingleDeviceHub {
                             operation_id,
                             owner,
                             command,
-                            audit,
-                            request_fingerprint,
+                            metadata,
                             handoff,
                             reply,
                         } => {
@@ -726,12 +724,11 @@ impl SingleDeviceHub {
                             };
                             let decision = {
                                 let mut persistent = self.inner.persistent.lock().await;
-                                match persistent.execution.prepare_with_audit(
+                                match persistent.execution.prepare_with_metadata(
                                     operation,
                                     owner.clone(),
                                     command.capability(),
-                                    audit,
-                                    request_fingerprint,
+                                    *metadata,
                                     unix_time_ms()?,
                                 ) {
                                     Ok(decision) => {
@@ -1930,30 +1927,27 @@ impl HubHandle {
         operation_id: String,
         command: DeviceCommand,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        self.start_command_as_with_id_and_audit(
+        self.start_command_as_with_id_and_metadata(
             owner,
             operation_id,
             command,
-            OperationAuditMetadata::empty(),
-            None,
+            OperationAdmissionMetadata::empty(),
         )
         .await
     }
 
-    pub async fn start_command_as_with_id_and_audit(
+    pub async fn start_command_as_with_id_and_metadata(
         &self,
         owner: OperationOwner,
         operation_id: String,
         command: DeviceCommand,
-        audit: OperationAuditMetadata,
-        request_fingerprint: Option<OperationRequestFingerprint>,
+        metadata: OperationAdmissionMetadata,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        self.start_command_as_with_id_and_audit_inner(
+        self.start_command_as_with_id_and_metadata_inner(
             owner,
             operation_id,
             command,
-            audit,
-            request_fingerprint,
+            metadata,
             CommandSessionFence::None,
         )
         .await
@@ -1961,21 +1955,19 @@ impl HubHandle {
 
     /// Starts only if the live session still matches the generation/revision that an external
     /// authority gate just observed. CUMG admission and exact-capability grants remain authoritative.
-    pub async fn start_command_as_with_id_and_audit_for_session(
+    pub async fn start_command_as_with_id_and_metadata_for_session(
         &self,
         owner: OperationOwner,
         operation_id: String,
         command: DeviceCommand,
-        audit: OperationAuditMetadata,
-        request_fingerprint: Option<OperationRequestFingerprint>,
+        metadata: OperationAdmissionMetadata,
         expected_session: (u64, u64),
     ) -> Result<HubPendingCommand, HubCommandError> {
-        self.start_command_as_with_id_and_audit_inner(
+        self.start_command_as_with_id_and_metadata_inner(
             owner,
             operation_id,
             command,
-            audit,
-            request_fingerprint,
+            metadata,
             CommandSessionFence::Session {
                 generation: expected_session.0,
                 capability_revision: expected_session.1,
@@ -1984,21 +1976,19 @@ impl HubHandle {
         .await
     }
 
-    pub async fn start_command_as_with_id_and_audit_for_handoff(
+    pub async fn start_command_as_with_id_and_metadata_for_handoff(
         &self,
         owner: OperationOwner,
         operation_id: String,
         command: DeviceCommand,
-        audit: OperationAuditMetadata,
-        request_fingerprint: Option<OperationRequestFingerprint>,
+        metadata: OperationAdmissionMetadata,
         handoff: RemoteHandoffAuthority,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        self.start_command_as_with_id_and_audit_inner(
+        self.start_command_as_with_id_and_metadata_inner(
             owner,
             operation_id,
             command,
-            audit,
-            request_fingerprint,
+            metadata,
             CommandSessionFence::Handoff(handoff),
         )
         .await
@@ -2042,13 +2032,12 @@ impl HubHandle {
         reply_rx.await.map_err(|_| HubCommandError::SessionClosed)?
     }
 
-    async fn start_command_as_with_id_and_audit_inner(
+    async fn start_command_as_with_id_and_metadata_inner(
         &self,
         owner: OperationOwner,
         operation_id: String,
         command: DeviceCommand,
-        audit: OperationAuditMetadata,
-        request_fingerprint: Option<OperationRequestFingerprint>,
+        metadata: OperationAdmissionMetadata,
         session_fence: CommandSessionFence,
     ) -> Result<HubPendingCommand, HubCommandError> {
         if self.inner.draining.load(Ordering::Acquire) {
@@ -2076,8 +2065,7 @@ impl HubHandle {
             operation_id: operation_id.clone(),
             owner,
             command: Box::new(command),
-            audit,
-            request_fingerprint,
+            metadata: Box::new(metadata),
             handoff,
             reply: reply_tx,
         })

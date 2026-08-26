@@ -5,9 +5,10 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
-    ExecutionReceipt, OperationOwner, ReconciliationStatus, RequestFingerprintComparison,
-    ResolutionRecord, RetirementAuthority, RetirementPolicy, RetirementRecord,
-    compare_request_fingerprint, fingerprint_process_request, fingerprint_shell_request,
+    ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner, ReconciliationStatus,
+    RequestFingerprintComparison, ResolutionRecord, RetirementAuthority, RetirementPolicy,
+    RetirementRecord, TextInputTargetEvidence, compare_request_fingerprint,
+    fingerprint_process_request, fingerprint_shell_request, fingerprint_text_input_candidate,
     retirement_policy_for_capability,
 };
 use crate::v2_m0::{
@@ -44,6 +45,23 @@ pub struct OfflineRetirementResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationEvidenceInspection {
+    pub schema_version: u16,
+    pub kind: String,
+    pub fingerprint_present: bool,
+    pub payload_bytes: u32,
+    pub payload_chars: u32,
+    pub line_count: u32,
+    pub ends_with_newline: bool,
+    pub separate_submit_requested: bool,
+    pub target_kind: String,
+    pub target_process_id: Option<u32>,
+    pub target_window_id: Option<u64>,
+    pub delivery: Option<String>,
+    pub delay_ms: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuarantineInspection {
     pub blocking_operation_id: String,
     pub device_id: String,
@@ -54,6 +72,7 @@ pub struct QuarantineInspection {
     pub workflow_step_id: Option<String>,
     pub client_correlation_id: Option<String>,
     pub request_fingerprint_present: bool,
+    pub evidence_envelope: Option<OperationEvidenceInspection>,
     pub dispatch_binding_present: bool,
     pub semantic_operation_class: String,
     pub effect_class: String,
@@ -190,6 +209,16 @@ pub fn inspect_quarantines_read_only(
             } else {
                 "keep_quarantine"
             };
+            let evidence_envelope = inspection
+                .evidence_envelope
+                .as_ref()
+                .map(operation_evidence_inspection);
+            let request_fingerprint_present = inspection.request_fingerprint.is_some()
+                || inspection
+                    .evidence_envelope
+                    .as_ref()
+                    .and_then(OperationEvidenceEnvelope::fingerprint)
+                    .is_some();
             QuarantineInspection {
                 blocking_operation_id: inspection.operation.operation_id,
                 device_id: inspection.operation.device_id,
@@ -199,7 +228,8 @@ pub fn inspect_quarantines_read_only(
                 workflow_id: inspection.audit.workflow_id,
                 workflow_step_id: inspection.audit.workflow_step_id,
                 client_correlation_id: inspection.audit.client_correlation_id,
-                request_fingerprint_present: inspection.request_fingerprint.is_some(),
+                request_fingerprint_present,
+                evidence_envelope,
                 dispatch_binding_present: inspection.dispatch_binding_present,
                 semantic_operation_class: capability.to_owned(),
                 effect_class: capability_effect_class(inspection.capability).to_owned(),
@@ -367,13 +397,23 @@ pub fn compare_quarantined_request_read_only(
                     .map_err(MaintenanceError::Execution)?,
             )
         }
+        "type_text" => {
+            let text = candidate_type_text(candidate_request)?;
+            Some(
+                fingerprint_text_input_candidate(fingerprint_secret, &text)
+                    .map_err(MaintenanceError::Execution)?,
+            )
+        }
         _ => return Ok(RequestComparisonReport::Unavailable),
     };
+    let stored = inspection.request_fingerprint.as_ref().or_else(|| {
+        inspection
+            .evidence_envelope
+            .as_ref()
+            .and_then(OperationEvidenceEnvelope::fingerprint)
+    });
     Ok(
-        match compare_request_fingerprint(
-            inspection.request_fingerprint.as_ref(),
-            candidate.as_ref(),
-        ) {
+        match compare_request_fingerprint(stored, candidate.as_ref()) {
             RequestFingerprintComparison::SameRequest => RequestComparisonReport::SameRequest,
             RequestFingerprintComparison::DifferentRequest => {
                 RequestComparisonReport::DifferentRequest
@@ -381,6 +421,61 @@ pub fn compare_quarantined_request_read_only(
             RequestFingerprintComparison::Unavailable => RequestComparisonReport::Unavailable,
         },
     )
+}
+
+fn operation_evidence_inspection(
+    envelope: &OperationEvidenceEnvelope,
+) -> OperationEvidenceInspection {
+    match envelope {
+        OperationEvidenceEnvelope::TextInput {
+            schema_version,
+            fingerprint,
+            payload_bytes,
+            payload_chars,
+            line_count,
+            ends_with_newline,
+            separate_submit_requested,
+            target,
+            delivery,
+            delay_ms,
+            ..
+        } => {
+            let (target_kind, target_process_id, target_window_id) = match target {
+                TextInputTargetEvidence::Unspecified => ("unspecified", None, None),
+                TextInputTargetEvidence::Desktop => ("desktop", None, None),
+                TextInputTargetEvidence::Window {
+                    process_id,
+                    window_id,
+                } => ("window", Some(*process_id), *window_id),
+                TextInputTargetEvidence::WindowPoint {
+                    process_id,
+                    window_id,
+                } => ("window_point", Some(*process_id), Some(*window_id)),
+                TextInputTargetEvidence::Element {
+                    process_id,
+                    window_id,
+                } => ("element", Some(*process_id), Some(*window_id)),
+            };
+            OperationEvidenceInspection {
+                schema_version: *schema_version,
+                kind: "text_input".to_owned(),
+                fingerprint_present: fingerprint.is_some(),
+                payload_bytes: *payload_bytes,
+                payload_chars: *payload_chars,
+                line_count: *line_count,
+                ends_with_newline: *ends_with_newline,
+                separate_submit_requested: *separate_submit_requested,
+                target_kind: target_kind.to_owned(),
+                target_process_id,
+                target_window_id,
+                delivery: delivery.map(|value| match value {
+                    crate::v2_m0::InputDeliveryMode::Background => "background".to_owned(),
+                    crate::v2_m0::InputDeliveryMode::Foreground => "foreground".to_owned(),
+                }),
+                delay_ms: *delay_ms,
+            }
+        }
+    }
 }
 
 fn capability_effect_class(capability: DeviceCapability) -> &'static str {
@@ -558,6 +653,12 @@ struct CandidateProcessArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CandidateTypeTextArgs {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CandidateShellArgs {
     command: String,
     cwd: String,
@@ -576,6 +677,15 @@ fn candidate_process_request(value: Value) -> Result<ProcessRequest, Maintenance
         env: env_map(args.env),
         timeout_ms: args.timeout_ms,
     })
+}
+
+fn candidate_type_text(value: Value) -> Result<String, MaintenanceError> {
+    let args: CandidateTypeTextArgs = serde_json::from_value(strip_audit_and_operation_id(value)?)
+        .map_err(|_| MaintenanceError::InvalidCandidateRequest)?;
+    if args.text.is_empty() {
+        return Err(MaintenanceError::InvalidCandidateRequest);
+    }
+    Ok(args.text)
 }
 
 fn candidate_shell_request(value: Value) -> Result<ShellRequest, MaintenanceError> {
@@ -934,7 +1044,8 @@ mod tests {
     use super::*;
     use crate::v2_execution_safety::{
         AgentTerminalEvidence, AuthoritativeOperationController, ExecutionEvidence,
-        OperationDispatchBinding, OperationOwner,
+        OperationAdmissionMetadata, OperationAuditMetadata, OperationDispatchBinding,
+        OperationOwner,
     };
     use crate::v2_m0::{DeviceCapability, DeviceIdentity, DeviceRegistry};
     use crate::v2_m0_execution::{AdmissionDecision, HubOperationState, OperationRef};
@@ -1045,6 +1156,108 @@ mod tests {
         (device_id, operation_id)
     }
 
+    fn seed_text_input_quarantine(state_dir: &Path) -> (String, String, Vec<u8>, String) {
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation_id = "op_text_evidence".to_owned();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: operation_id.clone(),
+        };
+        let secret = b"0123456789abcdef0123456789abcdef".to_vec();
+        let sensitive = "sensitive-short-secret\n".to_owned();
+        let command = crate::v2_m0::DeviceCommand::TypeTextAdvanced {
+            context_id: None,
+            text: sensitive.clone(),
+            target: crate::v2_m0::InputTarget::Window {
+                process_id: 81,
+                window_id: Some(91),
+            },
+            delivery: crate::v2_m0::InputDeliveryMode::Foreground,
+            delay_ms: 7,
+        };
+        let envelope =
+            crate::v2_execution_safety::text_input_evidence_envelope(Some(&secret), &command)
+                .unwrap()
+                .unwrap();
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare_with_metadata(
+                operation,
+                owner.clone(),
+                DeviceCapability::TypeText,
+                OperationAdmissionMetadata {
+                    audit: OperationAuditMetadata::empty(),
+                    request_fingerprint: None,
+                    evidence_envelope: Some(envelope),
+                },
+                100,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched(&operation_id, &owner, 1, 110)
+            .unwrap();
+        execution.mark_connection_lost(&operation_id, 120).unwrap();
+        CheckpointStore::new(state_dir.to_path_buf(), "hub")
+            .unwrap()
+            .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+        (device_id, operation_id, secret, sensitive)
+    }
+
+    fn seed_shape_only_text_input_quarantine(state_dir: &Path) -> String {
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation_id = "op_text_shape_only".to_owned();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: operation_id.clone(),
+        };
+        let command = crate::v2_m0::DeviceCommand::TypeText {
+            text: "shape-only-sensitive".to_owned(),
+        };
+        let envelope = crate::v2_execution_safety::text_input_evidence_envelope(None, &command)
+            .unwrap()
+            .unwrap();
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare_with_metadata(
+                operation,
+                owner.clone(),
+                DeviceCapability::TypeText,
+                OperationAdmissionMetadata {
+                    audit: OperationAuditMetadata::empty(),
+                    request_fingerprint: None,
+                    evidence_envelope: Some(envelope),
+                },
+                100,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched(&operation_id, &owner, 1, 110)
+            .unwrap();
+        execution.mark_connection_lost(&operation_id, 120).unwrap();
+        CheckpointStore::new(state_dir.to_path_buf(), "hub")
+            .unwrap()
+            .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+        device_id
+    }
+
     fn seed_correlated_shell_quarantine(
         state_dir: &Path,
     ) -> (
@@ -1083,16 +1296,19 @@ mod tests {
         })
         .unwrap();
         execution
-            .prepare_with_audit(
+            .prepare_with_metadata(
                 operation,
                 owner.clone(),
                 DeviceCapability::Shell,
-                OperationAuditMetadata {
-                    workflow_id: Some("wf_release_42".into()),
-                    workflow_step_id: Some("step_package".into()),
-                    client_correlation_id: Some("client_corr_7".into()),
+                OperationAdmissionMetadata {
+                    audit: OperationAuditMetadata {
+                        workflow_id: Some("wf_release_42".into()),
+                        workflow_step_id: Some("step_package".into()),
+                        client_correlation_id: Some("client_corr_7".into()),
+                    },
+                    request_fingerprint: Some(fingerprint.clone()),
+                    evidence_envelope: None,
                 },
-                Some(fingerprint.clone()),
                 100,
             )
             .unwrap();
@@ -1165,6 +1381,81 @@ mod tests {
         assert!(!serialized.contains("alice"));
         assert!(!serialized.contains("owner"));
         assert_eq!(checkpoint_count(), before_count);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn text_input_evidence_is_private_inspectable_and_candidate_matchable() {
+        let dir = test_dir("text-input-evidence");
+        let (device_id, operation_id, secret, sensitive) = seed_text_input_quarantine(&dir);
+        let report = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        let inspection = &report.quarantines[0];
+        assert!(inspection.request_fingerprint_present);
+        let evidence = inspection.evidence_envelope.as_ref().unwrap();
+        assert_eq!(evidence.kind, "text_input");
+        assert_eq!(evidence.schema_version, 1);
+        assert!(evidence.fingerprint_present);
+        assert_eq!(evidence.line_count, 2);
+        assert!(evidence.ends_with_newline);
+        assert!(!evidence.separate_submit_requested);
+        assert_eq!(evidence.target_kind, "window");
+        assert_eq!(evidence.target_process_id, Some(81));
+        assert_eq!(evidence.target_window_id, Some(91));
+        assert_eq!(evidence.delivery.as_deref(), Some("foreground"));
+        assert_eq!(evidence.delay_ms, Some(7));
+        let serialized_report = serde_json::to_string(&report).unwrap();
+        assert!(!serialized_report.contains(&sensitive));
+        assert!(!serialized_report.contains("sensitive-short-secret"));
+
+        let candidate = serde_json::json!({"text": sensitive});
+        assert_eq!(
+            compare_quarantined_request_read_only(
+                &dir,
+                &operation_id,
+                "type_text",
+                candidate.clone(),
+                &secret,
+            )
+            .unwrap(),
+            RequestComparisonReport::SameRequest
+        );
+        assert_eq!(
+            compare_quarantined_request_read_only(
+                &dir,
+                &operation_id,
+                "type_text",
+                serde_json::json!({"text": "sensitive-short-secret"}),
+                &secret,
+            )
+            .unwrap(),
+            RequestComparisonReport::DifferentRequest
+        );
+        assert_eq!(
+            compare_quarantined_request_read_only(
+                &dir,
+                &operation_id,
+                "type_text",
+                candidate,
+                b"fedcba9876543210fedcba9876543210",
+            )
+            .unwrap(),
+            RequestComparisonReport::Unavailable
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn text_input_shape_only_inspection_does_not_claim_fingerprint_presence() {
+        let dir = test_dir("text-input-shape-only");
+        let device_id = seed_shape_only_text_input_quarantine(&dir);
+        let report = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        let inspection = &report.quarantines[0];
+        assert!(!inspection.request_fingerprint_present);
+        let evidence = inspection.evidence_envelope.as_ref().unwrap();
+        assert!(!evidence.fingerprint_present);
+        assert_eq!(evidence.kind, "text_input");
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("shape-only-sensitive"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

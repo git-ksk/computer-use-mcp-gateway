@@ -28,8 +28,9 @@ use crate::{
         BrowserBackendSemanticRef, BrowserStagedUploadFile,
     },
     v2_execution_safety::{
-        OperationAuditMetadata, OperationOwner, OperationRequestFingerprint,
-        RecoverableOperationResult, fingerprint_process_request, fingerprint_shell_request,
+        OperationAdmissionMetadata, OperationAuditMetadata, OperationEvidenceEnvelope,
+        OperationOwner, OperationRequestFingerprint, RecoverableOperationResult,
+        fingerprint_process_request, fingerprint_shell_request, text_input_evidence_envelope,
     },
     v2_handoff_coordinator::{HandoffAdmission, HandoffCoordinator, HandoffCoordinatorError},
     v2_interaction_context::{
@@ -2586,6 +2587,21 @@ impl V2NorthboundMcp {
         Ok(Some(fingerprint))
     }
 
+    fn evidence_envelope_for_command(
+        &self,
+        command: &DeviceCommand,
+    ) -> Result<Option<OperationEvidenceEnvelope>, McpError> {
+        let secret = self.request_fingerprint_secret.as_deref();
+        if secret.is_some_and(|secret| secret.len() < 32) {
+            return Err(McpError::internal_error(
+                "Request fingerprint secret is invalid",
+                None,
+            ));
+        }
+        text_input_evidence_envelope(secret, command)
+            .map_err(|_| McpError::internal_error("Operation evidence construction failed", None))
+    }
+
     async fn handoff_admission(
         &self,
         principal: &AuthenticatedClientPrincipal,
@@ -2634,31 +2650,35 @@ impl V2NorthboundMcp {
             .handoff_admission(principal, &command, interaction_binding)
             .await?;
         let request_fingerprint = self.request_fingerprint_for_command(&command)?;
+        let evidence_envelope = self.evidence_envelope_for_command(&command)?;
         let NorthboundOperationCall {
             operation_id,
             audit,
         } = operation;
         let owner = OperationOwner::from_principal(principal);
+        let metadata = OperationAdmissionMetadata {
+            audit,
+            request_fingerprint,
+            evidence_envelope,
+        };
         let pending = if let Some(admission) = handoff.as_ref() {
             if admission.verification_local_to_agent {
                 self.hub
-                    .start_command_as_with_id_and_audit_for_handoff(
+                    .start_command_as_with_id_and_metadata_for_handoff(
                         owner.clone(),
                         operation_id.clone(),
                         command,
-                        audit,
-                        request_fingerprint,
+                        metadata,
                         admission.binding.remote_authority(),
                     )
                     .await
             } else {
                 self.hub
-                    .start_command_as_with_id_and_audit_for_session(
+                    .start_command_as_with_id_and_metadata_for_session(
                         owner.clone(),
                         operation_id.clone(),
                         command,
-                        audit,
-                        request_fingerprint,
+                        metadata,
                         (
                             admission.binding.generation,
                             admission.binding.capability_revision,
@@ -2668,12 +2688,11 @@ impl V2NorthboundMcp {
             }
         } else {
             self.hub
-                .start_command_as_with_id_and_audit(
+                .start_command_as_with_id_and_metadata(
                     owner.clone(),
                     operation_id.clone(),
                     command,
-                    audit,
-                    request_fingerprint,
+                    metadata,
                 )
                 .await
         }
