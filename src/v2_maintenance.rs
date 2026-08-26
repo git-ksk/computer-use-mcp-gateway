@@ -15,9 +15,12 @@ use crate::v2_m0::{
     CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
     ShellRequest,
 };
-use crate::v2_m0_execution::{AdmissionLimits, ExecutionError, IndeterminateResolution};
+use crate::v2_m0_execution::{
+    AdmissionLimits, ExecutionError, HubOperationState, IndeterminateResolution,
+};
 use crate::v2_m1_persistence::{
-    CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION, PersistenceError,
+    AgentPersistentState, CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION,
+    PersistenceError,
 };
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use serde::{Deserialize, Serialize};
@@ -129,6 +132,124 @@ pub struct AutoResolutionInspection {
 pub struct AutoResolutionInspectionReport {
     pub auto_resolved: Vec<AutoResolutionInspection>,
     pub retired_indeterminate: Vec<RetirementInspection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationEvidenceSource {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTerminalMarkerStatus {
+    Present,
+    Absent,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTerminalEvidenceStatus {
+    ExactAuthoritative,
+    PresentUnverifiable,
+    Absent,
+    Unavailable,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationEvidenceAuthority {
+    AuthoritativeTerminalEvidence,
+    LegacyNonAuthoritativeMarker,
+    ObservationalCorrelationOnly,
+    Missing,
+    StateMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationEvidenceStatus {
+    Sufficient,
+    Insufficient,
+    Unrecoverable,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationResolutionReadiness {
+    ConfirmedCompletedSupported,
+    ConfirmedNotExecutedSupported,
+    AuthoritativeTerminalSettlementSupported,
+    InsufficientEvidenceKeepQuarantine,
+    UnrecoverableEvidenceGap,
+    StateMismatchFailClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationSupportedDecision {
+    ConfirmedCompleted,
+    ConfirmedNotExecuted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationRecommendedAction {
+    AuthorizedRecoverySupported,
+    AwaitAuthoritativeSelfReconciliation,
+    KeepQuarantine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationAuditReason {
+    AuthoritativeTerminalEvidenceAvailable,
+    LegacyAgentTerminalMarkerOnly,
+    ObservationalCorrelationOnly,
+    MissingExactDispatchBinding,
+    NoTerminalHubReceipt,
+    AgentEvidenceSourceUnavailable,
+    AgentTerminalEvidenceMissing,
+    DeviceMismatch,
+    GenerationMismatch,
+    CapabilityMismatch,
+    DispatchBindingMismatch,
+    DuplicateAgentTerminalEvidence,
+    LegacyHubExecutionSchema,
+    HubReconciliationStateMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReconciliationReadinessAudit {
+    pub operation_id: String,
+    pub hub_execution_schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub capability: String,
+    pub dispatch_recorded: bool,
+    pub dispatch_binding_present: bool,
+    pub hub_terminal_evidence: String,
+    pub hub_reconciliation_status: String,
+    pub agent_evidence_source: ReconciliationEvidenceSource,
+    pub agent_device_match: Option<bool>,
+    pub agent_replay_generation: Option<u64>,
+    pub agent_terminal_marker: AgentTerminalMarkerStatus,
+    pub agent_terminal_marker_authoritative: bool,
+    pub agent_terminal_evidence: AgentTerminalEvidenceStatus,
+    pub authoritative_terminal_state: Option<String>,
+    pub authoritative_evidence_class: Option<String>,
+    pub evidence_authority: ReconciliationEvidenceAuthority,
+    pub evidence_status: ReconciliationEvidenceStatus,
+    pub resolution_readiness: ReconciliationResolutionReadiness,
+    pub supported_decisions: Vec<ReconciliationSupportedDecision>,
+    pub manual_audit_required: bool,
+    pub recommended_action: ReconciliationRecommendedAction,
+    pub reasons: Vec<ReconciliationAuditReason>,
+    pub replay_old_operation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -345,6 +466,268 @@ pub fn inspect_auto_resolutions_read_only(
         auto_resolved,
         retired_indeterminate,
     })
+}
+
+/// Audit durable Hub and Agent reconciliation evidence without taking recovery
+/// authority or mutating either checkpoint. Hidden dispatch-fence values are
+/// compared in memory and are never included in the returned report.
+pub fn audit_reconciliation_read_only(
+    state_dir: &Path,
+    agent_state_dir: &Path,
+    operation_id: &str,
+) -> Result<ReconciliationReadinessAudit, MaintenanceError> {
+    let hub_store = CheckpointStore::new(state_dir.to_path_buf(), "hub")
+        .map_err(MaintenanceError::Persistence)?;
+    let hub_state = hub_store
+        .load_latest::<HubPersistentState>()
+        .map_err(MaintenanceError::Persistence)?;
+    let limits = AdmissionLimits {
+        max_global_active: 1,
+        max_queued_per_device: 1,
+    };
+    let (_registry, execution) = hub_state
+        .clone()
+        .restore(limits)
+        .map_err(MaintenanceError::Persistence)?;
+    let inspection = execution
+        .quarantine_inspections()
+        .map_err(MaintenanceError::Execution)?
+        .into_iter()
+        .find(|inspection| inspection.operation.operation_id == operation_id)
+        .ok_or(MaintenanceError::AuditOperationNotQuarantined)?;
+    let hub_record = hub_state
+        .execution
+        .operations
+        .iter()
+        .find(|record| record.operation.operation_id == operation_id)
+        .ok_or(MaintenanceError::Execution(ExecutionError::InvalidSnapshot))?;
+
+    let mut reasons = vec![ReconciliationAuditReason::NoTerminalHubReceipt];
+    if hub_state.execution.schema_version < 4 {
+        reasons.push(ReconciliationAuditReason::LegacyHubExecutionSchema);
+    }
+    if hub_record.dispatch_binding.is_none() {
+        reasons.push(ReconciliationAuditReason::MissingExactDispatchBinding);
+    }
+
+    let mut report = ReconciliationReadinessAudit {
+        operation_id: inspection.operation.operation_id.clone(),
+        hub_execution_schema_version: hub_state.execution.schema_version,
+        device_id: inspection.operation.device_id.clone(),
+        device_generation: inspection.operation.device_generation,
+        capability: crate::v2_observability::capability_name(inspection.capability).to_owned(),
+        dispatch_recorded: inspection.dispatched_at_ms.is_some(),
+        dispatch_binding_present: hub_record.dispatch_binding.is_some(),
+        hub_terminal_evidence: "none".to_owned(),
+        hub_reconciliation_status: reconciliation_status_name(inspection.reconciliation_status)
+            .to_owned(),
+        agent_evidence_source: ReconciliationEvidenceSource::Unavailable,
+        agent_device_match: None,
+        agent_replay_generation: None,
+        agent_terminal_marker: AgentTerminalMarkerStatus::Unavailable,
+        agent_terminal_marker_authoritative: false,
+        agent_terminal_evidence: AgentTerminalEvidenceStatus::Unavailable,
+        authoritative_terminal_state: None,
+        authoritative_evidence_class: None,
+        evidence_authority: ReconciliationEvidenceAuthority::Missing,
+        evidence_status: ReconciliationEvidenceStatus::Insufficient,
+        resolution_readiness: ReconciliationResolutionReadiness::InsufficientEvidenceKeepQuarantine,
+        supported_decisions: Vec::new(),
+        manual_audit_required: true,
+        recommended_action: ReconciliationRecommendedAction::KeepQuarantine,
+        reasons,
+        replay_old_operation: false,
+    };
+
+    let agent_store = CheckpointStore::new(agent_state_dir.to_path_buf(), "agent")
+        .map_err(MaintenanceError::Persistence)?;
+    let agent_state = match agent_store.load_latest::<AgentPersistentState>() {
+        Ok(state) => state,
+        Err(error) if reconciliation_evidence_source_unavailable(&error) => {
+            report
+                .reasons
+                .push(ReconciliationAuditReason::AgentEvidenceSourceUnavailable);
+            report.evidence_status = ReconciliationEvidenceStatus::Unrecoverable;
+            report.resolution_readiness =
+                ReconciliationResolutionReadiness::UnrecoverableEvidenceGap;
+            return Ok(report);
+        }
+        Err(error) => return Err(MaintenanceError::Persistence(error)),
+    };
+    agent_state
+        .clone()
+        .restore_with_terminal_evidence()
+        .map_err(MaintenanceError::Persistence)?;
+
+    report.agent_evidence_source = ReconciliationEvidenceSource::Available;
+    report.agent_device_match = Some(agent_state.device_id == inspection.operation.device_id);
+    report.agent_replay_generation = agent_state.execution.replay_generation;
+    if report.agent_device_match != Some(true) {
+        report
+            .reasons
+            .push(ReconciliationAuditReason::DeviceMismatch);
+        fail_reconciliation_audit_closed(&mut report);
+        return Ok(report);
+    }
+
+    let marker_present = agent_state
+        .execution
+        .terminal_operation_ids
+        .iter()
+        .any(|candidate| candidate == operation_id);
+    report.agent_terminal_marker = if marker_present {
+        AgentTerminalMarkerStatus::Present
+    } else {
+        AgentTerminalMarkerStatus::Absent
+    };
+    if marker_present
+        && agent_state.execution.replay_generation != Some(inspection.operation.device_generation)
+    {
+        report
+            .reasons
+            .push(ReconciliationAuditReason::GenerationMismatch);
+        fail_reconciliation_audit_closed(&mut report);
+        return Ok(report);
+    }
+
+    let matching_evidence: Vec<_> = agent_state
+        .terminal_evidence
+        .iter()
+        .filter(|candidate| candidate.operation.operation_id == operation_id)
+        .collect();
+    if matching_evidence.len() > 1 {
+        report
+            .reasons
+            .push(ReconciliationAuditReason::DuplicateAgentTerminalEvidence);
+        report.agent_terminal_evidence = AgentTerminalEvidenceStatus::Mismatch;
+        fail_reconciliation_audit_closed(&mut report);
+        return Ok(report);
+    }
+
+    if let Some(terminal) = matching_evidence.first().copied() {
+        if terminal.operation.device_id != agent_state.device_id
+            || terminal.operation.device_id != inspection.operation.device_id
+        {
+            report
+                .reasons
+                .push(ReconciliationAuditReason::DeviceMismatch);
+            report.agent_terminal_evidence = AgentTerminalEvidenceStatus::Mismatch;
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
+        if terminal.operation.device_generation != inspection.operation.device_generation {
+            report
+                .reasons
+                .push(ReconciliationAuditReason::GenerationMismatch);
+            report.agent_terminal_evidence = AgentTerminalEvidenceStatus::Mismatch;
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
+        if terminal.capability != inspection.capability {
+            report
+                .reasons
+                .push(ReconciliationAuditReason::CapabilityMismatch);
+            report.agent_terminal_evidence = AgentTerminalEvidenceStatus::Mismatch;
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
+        let Some(binding) = hub_record.dispatch_binding.as_ref() else {
+            report.agent_terminal_evidence = AgentTerminalEvidenceStatus::PresentUnverifiable;
+            report.evidence_authority = if marker_present {
+                ReconciliationEvidenceAuthority::LegacyNonAuthoritativeMarker
+            } else {
+                ReconciliationEvidenceAuthority::Missing
+            };
+            report.evidence_status = ReconciliationEvidenceStatus::Insufficient;
+            report.resolution_readiness =
+                ReconciliationResolutionReadiness::InsufficientEvidenceKeepQuarantine;
+            report.recommended_action = ReconciliationRecommendedAction::KeepQuarantine;
+            return Ok(report);
+        };
+        if terminal.dispatch_binding() != *binding {
+            report
+                .reasons
+                .push(ReconciliationAuditReason::DispatchBindingMismatch);
+            report.agent_terminal_evidence = AgentTerminalEvidenceStatus::Mismatch;
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
+        if inspection.reconciliation_status != ReconciliationStatus::AutoReconciling {
+            report
+                .reasons
+                .push(ReconciliationAuditReason::HubReconciliationStateMismatch);
+            report.agent_terminal_evidence = AgentTerminalEvidenceStatus::PresentUnverifiable;
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
+
+        report.agent_terminal_evidence = AgentTerminalEvidenceStatus::ExactAuthoritative;
+        report.evidence_authority = ReconciliationEvidenceAuthority::AuthoritativeTerminalEvidence;
+        report.evidence_status = ReconciliationEvidenceStatus::Sufficient;
+        report.authoritative_terminal_state =
+            Some(hub_operation_state_name(terminal.terminal_state).to_owned());
+        report.authoritative_evidence_class = Some(evidence_name(terminal.evidence).to_owned());
+        report.manual_audit_required = false;
+        report
+            .reasons
+            .push(ReconciliationAuditReason::AuthoritativeTerminalEvidenceAvailable);
+        match (terminal.terminal_state, terminal.evidence) {
+            (HubOperationState::Completed, ExecutionEvidence::VerifiedAgentResult) => {
+                report.resolution_readiness =
+                    ReconciliationResolutionReadiness::ConfirmedCompletedSupported;
+                report
+                    .supported_decisions
+                    .push(ReconciliationSupportedDecision::ConfirmedCompleted);
+                report.recommended_action =
+                    ReconciliationRecommendedAction::AuthorizedRecoverySupported;
+            }
+            _ => {
+                report.resolution_readiness =
+                    ReconciliationResolutionReadiness::AuthoritativeTerminalSettlementSupported;
+                report.recommended_action =
+                    ReconciliationRecommendedAction::AwaitAuthoritativeSelfReconciliation;
+            }
+        }
+        return Ok(report);
+    }
+
+    report.agent_terminal_evidence = AgentTerminalEvidenceStatus::Absent;
+    report
+        .reasons
+        .push(ReconciliationAuditReason::AgentTerminalEvidenceMissing);
+    if marker_present {
+        report.evidence_authority = ReconciliationEvidenceAuthority::LegacyNonAuthoritativeMarker;
+        report
+            .reasons
+            .push(ReconciliationAuditReason::LegacyAgentTerminalMarkerOnly);
+    } else if inspection.request_fingerprint.is_some() || inspection.evidence_envelope.is_some() {
+        report.evidence_authority = ReconciliationEvidenceAuthority::ObservationalCorrelationOnly;
+        report
+            .reasons
+            .push(ReconciliationAuditReason::ObservationalCorrelationOnly);
+    }
+    if inspection.reconciliation_status == ReconciliationStatus::UnrecoverableEvidenceGap {
+        report.evidence_status = ReconciliationEvidenceStatus::Unrecoverable;
+        report.resolution_readiness = ReconciliationResolutionReadiness::UnrecoverableEvidenceGap;
+    }
+    Ok(report)
+}
+
+fn reconciliation_evidence_source_unavailable(error: &PersistenceError) -> bool {
+    matches!(error, PersistenceError::NoCheckpoint)
+        || matches!(
+            error,
+            PersistenceError::Io(io_error) if io_error.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
+fn fail_reconciliation_audit_closed(report: &mut ReconciliationReadinessAudit) {
+    report.evidence_authority = ReconciliationEvidenceAuthority::StateMismatch;
+    report.evidence_status = ReconciliationEvidenceStatus::Mismatch;
+    report.resolution_readiness = ReconciliationResolutionReadiness::StateMismatchFailClosed;
+    report.supported_decisions.clear();
+    report.manual_audit_required = true;
+    report.recommended_action = ReconciliationRecommendedAction::KeepQuarantine;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -989,6 +1372,7 @@ pub enum MaintenanceError {
         maintenance_state_schema: u16,
     },
     InvalidCandidateRequest,
+    AuditOperationNotQuarantined,
     PersistenceCompatibility {
         checkpoint_execution_schema: u16,
         maintenance_execution_schema: u16,
@@ -1027,6 +1411,9 @@ impl fmt::Display for MaintenanceError {
             Self::InvalidCandidateRequest => f.write_str(
                 "candidate request does not match the supported shell/process comparison contract",
             ),
+            Self::AuditOperationNotQuarantined => {
+                f.write_str("reconciliation audit requires one exact quarantined operation")
+            }
             Self::PersistenceCompatibility {
                 checkpoint_execution_schema,
                 maintenance_execution_schema,
@@ -1048,8 +1435,17 @@ mod tests {
         OperationAdmissionMetadata, OperationAuditMetadata, OperationDispatchBinding,
         OperationOwner,
     };
-    use crate::v2_m0::{DeviceCapability, DeviceIdentity, DeviceRegistry};
-    use crate::v2_m0_execution::{AdmissionDecision, HubOperationState, OperationRef};
+    use crate::v2_m0::{
+        DeviceCapability, DeviceIdentity, DeviceRegistry, GrantAuthority, GrantLedger,
+    };
+    use crate::v2_m0_execution::{
+        AdmissionDecision, AgentExecutionGate, AgentExecutionSnapshot, HubOperationState,
+        OperationRef,
+    };
+    use crate::v2_m0_transport::HubIdentity;
+    use crate::v2_m0_trust::TrustedHubIdentity;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1064,6 +1460,82 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         path
+    }
+
+    fn checkpoint_count(state_dir: &Path, prefix: &str) -> usize {
+        std::fs::read_dir(state_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(&format!("{prefix}-")) && name.ends_with(".json")
+                })
+            })
+            .count()
+    }
+
+    fn seed_reconciliation_quarantine(
+        state_dir: &Path,
+        dispatch_binding: Option<OperationDispatchBinding>,
+    ) -> (String, String) {
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation_id = "op_reconciliation_audit".to_owned();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: operation_id.clone(),
+        };
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare(operation, owner.clone(), DeviceCapability::Scroll, 100)
+            .unwrap();
+        execution
+            .mark_dispatched_with_binding(&operation_id, &owner, 1, dispatch_binding, 110)
+            .unwrap();
+        execution.mark_connection_lost(&operation_id, 120).unwrap();
+        CheckpointStore::new(state_dir.to_path_buf(), "hub")
+            .unwrap()
+            .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+        (device_id, operation_id)
+    }
+
+    fn seed_agent_reconciliation_state(
+        state_dir: &Path,
+        device_id: &str,
+        replay_generation: u64,
+        terminal_operation_ids: Vec<String>,
+        terminal_evidence: Vec<AgentTerminalEvidence>,
+    ) {
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let execution = AgentExecutionGate::restore_after_restart(AgentExecutionSnapshot {
+            replay_generation: Some(replay_generation),
+            terminal_operation_ids,
+        })
+        .unwrap();
+        let state = AgentPersistentState::capture_with_terminal_evidence(
+            device_id,
+            &trusted_hub,
+            &grants,
+            &execution,
+            &terminal_evidence,
+        )
+        .unwrap();
+        CheckpointStore::new(state_dir.to_path_buf(), "agent")
+            .unwrap()
+            .save(&state)
+            .unwrap();
     }
 
     fn seed_quarantine(state_dir: &Path) -> (String, String) {
@@ -1322,6 +1794,404 @@ mod tests {
             .save(&HubPersistentState::capture(&registry, &execution))
             .unwrap();
         (device_id, operation_id, secret, fingerprint)
+    }
+
+    #[test]
+    fn reconciliation_audit_schema_v3_hub_state_never_promotes_legacy_agent_marker() {
+        let root = test_dir("reconciliation-schema-v3");
+        let hub_dir = root.join("hub");
+        let agent_dir = root.join("agent");
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let operation_id = "op_schema_v3_legacy_audit".to_owned();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: operation_id.clone(),
+        };
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 1,
+        })
+        .unwrap();
+        execution
+            .prepare(operation, owner.clone(), DeviceCapability::Scroll, 100)
+            .unwrap();
+        execution
+            .mark_dispatched(&operation_id, &owner, 1, 110)
+            .unwrap();
+        execution.mark_connection_lost(&operation_id, 120).unwrap();
+        let mut hub_state = HubPersistentState::capture(&registry, &execution);
+        hub_state.execution.schema_version = 3;
+        hub_state.execution.auto_resolutions.clear();
+        hub_state.execution.retirements.clear();
+        for record in &mut hub_state.execution.operations {
+            record.dispatch_binding = None;
+            record.reconciliation_status = None;
+        }
+        CheckpointStore::new(hub_dir.clone(), "hub")
+            .unwrap()
+            .save(&hub_state)
+            .unwrap();
+        seed_agent_reconciliation_state(
+            &agent_dir,
+            &device_id,
+            1,
+            vec![operation_id.clone()],
+            Vec::new(),
+        );
+
+        let report = audit_reconciliation_read_only(&hub_dir, &agent_dir, &operation_id).unwrap();
+
+        assert_eq!(
+            report.resolution_readiness,
+            ReconciliationResolutionReadiness::InsufficientEvidenceKeepQuarantine
+        );
+        assert_eq!(
+            report.evidence_authority,
+            ReconciliationEvidenceAuthority::LegacyNonAuthoritativeMarker
+        );
+        assert_eq!(report.hub_execution_schema_version, 3);
+        assert!(!report.dispatch_binding_present);
+        assert_eq!(report.hub_reconciliation_status, "operator_required");
+        assert!(
+            report
+                .reasons
+                .contains(&ReconciliationAuditReason::LegacyHubExecutionSchema)
+        );
+        assert!(report.supported_decisions.is_empty());
+        assert!(
+            report
+                .reasons
+                .contains(&ReconciliationAuditReason::MissingExactDispatchBinding)
+        );
+        assert!(
+            report
+                .reasons
+                .contains(&ReconciliationAuditReason::LegacyAgentTerminalMarkerOnly)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_audit_legacy_marker_only_keeps_quarantine() {
+        let root = test_dir("reconciliation-legacy-marker");
+        let hub_dir = root.join("hub");
+        let agent_dir = root.join("agent");
+        let (device_id, operation_id) = seed_reconciliation_quarantine(&hub_dir, None);
+        seed_agent_reconciliation_state(
+            &agent_dir,
+            &device_id,
+            1,
+            vec![operation_id.clone()],
+            Vec::new(),
+        );
+        let hub_before = checkpoint_count(&hub_dir, "hub");
+        let agent_before = checkpoint_count(&agent_dir, "agent");
+
+        let report = audit_reconciliation_read_only(&hub_dir, &agent_dir, &operation_id).unwrap();
+
+        assert_eq!(
+            report.resolution_readiness,
+            ReconciliationResolutionReadiness::InsufficientEvidenceKeepQuarantine
+        );
+        assert_eq!(
+            report.evidence_authority,
+            ReconciliationEvidenceAuthority::LegacyNonAuthoritativeMarker
+        );
+        assert_eq!(
+            report.agent_terminal_marker,
+            AgentTerminalMarkerStatus::Present
+        );
+        assert!(!report.agent_terminal_marker_authoritative);
+        assert_eq!(
+            report.agent_terminal_evidence,
+            AgentTerminalEvidenceStatus::Absent
+        );
+        assert_eq!(report.hub_reconciliation_status, "operator_required");
+        assert!(!report.dispatch_binding_present);
+        assert!(report.supported_decisions.is_empty());
+        assert!(report.manual_audit_required);
+        assert_eq!(
+            report.recommended_action,
+            ReconciliationRecommendedAction::KeepQuarantine
+        );
+        assert!(!report.replay_old_operation);
+        assert!(
+            report
+                .reasons
+                .contains(&ReconciliationAuditReason::MissingExactDispatchBinding)
+        );
+        assert!(
+            report
+                .reasons
+                .contains(&ReconciliationAuditReason::LegacyAgentTerminalMarkerOnly)
+        );
+        assert_eq!(checkpoint_count(&hub_dir, "hub"), hub_before);
+        assert_eq!(checkpoint_count(&agent_dir, "agent"), agent_before);
+
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("https://issuer.example"));
+        assert!(!encoded.contains("alice"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_audit_exact_authoritative_evidence_supports_completed_without_mutation() {
+        let root = test_dir("reconciliation-authoritative");
+        let hub_dir = root.join("hub");
+        let agent_dir = root.join("agent");
+        let hidden_fence = "grant_private_reconciliation_fence";
+        let binding = OperationDispatchBinding::new(9, hidden_fence).unwrap();
+        let (device_id, operation_id) =
+            seed_reconciliation_quarantine(&hub_dir, Some(binding.clone()));
+        let evidence = AgentTerminalEvidence {
+            operation: OperationRef {
+                device_id: device_id.clone(),
+                device_generation: 1,
+                operation_id: operation_id.clone(),
+            },
+            capability_revision: binding.capability_revision,
+            capability: DeviceCapability::Scroll,
+            dispatch_grant_id: binding.grant_id.clone(),
+            terminal_state: HubOperationState::Completed,
+            evidence: ExecutionEvidence::VerifiedAgentResult,
+        };
+        seed_agent_reconciliation_state(
+            &agent_dir,
+            &device_id,
+            1,
+            vec![operation_id.clone()],
+            vec![evidence],
+        );
+        let hub_before = checkpoint_count(&hub_dir, "hub");
+        let agent_before = checkpoint_count(&agent_dir, "agent");
+
+        let report = audit_reconciliation_read_only(&hub_dir, &agent_dir, &operation_id).unwrap();
+
+        assert_eq!(
+            report.resolution_readiness,
+            ReconciliationResolutionReadiness::ConfirmedCompletedSupported
+        );
+        assert_eq!(
+            report.evidence_authority,
+            ReconciliationEvidenceAuthority::AuthoritativeTerminalEvidence
+        );
+        assert_eq!(
+            report.evidence_status,
+            ReconciliationEvidenceStatus::Sufficient
+        );
+        assert_eq!(
+            report.agent_terminal_evidence,
+            AgentTerminalEvidenceStatus::ExactAuthoritative
+        );
+        assert_eq!(
+            report.authoritative_terminal_state.as_deref(),
+            Some("completed")
+        );
+        assert_eq!(
+            report.authoritative_evidence_class.as_deref(),
+            Some("verified_agent_result")
+        );
+        assert_eq!(
+            report.supported_decisions,
+            vec![ReconciliationSupportedDecision::ConfirmedCompleted]
+        );
+        assert!(!report.manual_audit_required);
+        assert_eq!(
+            report.recommended_action,
+            ReconciliationRecommendedAction::AuthorizedRecoverySupported
+        );
+        assert!(!report.replay_old_operation);
+        assert_eq!(checkpoint_count(&hub_dir, "hub"), hub_before);
+        assert_eq!(checkpoint_count(&agent_dir, "agent"), agent_before);
+
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains(hidden_fence));
+        assert!(!encoded.contains("https://issuer.example"));
+        assert!(!encoded.contains("alice"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_audit_cross_state_mismatches_fail_closed() {
+        let root = test_dir("reconciliation-mismatch");
+        let hub_dir = root.join("hub");
+        let hidden_fence = "grant_hidden_hub_fence";
+        let binding = OperationDispatchBinding::new(11, hidden_fence).unwrap();
+        let (device_id, operation_id) =
+            seed_reconciliation_quarantine(&hub_dir, Some(binding.clone()));
+
+        for case in ["device", "generation", "capability", "binding"] {
+            let agent_dir = root.join(format!("agent-{case}"));
+            let mut agent_device_id = device_id.clone();
+            let mut replay_generation = 1;
+            let mut evidence = AgentTerminalEvidence {
+                operation: OperationRef {
+                    device_id: device_id.clone(),
+                    device_generation: 1,
+                    operation_id: operation_id.clone(),
+                },
+                capability_revision: binding.capability_revision,
+                capability: DeviceCapability::Scroll,
+                dispatch_grant_id: binding.grant_id.clone(),
+                terminal_state: HubOperationState::Completed,
+                evidence: ExecutionEvidence::VerifiedAgentResult,
+            };
+            let expected_reason = match case {
+                "device" => {
+                    agent_device_id = "different-stable-device".to_owned();
+                    evidence.operation.device_id = agent_device_id.clone();
+                    ReconciliationAuditReason::DeviceMismatch
+                }
+                "generation" => {
+                    replay_generation = 2;
+                    evidence.operation.device_generation = 2;
+                    ReconciliationAuditReason::GenerationMismatch
+                }
+                "capability" => {
+                    evidence.capability = DeviceCapability::PointerClick;
+                    ReconciliationAuditReason::CapabilityMismatch
+                }
+                "binding" => {
+                    evidence.dispatch_grant_id = "grant_hidden_agent_mismatch".to_owned();
+                    ReconciliationAuditReason::DispatchBindingMismatch
+                }
+                _ => unreachable!(),
+            };
+            seed_agent_reconciliation_state(
+                &agent_dir,
+                &agent_device_id,
+                replay_generation,
+                Vec::new(),
+                vec![evidence],
+            );
+
+            let report =
+                audit_reconciliation_read_only(&hub_dir, &agent_dir, &operation_id).unwrap();
+            assert_eq!(
+                report.resolution_readiness,
+                ReconciliationResolutionReadiness::StateMismatchFailClosed,
+                "case={case}"
+            );
+            assert_eq!(
+                report.evidence_authority,
+                ReconciliationEvidenceAuthority::StateMismatch,
+                "case={case}"
+            );
+            assert_eq!(
+                report.evidence_status,
+                ReconciliationEvidenceStatus::Mismatch
+            );
+            assert!(report.supported_decisions.is_empty());
+            assert_eq!(
+                report.recommended_action,
+                ReconciliationRecommendedAction::KeepQuarantine
+            );
+            assert!(report.reasons.contains(&expected_reason), "case={case}");
+            let encoded = serde_json::to_string(&report).unwrap();
+            assert!(!encoded.contains(hidden_fence));
+            assert!(!encoded.contains("grant_hidden_agent_mismatch"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_audit_structural_proof_is_not_authoritative_when_hub_state_rejects_it() {
+        let root = test_dir("reconciliation-hub-status-mismatch");
+        let hub_dir = root.join("hub");
+        let agent_dir = root.join("agent");
+        let binding = OperationDispatchBinding::new(13, "grant_hidden_status_fence").unwrap();
+        let (device_id, operation_id) =
+            seed_reconciliation_quarantine(&hub_dir, Some(binding.clone()));
+        let hub_store = CheckpointStore::new(hub_dir.clone(), "hub").unwrap();
+        let mut hub_state: HubPersistentState = hub_store.load_latest().unwrap();
+        let record = hub_state
+            .execution
+            .operations
+            .iter_mut()
+            .find(|record| record.operation.operation_id == operation_id)
+            .unwrap();
+        record.reconciliation_status = Some(ReconciliationStatus::OperatorRequired);
+        hub_store.save(&hub_state).unwrap();
+        seed_agent_reconciliation_state(
+            &agent_dir,
+            &device_id,
+            1,
+            Vec::new(),
+            vec![AgentTerminalEvidence {
+                operation: OperationRef {
+                    device_id: device_id.clone(),
+                    device_generation: 1,
+                    operation_id: operation_id.clone(),
+                },
+                capability_revision: binding.capability_revision,
+                capability: DeviceCapability::Scroll,
+                dispatch_grant_id: binding.grant_id.clone(),
+                terminal_state: HubOperationState::Completed,
+                evidence: ExecutionEvidence::VerifiedAgentResult,
+            }],
+        );
+
+        let report = audit_reconciliation_read_only(&hub_dir, &agent_dir, &operation_id).unwrap();
+
+        assert_eq!(
+            report.resolution_readiness,
+            ReconciliationResolutionReadiness::StateMismatchFailClosed
+        );
+        assert_eq!(
+            report.evidence_authority,
+            ReconciliationEvidenceAuthority::StateMismatch
+        );
+        assert_eq!(
+            report.agent_terminal_evidence,
+            AgentTerminalEvidenceStatus::PresentUnverifiable
+        );
+        assert!(report.supported_decisions.is_empty());
+        assert!(
+            report
+                .reasons
+                .contains(&ReconciliationAuditReason::HubReconciliationStateMismatch)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_audit_missing_agent_checkpoint_is_unrecoverable_and_read_only() {
+        let root = test_dir("reconciliation-agent-unavailable");
+        let hub_dir = root.join("hub");
+        let agent_dir = root.join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binding = OperationDispatchBinding::new(3, "grant_unavailable_agent").unwrap();
+        let (_device_id, operation_id) = seed_reconciliation_quarantine(&hub_dir, Some(binding));
+        let hub_before = checkpoint_count(&hub_dir, "hub");
+
+        let report = audit_reconciliation_read_only(&hub_dir, &agent_dir, &operation_id).unwrap();
+
+        assert_eq!(
+            report.agent_evidence_source,
+            ReconciliationEvidenceSource::Unavailable
+        );
+        assert_eq!(
+            report.resolution_readiness,
+            ReconciliationResolutionReadiness::UnrecoverableEvidenceGap
+        );
+        assert_eq!(
+            report.recommended_action,
+            ReconciliationRecommendedAction::KeepQuarantine
+        );
+        assert!(
+            report
+                .reasons
+                .contains(&ReconciliationAuditReason::AgentEvidenceSourceUnavailable)
+        );
+        assert_eq!(checkpoint_count(&hub_dir, "hub"), hub_before);
+        assert_eq!(checkpoint_count(&agent_dir, "agent"), 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

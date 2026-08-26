@@ -97,6 +97,27 @@ A northbound tool request rejected by an existing quarantine returns `code=devic
 
 For text-input ambiguity, `confirmed_effect_applied_uncommitted` is a third explicit offline decision: use it only when independent evidence proves the input was delivered but a distinct submit/commit action did not occur. It is not equivalent to `confirmed_not_executed`, and it never makes the old operation retry-safe. `v2_maint resolve --decision confirmed_effect_applied_uncommitted` rejects capabilities outside the bounded text-input set. Execution-safety schema v6 persists this distinction and refuses downgrade to v5 when such a record exists.
 
+### Cross-state reconciliation readiness audit
+
+Before manual checkpoint archaeology or an authority-bearing recovery decision, audit the exact quarantine against the latest durable Hub and Agent checkpoints:
+
+```bash
+v2_maint audit-reconciliation \
+  --state-dir /var/lib/cumg-v2/hub \
+  --agent-state-dir /var/lib/cumg-v2/agent \
+  --operation-id op_...
+```
+
+`audit-reconciliation` is strictly read-only. It reads the latest atomically committed Hub and Agent checkpoints without taking the offline recovery lock, never calls `resolve_indeterminate`, never clears quarantine, never signs or publishes recovery authority, and never retries, replays, dispatches, or contacts the backend. It may therefore run while the services are live. Because the two append-only stores are sampled independently, the output is a conservative point-in-time cross-state view; if one store advances during the audit, an observed mismatch fails closed. Re-run the audit rather than editing state or inferring completion from liveness.
+
+The audit correlates only bounded metadata for the exact quarantined operation: Hub execution-safety schema version, stable device, original generation, capability, dispatch-record presence, Hub reconciliation state, the Agent replay generation, legacy terminal-marker presence, and newer payload-free terminal-evidence metadata. The one-shot dispatch fence is compared only in memory and is never printed. Owner principal, raw grant/fingerprint values, command/argv/cwd/env, typed text, URL, clipboard/screenshot data, backend/result payloads, credentials, tokens, secrets, and private paths are not included in the report.
+
+Evidence authority is explicit. Schema-v1/v2/v3 Hub state is reported with its execution-safety schema version and `legacy_hub_execution_schema`; absence of a v4 dispatch binding is therefore not collapsed into generic `operator_required`. A legacy Agent `terminal_operation_id` is `legacy_non_authoritative_marker` even when the operation ID and generation correlate; by itself it always yields `insufficient_evidence_keep_quarantine`. Request fingerprints and evidence envelopes are `observational_correlation_only` and likewise cannot settle an operation. A newer Agent terminal-evidence entry is `authoritative_terminal_evidence` only when its exact device, original generation, capability, capability revision, hidden dispatch fence, terminal state, evidence class, and the Hub's `auto_reconciling` state pass the normal durable reconciliation contract. Device/generation/capability/fence or Hub reconciliation-state mismatches return `state_mismatch_fail_closed`. Missing Agent evidence after the Hub has already classified the gap, or an unavailable Agent checkpoint source, returns `unrecoverable_evidence_gap`.
+
+`confirmed_completed_supported` means an exact authoritative `Completed + VerifiedAgentResult` proof is available and `supported_decisions` contains only `confirmed_completed`; the audit itself still performs no recovery. Other exact authoritative terminal states are reported as `authoritative_terminal_settlement_supported` so the normal self-reconciliation path can consume them without inventing a different manual outcome. In particular, a verified remote error or proven process termination is **not** relabeled as `confirmed_not_executed`; that decision still requires independent evidence that no side effect occurred. Every insufficient or mismatched result keeps `recommended_action=keep_quarantine`, `replay_old_operation=false`, and leaves the existing quarantine untouched.
+
+Operator flow is therefore: `inspect-quarantine` -> `audit-reconciliation` -> either keep quarantine / allow normal authoritative self-reconciliation, or perform an explicitly authorized offline recovery using only a decision named in `supported_decisions`. Never promote a legacy marker, fingerprint match, reconnect, elapsed time, shell parsing, or UI/application heuristic into completion evidence.
+
 For shell/process/text-input deployments that want privacy-preserving candidate matching, provision one private file of at least 32 bytes and configure the Hub with `CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE`. The file must be readable only by the Hub/operator account and must not be committed or copied into logs. The Hub HMACs the canonical shell/process request or typed-text payload before dispatch; no raw request or typed text is persisted for this purpose. `type_text` also persists its bounded shape envelope even when the HMAC key is not configured; in that case candidate equality is unavailable. To compare a locally-held candidate request, place that candidate JSON in a private file and run:
 
 ```bash

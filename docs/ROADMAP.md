@@ -108,7 +108,7 @@ Remaining upstream closeout is intentionally outside CUMG authority: `mcp-execut
 
 Sustained CUMG + Handoff dogfood after the original production-hardening baseline intentionally continued to exercise real failure/recovery paths. That work found additional issues without changing the core authority model. Track them as a stabilization queue rather than silently expanding the `0.3.0` release gate:
 
-- execution/recovery semantics: `#179` partial input effects, `#180` quarantine-safe evidence lane, `#181` privacy-preserving evidence envelope, plus the existing `#133` reconciliation-readiness and `#115`/`#136`/`#137` recovery/retirement UX work;
+- execution/recovery semantics: `#179` partial input effects, `#180` quarantine-safe evidence lane, `#181` privacy-preserving evidence envelope, `#133` first-class reconciliation-readiness audit, plus `#115`/`#136`/`#137` recovery/retirement UX work;
 - Handoff/operator lifecycle: `#184` in-band Handoff-begin self-interference and `#185` explicit one-shot single-Mac maintenance jobs;
 - diagnostics and host reliability: `#141` privacy-safe structured execution errors, `#143` browser-staging startup diagnostics, `#112` disk/temp-exhaustion availability investigation, and `#194` `v2_doctor` self-observation;
 - each issue keeps its own severity, compatibility, tests, and acceptance boundary. A follow-up may be PATCH-compatible, admitted to a later minor, or deferred; none weakens quarantine/no-replay semantics to reduce backlog.
