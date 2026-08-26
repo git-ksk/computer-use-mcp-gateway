@@ -7,7 +7,7 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
-    OperationAdmissionMetadata, OperationDispatchBinding, OperationOwner,
+    OperationAdmissionMetadata, OperationDispatchBinding, OperationExecutionLane, OperationOwner,
     OperationRecoverySnapshot, ReconciliationStatus, RecoverableOperationResult, ResolutionRecord,
     terminal_evidence_for_device_result,
 };
@@ -732,13 +732,16 @@ impl SingleDeviceHub {
                                     unix_time_ms()?,
                                 ) {
                                     Ok(decision) => {
+                                        let recovery_evidence_read = persistent
+                                            .execution
+                                            .is_recovery_evidence_read(&operation_id);
                                         persist_locked(&self.inner, &persistent)?;
-                                        Ok(decision)
+                                        Ok((decision, recovery_evidence_read))
                                     }
                                     Err(error) => Err(command_error_from_execution(error)),
                                 }
                             };
-                            let decision = match decision {
+                            let (decision, recovery_evidence_read) = match decision {
                                 Ok(decision) => decision,
                                 Err(error) => {
                                     tracing::warn!(
@@ -766,6 +769,11 @@ impl SingleDeviceHub {
                                 generation,
                                 capability = crate::v2_observability::capability_name(command.capability()),
                                 outcome = admission_outcome,
+                                execution_lane = if recovery_evidence_read {
+                                    "recovery_evidence_read"
+                                } else {
+                                    "normal"
+                                },
                                 "operation admitted"
                             );
                             pending.insert(operation_id.clone(), PendingOperation {
@@ -1397,6 +1405,54 @@ impl SingleDeviceHub {
                 code: crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate
             }
         ) {
+            let recovery_evidence_read = {
+                let persistent = self.inner.persistent.lock().await;
+                persistent
+                    .execution
+                    .is_recovery_evidence_read(&operation_id)
+            };
+            if recovery_evidence_read {
+                let (next, _receipt) = {
+                    let mut persistent = self.inner.persistent.lock().await;
+                    let settled = persistent
+                        .execution
+                        .mark_recovery_read_interrupted(&operation_id, unix_time_ms()?)?;
+                    persist_locked(&self.inner, &persistent)?;
+                    settled
+                };
+                crate::v2_observability::operation_completed(
+                    capability,
+                    crate::v2_observability::OperationOutcome::Failed,
+                );
+                tracing::warn!(
+                    event = "v2_recovery_evidence_read_failed",
+                    operation_id = %operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    capability = crate::v2_observability::capability_name(capability),
+                    outcome = "failed_safe",
+                    error_code = "backend_outcome_unproven",
+                    "recovery evidence read failed without changing the existing quarantine"
+                );
+                if let Some(operation) = pending.remove(&operation_id) {
+                    let _ = operation.reply.send(Err(HubCommandError::Remote(
+                        crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate,
+                    )));
+                }
+                return self
+                    .dispatch_next(
+                        next,
+                        outbound,
+                        hello,
+                        challenge,
+                        generation,
+                        capability_revision,
+                        session_clock,
+                        pending,
+                        queue_order,
+                    )
+                    .await;
+            }
             let cancelled_queued = {
                 let mut persistent = self.inner.persistent.lock().await;
                 persistent.execution.mark_indeterminate(
@@ -1632,19 +1688,36 @@ impl SingleDeviceHub {
                 .ok_or(HubServiceError::PendingOperationMissing)?
                 .owner
                 .clone();
+            let recovery_capability = pending
+                .get(&ack.operation_id)
+                .ok_or(HubServiceError::PendingOperationMissing)?
+                .command
+                .capability();
+            let recovery_evidence_read = {
+                let persistent = self.inner.persistent.lock().await;
+                persistent
+                    .execution
+                    .is_recovery_evidence_read(&ack.operation_id)
+            };
             let cancelled_queued = {
                 let mut persistent = self.inner.persistent.lock().await;
                 if matches!(
                     persistent.execution.state(&ack.operation_id),
                     Some(HubOperationState::Dispatched | HubOperationState::CancelRequested)
                 ) {
-                    persistent.execution.mark_indeterminate(
-                        &ack.operation_id,
-                        &owner,
-                        generation,
-                        IndeterminateReason::CancellationUnproven,
-                        unix_time_ms()?,
-                    )?;
+                    if recovery_evidence_read {
+                        let _ = persistent
+                            .execution
+                            .mark_recovery_read_interrupted(&ack.operation_id, unix_time_ms()?)?;
+                    } else {
+                        persistent.execution.mark_indeterminate(
+                            &ack.operation_id,
+                            &owner,
+                            generation,
+                            IndeterminateReason::CancellationUnproven,
+                            unix_time_ms()?,
+                        )?;
+                    }
                 }
                 let cancelled: Vec<_> = pending
                     .keys()
@@ -1667,34 +1740,55 @@ impl SingleDeviceHub {
                 }
             }
             if let Some(operation) = pending.remove(&ack.operation_id) {
-                let _ = operation
-                    .reply
-                    .send(Err(HubCommandError::DeviceIndeterminate {
+                let response = if recovery_evidence_read {
+                    Err(HubCommandError::Remote(
+                        crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate,
+                    ))
+                } else {
+                    Err(HubCommandError::DeviceIndeterminate {
                         operation_id: ack.operation_id.clone(),
-                    }));
+                    })
+                };
+                let _ = operation.reply.send(response);
             }
-            crate::v2_observability::operation_indeterminate(
-                IndeterminateReason::CancellationUnproven,
-            );
-            emit_quarantine_created_alert(
-                &ack.operation_id,
-                &self.inner.device_id,
-                generation,
-                None,
-                IndeterminateReason::CancellationUnproven,
-            );
-            tracing::warn!(
-                event = "v2_operation_indeterminate",
-                operation_id = %ack.operation_id,
-                device_id = %self.inner.device_id,
-                generation,
-                outcome = "quarantined",
-                indeterminate_reason = crate::v2_observability::indeterminate_reason_name(
-                    IndeterminateReason::CancellationUnproven
-                ),
-                error_code = "cancellation_unproven",
-                "backend cancellation was propagated but side-effect interruption is unproven; device quarantined"
-            );
+            if recovery_evidence_read {
+                crate::v2_observability::operation_completed(
+                    recovery_capability,
+                    crate::v2_observability::OperationOutcome::Failed,
+                );
+                tracing::warn!(
+                    event = "v2_recovery_evidence_read_failed",
+                    operation_id = %ack.operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    outcome = "failed_safe",
+                    error_code = "cancellation_unproven",
+                    "recovery evidence read cancellation remained side-effect safe; existing quarantine retained"
+                );
+            } else {
+                crate::v2_observability::operation_indeterminate(
+                    IndeterminateReason::CancellationUnproven,
+                );
+                emit_quarantine_created_alert(
+                    &ack.operation_id,
+                    &self.inner.device_id,
+                    generation,
+                    None,
+                    IndeterminateReason::CancellationUnproven,
+                );
+                tracing::warn!(
+                    event = "v2_operation_indeterminate",
+                    operation_id = %ack.operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    outcome = "quarantined",
+                    indeterminate_reason = crate::v2_observability::indeterminate_reason_name(
+                        IndeterminateReason::CancellationUnproven
+                    ),
+                    error_code = "cancellation_unproven",
+                    "backend cancellation was propagated but side-effect interruption is unproven; device quarantined"
+                );
+            }
         }
         if let Some(waiter) = cancel_waiters.remove(&ack.operation_id) {
             let _ = waiter.send(Ok(ack.disposition));
@@ -1748,6 +1842,7 @@ impl SingleDeviceHub {
             .filter(|operation| operation.operation.device_generation == generation)
             .collect();
         let mut connection_lost_indeterminate = Vec::new();
+        let mut recovery_reads_interrupted = Vec::new();
         for operation in operations {
             let operation_id = operation.operation.operation_id;
             match persistent.execution.state(&operation_id) {
@@ -1755,8 +1850,13 @@ impl SingleDeviceHub {
                     persistent
                         .execution
                         .mark_connection_lost(&operation_id, unix_time_ms()?)?;
-                    connection_lost_indeterminate
-                        .push((operation_id.clone(), operation.capability));
+                    if operation.execution_lane == OperationExecutionLane::RecoveryEvidenceRead {
+                        recovery_reads_interrupted
+                            .push((operation_id.clone(), operation.capability));
+                    } else {
+                        connection_lost_indeterminate
+                            .push((operation_id.clone(), operation.capability));
+                    }
                 }
                 Some(HubOperationState::Queued | HubOperationState::ActiveNotDispatched) => {
                     let _ = persistent.execution.request_cancel(
@@ -1779,6 +1879,22 @@ impl SingleDeviceHub {
             persistent.registry.disconnect(&self.inner.device_id)?;
         }
         persist_locked(&self.inner, &persistent)?;
+        for (operation_id, capability) in recovery_reads_interrupted {
+            crate::v2_observability::operation_completed(
+                capability,
+                crate::v2_observability::OperationOutcome::Failed,
+            );
+            tracing::warn!(
+                event = "v2_recovery_evidence_read_failed",
+                operation_id = %operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                capability = crate::v2_observability::capability_name(capability),
+                outcome = "failed_safe",
+                error_code = "connection_lost",
+                "recovery evidence read lost transport without changing the existing quarantine"
+            );
+        }
         for (operation_id, capability) in connection_lost_indeterminate {
             crate::v2_observability::operation_indeterminate(IndeterminateReason::ConnectionLost);
             emit_quarantine_created_alert(

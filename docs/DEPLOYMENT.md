@@ -112,6 +112,8 @@ For a quarantined `type_text` operation, use the same command with `--tool type_
 
 Execution-safety schema v7 persists the text-input evidence envelope and rejects downgrade to v6 when an envelope exists. The envelope inspection reports only its versioned shape and whether a fingerprint is present; it never prints typed text or the HMAC value.
 
+Execution-safety schema v8 persists the recovery-evidence lane marker. While `v2_doctor` reports `hub.recovery_mode=restricted_read_only`, only the closed non-mutating recovery allowlist is admissible; generic `shell` / `execute_process` and all mutation/activation/write capabilities remain denied. An interrupted evidence read fails terminally without modifying the pre-existing quarantine. Rollback to a v7 reader is rejected if v8-only lane/evidence state would be lost.
+
 The command prints only `"same_request"`, `"different_request"`, or `"unavailable"`; it does not print the candidate, stored fingerprint, key identifier, or key. A different/rotated key intentionally yields `unavailable`, not `different_request`. Matching proves only request correlation. It never proves completion, clears quarantine, changes retry safety, or authorizes replay. Arbitrary shell text is never parsed to infer idempotency or postconditions. Remove the temporary candidate file according to the deployment's sensitive-file handling policy after use.
 
 ### Authoritative self-reconciliation after reconnect/restart

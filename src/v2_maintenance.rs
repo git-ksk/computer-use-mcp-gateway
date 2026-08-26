@@ -727,6 +727,7 @@ const fn evidence_name(evidence: ExecutionEvidence) -> &'static str {
         ExecutionEvidence::ProvenProcessTermination => "proven_process_termination",
         ExecutionEvidence::CancelledBeforeDispatch => "cancelled_before_dispatch",
         ExecutionEvidence::OperatorResolution => "operator_resolution",
+        ExecutionEvidence::RecoveryReadInterrupted => "recovery_read_interrupted",
     }
 }
 

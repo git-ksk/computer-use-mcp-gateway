@@ -74,6 +74,7 @@ pub struct HubSummary {
     pub capability_schema: Option<u16>,
     pub capability_revision: Option<u64>,
     pub live_quarantine_count: Option<usize>,
+    pub recovery_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -314,6 +315,7 @@ fn inspect_hub(
         capability_schema: None,
         capability_revision: None,
         live_quarantine_count: None,
+        recovery_mode: "normal".to_owned(),
     };
     let store = match CheckpointStore::new(config.hub_state_dir.clone(), "hub") {
         Ok(store) => store,
@@ -379,11 +381,15 @@ fn inspect_hub(
             let (persistent_count, diagnostic_caller_count) =
                 classify_quarantine_report(&report, summary.device_count, in_band_agent_descendant);
             summary.live_quarantine_count = Some(persistent_count);
+            let (recovery_mode, recovery_mode_status) =
+                recovery_mode_for_quarantine_count(persistent_count);
+            summary.recovery_mode = recovery_mode.to_owned();
             if persistent_count == 0 {
                 push(checks, "live_quarantine", CheckStatus::Ok, "none");
             } else {
                 push(checks, "live_quarantine", CheckStatus::Error, "present");
             }
+            push(checks, "recovery_mode", recovery_mode_status, recovery_mode);
             if diagnostic_caller_count == 1 {
                 push(
                     checks,
@@ -401,6 +407,14 @@ fn inspect_hub(
         ),
     }
     (summary, device_id)
+}
+
+fn recovery_mode_for_quarantine_count(persistent_count: usize) -> (&'static str, CheckStatus) {
+    if persistent_count == 0 {
+        ("normal", CheckStatus::Ok)
+    } else {
+        ("restricted_read_only", CheckStatus::Warning)
+    }
 }
 
 fn classify_quarantine_report(
@@ -1175,6 +1189,22 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_recovery_mode_is_explicitly_restricted_when_quarantine_exists() {
+        assert_eq!(
+            recovery_mode_for_quarantine_count(0),
+            ("normal", CheckStatus::Ok)
+        );
+        assert_eq!(
+            recovery_mode_for_quarantine_count(1),
+            ("restricted_read_only", CheckStatus::Warning)
+        );
+        assert_eq!(
+            recovery_mode_for_quarantine_count(3),
+            ("restricted_read_only", CheckStatus::Warning)
+        );
     }
 
     #[test]

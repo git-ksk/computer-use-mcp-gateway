@@ -224,9 +224,35 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
         quarantine.reason,
         IndeterminateReason::BackendOutcomeUnproven
     );
+    // Quarantine opens only the explicit evidence-read lane. The observation
+    // completes normally but cannot settle or replace the original ambiguity.
+    let recovery_read = handle
+        .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+        .await?
+        .wait()
+        .await?;
+    assert_eq!(
+        recovery_read.receipt.terminal_state,
+        HubOperationState::Completed
+    );
+    assert_eq!(
+        handle
+            .desktop_quarantine()
+            .await
+            .expect("evidence read must not clear quarantine")
+            .operation_id,
+        ambiguous_click_operation
+    );
     assert!(matches!(
         handle
-            .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+            .start_command_as(
+                bob.clone(),
+                DeviceCommand::PointerClick {
+                    x: 12,
+                    y: 23,
+                    button: computer_use_mcp_gateway::v2_m0::PointerButton::Left,
+                },
+            )
             .await?
             .wait()
             .await,
@@ -300,15 +326,23 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
     assert_eq!(quarantine.operation_id, ambiguous_operation);
     assert_eq!(quarantine.owner, alice);
 
-    let blocked = handle
+    let recovery_read = handle
         .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
         .await?
         .wait()
-        .await;
+        .await?;
     assert!(matches!(
-        blocked,
-        Err(HubCommandError::DeviceIndeterminate { operation_id }) if operation_id == ambiguous_operation
+        recovery_read.result,
+        DeviceResult::ScreenGeometry { .. }
     ));
+    assert_eq!(
+        handle
+            .desktop_quarantine()
+            .await
+            .expect("recovery evidence must not settle cancellation ambiguity")
+            .operation_id,
+        ambiguous_operation
+    );
 
     // Re-opening the desktop is persistence-gated. If the checkpoint cannot be
     // made durable, the in-memory resolution is rolled back to quarantine.
