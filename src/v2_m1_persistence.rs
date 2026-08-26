@@ -472,9 +472,48 @@ pub enum PersistenceError {
     InvalidState,
 }
 
+impl PersistenceError {
+    pub fn io_class(&self) -> &'static str {
+        match self {
+            Self::Io(error) => bounded_io_class(error.kind()),
+            _ => "not_applicable",
+        }
+    }
+
+    pub fn is_resource_exhaustion(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::OutOfMemory
+                )
+        )
+    }
+}
+
+fn bounded_io_class(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::WouldBlock => "would_block",
+        std::io::ErrorKind::InvalidInput => "invalid_input",
+        std::io::ErrorKind::InvalidData => "invalid_data",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::WriteZero => "write_zero",
+        std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        std::io::ErrorKind::OutOfMemory => "out_of_memory",
+        std::io::ErrorKind::StorageFull => "storage_full",
+        _ => "other",
+    }
+}
+
 impl SafeErrorCode for PersistenceError {
     fn safe_error_code(&self) -> &'static str {
         match self {
+            Self::Io(_) if self.is_resource_exhaustion() => "persistence_resource_exhausted",
             Self::Io(_) => "persistence_io",
             Self::Serialization(_) => "persistence_serialization",
             Self::Control(_) => "persistence_control_state",
@@ -1087,6 +1126,68 @@ mod tests {
         let result: Result<serde_json::Value, _> = store.load_latest();
         assert!(matches!(result, Err(PersistenceError::UnsafePermissions)));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn agent_checkpoint_storage_full_preserves_replay_barrier_and_recovers_after_capacity_returns()
+    {
+        let directory = temp_directory("agent-storage-full-recovery");
+        let store = CheckpointStore::new(&directory, "agent").unwrap();
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let mut execution = AgentExecutionGate::default();
+        execution
+            .begin(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 7,
+                operation_id: "op-before-storage-full".into(),
+            })
+            .unwrap();
+        let committed =
+            AgentPersistentState::capture("dev-a", &trusted_hub, &grants, &execution).unwrap();
+        store.save(&committed).unwrap();
+
+        let failed = store
+            .save_with_size_inner(&committed, |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            })
+            .unwrap_err();
+        assert_eq!(failed.safe_error_code(), "persistence_resource_exhausted");
+        assert_eq!(failed.io_class(), "storage_full");
+        assert!(failed.is_resource_exhaustion());
+
+        // The failed candidate never becomes authoritative. Restart restores the last
+        // committed replay barrier, so the exact operation cannot be automatically replayed.
+        let restarted = CheckpointStore::new(&directory, "agent").unwrap();
+        let restored: AgentPersistentState = restarted.load_latest().unwrap();
+        let (_, _, _, mut restored_execution) = restored.restore().unwrap();
+        assert_eq!(
+            restored_execution.begin(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 7,
+                operation_id: "op-before-storage-full".into(),
+            }),
+            Err(crate::v2_m0_execution::ExecutionError::OperationReplay)
+        );
+
+        // Once capacity is available again, the same store can commit normally without any
+        // special replay or state repair path.
+        store.save(&committed).unwrap();
+        let recovered: AgentPersistentState = store.load_latest().unwrap();
+        assert_eq!(recovered.device_id, "dev-a");
+        assert_eq!(recovered.execution.replay_generation, Some(7));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn persistence_resource_exhaustion_formatting_is_bounded() {
+        let error = PersistenceError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert_eq!(error.safe_error_code(), "persistence_resource_exhausted");
+        assert_eq!(error.io_class(), "storage_full");
+        assert_eq!(format!("{error:?}"), "persistence_resource_exhausted");
+        assert_eq!(error.to_string(), "persistence_resource_exhausted");
     }
 
     #[test]

@@ -1986,7 +1986,11 @@ fn record_agent_persistence_failure(device_id: &str, error: &PersistenceError) {
         device_id,
         outcome = "failed",
         error_code = error.safe_error_code(),
+        io_class = error.io_class(),
+        resource_exhausted = error.is_resource_exhaustion(),
         component = "agent",
+        agent_availability = "fail_closed_exit",
+        service_manager_retry = "external",
         "Agent checkpoint persistence failed"
     );
 }
@@ -2183,6 +2187,16 @@ impl std::error::Error for AgentServiceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_full_persistence_failure_is_bounded_and_forces_fail_closed_exit() {
+        let error = AgentServiceError::Persistence(PersistenceError::Io(std::io::Error::from(
+            std::io::ErrorKind::StorageFull,
+        )));
+        assert_eq!(error.safe_error_code(), "persistence_resource_exhausted");
+        assert!(!error.reconnectable());
+        assert_eq!(format!("{error:?}"), "persistence_resource_exhausted");
+    }
 
     #[test]
     fn process_terminal_proof_classification_controls_indeterminate_routing() {
