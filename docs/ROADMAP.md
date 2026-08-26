@@ -41,7 +41,7 @@ The completed V1/V2 implementation history and acceptance evidence remain availa
 Current priorities:
 
 - preserve the authoritative operation/quarantine/resolution/no-auto-replay state machine;
-- keep control schema v8 and capability-advertisement schema v5 behavior explicit; v5 is the reviewed change that adds the signed payload-free reconciliation-report boundary and mixed versions fail closed;
+- keep live control schema v9 and capability-advertisement schema v5 behavior explicit; capability schema v5 is the reviewed change that adds the signed payload-free reconciliation-report boundary, and mixed versions fail closed;
 - keep Cua Driver upgrades as reviewed compatibility changes with pinned/repeatable evidence;
 - maintain security, dependency, documentation, packaging, CI, conformance, soak, and resource-regression quality;
 - keep the remaining V1-only compatibility observations (#14 and #15) explicitly blocked on their upstream Cua issues rather than treating them as active CUMG release blockers;
@@ -114,6 +114,20 @@ Sustained CUMG + Handoff dogfood after the original production-hardening baselin
 - each issue keeps its own severity, compatibility, tests, and acceptance boundary. A follow-up may be PATCH-compatible, admitted to a later minor, or deferred; none weakens quarantine/no-replay semantics to reduce backlog.
 
 This queue records the practical result of continuing Handoff integration and physical dogfood while #100 remained the known `0.3.0` blocker.
+
+### Current open issue inventory
+
+As of 2026-08-26 the repository has **18 open issues**. Every open issue is intentionally listed here so an issue cannot silently fall out of roadmap visibility. This inventory is a tracking snapshot, not a promise that every item ships in the next release; issue closure/opening must update this section or a nearby roadmap section in the same documentation pass.
+
+- **`0.3.0` release gate / closeout:** `#100` local-user-authorized online quarantine recovery is the only explicit runtime release blocker and still needs trusted physical-macOS acceptance; `#120` is release-document closeout and now retains only the final tag-time version/reference re-check.
+- **Recovery and indeterminate-state UX:** `#103` extends durable operation recovery to effectful Desktop/Browser calls; `#109` confirms durable Hub completion from the online-recovery CLI; `#115` makes indeterminate operations actionable without unsafe replay; `#136` separates permanent replay tombstones from bounded retirement audit history; `#137` explores local-human acceptance of current state for low-impact indeterminate GUI operations. None may weaken quarantine, replay fencing, or persistence-gated settlement.
+- **Runtime/process/filesystem hardening:** `#96` investigates deliberate Unix session-detachment escape from process-group supervision; `#104` separates filesystem observation roots from process working-directory roots. These are hardening follow-ups, not current `0.3.0` blockers.
+- **Bounded workspace/developer capabilities:** `#83` adds retrievable references for truncated shell/process output; `#105` adds ranged file reads and deterministic directory continuation; `#106` adds explicitly managed long-running development jobs; `#107` adds bounded atomic workspace mutation without requiring shell; `#114` adds sandboxed Playwright/E2E execution. Each requires an explicit capability boundary rather than inheriting unrestricted shell authority.
+- **Performance and repeatability:** `#111` adds a reproducible Gateway latency/concurrency benchmark. It is measurement infrastructure and does not redefine execution authority.
+- **Post-`0.3.0` identity expansion:** `#139` adds generic OIDC/JWT northbound identity for multi-principal authorization and remains deliberately sequenced after the production-hardening closeout.
+- **Upstream-blocked V1 compatibility:** `#14` (`get_screen_size` session/escalation) and `#15` (`list_apps` live-process discovery mismatch) remain blocked on upstream Cua. They are not active CUMG release blockers and may become no-longer-applicable if V1 is deliberately retired.
+
+The classifications above are ordering/admission guidance only. Severity and acceptance requirements remain authoritative in each issue. If an open issue is not represented in this inventory or another explicit roadmap section, the roadmap is stale and should be corrected before declaring documentation closeout.
 
 ### Post-`0.3.0` candidate: multi-principal northbound identity
 
