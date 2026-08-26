@@ -90,9 +90,12 @@ The active implementation is tracked by capability rather than by internal miles
 | Desktop semantic path | Complete / accepted |
 | Browser core | Complete / accepted |
 | Browser transfer (upload/download) | Complete / accepted |
+| Optional Human Handoff coordination | First-class / accepted in CUMG; Window + Terminal consume upstream Handoff components |
 | V1 regression/conformance | Required and preserved |
 
 Browser core covers the typed prepare, bind, inspect, navigate, click, type, dialog, and pointer paths while preserving opaque CUMG references and exact-or-refuse execution semantics. Browser transfer adds bounded staged upload/download with context-scoped references, Agent-private filesystem staging, exact capability checks, and fail-closed handling of stale references, path escape, partial completion, timeout, and cancellation.
+
+When optional Human Handoff is enabled, CUMG treats upstream Handoff authority as part of the Agent execution boundary rather than as a best-effort sidecar. Window integration now consumes `WindowHandoffAdapter`; Terminal/PTY integration consumes `TerminalHandoffAdapter` and no longer imports Handoff's experimental Terminal authority/WebRTC modules directly. CUMG still owns authorization, operation/quarantine semantics, PTY/process containment, and fresh semantic verification. Upstream Window issue #85 remains open for a first-class same-LAN direct physical rerun; that does not reopen CUMG #152 or the completed Terminal integration.
 
 See [`docs/v2/STATUS.md`](docs/v2/STATUS.md) for the current map, [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) for Browser core evidence, [`docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) for Browser transfer evidence, and [`docs/README.md`](docs/README.md) for how active specs, acceptance evidence, and archived decision records are organized.
 

@@ -90,9 +90,12 @@ CUMG は、デスクトップを変更できる capability について fail-clo
 | Desktop semantic path | Complete / accepted |
 | Browser core | Complete / accepted |
 | Browser transfer (upload/download) | Complete / accepted |
+| Optional Human Handoff coordination | CUMGではfirst-class / accepted。Window + Terminalはupstream Handoff componentを利用 |
 | V1 regression/conformance | Required and preserved |
 
 Browser core は、opaque CUMG reference と exact-or-refuse 実行 semantics を維持したまま、型付きの prepare、bind、inspect、navigate、click、type、dialog、pointer 経路を提供します。Browser transfer は、context-scoped ref、Agent-private filesystem staging、exact capability check、および stale ref、path escape、partial completion、timeout、cancellation に対する fail-closed 処理を備えた bounded staged upload/download を追加します。
+
+optional Human Handoffを有効化した場合、CUMGはupstream Handoff authorityをbest-effort sidecarではなくAgent execution boundaryの一部として扱います。Window integrationは `WindowHandoffAdapter`、Terminal/PTY integrationは `TerminalHandoffAdapter` をconsumeし、Handoffのexperimental Terminal authority / WebRTC moduleを直接importしません。authorization、operation/quarantine semantics、PTY/process containment、fresh semantic verificationは引き続きCUMGが所有します。upstream Window #85にはfirst-class adapterのsame-LAN direct physical rerunが残っていますが、CUMG #152や完了済みTerminal integrationをreopenするものではありません。
 
 現在の全体像は [`docs/v2/STATUS.ja.md`](docs/v2/STATUS.ja.md) を参照してください。Browser core の evidence は [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md)、Browser transfer の evidence は [`docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) にあります。active spec、acceptance evidence、archive 済み decision record の整理方法は [`docs/README.md`](docs/README.md) を参照してください。
 

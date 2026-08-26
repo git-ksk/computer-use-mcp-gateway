@@ -89,14 +89,16 @@ physical CUMG + `mcp-execution-handoff` では、exact macOS Window に対する
 
 Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) でこの integration と merged-main physical OS-window acceptance は完了しました。構成原則は **first-class だが optional** です。通常の CUMG capability は Handoff を必須としませんが、Handoff を有効化した deployment では authority decision を best-effort な外付け判定ではなく execution boundary の一部として扱います。操作対象 Agent が canonical Handoff FSM/checkpoint、WebRTC/TURN、capture、Human input、local verification を所有し、Hub は CUMG authorization / ledger / quarantine と conservative な pre-dispatch fence、signed operator-control relay のみを保持します。Hub/Agent に二重の Handoff state machine は作りません。generation rollover は fresh same-surface observation を伴う explicit `rebind_live` とし、Agent は Cua 直前に signed authority binding と実 command surface を再検証します。有効化後に runtime/transport が unavailable になった場合は coordinator を迂回せず fail closed します。
 
-依存順は次です。
+当初の依存順はcomponent migrationまで完了しました。
 
-1. `#152` — first-class coordinator / local control / physical Window regression acceptance;
-2. `mcp-execution-handoff#48` — bounded PTY session と Agent/Human-exclusive input;
-3. `mcp-execution-handoff#47` — Window + Terminal evidence から残り OS/window primitive を整理;
-4. `mcp-execution-handoff#45` — dogfood evidence 後に terminology / public API を収束。
+1. `#152` — first-class CUMG HandoffCoordinator / OS-window regression acceptance — **closed**
+2. `mcp-execution-handoff#48` — bounded PTY semantic dogfood — **closed**
+3. `mcp-execution-handoff#47` — reusable bounded OS/window primitive — **closed**
+4. CUMG `#176` / `#177` — Window / Terminal runtime compositionをupstream `WindowHandoffAdapter` / `TerminalHandoffAdapter` へ移行 — **merged**
+5. `#157` — legacy/current launchd coexistenceをfail closed — **closed**
+6. `#168` — production cutover前にdependency-complete / import-provenなHandoff runtime packagingを保証 — **closed**
 
-WebRTC quality の `mcp-execution-handoff#56` は独立課題であり、この順序の prerequisite ではありません。
+残るcloseoutは意図的にCUMG authority外のupstream課題です。`mcp-execution-handoff#85` はfirst-class Windowのsame-LAN direct physical rerun、#91はTerminal mobile connection/status表示、#46/#45は最終Target Surface terminology/API収束を追跡します。CUMGはupstream naming decisionを先取りせずfirst-class componentをconsumeし続けます。WebRTC qualityは独立したHandoff課題です。
 
 ### `0.3.0` 後の candidate: multi-principal northbound identity
 
