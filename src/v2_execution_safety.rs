@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 7;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 8;
+const EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 7;
 const PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 6;
 const RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 5;
 const RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 4;
@@ -103,6 +104,7 @@ pub enum ExecutionEvidence {
     ProvenProcessTermination,
     CancelledBeforeDispatch,
     OperatorResolution,
+    RecoveryReadInterrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -876,11 +878,27 @@ impl ArchivedOperationRecovery {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationExecutionLane {
+    #[default]
+    Normal,
+    RecoveryEvidenceRead,
+}
+
+impl OperationExecutionLane {
+    fn is_normal(value: &Self) -> bool {
+        *value == Self::Normal
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyOperationSnapshot {
     pub operation: OperationRef,
     pub owner: OperationOwner,
     pub capability: DeviceCapability,
+    #[serde(default, skip_serializing_if = "OperationExecutionLane::is_normal")]
+    pub execution_lane: OperationExecutionLane,
     pub state: HubOperationState,
     pub prepared_at_ms: u64,
     pub dispatched_at_ms: Option<u64>,
@@ -920,6 +938,7 @@ struct SafetyOperation {
     operation: OperationRef,
     owner: OperationOwner,
     capability: DeviceCapability,
+    execution_lane: OperationExecutionLane,
     state: HubOperationState,
     prepared_at_ms: u64,
     dispatched_at_ms: Option<u64>,
@@ -1003,7 +1022,28 @@ impl AuthoritativeOperationController {
             request_fingerprint,
             evidence_envelope,
         } = metadata;
-        let decision = self.admission.admit(operation.clone())?;
+        let execution_lane = if self.quarantines.contains_key(&operation.device_id) {
+            if !capability.is_recovery_evidence_read_only() {
+                let blocking_operation_id = self
+                    .quarantines
+                    .get(&operation.device_id)
+                    .expect("quarantine existence checked above")
+                    .operation_id
+                    .clone();
+                return Err(ExecutionError::DeviceIndeterminate {
+                    operation_id: blocking_operation_id,
+                });
+            }
+            OperationExecutionLane::RecoveryEvidenceRead
+        } else {
+            OperationExecutionLane::Normal
+        };
+        let decision = match execution_lane {
+            OperationExecutionLane::Normal => self.admission.admit(operation.clone())?,
+            OperationExecutionLane::RecoveryEvidenceRead => {
+                self.admission.admit_recovery_read_only(operation.clone())?
+            }
+        };
         let state = match decision {
             AdmissionDecision::StartNow(_) => HubOperationState::ActiveNotDispatched,
             AdmissionDecision::Queued { .. } => HubOperationState::Queued,
@@ -1014,6 +1054,7 @@ impl AuthoritativeOperationController {
                 operation,
                 owner,
                 capability,
+                execution_lane,
                 state,
                 prepared_at_ms: now_ms,
                 dispatched_at_ms: None,
@@ -1162,6 +1203,49 @@ impl AuthoritativeOperationController {
         self.mark_indeterminate_internal(operation_id, reason, now_ms)
     }
 
+    pub fn is_recovery_evidence_read(&self, operation_id: &str) -> bool {
+        self.operations.get(operation_id).is_some_and(|record| {
+            record.execution_lane == OperationExecutionLane::RecoveryEvidenceRead
+        })
+    }
+
+    pub fn mark_recovery_read_interrupted(
+        &mut self,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> Result<(CompletionDecision, ExecutionReceipt), ExecutionError> {
+        let record = self
+            .operations
+            .get(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if record.execution_lane != OperationExecutionLane::RecoveryEvidenceRead
+            || !matches!(
+                record.state,
+                HubOperationState::Dispatched | HubOperationState::CancelRequested
+            )
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let next = self.admission.fail_recovery_read_only(operation_id)?;
+        let record = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        record.state = HubOperationState::Failed;
+        record.indeterminate_reason = None;
+        record.recoverable_result = None;
+        record.reconciliation_status = None;
+        let receipt = Self::receipt_for(
+            record,
+            HubOperationState::Failed,
+            ExecutionEvidence::RecoveryReadInterrupted,
+            now_ms,
+        );
+        record.receipt = Some(receipt.clone());
+        self.activate_next(&next);
+        Ok((next, receipt))
+    }
+
     /// Internal connection/restart path. Ownership is read from the durable
     /// record rather than inferred from a new connection/session.
     pub fn mark_connection_lost(
@@ -1169,6 +1253,11 @@ impl AuthoritativeOperationController {
         operation_id: &str,
         now_ms: u64,
     ) -> Result<CompletionDecision, ExecutionError> {
+        if self.is_recovery_evidence_read(operation_id) {
+            return self
+                .mark_recovery_read_interrupted(operation_id, now_ms)
+                .map(|(next, _)| next);
+        }
         self.mark_indeterminate_internal(operation_id, IndeterminateReason::ConnectionLost, now_ms)
     }
 
@@ -1182,10 +1271,12 @@ impl AuthoritativeOperationController {
             .operations
             .get(operation_id)
             .ok_or(ExecutionError::UnknownOperation)?;
-        if !matches!(
-            target.state,
-            HubOperationState::Dispatched | HubOperationState::CancelRequested
-        ) {
+        if target.execution_lane != OperationExecutionLane::Normal
+            || !matches!(
+                target.state,
+                HubOperationState::Dispatched | HubOperationState::CancelRequested
+            )
+        {
             return Err(ExecutionError::InvalidTransition);
         }
         let device_id = target.operation.device_id.clone();
@@ -1793,6 +1884,19 @@ impl AuthoritativeOperationController {
                     ));
                     recoverable_result = None;
                 }
+                HubOperationState::Dispatched | HubOperationState::CancelRequested
+                    if record.execution_lane == OperationExecutionLane::RecoveryEvidenceRead =>
+                {
+                    state = HubOperationState::Failed;
+                    reason = None;
+                    receipt = Some(Self::receipt_for(
+                        record,
+                        HubOperationState::Failed,
+                        ExecutionEvidence::RecoveryReadInterrupted,
+                        record.dispatched_at_ms.unwrap_or(record.prepared_at_ms),
+                    ));
+                    recoverable_result = None;
+                }
                 HubOperationState::Dispatched | HubOperationState::CancelRequested => {
                     state = HubOperationState::Indeterminate;
                     reason = Some(IndeterminateReason::HubRestartAfterDispatch);
@@ -1816,6 +1920,7 @@ impl AuthoritativeOperationController {
                 operation: record.operation.clone(),
                 owner: record.owner.clone(),
                 capability: record.capability,
+                execution_lane: record.execution_lane,
                 state,
                 prepared_at_ms: record.prepared_at_ms,
                 dispatched_at_ms: record.dispatched_at_ms,
@@ -1880,10 +1985,32 @@ impl AuthoritativeOperationController {
             .operations
             .iter()
             .any(|record| record.evidence_envelope.is_some());
+        let has_v8_state = snapshot.operations.iter().any(|record| {
+            record.execution_lane == OperationExecutionLane::RecoveryEvidenceRead
+                || record.receipt.as_ref().is_some_and(|receipt| {
+                    receipt.evidence == ExecutionEvidence::RecoveryReadInterrupted
+                })
+        });
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v8_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version =
+                        EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v7_state {
+                if has_v7_state || has_v8_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -1898,7 +2025,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v6_state || has_v7_state {
+                if has_v6_state || has_v7_state || has_v8_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -1913,7 +2040,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v5_state || has_v6_state || has_v7_state {
+                if has_v5_state || has_v6_state || has_v7_state || has_v8_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.retirements.clear();
@@ -1934,7 +2061,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v4_state || has_v5_state || has_v6_state || has_v7_state {
+                if has_v4_state || has_v5_state || has_v6_state || has_v7_state || has_v8_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.auto_resolutions.clear();
@@ -1961,6 +2088,7 @@ impl AuthoritativeOperationController {
                     || has_v5_state
                     || has_v6_state
                     || has_v7_state
+                    || has_v8_state
                     || snapshot.operations.iter().any(|record| {
                         !record.audit.is_empty() || record.request_fingerprint.is_some()
                     })
@@ -1991,6 +2119,7 @@ impl AuthoritativeOperationController {
                     || has_v5_state
                     || has_v6_state
                     || has_v7_state
+                    || has_v8_state
                     || !snapshot.recoveries.is_empty()
                     || snapshot.operations.iter().any(|record| {
                         record.recoverable_result.is_some()
@@ -2032,6 +2161,7 @@ impl AuthoritativeOperationController {
                 | RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION
                 | RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION
+                | EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -2067,11 +2197,21 @@ impl AuthoritativeOperationController {
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION
             && snapshot
                 .operations
                 .iter()
                 .any(|record| record.evidence_envelope.is_some())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && snapshot.operations.iter().any(|record| {
+                record.execution_lane == OperationExecutionLane::RecoveryEvidenceRead
+                    || record.receipt.as_ref().is_some_and(|receipt| {
+                        receipt.evidence == ExecutionEvidence::RecoveryReadInterrupted
+                    })
+            })
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -2122,6 +2262,16 @@ impl AuthoritativeOperationController {
                     record.reconciliation_status,
                     record.dispatch_binding.as_ref(),
                 )
+                || (record.execution_lane == OperationExecutionLane::RecoveryEvidenceRead
+                    && (!record.capability.is_recovery_evidence_read_only()
+                        || record.state == HubOperationState::Indeterminate
+                        || record.dispatch_binding.is_some()
+                        || record.reconciliation_status.is_some()))
+                || record.receipt.as_ref().is_some_and(|receipt| {
+                    receipt.evidence == ExecutionEvidence::RecoveryReadInterrupted
+                        && (record.execution_lane != OperationExecutionLane::RecoveryEvidenceRead
+                            || record.state != HubOperationState::Failed)
+                })
             {
                 return Err(ExecutionError::InvalidSnapshot);
             }
@@ -2131,6 +2281,7 @@ impl AuthoritativeOperationController {
                     operation: record.operation,
                     owner: record.owner,
                     capability: record.capability,
+                    execution_lane: record.execution_lane,
                     state: record.state,
                     prepared_at_ms: record.prepared_at_ms,
                     dispatched_at_ms: record.dispatched_at_ms,
@@ -4216,6 +4367,205 @@ mod tests {
                     max_queued_per_device: 8,
                 },
                 forged_v3,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
+    fn recovery_evidence_read_preserves_original_quarantine_and_fails_safe_on_loss() {
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-ambiguous", 7),
+                alice(),
+                DeviceCapability::TypeText,
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-ambiguous", &alice(), 7, 2)
+            .unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-ambiguous",
+                &alice(),
+                7,
+                IndeterminateReason::BackendOutcomeUnproven,
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.prepare(op("op-mutation", 7), alice(), DeviceCapability::TypeText, 4,),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "op-ambiguous".into()
+            })
+        );
+        assert!(matches!(
+            ledger
+                .prepare(
+                    op("op-evidence", 7),
+                    alice(),
+                    DeviceCapability::ListWindows,
+                    4,
+                )
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        assert!(ledger.is_recovery_evidence_read("op-evidence"));
+        ledger
+            .mark_dispatched("op-evidence", &alice(), 7, 5)
+            .unwrap();
+        ledger.mark_connection_lost("op-evidence", 6).unwrap();
+
+        assert_eq!(ledger.state("op-evidence"), Some(HubOperationState::Failed));
+        let evidence_receipt = ledger.receipt("op-evidence").unwrap();
+        assert_eq!(
+            evidence_receipt.evidence,
+            ExecutionEvidence::RecoveryReadInterrupted
+        );
+        assert_eq!(
+            ledger.quarantine("desktop-a").unwrap().operation_id,
+            "op-ambiguous"
+        );
+
+        let snapshot = ledger.snapshot_for_restart();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(encoded.contains("recovery_evidence_read"));
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.quarantine("desktop-a").unwrap().operation_id,
+            "op-ambiguous"
+        );
+        assert_eq!(
+            restored.state("op-evidence"),
+            Some(HubOperationState::Failed)
+        );
+    }
+
+    #[test]
+    fn successful_recovery_evidence_read_never_settles_original_quarantine() {
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-original-ambiguity", 9),
+                alice(),
+                DeviceCapability::TypeText,
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-original-ambiguity", &alice(), 9, 2)
+            .unwrap();
+        ledger
+            .mark_connection_lost("op-original-ambiguity", 3)
+            .unwrap();
+
+        ledger
+            .prepare(
+                op("op-list-windows-evidence", 9),
+                alice(),
+                DeviceCapability::ListWindows,
+                4,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-list-windows-evidence", &alice(), 9, 5)
+            .unwrap();
+        let (_, receipt) = ledger
+            .finalize(
+                "op-list-windows-evidence",
+                &alice(),
+                9,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                6,
+            )
+            .unwrap();
+        assert_eq!(receipt.terminal_state, HubOperationState::Completed);
+        assert_eq!(
+            ledger.quarantine("desktop-a").unwrap().operation_id,
+            "op-original-ambiguity"
+        );
+        assert_eq!(
+            ledger.prepare(
+                op("op-mutation-still-blocked", 9),
+                alice(),
+                DeviceCapability::PointerClick,
+                7,
+            ),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "op-original-ambiguity".into()
+            })
+        );
+    }
+
+    #[test]
+    fn recovery_evidence_read_is_explicitly_allowlisted_and_v8_only() {
+        for capability in [
+            DeviceCapability::ListApplications,
+            DeviceCapability::ScreenGeometry,
+            DeviceCapability::Screenshot,
+            DeviceCapability::ReadFile,
+            DeviceCapability::ListDirectory,
+            DeviceCapability::ListWindows,
+            DeviceCapability::InspectWindow,
+            DeviceCapability::VerifyUiState,
+            DeviceCapability::ClipboardRead,
+            DeviceCapability::PointerPosition,
+            DeviceCapability::CaptureRegion,
+            DeviceCapability::BrowserInspect,
+        ] {
+            assert!(capability.is_recovery_evidence_read_only());
+        }
+        for capability in [
+            DeviceCapability::TypeText,
+            DeviceCapability::PointerClick,
+            DeviceCapability::ExecuteProcess,
+            DeviceCapability::Shell,
+            DeviceCapability::LaunchApplication,
+            DeviceCapability::TerminateApplication,
+            DeviceCapability::ActivateWindow,
+            DeviceCapability::ClipboardWrite,
+            DeviceCapability::BrowserNavigate,
+            DeviceCapability::BrowserType,
+            DeviceCapability::BrowserDownload,
+        ] {
+            assert!(!capability.is_recovery_evidence_read_only());
+        }
+
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-ambiguous-v8", 7),
+                alice(),
+                DeviceCapability::TypeText,
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-ambiguous-v8", &alice(), 7, 2)
+            .unwrap();
+        ledger.mark_connection_lost("op-ambiguous-v8", 3).unwrap();
+        ledger
+            .prepare(
+                op("op-evidence-v8", 7),
+                alice(),
+                DeviceCapability::ListWindows,
+                4,
+            )
+            .unwrap();
+        assert!(matches!(
+            ledger.snapshot_for_restart_compatible_with(
+                EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION
             ),
             Err(ExecutionError::InvalidSnapshot)
         ));

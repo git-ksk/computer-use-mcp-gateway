@@ -87,6 +87,24 @@ pub enum DeviceCapability {
 }
 
 impl DeviceCapability {
+    pub fn is_recovery_evidence_read_only(self) -> bool {
+        matches!(
+            self,
+            Self::ListApplications
+                | Self::ScreenGeometry
+                | Self::Screenshot
+                | Self::ReadFile
+                | Self::ListDirectory
+                | Self::ListWindows
+                | Self::InspectWindow
+                | Self::VerifyUiState
+                | Self::ClipboardRead
+                | Self::PointerPosition
+                | Self::CaptureRegion
+                | Self::BrowserInspect
+        )
+    }
+
     pub fn class(self) -> CapabilityClass {
         match self {
             Self::ListApplications
