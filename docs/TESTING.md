@@ -61,9 +61,9 @@ Do not weaken these tests by asserting raw payload text for diagnostics. If a ne
 3. exactly 100 successful `tools/call` round trips through Gateway → backend MCP stdio;
 4. gateway readiness after the soak;
 5. `/healthz` contains the gateway-owned backend child PID, cumulative CPU seconds, and RSS bytes;
-6. a five-second Linux-hosted idle sample of the gateway process stays below the regression gates of 2% CPU and 128 MiB RSS.
+6. on Linux, a five-second idle sample of the gateway process stays below the regression gates of 2% CPU and 128 MiB RSS; on platforms without the Linux `/proc` counters used by this fixture, the script reports an explicit `idle resource gate SKIP` after the portable health and 100-call soak checks pass.
 
-These thresholds are regression guards, not capacity or production-performance claims. A representative passing hosted-Linux sample measured 100 calls in 0.142 seconds, 0.000% idle gateway CPU, and 17.191 MiB gateway RSS. Exact numbers vary by runner; the configured thresholds are the pass/fail contract.
+The Linux thresholds remain enforced regression guards, not capacity or production-performance claims. A representative passing hosted-Linux sample measured 100 calls in 0.142 seconds, 0.000% idle gateway CPU, and 17.191 MiB gateway RSS. Exact numbers vary by runner; the configured Linux thresholds remain the pass/fail contract. The unsupported-platform skip does not weaken the Linux CI gate and does not skip the portable gateway/backend health or 100-call soak checks.
 
 ### Official MCP conformance runner
 

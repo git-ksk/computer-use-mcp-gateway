@@ -47,7 +47,6 @@ completion provable?
 - 残っている V1 compatibility / quality issue を調査し、close または明示的に document する:
   - issue #14 — read-only `get_screen_size` の session / escalation semantics;
   - issue #15 — Cua Driver の application/process discovery identity の不整合;
-  - issue #20 — Linux enforcement を弱めずに V1 idle resource quality gate の portable behavior を定義する;
 - compatible な runtime/security/reliability defect は PATCH candidate として修正する;
 - docs-only/editorial work は、immutable な corrected release snapshot が operationally 必要な場合を除き version-neutral とする。
 
