@@ -147,6 +147,44 @@ The gateway has reached `CUMG_MAX_HTTP_CONCURRENCY` (default `16`). Excess MCP H
 
 This is separate from backend desktop serialization and separate from reverse-proxy rate limiting. If normal traffic reaches the ceiling, first check for a buggy client retry loop, abandoned concurrent requests, or an overly aggressive caller. Increase the limit only after understanding the workload; do not disable proxy-side rate limits or authentication as a workaround.
 
+## V2 returns `device_indeterminate`
+
+`device_indeterminate` means an **earlier state-changing operation has an unproven outcome and is already quarantining the device**. The returned `blocking_operation_id` names that earlier ambiguous operation; it is not a new retry ID for the request that was just refused. Do not replay the old operation or clear state merely because the Agent reconnects.
+
+First inspect the latest durable Hub state while the Hub is still serving:
+
+```bash
+v2_maint inspect-quarantine \
+  --state-dir /var/lib/cumg-v2/hub
+```
+
+Then correlate the exact blocking operation with the Agent checkpoint before doing manual checkpoint/log archaeology:
+
+```bash
+v2_maint audit-reconciliation \
+  --state-dir /var/lib/cumg-v2/hub \
+  --agent-state-dir /var/lib/cumg-v2/agent \
+  --operation-id op_...
+```
+
+Both commands are read-only and may run while the services are live. They do not clear quarantine, sign recovery authority, contact the backend, or replay work. Treat legacy terminal markers, request/fingerprint matches, reconnect, elapsed time, and heuristic UI/application state as non-authoritative unless the audit explicitly reports an accepted authoritative proof. If evidence remains insufficient, keep quarantine intact.
+
+Choose a manual decision only from independent evidence for the exact operation: `confirmed_completed` requires proof that the intended effect completed; `confirmed_not_executed` requires proof that no effect occurred; `confirmed_effect_applied_uncommitted` is reserved for the bounded text-input case where input delivery occurred but a distinct submit/commit did not. None makes the old operation retry-safe.
+
+Only the authority-bearing offline mutation requires stopping the Hub. Install `v2_hub` and `v2_maint` from the same reviewed build/release, stop `v2_hub` completely, and then run the exact resolution. For example:
+
+```bash
+v2_maint resolve \
+  --state-dir /var/lib/cumg-v2/hub \
+  --operation-id op_... \
+  --decision confirmed_not_executed \
+  --evidence "ticket-1234: operator verified no side effect"
+```
+
+Do not run a newer arbitrary `v2_maint` checkout against an older deployed Hub's state. The maintenance path preserves the checkpoint's existing durable writer contract and fails before publication if the candidate cannot be represented. If pairing is uncertain, deploy/use the matching Hub + maintenance artifacts first rather than editing checkpoint JSON. Restart the Hub only after maintenance exits successfully.
+
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full inspection, reconciliation, retirement, and offline-recovery contracts.
+
 ## MCP connects but shows no tools
 
 The gateway is **deny-by-default**. An empty allowlist is intentionally a valid zero-tool configuration.
