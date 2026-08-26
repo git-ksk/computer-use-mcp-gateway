@@ -22,13 +22,13 @@ use crate::v2_m0::{
 use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubToAgent,
-    RemoteBackendSessionEnd, RemoteHandoffErrorCode, RemoteHandoffOperatorCommand,
-    RemoteHandoffRequestKind, RemoteHandoffResponseKind, TrustedSessionClock,
-    build_agent_heartbeat, build_agent_proof, build_remote_backend_session_ended,
-    build_remote_cancellation_ack, build_remote_handoff_response,
-    build_remote_reconciliation_report, build_remote_result, verify_hub_challenge,
-    verify_hub_heartbeat_ack, verify_remote_backend_session_end, verify_remote_cancel,
-    verify_remote_command, verify_remote_handoff_request, verify_session_accepted,
+    RemoteBackendSessionEnd, RemoteHandoffErrorCode, RemoteHandoffResponseKind,
+    TrustedSessionClock, build_agent_heartbeat, build_agent_proof,
+    build_remote_backend_session_ended, build_remote_cancellation_ack,
+    build_remote_handoff_response, build_remote_reconciliation_report, build_remote_result,
+    verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_backend_session_end,
+    verify_remote_cancel, verify_remote_command, verify_remote_handoff_request,
+    verify_session_accepted,
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
@@ -871,7 +871,7 @@ impl AgentService {
                                     },
                                 ));
                             }
-                            let requires_idle = handoff_request_requires_idle(&remote.request);
+                            let requires_idle = remote.request.requires_agent_idle();
                             let response = if requires_idle && active.is_some() {
                                 RemoteHandoffResponseKind::Rejected {
                                     code: RemoteHandoffErrorCode::Rejected,
@@ -1367,17 +1367,6 @@ struct ActiveOperation {
 struct PendingHandoffVerification {
     authority: crate::v2_m0_transport::RemoteHandoffAuthority,
     token: VerificationToken,
-}
-
-fn handoff_request_requires_idle(request: &RemoteHandoffRequestKind) -> bool {
-    match request {
-        RemoteHandoffRequestKind::Admission { .. } => false,
-        RemoteHandoffRequestKind::Operator {
-            command: RemoteHandoffOperatorCommand::Status,
-            ..
-        } => false,
-        RemoteHandoffRequestKind::Operator { .. } => true,
-    }
 }
 
 enum ActiveCancellation {
