@@ -5,8 +5,9 @@ use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_secret_text,
     v2_maintenance::{
-        compare_quarantined_request_read_only, inspect_auto_resolutions_read_only,
-        inspect_quarantines_read_only, resolve_indeterminate_offline, retire_indeterminate_offline,
+        audit_reconciliation_read_only, compare_quarantined_request_read_only,
+        inspect_auto_resolutions_read_only, inspect_quarantines_read_only,
+        resolve_indeterminate_offline, retire_indeterminate_offline,
     },
 };
 use std::path::PathBuf;
@@ -66,6 +67,16 @@ enum Command {
         /// Optionally restrict output to one stable device ID.
         #[arg(long)]
         device_id: Option<String>,
+    },
+    /// Audit one quarantine against durable Hub and Agent reconciliation evidence.
+    /// This is inspection-only and never resolves, retries, replays, signs, or dispatches work.
+    AuditReconciliation {
+        #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_AGENT_STATE_DIR")]
+        agent_state_dir: PathBuf,
+        #[arg(long)]
+        operation_id: String,
     },
     /// Compare one local candidate shell/process/text-input request to a quarantined request.
     /// Output is only same_request, different_request, or unavailable; request content
@@ -215,6 +226,16 @@ fn main() -> Result<()> {
         } => {
             let report = inspect_auto_resolutions_read_only(&state_dir, device_id.as_deref())
                 .context("read-only reconciliation history inspection failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::AuditReconciliation {
+            state_dir,
+            agent_state_dir,
+            operation_id,
+        } => {
+            let report =
+                audit_reconciliation_read_only(&state_dir, &agent_state_dir, &operation_id)
+                    .context("read-only reconciliation readiness audit failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::CompareQuarantineRequest {

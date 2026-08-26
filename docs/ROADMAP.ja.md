@@ -108,7 +108,7 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 当初の production-hardening baseline 完了後も、CUMG + Handoff の sustained dogfood で実際の failure/recovery path を継続して試しました。その結果、core authority model を変更せず追加の課題が見つかっています。これらは `0.3.0` gate を暗黙に拡張せず、stabilization queue として追跡します。
 
-- execution/recovery semantics: `#179` partial input effect、`#180` quarantine-safe evidence lane、`#181` privacy-preserving evidence envelope、および既存 `#133` reconciliation readiness、`#115`/`#136`/`#137` recovery/retirement UX;
+- execution/recovery semantics: `#179` partial input effect、`#180` quarantine-safe evidence lane、`#181` privacy-preserving evidence envelope、`#133` first-class reconciliation readiness audit、および `#115`/`#136`/`#137` recovery/retirement UX;
 - Handoff/operator lifecycle: `#184` in-band Handoff begin の self-interference、`#185` explicit one-shot single-Mac maintenance job;
 - diagnostics / host reliability: `#141` privacy-safe structured execution error、`#143` browser staging startup diagnostics、`#112` disk/temp exhaustion availability 調査、`#194` `v2_doctor` self-observation;
 - 各 issue は独立した severity、compatibility、test、acceptance boundary を維持する。follow-up は PATCH-compatible、将来 minor への admission、または defer のいずれもあり得るが、backlog を減らすために quarantine/no-replay semantics を弱めない。
