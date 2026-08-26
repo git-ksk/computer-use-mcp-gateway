@@ -8,8 +8,8 @@
 use crate::v2_agent_handoff::{AgentHandoffCoordinator, AgentHandoffSessionFence};
 use crate::v2_browser_execute::BrowserRefusalReason;
 use crate::v2_browser_staging::{
-    BrowserDownloadStagingBroker, BrowserDownloadStagingError, BrowserUploadStagingBroker,
-    BrowserUploadStagingError,
+    BrowserDownloadStagingBroker, BrowserDownloadStagingError, BrowserStagingStartupError,
+    BrowserUploadStagingBroker, BrowserUploadStagingError,
 };
 use crate::v2_execution_safety::{
     AgentTerminalEvidence, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES, terminal_evidence_for_device_result,
@@ -280,10 +280,28 @@ impl AgentService {
             }
             Err(error) => return Err(AgentServiceError::Persistence(error)),
         };
-        let browser_upload_staging = BrowserUploadStagingBroker::new(&config.state_dir)
-            .map_err(AgentServiceError::BrowserUploadStaging)?;
-        let browser_download_staging = BrowserDownloadStagingBroker::new(&config.state_dir)
-            .map_err(AgentServiceError::BrowserDownloadStaging)?;
+        let browser_upload_staging = match BrowserUploadStagingBroker::new(&config.state_dir) {
+            Ok(staging) => staging,
+            Err(error) => {
+                emit_browser_staging_startup_failure(
+                    "upload",
+                    error.upload_safe_error_code(),
+                    &error,
+                );
+                return Err(AgentServiceError::BrowserUploadStagingStartup(error));
+            }
+        };
+        let browser_download_staging = match BrowserDownloadStagingBroker::new(&config.state_dir) {
+            Ok(staging) => staging,
+            Err(error) => {
+                emit_browser_staging_startup_failure(
+                    "download",
+                    error.download_safe_error_code(),
+                    &error,
+                );
+                return Err(AgentServiceError::BrowserDownloadStagingStartup(error));
+            }
+        };
         let service = Self {
             config,
             material,
@@ -2034,6 +2052,25 @@ fn der_certificate_to_pem(der: &[u8]) -> Vec<u8> {
     pem.into_bytes()
 }
 
+fn emit_browser_staging_startup_failure(
+    staging_direction: &'static str,
+    io_safe_code: &'static str,
+    error: &BrowserStagingStartupError,
+) {
+    let safe_error_code = io_safe_code;
+    tracing::error!(
+        event = "v2_agent_browser_staging_startup_failed",
+        staging_direction,
+        stage = error.stage(),
+        failure_class = error.failure_class(),
+        io_class = error.io_class(),
+        error_code = safe_error_code,
+        agent_startup = "refused",
+        service_manager_retry = "external",
+        "browser staging initialization failed; Agent startup remains fail-closed"
+    );
+}
+
 pub enum AgentServiceError {
     InvalidConfig(&'static str),
     Transport(tonic::transport::Error),
@@ -2045,6 +2082,8 @@ pub enum AgentServiceError {
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
     Filesystem(FilesystemError),
+    BrowserUploadStagingStartup(BrowserStagingStartupError),
+    BrowserDownloadStagingStartup(BrowserStagingStartupError),
     BrowserUploadStaging(BrowserUploadStagingError),
     BrowserDownloadStaging(BrowserDownloadStagingError),
     Backend(M1BackendError),
@@ -2095,6 +2134,8 @@ impl SafeErrorCode for AgentServiceError {
             Self::Execution(_) => "execution_error",
             Self::Process(_) => "process_error",
             Self::Filesystem(_) => "filesystem_error",
+            Self::BrowserUploadStagingStartup(error) => error.upload_safe_error_code(),
+            Self::BrowserDownloadStagingStartup(error) => error.download_safe_error_code(),
             Self::BrowserUploadStaging(error) => error.safe_error_code(),
             Self::BrowserDownloadStaging(error) => error.safe_error_code(),
             Self::Backend(error) => error.safe_error_code(),

@@ -110,7 +110,7 @@ Sustained CUMG + Handoff dogfood after the original production-hardening baselin
 
 - execution/recovery semantics: `#179` partial input effects, `#180` quarantine-safe evidence lane, `#181` privacy-preserving evidence envelope, `#133` first-class reconciliation-readiness audit, plus `#115`/`#136`/`#137` recovery/retirement UX work;
 - Handoff/operator lifecycle: `#184` in-band Handoff-begin self-interference and `#185` explicit one-shot single-Mac maintenance jobs;
-- diagnostics and host reliability: `#141` privacy-safe structured execution errors, `#143` browser-staging startup diagnostics, `#112` disk/temp-exhaustion availability investigation, and `#194` `v2_doctor` self-observation;
+- diagnostics and host reliability: `#141` privacy-safe structured execution errors, `#143` privacy-safe browser-staging startup stage/I/O diagnostics, `#112` disk/temp-exhaustion availability investigation, and `#194` `v2_doctor` self-observation;
 - each issue keeps its own severity, compatibility, tests, and acceptance boundary. A follow-up may be PATCH-compatible, admitted to a later minor, or deferred; none weakens quarantine/no-replay semantics to reduce backlog.
 
 This queue records the practical result of continuing Handoff integration and physical dogfood while #100 remained the known `0.3.0` blocker.

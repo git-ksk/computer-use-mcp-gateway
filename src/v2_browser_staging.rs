@@ -21,6 +21,133 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserStagingStartupStage {
+    RemoveExistingRoot,
+    CreateRoot,
+    SetPermissions,
+    Metadata,
+    Canonicalize,
+}
+
+impl BrowserStagingStartupStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RemoveExistingRoot => "remove_existing_root",
+            Self::CreateRoot => "create_root",
+            Self::SetPermissions => "set_permissions",
+            Self::Metadata => "metadata",
+            Self::Canonicalize => "canonicalize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserStagingStartupFailure {
+    Io,
+    InvalidRoot,
+}
+
+impl BrowserStagingStartupFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::InvalidRoot => "invalid_root",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserStagingStartupError {
+    stage: BrowserStagingStartupStage,
+    failure: BrowserStagingStartupFailure,
+    io_kind: Option<std::io::ErrorKind>,
+}
+
+impl BrowserStagingStartupError {
+    fn from_private(stage: BrowserStagingStartupStage, error: PrivateRootError) -> Self {
+        match error {
+            PrivateRootError::InvalidRoot => Self::invalid_root(stage),
+            PrivateRootError::Io(kind) => Self {
+                stage,
+                failure: BrowserStagingStartupFailure::Io,
+                io_kind: Some(kind),
+            },
+        }
+    }
+
+    fn io(stage: BrowserStagingStartupStage, error: &std::io::Error) -> Self {
+        Self {
+            stage,
+            failure: BrowserStagingStartupFailure::Io,
+            io_kind: Some(error.kind()),
+        }
+    }
+
+    fn invalid_root(stage: BrowserStagingStartupStage) -> Self {
+        Self {
+            stage,
+            failure: BrowserStagingStartupFailure::InvalidRoot,
+            io_kind: None,
+        }
+    }
+
+    pub const fn stage(&self) -> &'static str {
+        self.stage.as_str()
+    }
+
+    pub const fn failure_class(&self) -> &'static str {
+        self.failure.as_str()
+    }
+
+    pub fn io_class(&self) -> &'static str {
+        match self.io_kind {
+            Some(std::io::ErrorKind::NotFound) => "not_found",
+            Some(std::io::ErrorKind::PermissionDenied) => "permission_denied",
+            Some(std::io::ErrorKind::AlreadyExists) => "already_exists",
+            Some(std::io::ErrorKind::WouldBlock) => "would_block",
+            Some(std::io::ErrorKind::InvalidInput) => "invalid_input",
+            Some(std::io::ErrorKind::InvalidData) => "invalid_data",
+            Some(std::io::ErrorKind::TimedOut) => "timed_out",
+            Some(std::io::ErrorKind::Interrupted) => "interrupted",
+            Some(std::io::ErrorKind::WriteZero) => "write_zero",
+            Some(std::io::ErrorKind::UnexpectedEof) => "unexpected_eof",
+            Some(std::io::ErrorKind::OutOfMemory) => "out_of_memory",
+            Some(std::io::ErrorKind::StorageFull) => "storage_full",
+            Some(_) => "other",
+            None => "not_applicable",
+        }
+    }
+
+    pub const fn is_io(&self) -> bool {
+        matches!(self.failure, BrowserStagingStartupFailure::Io)
+    }
+
+    pub const fn upload_safe_error_code(&self) -> &'static str {
+        if self.is_io() {
+            "browser_upload_staging_io"
+        } else {
+            "browser_upload_staging_invalid_root"
+        }
+    }
+
+    pub const fn download_safe_error_code(&self) -> &'static str {
+        if self.is_io() {
+            "browser_download_staging_io"
+        } else {
+            "browser_download_staging_invalid_root"
+        }
+    }
+}
+
+impl fmt::Display for BrowserStagingStartupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("browser_staging_startup_failed")
+    }
+}
+
+impl std::error::Error for BrowserStagingStartupError {}
+
 #[derive(Clone)]
 pub struct BrowserUploadStagingBroker {
     inner: Arc<Mutex<UploadInner>>,
@@ -107,9 +234,8 @@ impl BrowserUploadStagingError {
 }
 
 impl BrowserUploadStagingBroker {
-    pub fn new(state_dir: &Path) -> Result<Self, BrowserUploadStagingError> {
-        let (root, canonical_root) = create_private_root(state_dir, "browser-upload-staging")
-            .map_err(map_private_root_upload_error)?;
+    pub fn new(state_dir: &Path) -> Result<Self, BrowserStagingStartupError> {
+        let (root, canonical_root) = create_private_root(state_dir, "browser-upload-staging")?;
         Ok(Self {
             inner: Arc::new(Mutex::new(UploadInner {
                 root,
@@ -443,9 +569,8 @@ impl BrowserDownloadStagingError {
 }
 
 impl BrowserDownloadStagingBroker {
-    pub fn new(state_dir: &Path) -> Result<Self, BrowserDownloadStagingError> {
-        let (root, canonical_root) = create_private_root(state_dir, "browser-download-staging")
-            .map_err(map_private_root_download_error)?;
+    pub fn new(state_dir: &Path) -> Result<Self, BrowserStagingStartupError> {
+        let (root, canonical_root) = create_private_root(state_dir, "browser-download-staging")?;
         Ok(Self {
             inner: Arc::new(Mutex::new(DownloadInner {
                 root,
@@ -758,37 +883,77 @@ impl Drop for DownloadInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivateRootError {
     InvalidRoot,
-    Io,
+    Io(std::io::ErrorKind),
 }
 
 fn create_private_root(
     state_dir: &Path,
     child: &str,
-) -> Result<(PathBuf, PathBuf), PrivateRootError> {
+) -> Result<(PathBuf, PathBuf), BrowserStagingStartupError> {
+    create_private_root_inner(state_dir, child, None)
+}
+
+fn create_private_root_inner(
+    state_dir: &Path,
+    child: &str,
+    injected_failure: Option<(BrowserStagingStartupStage, std::io::ErrorKind)>,
+) -> Result<(PathBuf, PathBuf), BrowserStagingStartupError> {
     let root = state_dir.join(child);
-    remove_private_root(&root)?;
-    fs::create_dir_all(&root).map_err(|_| PrivateRootError::Io)?;
-    harden_directory_permissions(&root).map_err(|_| PrivateRootError::Io)?;
-    let metadata = fs::symlink_metadata(&root).map_err(|_| PrivateRootError::Io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(PrivateRootError::InvalidRoot);
-    }
-    let canonical_root = fs::canonicalize(&root).map_err(|_| PrivateRootError::InvalidRoot)?;
+    maybe_inject_startup_failure(
+        injected_failure,
+        BrowserStagingStartupStage::RemoveExistingRoot,
+    )?;
+    remove_private_root(&root).map_err(|error| {
+        BrowserStagingStartupError::from_private(
+            BrowserStagingStartupStage::RemoveExistingRoot,
+            error,
+        )
+    })?;
+    maybe_inject_startup_failure(injected_failure, BrowserStagingStartupStage::CreateRoot)?;
+    fs::create_dir_all(&root).map_err(|error| {
+        BrowserStagingStartupError::io(BrowserStagingStartupStage::CreateRoot, &error)
+    })?;
+    maybe_inject_startup_failure(injected_failure, BrowserStagingStartupStage::SetPermissions)?;
+    harden_directory_permissions(&root).map_err(|error| {
+        BrowserStagingStartupError::io(BrowserStagingStartupStage::SetPermissions, &error)
+    })?;
+    maybe_inject_startup_failure(injected_failure, BrowserStagingStartupStage::Metadata)?;
+    let metadata = fs::symlink_metadata(&root).map_err(|error| {
+        BrowserStagingStartupError::io(BrowserStagingStartupStage::Metadata, &error)
+    })?;
+    validate_private_root_metadata(&metadata)?;
+    maybe_inject_startup_failure(injected_failure, BrowserStagingStartupStage::Canonicalize)?;
+    let canonical_root = fs::canonicalize(&root).map_err(|error| {
+        BrowserStagingStartupError::io(BrowserStagingStartupStage::Canonicalize, &error)
+    })?;
     Ok((root, canonical_root))
 }
 
-fn map_private_root_upload_error(error: PrivateRootError) -> BrowserUploadStagingError {
-    match error {
-        PrivateRootError::InvalidRoot => BrowserUploadStagingError::InvalidRoot,
-        PrivateRootError::Io => BrowserUploadStagingError::Io,
+fn validate_private_root_metadata(
+    metadata: &fs::Metadata,
+) -> Result<(), BrowserStagingStartupError> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(BrowserStagingStartupError::invalid_root(
+            BrowserStagingStartupStage::Metadata,
+        ));
     }
+    Ok(())
 }
 
-fn map_private_root_download_error(error: PrivateRootError) -> BrowserDownloadStagingError {
-    match error {
-        PrivateRootError::InvalidRoot => BrowserDownloadStagingError::InvalidRoot,
-        PrivateRootError::Io => BrowserDownloadStagingError::Io,
+fn maybe_inject_startup_failure(
+    injected_failure: Option<(BrowserStagingStartupStage, std::io::ErrorKind)>,
+    stage: BrowserStagingStartupStage,
+) -> Result<(), BrowserStagingStartupError> {
+    if let Some((failed_stage, kind)) = injected_failure
+        && failed_stage == stage
+    {
+        return Err(BrowserStagingStartupError {
+            stage,
+            failure: BrowserStagingStartupFailure::Io,
+            io_kind: Some(kind),
+        });
     }
+    Ok(())
 }
 
 fn unique_handle(prefix: &str, exists: impl Fn(&str) -> bool) -> Result<String, PrivateRootError> {
@@ -804,7 +969,7 @@ fn unique_handle(prefix: &str, exists: impl Fn(&str) -> bool) -> Result<String, 
             return Ok(handle);
         }
     }
-    Err(PrivateRootError::Io)
+    Err(PrivateRootError::Io(std::io::ErrorKind::Other))
 }
 
 fn safe_single_component(value: &str) -> bool {
@@ -857,25 +1022,25 @@ fn read_bounded_exact(
 fn remove_private_root(root: &Path) -> Result<(), PrivateRootError> {
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
-            fs::remove_file(root).map_err(|_| PrivateRootError::InvalidRoot)
+            fs::remove_file(root).map_err(|error| PrivateRootError::Io(error.kind()))
         }
         Ok(metadata) if metadata.is_dir() => {
-            fs::remove_dir_all(root).map_err(|_| PrivateRootError::Io)
+            fs::remove_dir_all(root).map_err(|error| PrivateRootError::Io(error.kind()))
         }
         Ok(_) => Err(PrivateRootError::InvalidRoot),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(PrivateRootError::Io),
+        Err(error) => Err(PrivateRootError::Io(error.kind())),
     }
 }
 
 #[cfg(unix)]
-fn harden_directory_permissions(path: &Path) -> Result<(), PrivateRootError> {
+fn harden_directory_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| PrivateRootError::Io)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
-fn harden_directory_permissions(_path: &Path) -> Result<(), PrivateRootError> {
+fn harden_directory_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -907,6 +1072,119 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn startup_failure_stage_and_io_class_are_bounded_for_every_private_root_step() {
+        let stages = [
+            BrowserStagingStartupStage::RemoveExistingRoot,
+            BrowserStagingStartupStage::CreateRoot,
+            BrowserStagingStartupStage::SetPermissions,
+            BrowserStagingStartupStage::Metadata,
+            BrowserStagingStartupStage::Canonicalize,
+        ];
+        for stage in stages {
+            let state = root();
+            fs::create_dir_all(&state).unwrap();
+            let error = create_private_root_inner(
+                &state,
+                "browser-upload-staging",
+                Some((stage, std::io::ErrorKind::StorageFull)),
+            )
+            .unwrap_err();
+            assert_eq!(error.stage(), stage.as_str());
+            assert_eq!(error.failure_class(), "io");
+            assert_eq!(error.io_class(), "storage_full");
+            assert!(error.is_io());
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains(state.to_string_lossy().as_ref()));
+            let _ = fs::remove_dir_all(state);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_startup_roots_are_private_and_invalid_metadata_fails_closed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let state = root();
+        fs::create_dir_all(&state).unwrap();
+        let upload = BrowserUploadStagingBroker::new(&state).unwrap();
+        let download = BrowserDownloadStagingBroker::new(&state).unwrap();
+        let upload_root = upload.inner.lock().unwrap().root.clone();
+        let download_root = download.inner.lock().unwrap().root.clone();
+        assert_eq!(
+            fs::metadata(&upload_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&download_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let regular_file = state.join("not-a-root");
+        fs::write(&regular_file, b"not a directory").unwrap();
+        let file_error =
+            validate_private_root_metadata(&fs::symlink_metadata(&regular_file).unwrap())
+                .unwrap_err();
+        assert_eq!(file_error.stage(), "metadata");
+        assert_eq!(file_error.failure_class(), "invalid_root");
+        assert_eq!(file_error.io_class(), "not_applicable");
+
+        let symlink_path = state.join("symlink-root");
+        symlink(&regular_file, &symlink_path).unwrap();
+        let symlink_error =
+            validate_private_root_metadata(&fs::symlink_metadata(&symlink_path).unwrap())
+                .unwrap_err();
+        assert_eq!(symlink_error.stage(), "metadata");
+        assert_eq!(symlink_error.failure_class(), "invalid_root");
+        assert!(!symlink_error.is_io());
+        drop(upload);
+        drop(download);
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn public_browser_staging_codes_remain_bounded() {
+        assert_eq!(
+            BrowserUploadStagingError::Io.safe_error_code(),
+            "browser_upload_staging_io"
+        );
+        assert_eq!(
+            BrowserUploadStagingError::InvalidRoot.safe_error_code(),
+            "browser_upload_staging_invalid_root"
+        );
+        assert_eq!(
+            BrowserDownloadStagingError::Io.safe_error_code(),
+            "browser_download_staging_io"
+        );
+        assert_eq!(
+            BrowserDownloadStagingError::InvalidRoot.safe_error_code(),
+            "browser_download_staging_invalid_root"
+        );
+        let startup_io = BrowserStagingStartupError {
+            stage: BrowserStagingStartupStage::CreateRoot,
+            failure: BrowserStagingStartupFailure::Io,
+            io_kind: Some(std::io::ErrorKind::StorageFull),
+        };
+        assert_eq!(
+            startup_io.upload_safe_error_code(),
+            "browser_upload_staging_io"
+        );
+        assert_eq!(
+            startup_io.download_safe_error_code(),
+            "browser_download_staging_io"
+        );
+        let startup_invalid =
+            BrowserStagingStartupError::invalid_root(BrowserStagingStartupStage::Metadata);
+        assert_eq!(
+            startup_invalid.upload_safe_error_code(),
+            "browser_upload_staging_invalid_root"
+        );
+        assert_eq!(
+            startup_invalid.download_safe_error_code(),
+            "browser_download_staging_invalid_root"
+        );
     }
 
     #[test]
