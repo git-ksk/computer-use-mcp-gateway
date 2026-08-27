@@ -4,7 +4,7 @@
 
 CUMG は Semantic Versioning を採用し、pre-1.0 policy を明示します。
 
-現在の released line は **0.2.x** です。`v0.2.0` は V2-complete milestone を表し、その後の maintenance / documentation work で過去の tag の意味を後から変更しません。
+現在の released line は **0.3.x** です。`v0.3.0` は V2 Production Hardening / Operational Readiness milestone を表し、`v0.2.0` は immutable な V2-complete historical tag として維持します。
 
 ## Version format
 

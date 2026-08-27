@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-08-26 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、current released version は `v0.2.0` です。**
+2026-08-27 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、current released version は `v0.3.0` です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,9 +34,9 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Current maintenance line: `0.2.x`
+## Current maintenance line: `0.3.x`
 
-`0.2.x` は released V2 public direction を維持します。その contract と互換な work は、新しい milestone number を作るのではなく patch line に残します。
+`0.3.x` は released V2 Production Hardening / Operational Readiness direction を維持します。その contract と互換な work は、新しい milestone number を作るのではなく patch line に残します。
 
 現在の priority:
 
@@ -48,7 +48,7 @@ completion provable?
 - compatible な runtime/security/reliability defect は PATCH candidate として修正する;
 - docs-only/editorial work は、immutable な corrected release snapshot が operationally 必要な場合を除き version-neutral とする。
 
-`v0.2.0` 後に merge された compatible fix は将来の `0.2.1` に含められますが、maintenance commit が存在するだけで release を必須にはしません。
+`v0.3.0` 後に merge された compatible fix は将来の `0.3.1` に含められますが、maintenance commit が存在するだけで release を必須にはしません。
 
 ### Legacy V1 retirement candidate
 
@@ -74,7 +74,7 @@ candidate area はそれぞれ独立に評価します。
 
 当初の `0.3.0` Production Hardening / Operational Readiness baseline は実装済みです。`#64`〜`#73` はすべて closed で、authoritative operation / quarantine / no-auto-replay model を弱めず、production recovery、shutdown、persistence、audit、local-abuse、trust-lifecycle、signing-authority の基盤を確立しました。
 
-残る明示的な `0.3.0` release blocker は **#100 — local-user-authorized online quarantine recovery** です。implementation は draft PR #101 にありますが、release acceptance には trusted physical macOS 上での Secure Enclave / user-presence flow と、実際の ambiguous desktop operation を replay せず一度だけ観測・resolve できることの確認が残っています。
+最後の明示的な `0.3.0` runtime release blocker だった **#100 — local-user-authorized online quarantine recovery** は complete です。trusted physical macOS の Secure Enclave/user-presence acceptance で実 ambiguous desktop operation を replay せず resolve し、authorization は user presence 後にだけ publish、quarantine は verified resolution 後にだけ clear、Hub restart 後も terminal resolution が維持され旧 operation は復活しないことを確認しました。
 
 したがって `0.3.0` は、その後の dogfood で見つかったすべての issue を自動的には取り込みません。新しい issue が release blocker になるのは、既に約束した `0.3.0` safety/operability invariant を破る、または #100 acceptance を無効にする evidence がある場合だけです。それ以外は issue-driven な follow-up hardening として扱い、release scope を bounded に保ちながら fail-closed semantics を維持します。
 
@@ -85,7 +85,7 @@ candidate area はそれぞれ独立に評価します。
 - audit / local caller protection: `#70`、`#71`;
 - trust lifecycle / signing authority: `#68`、`#67`、`#66`。
 
-既存 release PR #99 は、その後 main に substantial work が merge される前の snapshot です。#100 acceptance 後に current `main` から refresh または作り直し、stale release snapshot のまま merge しません。
+stale release PR #99 は、その後 main に substantial work が merge される前の snapshot だったため、#100 acceptance 後の current `main` から作った fresh release snapshot で supersede します。
 
 ### First-class Human Handoff: integrated, now in dogfood hardening
 
@@ -113,13 +113,13 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 - diagnostics / host reliability: `#141` privacy-safe structured execution error、`#143` privacy-safe browser staging startup stage/I/O diagnostics、`#112` disk/temp exhaustion の fail-closed 診断・回復、`#194` `v2_doctor` self-observation;
 - 各 issue は独立した severity、compatibility、test、acceptance boundary を維持する。follow-up は PATCH-compatible、将来 minor への admission、または defer のいずれもあり得るが、backlog を減らすために quarantine/no-replay semantics を弱めない。
 
-この queue は、#100 が既知の `0.3.0` blocker として残る間にも Handoff integration / physical dogfood を進めた結果を roadmap に反映するものです。
+この queue は、#100 が既知の `0.3.0` blocker だった期間にも Handoff integration / physical dogfood を進めた結果です。各 follow-up の evidence が released invariant を無効化しない限り、completed v0.3.0 runtime gate の外で追跡します。
 
 ### 現在の open issue inventory
 
-2026-08-26 時点で repository には **18件の open issue** があります。issue が roadmap の可視性から黙って抜け落ちないよう、すべての open issue をここで明示的に追跡します。この inventory は次 release への全件投入を約束するものではなく、tracking snapshot です。issue の close/open 時には、この section または近接する roadmap section を同じ documentation pass で更新します。
+repository の open issue は、roadmap の可視性から黙って抜け落ちないよう以下で分類して追跡します。release closeout issue は tag 時に close され得るため、ここでは hard-coded count を持ちません。この inventory は tracking map であり、次 release への全件投入を約束するものではありません。
 
-- **`0.3.0` release gate / closeout:** `#100` local-user-authorized online quarantine recovery が唯一の明示的 runtime release blocker で、trusted physical macOS acceptance が残っています。`#120` は release-document closeout で、現在残るのは tag 直前の version/reference 最終再確認だけです。
+- **`0.3.0` release closeout:** `#100` local-user-authorized online quarantine recovery は trusted physical macOS acceptance と no-replay restart durability evidence まで complete です。`#120` は final release/tag-time の version/reference 最終再確認だけを所有し、release とともに close します。
 - **Recovery / indeterminate-state UX:** `#103` は effectful Desktop/Browser call の durable operation recovery、`#109` は online-recovery CLI からの durable Hub completion 確認、`#115` は unsafe replay を伴わない actionable indeterminate UX、`#136` は permanent replay tombstone と bounded retirement audit history の分離、`#137` は low-impact indeterminate GUI operation に対する local-human current-state acceptance を追跡します。quarantine、replay fence、persistence-gated settlement を弱めてはいけません。
 - **Runtime/process/filesystem hardening:** `#96` は deliberate Unix session-detachment による process-group supervision escape、`#104` は filesystem observation root と process working-directory root の分離を追跡します。どちらも hardening follow-up で、現在の `0.3.0` blocker ではありません。
 - **Bounded workspace/developer capability:** `#83` は truncated shell/process output の retrievable reference、`#105` は ranged file read / deterministic directory continuation、`#106` は explicitly managed long-running development job、`#107` は shell を要求しない bounded atomic workspace mutation、`#114` は sandboxed Playwright/E2E execution を追跡します。いずれも unrestricted shell authority を暗黙継承せず、explicit capability boundary を必要とします。
