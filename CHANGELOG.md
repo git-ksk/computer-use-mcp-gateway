@@ -1,8 +1,8 @@
 # Changelog
 
-## v0.3.0 — Unreleased
+## v0.3.0 — 2026-08-27
 
-Production-hardening and operational-readiness candidate. This version is **not released yet**. Final release remains gated on issue #100 trusted physical-macOS Secure Enclave/user-presence acceptance and proof that a real ambiguous desktop operation is resolved without replay. The older release PR #99 predates substantial merged-main work and must be refreshed or replaced from current `main` after that acceptance.
+V2 Production Hardening / Operational Readiness release. The final #100 trusted physical-macOS Secure Enclave/user-presence acceptance passed on merged release-candidate code: a real ambiguous desktop operation was resolved through local-user-authorized online recovery, the durable quarantine cleared only after verified authorization, Hub restart preserved the resolution, and the old operation was never replayed. The stale release PR #99 was superseded by a fresh release snapshot from current `main`.
 
 ### Execution safety and recovery
 
@@ -28,7 +28,7 @@ Production-hardening and operational-readiness candidate. This version is **not 
 ### Acceptance status
 
 - merged-main regression coverage includes warning-free Rust gates, V1 quality/conformance preservation, pinned-Cua Linux/macOS/Windows smoke, privacy/no-replay durability tests, and the previously accepted physical Desktop/Window/Terminal Handoff evidence applicable to their respective changes;
-- the remaining `v0.3.0` release acceptance is intentionally the #100 physical local-user online-recovery flow, not the deferred stabilization/enhancement backlog.
+- #100 trusted physical local-user online recovery passed with Secure Enclave user presence, durable resolution across Hub restart, quarantine remaining clear, and `operation_replayed=false`; deferred stabilization/enhancement issues remain outside the v0.3.0 release gate.
 
 ## v0.2.0 — 2026-08-13
 

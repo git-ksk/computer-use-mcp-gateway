@@ -4,7 +4,7 @@
 
 CUMG uses Semantic Versioning with an explicit pre-1.0 policy.
 
-Current released line: **0.2.x**. `v0.2.0` represents the V2-complete milestone; later maintenance or documentation work does not retroactively change that tag.
+Current released line: **0.3.x**. `v0.3.0` represents the V2 Production Hardening / Operational Readiness milestone; `v0.2.0` remains the immutable V2-complete historical tag.
 
 ## Version shape
 

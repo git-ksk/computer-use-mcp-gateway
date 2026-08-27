@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-08-26: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.2.0`.**
+Status as of 2026-08-27: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.3.0`.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -34,9 +34,9 @@ An ambiguous state-changing operation is never automatically retried or replayed
 
 The completed V1/V2 implementation history and acceptance evidence remain available through [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), [`v2/STATUS.md`](v2/STATUS.md), [`v2/acceptance/`](v2/acceptance/), and [`archive/`](archive/). This file intentionally focuses on work that is still relevant after the V2 closeout.
 
-## Current maintenance line: `0.2.x`
+## Current maintenance line: `0.3.x`
 
-`0.2.x` preserves the released V2 public direction. Work that remains compatible with that contract should stay on the patch line rather than inventing a new milestone number.
+`0.3.x` preserves the released V2 Production Hardening / Operational Readiness direction. Work that remains compatible with that contract should stay on the patch line rather than inventing a new milestone number.
 
 Current priorities:
 
@@ -48,7 +48,7 @@ Current priorities:
 - fix compatible runtime/security/reliability defects as PATCH candidates;
 - keep docs-only/editorial work version-neutral unless an immutable corrected release snapshot is operationally necessary.
 
-A compatible fix merged after `v0.2.0` may contribute to a future `0.2.1`; the roadmap does not require a release merely because maintenance commits exist.
+A compatible fix merged after `v0.3.0` may contribute to a future `0.3.1`; the roadmap does not require a release merely because maintenance commits exist.
 
 ### Legacy V1 retirement candidate
 
@@ -74,7 +74,7 @@ Candidate areas are evaluated independently.
 
 The original `0.3.0` Production Hardening / Operational Readiness baseline is implemented. Issues `#64` through `#73` are all closed and established the production recovery, shutdown, persistence, audit, local-abuse, trust-lifecycle, and signing-authority foundations without weakening the authoritative operation/quarantine/no-auto-replay model.
 
-The remaining explicit `0.3.0` release blocker is **#100 — local-user-authorized online quarantine recovery**. Its implementation exists in draft PR #101; release acceptance still requires the trusted physical-macOS Secure Enclave/user-presence flow and confirmation that a real ambiguous desktop operation is observed and resolved without replay.
+The final explicit `0.3.0` runtime release blocker, **#100 — local-user-authorized online quarantine recovery**, is complete. Trusted physical-macOS Secure Enclave/user-presence acceptance resolved a real ambiguous desktop operation without replay; authorization publication was user-presence-gated, the quarantine cleared only after the verified resolution, and Hub restart preserved the terminal resolution without reviving the old operation.
 
 `0.3.0` therefore does **not** absorb every issue discovered by later dogfood. New work blocks the release only when evidence shows that it violates an already-promised `0.3.0` safety/operability invariant or invalidates #100 acceptance. Otherwise it remains issue-driven follow-up hardening. This keeps release scope bounded while preserving fail-closed semantics.
 
@@ -85,7 +85,7 @@ The completed baseline was:
 - audit and local caller protection: `#70`, `#71`;
 - trust lifecycle and signing authority: `#68`, `#67`, `#66`.
 
-The existing release PR #99 predates substantial merged-main work. It must be refreshed or replaced from current `main` after #100 acceptance rather than merged as a stale release snapshot.
+The stale release PR #99 predates substantial merged-main work and was superseded by a fresh release snapshot from current `main` after #100 acceptance.
 
 ### First-class Human Handoff: integrated, now in dogfood hardening
 
@@ -113,13 +113,13 @@ Sustained CUMG + Handoff dogfood after the original production-hardening baselin
 - diagnostics and host reliability: `#141` privacy-safe structured execution errors, `#143` privacy-safe browser-staging startup stage/I/O diagnostics, `#112` disk/temp-exhaustion fail-closed diagnostics and recovery, and `#194` `v2_doctor` self-observation;
 - each issue keeps its own severity, compatibility, tests, and acceptance boundary. A follow-up may be PATCH-compatible, admitted to a later minor, or deferred; none weakens quarantine/no-replay semantics to reduce backlog.
 
-This queue records the practical result of continuing Handoff integration and physical dogfood while #100 remained the known `0.3.0` blocker.
+This queue records the practical result of continuing Handoff integration and physical dogfood while #100 was the known `0.3.0` blocker. Those follow-ups remain outside the completed v0.3.0 runtime gate unless their own evidence invalidates a released invariant.
 
 ### Current open issue inventory
 
-As of 2026-08-26 the repository has **18 open issues**. Every open issue is intentionally listed here so an issue cannot silently fall out of roadmap visibility. This inventory is a tracking snapshot, not a promise that every item ships in the next release; issue closure/opening must update this section or a nearby roadmap section in the same documentation pass.
+The repository's open issues are intentionally classified below so an issue cannot silently fall out of roadmap visibility. Avoid a hard-coded count here because release-closeout issues can close at tag time; this inventory is a tracking map, not a promise that every item ships in the next release.
 
-- **`0.3.0` release gate / closeout:** `#100` local-user-authorized online quarantine recovery is the only explicit runtime release blocker and still needs trusted physical-macOS acceptance; `#120` is release-document closeout and now retains only the final tag-time version/reference re-check.
+- **`0.3.0` release closeout:** `#100` local-user-authorized online quarantine recovery is complete with trusted physical-macOS acceptance and no-replay restart durability evidence. `#120` owns only the final release/tag-time version/reference re-check and closes with the release.
 - **Recovery and indeterminate-state UX:** `#103` extends durable operation recovery to effectful Desktop/Browser calls; `#109` confirms durable Hub completion from the online-recovery CLI; `#115` makes indeterminate operations actionable without unsafe replay; `#136` separates permanent replay tombstones from bounded retirement audit history; `#137` explores local-human acceptance of current state for low-impact indeterminate GUI operations. None may weaken quarantine, replay fencing, or persistence-gated settlement.
 - **Runtime/process/filesystem hardening:** `#96` investigates deliberate Unix session-detachment escape from process-group supervision; `#104` separates filesystem observation roots from process working-directory roots. These are hardening follow-ups, not current `0.3.0` blockers.
 - **Bounded workspace/developer capabilities:** `#83` adds retrievable references for truncated shell/process output; `#105` adds ranged file reads and deterministic directory continuation; `#106` adds explicitly managed long-running development jobs; `#107` adds bounded atomic workspace mutation without requiring shell; `#114` adds sandboxed Playwright/E2E execution. Each requires an explicit capability boundary rather than inheriting unrestricted shell authority.
