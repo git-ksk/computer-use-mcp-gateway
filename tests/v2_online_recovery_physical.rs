@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 fn acceptance_root() -> Result<PathBuf> {
@@ -194,6 +194,7 @@ async fn physical_secure_enclave_online_recovery_never_replays_ambiguous_cua_ope
     let address = listener.local_addr()?;
     let endpoint = format!("https://localhost:{}", address.port());
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         Server::builder()
             .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
@@ -202,7 +203,9 @@ async fn physical_secure_enclave_online_recovery_never_replays_ambiguous_cua_ope
                     .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
                     .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
             )
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, async move {
+                let _ = server_shutdown_rx.await;
+            })
             .await
     });
 
@@ -358,8 +361,11 @@ async fn physical_secure_enclave_online_recovery_never_replays_ambiguous_cua_ope
         .context("second physical online-recovery Agent did not shut down")?
         .context("second Agent task join failed")?;
     second_agent_result?;
-    server.abort();
-    let _ = server.await;
+    let _ = server_shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(8), server)
+        .await
+        .context("physical online-recovery Hub server did not shut down")?
+        .context("physical online-recovery Hub server join failed")??;
     drop(handle);
 
     // Restart the Hub from durable state. Resolution must survive and the old
