@@ -29,6 +29,8 @@ The ordinary project gates (`fmt`, `check --locked --all-targets`, tests, clippy
 
 Run this only on an operator-controlled Mac whose Agent already has the reviewed Cua/TCC permissions. Do not substitute the GitHub hosted macOS runner: hosted CI can compile/link Security.framework but cannot prove the intended physical user-presence interaction for the deployment user.
 
+The permanent isolated harness is `tests/v2_online_recovery_physical.rs`. It does not install the PR build into the live single-Mac profile and it never creates a Secure Enclave key by itself. Provision the reviewed recovery key first, pass only its exported public key to the harness, then run the ignored test with an explicit new absolute acceptance root and `CUMG_V2_ONLINE_RECOVERY_E2E_ACK=1`. When the harness prints `ONLINE_RECOVERY_PHYSICAL_READY`, run the PR-head `v2_recover status` / `resolve` against the printed temporary Agent state and Hub public-key file.
+
 1. Provision a **new** Secure Enclave recovery key using `v2_recover init-key`; confirm a second init using the same label fails closed.
 2. Install only its public key as `<HUB_STATE_DIR>/recovery-public-key.p256` with safe ownership/permissions, then restart the Hub to load it.
 3. Start Hub and Agent and record the authenticated current generation.
