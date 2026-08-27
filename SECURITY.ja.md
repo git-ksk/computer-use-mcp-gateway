@@ -10,8 +10,8 @@
 
 | Version | Security support |
 | --- | --- |
-| `0.2.x` | Supported |
-| `< 0.2` | Not actively supported |
+| `0.3.x` | Supported |
+| `< 0.3` | Not actively supported |
 
 より新しい minor release が存在する場合、この表の更新が追いついていなくても、その latest minor line を actively supported line として扱います。
 

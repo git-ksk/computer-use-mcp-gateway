@@ -64,11 +64,36 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 これらを満たすまでは V1 を narrow / regression-only に保ち、新しい capability は追加しません。
 
-## Next minor: admission-driven, not number-driven
+## Post-v0.3 の製品化シーケンス
 
-次の minor release は、accepted work が public contract を変更・有意に拡張する場合、または deliberate な pre-1.0 incompatibility が正当化される場合にのみ作成します。現時点なら通常は `0.3.0` ですが、この roadmap はその number に feature bundle を事前固定しません。
+CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 では execution-safety boundary を弱めず、security-focused な source release から install / operate しやすい product へ段階的に進めます。以下の minor number は現在の作業順であり日程の約束ではありません。minor release は admitted public-contract scope と evidence が揃った場合だけ切ります。
 
-candidate area はそれぞれ独立に評価します。
+現在の作業順:
+
+- **`0.3.x` — Product Readiness & Stabilization:** 新しい public contract を必要としない operator UX、configuration / least-privilege hardening、再現可能な performance evidence、packaging / release hygiene、compatible fix。現在の候補は #109、#115、#104、#111、および #96 の bounded な調査 / documentation 部分。
+- **`0.4.0` — Recovery & Reconciliation:** durable operation identity/status を effectful operation へ広げる #103、review 済み low-impact GUI ambiguity を local Human が current state として明示 acceptance できる #137、permanent replay tombstone と bounded detailed retirement history を分離する #136 により、曖昧な effectful work から replay せず安全に復帰する contract を強化。
+- **`0.5.0` — Multi-principal Identity:** #139 で provider-neutral OIDC/JWT caller identity を追加し、既存の exact `principal -> device -> capability` authorizer と single-principal / introspection adapter を維持。
+- **`0.6.0` — Least-privilege Workspace:** #83 の bounded retrievable output、#105 の ranged / deterministic filesystem observation、#107 の明示的 writable root 下での atomic workspace mutation により Dangerous shell authority への依存を減らす。
+- **`0.7.0` — Managed Developer Execution:** #106 の explicitly managed long-running job と #114 の separately sandboxed Playwright/E2E execution を追加。background-shell escape compatibility ではなく #96 の Unix containment 調査を前提にする。
+
+implementation evidence により area の combine / split / defer、または compatible patch 扱いが妥当と分かった場合は release number を動かしてよいものとします。number より dependency / safety boundary を優先します。
+
+### 横断 Product Readiness track
+
+umbrella tracking は [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213) です。各 sub-area が具体化した時点で、実装責務を narrower issue へ分割します。
+
+source-tree dogfood で capability が動くだけでは製品化完了とはしません。Post-v0.3 の各 milestone は次の product-level foundation を改善または維持します。
+
+1. **Distribution / release integrity.** Source release は引き続き有効ですが、installable product path は最終的に reviewed な platform 別 artifact、deterministic checksum、provenance / attestation、SBOM と third-party license / notice inventory、適用可能な platform signing / notarization を提供します。release artifact に credential / private endpoint を含めません。source checkout だけでなく clean-machine artifact install smoke で user が受け取る実物を検証します。
+2. **Install / upgrade / rollback.** 初回 install、Hub / Agent / maintenance / helper の coordinated upgrade、durable-state migration、rollback の supported path を明示します。version-paired component と checkpoint compatibility を明確にし、incompatible mixed version は silent rolling compatibility を試さず fail closed します。durable / wire state を変更する release は previous supported minor からの upgrade と safe rollback boundary を証明します。
+3. **First-run / configuration UX.** supported platform ごとに明確な reference deployment を保ち、可能な範囲で effectful service start 前に configuration を validate します。missing / unsafe secret・trust anchor を actionable にし、`v2_doctor` / preflight 系チェックで新規 operator が internal state file を読まず configuration、permission、capacity、trust、backend failure を区別できるようにします。safe default は least-privilege / fail-closed のままです。
+4. **Operational readiness.** service lifecycle、health/readiness、quarantine、recovery、TLS/key expiry、storage pressure、restart/drain、backup/restore、incident runbook を product behavior として扱います。operator signal は bounded / privacy-safe とし、raw desktop、command、credential、identity content を公開せず「operator action が必要」を検出できるようにします。
+5. **Reliability / performance / resource budget.** deterministic regression、soak、concurrency、restart/reconnect、fault injection、capacity evidence を維持します。#111 で再現可能な latency / throughput distribution を確立し、future release でも safe operation に関係する CPU / RSS / disk / output / concurrency ceiling を明示します。workstation measurement は regression evidence であり production capacity の marketing claim にはしません。
+6. **Security / privacy / supply chain.** threat model、exact capability authorization、no-auto-replay、secret isolation、key/certificate rotation、private vulnerability reporting、Dependency Review、CodeQL、content-minimizing telemetry を維持します。distribution automation が source/dependency provenance を弱めたり、signing infrastructure を runtime authority に変えたりしてはいけません。
+7. **Compatibility / support / deprecation.** supported CUMG minor line、tested OS / Cua / backend / deployment matrix、schema mismatch behavior、migration / deprecation note を公開します。1.0 前は latest released minor のみ actively supported とし、compatibility claim は近い version だからではなく evidence に基づけます。
+8. **Onboarding / documentation.** supported reference path では repository archaeology を要求せず、install → healthy diagnostics → 最初の read-only call → 明示 authorize した effectful call → documented recovery path まで進める状態を目指します。security / deployment / versioning / operator-critical behavior の EN/JA normative docs を同期します。
+
+これらは横断 gate であり、hosted dashboard、account system、auto-updater、generic device fleet、remote-desktop product を作る約束ではありません。product feature は既存 CUMG boundary に収まる場合、または evidence 付きで boundary を deliberate に改訂する場合だけ admit します。
 
 ### `0.3.0` closeout: V2 Production Hardening
 
@@ -102,7 +127,7 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 5. `#157` — legacy/current launchd coexistenceをfail closed — **closed**
 6. `#168` — production cutover前にdependency-complete / import-provenなHandoff runtime packagingを保証 — **closed**
 
-残るcloseoutは意図的にCUMG authority外のupstream課題です。`mcp-execution-handoff#85` はfirst-class Windowのsame-LAN direct physical rerun、#91はTerminal mobile connection/status表示、#46/#45は最終Target Surface terminology/API収束を追跡します。CUMGはupstream naming decisionを先取りせずfirst-class componentをconsumeし続けます。WebRTC qualityは独立したHandoff課題です。
+以前ここで参照していた upstream Handoff closeout（#45、#46、#85、#91）は完了し、その後の LocalAuthentication lifecycle fix #147/#149 も完了しています。CUMG は upstream first-class component を継続利用し、semantic を fork しません。`mcp-execution-handoff#150` のような残る upstream UX polish は独立した Handoff 課題であり、CUMG の safety / operability invariant を破る evidence がない限り CUMG release blocker にはしません。
 
 ### Production baseline 後の operational dogfood follow-up
 
@@ -117,21 +142,20 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 ### 現在の open issue inventory
 
-repository の open issue は、roadmap の可視性から黙って抜け落ちないよう以下で分類して追跡します。release closeout issue は tag 時に close され得るため、ここでは hard-coded count を持ちません。この inventory は tracking map であり、次 release への全件投入を約束するものではありません。
+repository の open issue は、work が roadmap の可視性から黙って抜け落ちないよう working milestone ごとに分類します。これらの milestone は ordering / admission guidance であり、evidence により split / defer が必要になった場合まで同時 ship を約束するものではありません。
 
-- **`0.3.0` release closeout:** `#100` local-user-authorized online quarantine recovery は trusted physical macOS acceptance と no-replay restart durability evidence まで complete です。`#120` は final release/tag-time の version/reference 最終再確認だけを所有し、release とともに close します。
-- **Recovery / indeterminate-state UX:** `#103` は effectful Desktop/Browser call の durable operation recovery、`#109` は online-recovery CLI からの durable Hub completion 確認、`#115` は unsafe replay を伴わない actionable indeterminate UX、`#136` は permanent replay tombstone と bounded retirement audit history の分離、`#137` は low-impact indeterminate GUI operation に対する local-human current-state acceptance を追跡します。quarantine、replay fence、persistence-gated settlement を弱めてはいけません。
-- **Runtime/process/filesystem hardening:** `#96` は deliberate Unix session-detachment による process-group supervision escape、`#104` は filesystem observation root と process working-directory root の分離を追跡します。どちらも hardening follow-up で、現在の `0.3.0` blocker ではありません。
-- **Bounded workspace/developer capability:** `#83` は truncated shell/process output の retrievable reference、`#105` は ranged file read / deterministic directory continuation、`#106` は explicitly managed long-running development job、`#107` は shell を要求しない bounded atomic workspace mutation、`#114` は sandboxed Playwright/E2E execution を追跡します。いずれも unrestricted shell authority を暗黙継承せず、explicit capability boundary を必要とします。
-- **Performance / repeatability:** `#111` は再現可能な Gateway latency/concurrency benchmark を追加します。measurement infrastructure であり execution authority は変更しません。
-- **`0.3.0` 後の identity expansion:** `#139` は multi-principal authorization 向け generic OIDC/JWT northbound identity を追加し、production-hardening closeout 後に進める順序を維持します。
-- **Upstream-blocked V1 compatibility:** `#14`（`get_screen_size` session/escalation）と `#15`（`list_apps` live-process discovery mismatch）は upstream Cua 待ちです。active CUMG release blocker ではなく、V1 を deliberate に retire する場合は no-longer-applicable になる可能性があります。
+- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate、#109 が online-recovery CLI の durable completion confirmation、#115 が replay しない actionable `Indeterminate` operator UX、#104 が filesystem observation root と process cwd root の分離、#111 が再現可能な latency / concurrency evidence、#96 が Unix descendant containment の正確な boundary 調査を所有します。
+- **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離を扱います。
+- **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity を追加します。
+- **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。
+- **`0.7.0 — Managed Developer Execution`:** #106 が explicit managed-job lifecycle、#114 が separately sandboxed Playwright/E2E execution を追加します。
+- **Upstream-blocked V1 compatibility:** #14（`get_screen_size` session/escalation）と #15（`list_apps` live-process discovery mismatch）は upstream Cua 待ちのまま、active post-v0.3 milestone を意図的に付けません。V1 を deliberate に retire する場合は no-longer-applicable になる可能性があります。
 
-上記分類は ordering/admission guidance であり、severity と acceptance requirement は各 issue 本文を authoritative とします。open issue がこの inventory または他の明示的 roadmap section のどちらにも存在しない場合、roadmap は stale とみなし、documentation closeout を宣言する前に修正します。
+open issue がこの inventory または他の明示的 roadmap section に存在しない場合、roadmap は stale とみなし、milestone / release closeout を宣言する前に修正します。
 
-### `0.3.0` 後の candidate: multi-principal northbound identity
+### `0.5.0` candidate: multi-principal northbound identity
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は `0.3.0` Production Hardening closeout には**意図的に含めません**。operational-readiness work を close した後に扱う、次の northbound authentication expansion candidate とします。追跡 milestone は `Post-v0.3 — Multi-principal Northbound Identity` とし、この milestone 自体では release number を事前固定しません。
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は `0.3.x` stabilization / `0.4.0` Recovery & Reconciliation contract には**意図的に含めません**。distinct authenticated principal が必要な deployment 向けの provider-neutral signed-token path として、現在の作業順では `0.5.0` northbound-authentication expansion に置きます。正確なrelease numberは上記admission/evidence ruleに従います。
 
 target architecture は次です。
 
@@ -233,6 +257,8 @@ future minor release を切る前に public-contract scope を明示し、applic
 - control/capability schema の upgrade / mismatch behavior を document している;
 - supported backend/deployment compatibility を document し、repeatable acceptance がある;
 - governance、release、security、support、deprecation rule が書かれているだけでなく実際に運用されている;
+- 少なくとも1つの documented install / upgrade / rollback path が ad-hoc な source-tree assembly ではなく reviewed release artifact を使い、release integrity / provenance を再現できる;
+- first-run diagnostics、supported compatibility matrix、operational recovery、resource / health signal が十分明確で、通常 deployment が maintainer だけの repository 知識に依存しない;
 - maintainer が 1.x 内の backward compatibility を維持する準備ができている。
 
 remaining parity gap は **自動的には 1.0 blocker ではありません**。各 gap を supported、intentionally unsupported、deferred、deprecated のいずれかに分類し、stable boundary を user が理解できることを要求します。
