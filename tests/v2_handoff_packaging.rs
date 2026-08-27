@@ -33,6 +33,10 @@ fn single_mac_handoff_is_agent_owned_and_stably_codesigned_for_tcc() {
     assert!(upgrade.contains("com.github.git-ksk.cumg-v2-recover"));
     assert!(upgrade.contains("recovery_cli_stable_codesign_failed"));
     assert!(upgrade.contains("--bin v2_recover"));
+    assert!(upgrade.contains("build-macos-recovery-helper.sh"));
+    assert!(upgrade.contains("v2_recovery_enclave_helper"));
+    assert!(upgrade.contains("com.github.git-ksk.cumg-v2-recovery-helper"));
+    assert!(upgrade.contains("recovery_helper_stable_codesign_failed"));
     assert!(upgrade.contains("com.github.git-ksk.cumg-v2-handoff-webrtc-host"));
     assert!(upgrade.contains("CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE"));
     assert!(upgrade.contains("$ROOT\"/v2/handoff/*"));

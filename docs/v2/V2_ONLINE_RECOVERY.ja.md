@@ -10,7 +10,7 @@
 
 Agent device identity は recovery authority ではありません。侵害されたAgentはローカルdesktop/backend状態について虚偽を報告できるため、Agent device keyだけでquarantineを解除してはいけません。
 
-そこでmacOSでは、Agent keyとは別にP-256 recovery keyをSecure Enclaveへ生成し、Keychainの `userPresence + privateKeyUsage` 制約を付けます。Hubには公開鍵だけをpinします。初回provisioningは同じlabelの既存鍵を再利用せず拒否し、Hub側の公開鍵ファイルも既存trust anchorと同じsymlink/permission検査を通します。
+そこでmacOSでは、Agent keyとは別にP-256 recovery keyを小さなstable-signed CryptoKit helperでSecure Enclaveへ生成し、`userPresence + privateKeyUsage` 制約を付けます。永続化するのはSecure Enclaveのsealed `dataRepresentation`だけで、private key本体はSecure Enclave外へ出ません。sealed fileはCUMGがowner-privateに管理し、Hubには公開鍵だけをpinします。初回provisioningは既存sealed-key pathを再利用せず拒否し、sealed fileとHub側public-key fileの両方でpath/symlink/permissionをfail-closedに検証します。
 
 初期実装のローカル承認providerはmacOSのみです。Windows/Linuxに弱いsoftware-key fallbackは追加せず、同等のuser-presence providerがレビューされるまでは既存のoffline maintenanceを使用します。
 
@@ -74,11 +74,14 @@ Hubは次の条件をすべて満たす場合だけonline resolutionを受理し
 
 ## macOS provisioning
 
-`v2_recover` を `v2_agent` と一緒にinstallします。Agentを動かすログインユーザーで一度だけSecure Enclave recovery keyを作成します。
+`v2_recover` と stable-signed `v2_recovery_enclave_helper` を `v2_agent` と一緒にinstallします。Agentを動かすログインユーザーでowner-private recovery directoryを作り、一度だけSecure Enclave recovery keyを作成します。
 
 ```bash
+install -d -m 700 "$HOME/Library/Application Support/cumg-v2-agent/recovery"
 v2_recover init-key \
-  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery-public-key.p256"
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
+  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-public-key.p256"
 ```
 
 exportされるのは公開鍵だけです。operator-authenticated provisioning channelでHubへ移し、次へ配置します。
@@ -103,6 +106,8 @@ v2_recover status \
 v2_recover resolve \
   --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
   --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --decision confirmed-completed \
   --evidence "local user inspected the current desktop"
 ```
@@ -111,7 +116,7 @@ v2_recover resolve \
 
 ## 障害時
 
-recovery private key紛失、Agent接続不能、Secure Enclave利用不能、online protocol故障などでは、既存 `v2_maint` をbreak-glassとして残します。device key侵害が疑われる場合でも、それだけでrecovery authorityにはなりません。
+sealed Secure Enclave recovery-key representation紛失、Agent接続不能、Secure Enclave利用不能、online protocol故障などでは、既存 `v2_maint` をbreak-glassとして残します。device key侵害が疑われる場合でも、それだけでrecovery authorityにはなりません。
 
 ## リリース前acceptance
 
@@ -129,6 +134,6 @@ recovery private key紛失、Agent接続不能、Secure Enclave利用不能、on
 
 ## Protocol互換性とchallenge更新
 
-Online recoveryではHub-Agent message variantを追加し、`HUB_AGENT_SCHEMA_VERSION` を1から2へ進めます。schema validationはfail-closedのままなので、このreleaseを有効にする際はHubとAgentを協調して更新し、mixed-version rolling compatibilityには依存しません。V1 gatewayの動作は変わりません。
+Online recoveryは現在の `HUB_AGENT_SCHEMA_VERSION = 4` application protocolの一部です。schema validationはfail-closedのままなので、このreleaseを有効にする際はHubとAgentを協調して更新し、mixed-version rolling compatibilityには依存しません。V1 gatewayの動作は変わりません。
 
 Recovery challengeは120秒で期限切れになります。desktopがquarantineのままなら、通常のauthenticated Agent heartbeatを契機にHubがpending challengeを再確認し、期限切れ後はfresh nonceを持つchallengeを再発行します。承認時間切れだけを理由にHub/Agentを再起動する必要はありません。fresh challenge受信時は以前のlocal authorization handoffを無効化します。

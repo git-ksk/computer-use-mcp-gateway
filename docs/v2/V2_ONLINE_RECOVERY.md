@@ -10,7 +10,7 @@ This document defines the online recovery path for a desktop that entered durabl
 
 The Agent device identity is **not** recovery authority. A compromised Agent may lie about local desktop/backend state, so possession of the Agent device key must never be enough to clear quarantine.
 
-Online recovery therefore uses a separately provisioned endpoint recovery key. On macOS the private key is generated in the Secure Enclave and protected by Keychain access control requiring user presence plus private-key use. The Hub stores only the P-256 public verifier. Initial provisioning refuses to reuse an existing key label, and the Hub validates the public-key file with the same no-symlink / safe-permissions checks used for other public trust anchors.
+Online recovery therefore uses a separately provisioned endpoint recovery key. On macOS a small stable-signed CryptoKit helper creates a Secure Enclave P-256 key protected by `userPresence + privateKeyUsage`. Only the Secure Enclave sealed `dataRepresentation` is persisted, in an owner-private file managed by CUMG; the private key itself never leaves the Secure Enclave. The Hub stores only the P-256 public verifier. Initial provisioning uses create-new file semantics, and both the sealed-key file and Hub public-key file are validated with strict path/symlink/permission rules.
 
 The initial implementation is intentionally macOS-only for local approval. Windows and Linux do not gain a weaker software-key substitute; they continue to use the existing explicit offline maintenance path until an equivalent reviewed user-presence provider exists.
 
@@ -105,14 +105,17 @@ These files are not execution authority: the Hub's durable quarantine/checkpoint
 
 ## macOS provisioning and use
 
-Build/install the `v2_recover` binary alongside `v2_agent`. From the logged-in Agent user account, initialize a new Secure Enclave recovery key once:
+Build/install `v2_recover` and the stable-signed `v2_recovery_enclave_helper` alongside `v2_agent`. From the logged-in Agent user account, create an owner-private recovery directory and initialize a new Secure Enclave recovery key once:
 
 ```bash
+install -d -m 700 "$HOME/Library/Application Support/cumg-v2-agent/recovery"
 v2_recover init-key \
-  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery-public-key.p256"
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
+  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-public-key.p256"
 ```
 
-`init-key` uses create-new semantics and refuses an existing recovery-key label. Transfer only the exported public key through the operator-authenticated provisioning channel to the Hub and install it as:
+`init-key` uses create-new semantics and refuses an existing sealed-key path. The sealed file is not a software private key: it is the bounded Secure Enclave representation required to re-open the non-exportable key on this Mac. Keep it owner-private and local. Transfer only the exported public key through the operator-authenticated provisioning channel to the Hub and install it as:
 
 ```text
 <HUB_STATE_DIR>/recovery-public-key.p256
@@ -134,6 +137,8 @@ Inspect the actual desktop, then approve exactly one decision:
 v2_recover resolve \
   --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
   --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --decision confirmed-completed \
   --evidence "local user inspected the current desktop"
 ```
@@ -144,7 +149,7 @@ The signing operation requires macOS user presence. Cancellation/denial leaves q
 
 Recovery-key rotation is a separately reviewed administrative trust change. Do not silently replace `<HUB_STATE_DIR>/recovery-public-key.p256` while relying on a running Hub; stage and review the replacement, then restart the Hub so the new verifier becomes explicit process state.
 
-Loss of the recovery private key does not make the desktop reusable. Reprovision a new recovery key through the authenticated administrative channel or use the existing offline maintenance path. Suspicion that the Agent/device key is compromised does not authorize recovery because the recovery key is independent.
+Loss of the sealed Secure Enclave recovery-key representation does not make the desktop reusable. Reprovision a new recovery key through the authenticated administrative channel or use the existing offline maintenance path. Suspicion that the Agent/device key is compromised does not authorize recovery because the recovery key is independent.
 
 If the Agent cannot connect, the Secure Enclave key is unavailable, user presence cannot be completed, or the online protocol itself is damaged, retain `v2_maint` as the break-glass path. The offline resolver remains an explicit, persistence-gated administrative action.
 
@@ -176,6 +181,6 @@ Before enabling the macOS online path in a release, a trusted physical Mac must 
 
 ## Protocol compatibility and challenge renewal
 
-Online recovery adds Hub-Agent message variants and advances `HUB_AGENT_SCHEMA_VERSION` from 1 to 2. Schema validation remains fail-closed, so a deployment enabling this release must upgrade Hub and Agent as a coordinated pair rather than relying on mixed-version rolling compatibility. V1 gateway behavior is unchanged.
+Online recovery is part of the current `HUB_AGENT_SCHEMA_VERSION = 4` application protocol. Schema validation remains fail-closed, so a deployment enabling this release must upgrade Hub and Agent as a coordinated pair rather than relying on mixed-version rolling compatibility. V1 gateway behavior is unchanged.
 
 A recovery challenge expires after 120 seconds. While the desktop remains quarantined, normal authenticated Agent heartbeats cause the Hub to re-check the pending challenge and issue a fresh nonce-bound challenge after expiry. An operator therefore does not need to restart the Hub or Agent merely because a local approval window elapsed. Receiving a fresh challenge invalidates the prior local authorization handoff.

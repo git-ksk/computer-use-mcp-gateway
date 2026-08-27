@@ -27,11 +27,34 @@ The ordinary project gates (`fmt`, `check --locked --all-targets`, tests, clippy
 
 ## Trusted physical Mac acceptance
 
-Run this only on an operator-controlled Mac whose Agent already has the reviewed Cua/TCC permissions. Do not substitute the GitHub hosted macOS runner: hosted CI can compile/link Security.framework but cannot prove the intended physical user-presence interaction for the deployment user.
+Run this only on an operator-controlled Mac whose Agent already has the reviewed Cua/TCC permissions. Do not substitute the GitHub hosted macOS runner: hosted CI can compile the CryptoKit helper but cannot prove the intended physical user-presence interaction for the deployment user.
 
 The permanent isolated harness is `tests/v2_online_recovery_physical.rs`. It does not install the PR build into the live single-Mac profile and it never creates a Secure Enclave key by itself. Provision the reviewed recovery key first, pass only its exported public key to the harness, then run the ignored test with an explicit new absolute acceptance root and `CUMG_V2_ONLINE_RECOVERY_E2E_ACK=1`. When the harness prints `ONLINE_RECOVERY_PHYSICAL_READY`, run the PR-head `v2_recover status` / `resolve` against the printed temporary Agent state and Hub public-key file.
 
-1. Provision a **new** Secure Enclave recovery key using `v2_recover init-key`; confirm a second init using the same label fails closed.
+Example isolated invocation (use a fresh owner-private directory and the reviewed PR-head binaries):
+
+```bash
+ACCEPT_ROOT="$(mktemp -d /tmp/cumg-online-recovery-acceptance.XXXXXX)"
+chmod 700 "$ACCEPT_ROOT"
+RECOVERY_ROOT="$ACCEPT_ROOT/recovery"
+mkdir -m 700 "$RECOVERY_ROOT"
+
+./target/release/v2_recover init-key \
+  --key-file "$RECOVERY_ROOT/recovery-key.sealed" \
+  --secure-enclave-helper "$PWD/target/release/v2_recovery_enclave_helper" \
+  --public-key-out "$RECOVERY_ROOT/recovery-public-key.p256"
+
+CUMG_V2_ONLINE_RECOVERY_E2E_ACK=1 \
+CUMG_V2_ONLINE_RECOVERY_ACCEPTANCE_ROOT="$ACCEPT_ROOT/runtime" \
+CUMG_V2_ONLINE_RECOVERY_PUBLIC_KEY_FILE="$RECOVERY_ROOT/recovery-public-key.p256" \
+cargo test --locked --test v2_online_recovery_physical \
+  physical_secure_enclave_online_recovery_never_replays_ambiguous_cua_operation \
+  -- --ignored --nocapture
+```
+
+Leave that test running after `ONLINE_RECOVERY_PHYSICAL_READY`. In another terminal, use the printed `state_dir` and `hub_public_key_file` with `v2_recover status`, then call `resolve` with the same `--key-file` and `--secure-enclave-helper`. First deny/cancel the user-presence prompt and confirm the harness remains quarantined; then repeat `resolve` and approve the exact reviewed decision. The acceptance root contains no reusable production authority and may be removed only after the test has completed and evidence has been recorded.
+
+1. Provision a **new** Secure Enclave recovery key using `v2_recover init-key` with an owner-private absolute `--key-file` and the reviewed stable-signed `--secure-enclave-helper`; confirm a second init using the same key-file path fails closed.
 2. Install only its public key as `<HUB_STATE_DIR>/recovery-public-key.p256` with safe ownership/permissions, then restart the Hub to load it.
 3. Start Hub and Agent and record the authenticated current generation.
 4. Trigger a reviewed mutating Cua operation whose outcome can intentionally become ambiguous, producing durable `Indeterminate` plus `DesktopQuarantine`.

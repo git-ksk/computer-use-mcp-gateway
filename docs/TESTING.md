@@ -339,4 +339,4 @@ The existing `v2_p1_backend_portability` test remains the semantic guard: backen
 
 Permanent automated coverage is defined by [`v2/acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md`](v2/acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md). It covers signed challenge/decision binding, stale generation and quarantine rejection, trust-anchor hardening, no-clobber local handoff, persistence-gated Hub resolution, idempotent identical delivery, conflicting-decision rejection, and restart/no-replay semantics.
 
-Hosted macOS CI is sufficient for Security.framework compile/link and protocol/state-machine tests, but it is not evidence that a physical Secure Enclave key produced the intended deployment-user Touch ID/password/Apple Watch user-presence interaction. Run the trusted physical Mac acceptance before enabling the online path in a release.
+Hosted macOS CI compiles the CryptoKit Secure Enclave helper and runs protocol/state-machine tests, but it is not evidence that a physical Secure Enclave key produced the intended deployment-user Touch ID/password/Apple Watch user-presence interaction. Run the trusted physical Mac acceptance before enabling the online path in a release.

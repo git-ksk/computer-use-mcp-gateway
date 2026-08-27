@@ -107,7 +107,7 @@ expired-recovery abandonment は signed checkpoint を削除する前に private
 
 standard profile では次を確認します。
 
-- runtime manifest schema 3、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_recover` / `v2_grant_signer` の exact SHA-256 identity;
+- runtime manifest schema 3、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_recover` / `v2_recovery_enclave_helper` / `v2_grant_signer` の exact SHA-256 identity;
 - authoritative Hub checkpoint の readability と current registry/capability schema;
 - enrolled single-Mac device が 1 台だけであることと current generation;
 - Agent checkpoint readability と exact Hub/Agent generation pairing;

@@ -9,9 +9,7 @@ use computer_use_mcp_gateway::v2_online_recovery::{
 use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_verifying_key,
-    v2_online_recovery::{
-        DEFAULT_MACOS_RECOVERY_KEY_LABEL, load_challenge, verify_recovery_challenge,
-    },
+    v2_online_recovery::{load_challenge, verify_recovery_challenge},
 };
 #[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
@@ -30,10 +28,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create/load the macOS Secure Enclave recovery key and export only its public key.
+    /// Create a new macOS Secure Enclave recovery key and export only its public key.
     InitKey {
-        #[arg(long, default_value = DEFAULT_MACOS_RECOVERY_KEY_LABEL)]
-        key_label: String,
+        #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+        key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+        secure_enclave_helper: PathBuf,
+        #[arg(long)]
+        public_key_out: PathBuf,
+    },
+    /// Export the public key for an already provisioned Secure Enclave sealed key.
+    ExportPublic {
+        #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+        key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+        secure_enclave_helper: PathBuf,
         #[arg(long)]
         public_key_out: PathBuf,
     },
@@ -50,8 +59,10 @@ enum Command {
         state_dir: PathBuf,
         #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
         hub_public_key_file: PathBuf,
-        #[arg(long, default_value = DEFAULT_MACOS_RECOVERY_KEY_LABEL)]
-        key_label: String,
+        #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+        key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+        secure_enclave_helper: PathBuf,
         #[arg(long, value_enum)]
         decision: DecisionArg,
         /// Short metadata describing what the local user inspected. Do not include secrets or screenshots.
@@ -109,9 +120,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::InitKey {
-            key_label,
+            key_file,
+            secure_enclave_helper,
             public_key_out,
-        } => init_key(key_label, public_key_out),
+        } => init_key(key_file, secure_enclave_helper, public_key_out),
+        Command::ExportPublic {
+            key_file,
+            secure_enclave_helper,
+            public_key_out,
+        } => export_public(key_file, secure_enclave_helper, public_key_out),
         Command::Status {
             state_dir,
             hub_public_key_file,
@@ -128,13 +145,15 @@ fn main() -> Result<()> {
         Command::Resolve {
             state_dir,
             hub_public_key_file,
-            key_label,
+            key_file,
+            secure_enclave_helper,
             decision,
             evidence,
         } => resolve(
             state_dir,
             hub_public_key_file,
-            key_label,
+            key_file,
+            secure_enclave_helper,
             decision.into(),
             evidence,
         ),
@@ -142,13 +161,7 @@ fn main() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn init_key(key_label: String, public_key_out: PathBuf) -> Result<()> {
-    use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
-    let key = MacRecoveryKey::create_new(&key_label)
-        .context("failed to create/load Secure Enclave recovery key")?;
-    let public_key = key
-        .public_key_bytes()
-        .context("failed to export recovery public key")?;
+fn write_public_key(public_key_out: &Path, public_key: &[u8; 65]) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -157,16 +170,64 @@ fn init_key(key_label: String, public_key_out: PathBuf) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options
-        .open(&public_key_out)
+        .open(public_key_out)
         .with_context(|| format!("refusing to overwrite {}", public_key_out.display()))?;
-    file.write_all(&public_key)?;
+    file.write_all(public_key)?;
     file.sync_all()?;
     println!("recovery_public_key={}", public_key_out.display());
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn init_key(
+    key_file: PathBuf,
+    secure_enclave_helper: PathBuf,
+    public_key_out: PathBuf,
+) -> Result<()> {
+    use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
+    if std::fs::symlink_metadata(&public_key_out).is_ok() {
+        anyhow::bail!("refusing to overwrite {}", public_key_out.display());
+    }
+    let key = MacRecoveryKey::create_new(&secure_enclave_helper, &key_file)
+        .context("failed to create Secure Enclave recovery key")?;
+    let public_key = key
+        .public_key_bytes()
+        .context("failed to export recovery public key")?;
+    write_public_key(&public_key_out, &public_key)?;
+    println!("recovery_key_file={}", key_file.display());
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
-fn init_key(_key_label: String, _public_key_out: PathBuf) -> Result<()> {
+fn init_key(
+    _key_file: PathBuf,
+    _secure_enclave_helper: PathBuf,
+    _public_key_out: PathBuf,
+) -> Result<()> {
+    bail!("Secure Enclave recovery approval is supported only on macOS")
+}
+
+#[cfg(target_os = "macos")]
+fn export_public(
+    key_file: PathBuf,
+    secure_enclave_helper: PathBuf,
+    public_key_out: PathBuf,
+) -> Result<()> {
+    use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
+    let key = MacRecoveryKey::load(&secure_enclave_helper, &key_file)
+        .context("recovery key is not provisioned")?;
+    let public_key = key
+        .public_key_bytes()
+        .context("failed to export recovery public key")?;
+    write_public_key(&public_key_out, &public_key)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn export_public(
+    _key_file: PathBuf,
+    _secure_enclave_helper: PathBuf,
+    _public_key_out: PathBuf,
+) -> Result<()> {
     bail!("Secure Enclave recovery approval is supported only on macOS")
 }
 
@@ -174,7 +235,8 @@ fn init_key(_key_label: String, _public_key_out: PathBuf) -> Result<()> {
 fn resolve(
     state_dir: PathBuf,
     hub_public_key_file: PathBuf,
-    key_label: String,
+    key_file: PathBuf,
+    secure_enclave_helper: PathBuf,
     decision: IndeterminateResolution,
     evidence: String,
 ) -> Result<()> {
@@ -208,7 +270,8 @@ fn resolve(
         }
     };
     println!("decision={decision_name}");
-    let key = MacRecoveryKey::load(&key_label).context("recovery key is not provisioned")?;
+    let key = MacRecoveryKey::load(&secure_enclave_helper, &key_file)
+        .context("recovery key is not provisioned")?;
     let authorization = key
         .sign_authorization(authorization)
         .context("OS user-presence approval was not completed")?;
@@ -224,7 +287,8 @@ fn resolve(
 fn resolve(
     _state_dir: PathBuf,
     _hub_public_key_file: PathBuf,
-    _key_label: String,
+    _key_file: PathBuf,
+    _secure_enclave_helper: PathBuf,
     _decision: IndeterminateResolution,
     _evidence: String,
 ) -> Result<()> {

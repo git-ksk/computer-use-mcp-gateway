@@ -621,7 +621,7 @@ A trusted development Mac that intentionally co-locates Hub, external grant sign
 
 The optional online quarantine-recovery path is documented in [`v2/V2_ONLINE_RECOVERY.md`](v2/V2_ONLINE_RECOVERY.md). It does not expose recovery through northbound MCP and does not make the Agent device key a resolver credential.
 
-For macOS, install `v2_recover` alongside `v2_agent`. Provision its Secure Enclave recovery key once from the logged-in Agent account, transfer only the exported P-256 public key through the authenticated administrative channel, and install it as `<HUB_STATE_DIR>/recovery-public-key.p256`. The Hub validates that file with the existing public trust-anchor symlink/permission rules and loads it only at startup. An absent verifier disables online recovery without changing fail-closed quarantine behavior.
+For macOS, install `v2_recover` plus the stable-signed `v2_recovery_enclave_helper` alongside `v2_agent`. Provision its Secure Enclave recovery key once from the logged-in Agent account into an owner-private sealed-key file, transfer only the exported P-256 public key through the authenticated administrative channel, and install it as `<HUB_STATE_DIR>/recovery-public-key.p256`. The Hub validates that file with the existing public trust-anchor symlink/permission rules and loads it only at startup. An absent verifier disables online recovery without changing fail-closed quarantine behavior.
 
 The existing `v2_maint` offline resolver remains required as break-glass for an unreachable Agent, unavailable recovery key, failed local user-presence authorization, or damaged online recovery transport.
 

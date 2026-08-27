@@ -247,3 +247,34 @@ fn online_recovery_rejects_offline_only_applied_uncommitted_resolution() {
     .unwrap_err();
     assert_eq!(error.safe_code(), "recovery_invalid_message");
 }
+
+#[test]
+fn recovery_cli_requires_explicit_secure_enclave_artifacts() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("export-public"));
+
+    let init = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .args(["init-key", "--help"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let init_help = String::from_utf8(init.stdout).unwrap();
+    assert!(init_help.contains("--key-file"));
+    assert!(init_help.contains("--secure-enclave-helper"));
+    assert!(!init_help.contains("--key-label"));
+
+    let resolve = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .args(["resolve", "--help"])
+        .output()
+        .unwrap();
+    assert!(resolve.status.success());
+    let resolve_help = String::from_utf8(resolve.stdout).unwrap();
+    assert!(resolve_help.contains("--key-file"));
+    assert!(resolve_help.contains("--secure-enclave-helper"));
+    assert!(!resolve_help.contains("--key-label"));
+}

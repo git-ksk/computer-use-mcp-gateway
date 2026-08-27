@@ -27,7 +27,6 @@ pub const MAX_RECOVERY_FILE_BYTES: usize = 16 * 1024;
 pub const RECOVERY_PUBLIC_KEY_FILENAME: &str = "recovery-public-key.p256";
 pub const RECOVERY_CHALLENGE_FILENAME: &str = "recovery-challenge.json";
 pub const RECOVERY_AUTHORIZATION_FILENAME: &str = "recovery-authorization.json";
-pub const DEFAULT_MACOS_RECOVERY_KEY_LABEL: &str = "com.github.git-ksk.cumg-v2-recovery";
 
 const CHALLENGE_DOMAIN: &[u8] = b"cumg-v2-online-recovery-challenge-v1";
 const AUTHORIZATION_DOMAIN: &[u8] = b"cumg-v2-online-recovery-authorization-v1";
@@ -620,6 +619,9 @@ pub enum RecoveryError {
     InvalidPath,
     Io,
     UnsafeTrustAnchor,
+    UnsafeRecoveryKey,
+    RecoveryHelperUnavailable,
+    RecoveryHelperProtocol,
     UnsupportedPlatform,
     KeyUnavailable,
     KeyAlreadyExists,
@@ -641,6 +643,9 @@ impl RecoveryError {
             Self::InvalidPath => "recovery_invalid_path",
             Self::Io => "recovery_io",
             Self::UnsafeTrustAnchor => "recovery_unsafe_trust_anchor",
+            Self::UnsafeRecoveryKey => "recovery_unsafe_key_material",
+            Self::RecoveryHelperUnavailable => "recovery_helper_unavailable",
+            Self::RecoveryHelperProtocol => "recovery_helper_protocol",
             Self::UnsupportedPlatform => "recovery_unsupported_platform",
             Self::KeyUnavailable => "recovery_key_unavailable",
             Self::KeyAlreadyExists => "recovery_key_already_exists",
@@ -667,65 +672,78 @@ impl std::error::Error for RecoveryError {}
 #[cfg(target_os = "macos")]
 pub mod macos {
     use super::*;
-    use security_framework::access_control::{ProtectionMode, SecAccessControl};
-    use security_framework::item::{
-        ItemSearchOptions, KeyClass, Location, Reference, SearchResult,
-    };
-    use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
-    use security_framework_sys::access_control::{
-        kSecAccessControlPrivateKeyUsage, kSecAccessControlUserPresence,
-    };
-    use security_framework_sys::base::errSecItemNotFound;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Serialize};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::process::{Command, Stdio};
+
+    const HELPER_SCHEMA_VERSION: u16 = 1;
+    const MAX_SEALED_KEY_BYTES: usize = 4096;
+    const MAX_HELPER_MESSAGE_BYTES: usize = 16 * 1024;
+    const MAX_HELPER_OUTPUT_BYTES: usize = 16 * 1024;
+
+    #[derive(Serialize)]
+    struct HelperRequest<'a> {
+        schema_version: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sealed_key_base64: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_base64: Option<&'a str>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HelperResponse {
+        schema_version: u16,
+        sealed_key_base64: Option<String>,
+        public_key_base64: Option<String>,
+        signature_base64: Option<String>,
+    }
 
     pub struct MacRecoveryKey {
-        private_key: SecKey,
+        helper: PathBuf,
+        sealed_key: Vec<u8>,
     }
 
     impl MacRecoveryKey {
-        pub fn create_new(label: &str) -> Result<Self, RecoveryError> {
-            if label.trim().is_empty() {
-                return Err(RecoveryError::KeyUnavailable);
-            }
-            // Initial provisioning never trusts a pre-existing label. This
-            // prevents a software key planted under the default label from
-            // being exported and pinned as recovery authority.
-            if load_private_key(label)?.is_some() {
-                return Err(RecoveryError::KeyAlreadyExists);
-            }
-            let flags = kSecAccessControlUserPresence | kSecAccessControlPrivateKeyUsage;
-            let access_control = SecAccessControl::create_with_protection(
-                Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-                flags,
-            )
-            .map_err(|_| RecoveryError::KeyUnavailable)?;
-            let mut options = GenerateKeyOptions::default();
-            options
-                .set_key_type(KeyType::ec())
-                .set_size_in_bits(256)
-                .set_token(Token::SecureEnclave)
-                .set_location(Location::DataProtectionKeychain)
-                .set_label(label)
-                .set_access_control(access_control);
-            let private_key = SecKey::new(&options).map_err(|_| RecoveryError::KeyUnavailable)?;
-            Ok(Self { private_key })
+        pub fn create_new(helper: &Path, key_file: &Path) -> Result<Self, RecoveryError> {
+            validate_helper(helper)?;
+            validate_new_key_path(key_file)?;
+            let response = run_helper(helper, "generate", None)?;
+            let sealed_key =
+                decode_bounded(response.sealed_key_base64.as_deref(), MAX_SEALED_KEY_BYTES)?;
+            let public_key = decode_bounded(response.public_key_base64.as_deref(), 65)?;
+            RecoveryVerifier::from_x963_bytes(&public_key)?;
+            write_private_key_file(key_file, &sealed_key)?;
+            Ok(Self {
+                helper: helper.to_path_buf(),
+                sealed_key,
+            })
         }
 
-        pub fn load(label: &str) -> Result<Self, RecoveryError> {
-            load_private_key(label)?
-                .map(|private_key| Self { private_key })
-                .ok_or(RecoveryError::KeyUnavailable)
+        pub fn load(helper: &Path, key_file: &Path) -> Result<Self, RecoveryError> {
+            validate_helper(helper)?;
+            let sealed_key = read_private_key_file(key_file)?;
+            Ok(Self {
+                helper: helper.to_path_buf(),
+                sealed_key,
+            })
         }
 
         pub fn public_key_bytes(&self) -> Result<[u8; 65], RecoveryError> {
-            let public = self
-                .private_key
-                .public_key()
-                .ok_or(RecoveryError::KeyUnavailable)?;
-            let bytes = public
-                .external_representation()
-                .ok_or(RecoveryError::KeyUnavailable)?
-                .to_vec();
-            RecoveryVerifier::from_x963_bytes(&bytes).map(|verifier| verifier.public_key_bytes())
+            let sealed = STANDARD.encode(&self.sealed_key);
+            let request = HelperRequest {
+                schema_version: HELPER_SCHEMA_VERSION,
+                sealed_key_base64: Some(&sealed),
+                message_base64: None,
+            };
+            let input = serde_json::to_vec(&request).map_err(|_| RecoveryError::InvalidMessage)?;
+            let response = run_helper(&self.helper, "public", Some(&input))?;
+            if response.sealed_key_base64.is_some() || response.signature_base64.is_some() {
+                return Err(RecoveryError::RecoveryHelperProtocol);
+            }
+            let public = decode_bounded(response.public_key_base64.as_deref(), 65)?;
+            RecoveryVerifier::from_x963_bytes(&public).map(|verifier| verifier.public_key_bytes())
         }
 
         pub fn sign_authorization(
@@ -735,33 +753,313 @@ pub mod macos {
             if !authorization.signature.is_empty() {
                 return Err(RecoveryError::InvalidMessage);
             }
-            let bytes = authorization_signing_bytes(&authorization)?;
-            authorization.signature = self
-                .private_key
-                .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, &bytes)
-                .map_err(|_| RecoveryError::UserPresenceDenied)?;
+            let message = authorization_signing_bytes(&authorization)?;
+            if message.len() > MAX_HELPER_MESSAGE_BYTES {
+                return Err(RecoveryError::InvalidMessage);
+            }
+            let sealed = STANDARD.encode(&self.sealed_key);
+            let message_base64 = STANDARD.encode(&message);
+            let request = HelperRequest {
+                schema_version: HELPER_SCHEMA_VERSION,
+                sealed_key_base64: Some(&sealed),
+                message_base64: Some(&message_base64),
+            };
+            let input = serde_json::to_vec(&request).map_err(|_| RecoveryError::InvalidMessage)?;
+            let response = run_helper(&self.helper, "sign", Some(&input))?;
+            if response.sealed_key_base64.is_some() || response.public_key_base64.is_some() {
+                return Err(RecoveryError::RecoveryHelperProtocol);
+            }
+            let signature = decode_bounded(response.signature_base64.as_deref(), 256)?;
+            let public_key = self.public_key_bytes()?;
+            signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, public_key)
+                .verify(&message, &signature)
+                .map_err(|_| RecoveryError::InvalidRecoverySignature)?;
+            authorization.signature = signature;
             Ok(authorization)
         }
     }
 
-    fn load_private_key(label: &str) -> Result<Option<SecKey>, RecoveryError> {
-        let mut search = ItemSearchOptions::new();
-        search
-            .key_class(KeyClass::private())
-            .label(label)
-            .load_refs(true)
-            .ignore_legacy_keychains();
-        let results = match search.search() {
-            Ok(results) => results,
-            Err(error) if error.code() == errSecItemNotFound => return Ok(None),
-            Err(_) => return Err(RecoveryError::KeyUnavailable),
-        };
-        for result in results {
-            if let SearchResult::Ref(Reference::Key(key)) = result {
-                return Ok(Some(key));
-            }
+    fn validate_helper(path: &Path) -> Result<(), RecoveryError> {
+        if !path.is_absolute() {
+            return Err(RecoveryError::InvalidPath);
         }
-        Ok(None)
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.mode() & 0o111 == 0
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(RecoveryError::RecoveryHelperUnavailable);
+        }
+        let parent = path.parent().ok_or(RecoveryError::InvalidPath)?;
+        let parent_metadata =
+            fs::symlink_metadata(parent).map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || parent_metadata.mode() & 0o022 != 0
+        {
+            return Err(RecoveryError::RecoveryHelperUnavailable);
+        }
+        Ok(())
+    }
+
+    fn validate_new_key_path(path: &Path) -> Result<(), RecoveryError> {
+        if !path.is_absolute() {
+            return Err(RecoveryError::InvalidPath);
+        }
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(RecoveryError::KeyAlreadyExists);
+        }
+        let parent = path.parent().ok_or(RecoveryError::InvalidPath)?;
+        let metadata =
+            fs::symlink_metadata(parent).map_err(|_| RecoveryError::UnsafeRecoveryKey)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
+            return Err(RecoveryError::UnsafeRecoveryKey);
+        }
+        Ok(())
+    }
+
+    fn write_private_key_file(path: &Path, bytes: &[u8]) -> Result<(), RecoveryError> {
+        if bytes.is_empty() || bytes.len() > MAX_SEALED_KEY_BYTES {
+            return Err(RecoveryError::RecoveryHelperProtocol);
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                RecoveryError::KeyAlreadyExists
+            } else {
+                RecoveryError::Io
+            }
+        })?;
+        file.write_all(bytes).map_err(|_| RecoveryError::Io)?;
+        file.sync_all().map_err(|_| RecoveryError::Io)?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| RecoveryError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn read_private_key_file(path: &Path) -> Result<Vec<u8>, RecoveryError> {
+        if !path.is_absolute() {
+            return Err(RecoveryError::InvalidPath);
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|_| RecoveryError::KeyUnavailable)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() == 0
+            || metadata.len() > MAX_SEALED_KEY_BYTES as u64
+        {
+            return Err(RecoveryError::UnsafeRecoveryKey);
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(path)
+            .map_err(|_| RecoveryError::KeyUnavailable)?;
+        let opened_metadata = file.metadata().map_err(|_| RecoveryError::KeyUnavailable)?;
+        if !opened_metadata.is_file()
+            || opened_metadata.mode() & 0o077 != 0
+            || opened_metadata.len() == 0
+            || opened_metadata.len() > MAX_SEALED_KEY_BYTES as u64
+        {
+            return Err(RecoveryError::UnsafeRecoveryKey);
+        }
+        let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+        file.take(MAX_SEALED_KEY_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| RecoveryError::KeyUnavailable)?;
+        if bytes.is_empty() || bytes.len() > MAX_SEALED_KEY_BYTES {
+            return Err(RecoveryError::UnsafeRecoveryKey);
+        }
+        Ok(bytes)
+    }
+
+    fn decode_bounded(value: Option<&str>, max_bytes: usize) -> Result<Vec<u8>, RecoveryError> {
+        let value = value.ok_or(RecoveryError::RecoveryHelperProtocol)?;
+        if value.len() > max_bytes.saturating_mul(2) {
+            return Err(RecoveryError::RecoveryHelperProtocol);
+        }
+        let bytes = STANDARD
+            .decode(value)
+            .map_err(|_| RecoveryError::RecoveryHelperProtocol)?;
+        if bytes.is_empty() || bytes.len() > max_bytes {
+            return Err(RecoveryError::RecoveryHelperProtocol);
+        }
+        Ok(bytes)
+    }
+
+    fn run_helper(
+        helper: &Path,
+        command: &str,
+        input: Option<&[u8]>,
+    ) -> Result<HelperResponse, RecoveryError> {
+        validate_helper(helper)?;
+        let mut process = Command::new(helper);
+        process
+            .arg(command)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = process
+            .spawn()
+            .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
+        if let Some(input) = input {
+            if input.len() > MAX_HELPER_OUTPUT_BYTES {
+                let _ = child.kill();
+                return Err(RecoveryError::InvalidMessage);
+            }
+            let Some(mut stdin) = child.stdin.take() else {
+                let _ = child.kill();
+                return Err(RecoveryError::RecoveryHelperProtocol);
+            };
+            stdin
+                .write_all(input)
+                .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
+        }
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            return Err(RecoveryError::RecoveryHelperProtocol);
+        };
+        let mut output = Vec::new();
+        stdout
+            .take(MAX_HELPER_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut output)
+            .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
+        if output.len() > MAX_HELPER_OUTPUT_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RecoveryError::RecoveryHelperProtocol);
+        }
+        let status = child
+            .wait()
+            .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
+        if !status.success() {
+            return Err(match status.code() {
+                Some(22) => RecoveryError::UserPresenceDenied,
+                Some(20) | Some(23) => RecoveryError::RecoveryHelperProtocol,
+                _ => RecoveryError::KeyUnavailable,
+            });
+        }
+        if output.is_empty() || output.len() > MAX_HELPER_OUTPUT_BYTES {
+            return Err(RecoveryError::RecoveryHelperProtocol);
+        }
+        let response: HelperResponse =
+            serde_json::from_slice(&output).map_err(|_| RecoveryError::RecoveryHelperProtocol)?;
+        if response.schema_version != HELPER_SCHEMA_VERSION {
+            return Err(RecoveryError::RecoveryHelperProtocol);
+        }
+        Ok(response)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        fn temp_dir(name: &str) -> PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "cumg-recovery-provider-{name}-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        }
+
+        fn write_helper(path: &Path, body: &str) {
+            fs::write(path, body).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        #[test]
+        fn helper_requires_safe_executable_and_parent() {
+            let root = temp_dir("helper");
+            let helper = root.join("helper");
+            write_helper(&helper, "#!/bin/sh\nexit 0\n");
+            assert_eq!(validate_helper(&helper), Ok(()));
+
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+            assert_eq!(
+                validate_helper(&helper),
+                Err(RecoveryError::RecoveryHelperUnavailable)
+            );
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o722)).unwrap();
+            assert_eq!(
+                validate_helper(&helper),
+                Err(RecoveryError::RecoveryHelperUnavailable)
+            );
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let link = root.join("helper-link");
+            symlink(&helper, &link).unwrap();
+            assert_eq!(
+                validate_helper(&link),
+                Err(RecoveryError::RecoveryHelperUnavailable)
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn sealed_key_file_is_create_new_private_and_no_follow() {
+            let root = temp_dir("key");
+            let key = root.join("recovery-key.sealed");
+            assert_eq!(validate_new_key_path(&key), Ok(()));
+            write_private_key_file(&key, b"sealed-key-fixture").unwrap();
+            assert_eq!(read_private_key_file(&key).unwrap(), b"sealed-key-fixture");
+            assert_eq!(
+                validate_new_key_path(&key),
+                Err(RecoveryError::KeyAlreadyExists)
+            );
+
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                read_private_key_file(&key),
+                Err(RecoveryError::UnsafeRecoveryKey)
+            );
+            fs::remove_file(&key).unwrap();
+            let actual = root.join("actual");
+            fs::write(&actual, b"sealed-key-fixture").unwrap();
+            fs::set_permissions(&actual, fs::Permissions::from_mode(0o600)).unwrap();
+            symlink(&actual, &key).unwrap();
+            assert_eq!(
+                read_private_key_file(&key),
+                Err(RecoveryError::UnsafeRecoveryKey)
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn helper_protocol_rejects_unknown_fields_and_maps_denial() {
+            let root = temp_dir("protocol");
+            let helper = root.join("helper");
+            write_helper(
+                &helper,
+                "#!/bin/sh\nprintf '%s\n' '{\"schema_version\":1,\"sealed_key_base64\":null,\"public_key_base64\":null,\"signature_base64\":null,\"unexpected\":true}'\n",
+            );
+            assert!(matches!(
+                run_helper(&helper, "public", None),
+                Err(RecoveryError::RecoveryHelperProtocol)
+            ));
+
+            write_helper(&helper, "#!/bin/sh\nexit 22\n");
+            assert!(matches!(
+                run_helper(&helper, "sign", Some(b"{}")),
+                Err(RecoveryError::UserPresenceDenied)
+            ));
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }
 

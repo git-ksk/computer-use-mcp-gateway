@@ -47,10 +47,6 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 portable-pty = "0.9.0"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
-security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
