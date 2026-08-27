@@ -10,6 +10,7 @@ use crate::v2_m0::{
     CapabilityAdvertisement, CommandEnvelope, CommandResultEnvelope, ControlError, DeviceIdentity,
     DeviceRegistry, GrantToken,
 };
+use crate::v2_online_recovery::{RecoveryAuthorization, RecoveryChallenge, RecoveryResolved};
 use crate::v2_operator_handoff::{
     HandoffActiveStatus, HandoffInterventionStatus, HandoffSurfaceKind,
 };
@@ -537,6 +538,7 @@ pub enum AgentToHub {
     ReconciliationReport(RemoteReconciliationReport),
     CancellationAck(RemoteCancellationAck),
     BackendSessionEnded(RemoteBackendSessionEnded),
+    RecoveryAuthorization(RecoveryAuthorization),
     HandoffResponse(RemoteHandoffResponse),
     Heartbeat(AgentHeartbeat),
 }
@@ -552,6 +554,8 @@ pub enum HubToAgent {
     Command(RemoteCommand),
     Cancel(RemoteCancel),
     BackendSessionEnd(RemoteBackendSessionEnd),
+    RecoveryChallenge(RecoveryChallenge),
+    RecoveryResolved(RecoveryResolved),
     HandoffRequest(RemoteHandoffRequest),
     HeartbeatAck(HubHeartbeatAck),
 }
@@ -565,6 +569,7 @@ impl AgentToHub {
             Self::ReconciliationReport(_) => "reconciliation_report",
             Self::CancellationAck(_) => "cancellation_ack",
             Self::BackendSessionEnded(_) => "backend_session_ended",
+            Self::RecoveryAuthorization(_) => "recovery_authorization",
             Self::HandoffResponse(_) => "handoff_response",
             Self::Heartbeat(_) => "heartbeat",
         }
@@ -579,6 +584,8 @@ impl HubToAgent {
             Self::Command(_) => "command",
             Self::Cancel(_) => "cancel",
             Self::BackendSessionEnd(_) => "backend_session_end",
+            Self::RecoveryChallenge(_) => "recovery_challenge",
+            Self::RecoveryResolved(_) => "recovery_resolved",
             Self::HandoffRequest(_) => "handoff_request",
             Self::HeartbeatAck(_) => "heartbeat_ack",
         }

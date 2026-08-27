@@ -40,7 +40,7 @@ class RuntimeCleanupTests(unittest.TestCase):
         os.chmod(env_file, 0o600)
         manifest = root / "runtime-manifest.json"
         manifest.write_text(
-            '{"schema_version":2,"hub_agent_schema_version":4,"source_commit":"' + COMMIT + '"}',
+            '{"schema_version":3,"hub_agent_schema_version":4,"source_commit":"' + COMMIT + '"}',
             encoding="utf-8",
         )
         agent_plist = Path(temp.name) / "agent.plist"

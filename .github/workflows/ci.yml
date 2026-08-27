@@ -90,6 +90,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxi6 at-spi2-core
 
+      - name: Build macOS Secure Enclave recovery helper
+        if: runner.os == 'macOS'
+        shell: bash
+        run: scripts/build-macos-recovery-helper.sh target/debug/v2_recovery_enclave_helper
+
       - name: Verify Cua release payload (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

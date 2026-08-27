@@ -46,6 +46,11 @@ use crate::v2_m1_process::{
 };
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
+use crate::v2_online_recovery::{
+    RecoveryError, clear_authorization, clear_recovery_handoff, load_authorization, load_challenge,
+    store_challenge, validate_authorization_against_challenge, verify_recovery_challenge,
+    verify_recovery_resolved,
+};
 use crate::v2_operator_handoff::{
     VerificationToken, is_exact_verification_candidate, is_phase1_protected_command,
 };
@@ -601,6 +606,10 @@ impl AgentService {
         self.browser_download_staging
             .cleanup_all()
             .map_err(AgentServiceError::BrowserDownloadStaging)?;
+        // Recovery challenges are generation-bound. Never carry an authorization
+        // across an authenticated reconnect; a fresh Hub challenge is required.
+        clear_recovery_handoff(&self.config.state_dir)
+            .map_err(AgentServiceError::OnlineRecovery)?;
         let trusted_clock = TrustedSessionClock::new(accepted.hub_time_ms);
 
         self.run_session_loop(
@@ -636,6 +645,9 @@ impl AgentService {
         let (operation_done_tx, mut operation_done_rx) = mpsc::channel::<OperationCompletion>(1);
         let mut active: Option<ActiveOperation> = None;
         let mut pending_backend_session_ends = VecDeque::<RemoteBackendSessionEnd>::new();
+        let mut recovery_poll = tokio::time::interval(Duration::from_millis(250));
+        recovery_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut pending_recovery_request: Option<String> = None;
 
         let session_result = async {
             loop {
@@ -856,6 +868,56 @@ impl AgentService {
                         &outbound_tx,
                     ).await?;
                 }
+                _ = recovery_poll.tick() => {
+                    if pending_recovery_request.is_none() {
+                        if let Some(authorization) = load_authorization(&self.config.state_dir)
+                            .map_err(AgentServiceError::OnlineRecovery)?
+                        {
+                            let challenge = match load_challenge(&self.config.state_dir)
+                                .map_err(AgentServiceError::OnlineRecovery)?
+                            {
+                                Some(challenge) => challenge,
+                                None => {
+                                    clear_authorization(&self.config.state_dir)
+                                        .map_err(AgentServiceError::OnlineRecovery)?;
+                                    tracing::warn!(
+                                        event = "v2_recovery_authorization_rejected",
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "rejected",
+                                        error_code = "recovery_challenge_missing",
+                                        "local recovery authorization had no current Hub challenge"
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Err(error) = validate_authorization_against_challenge(
+                                &challenge,
+                                &authorization,
+                                trusted_clock.now_ms(),
+                            ) {
+                                clear_authorization(&self.config.state_dir)
+                                    .map_err(AgentServiceError::OnlineRecovery)?;
+                                tracing::warn!(
+                                    event = "v2_recovery_authorization_rejected",
+                                    device_id = %session.device_id,
+                                    generation = session.generation,
+                                    outcome = "rejected",
+                                    error_code = error.safe_code(),
+                                    "stale or mismatched local recovery authorization rejected before relay"
+                                );
+                                continue;
+                            }
+                            let request_id = authorization.request_id.clone();
+                            send_agent(
+                                &outbound_tx,
+                                AgentToHub::RecoveryAuthorization(authorization),
+                            )
+                            .await?;
+                            pending_recovery_request = Some(request_id);
+                        }
+                    }
+                }
                 message = inbound.message() => {
                     let frame = match message.map_err(AgentServiceError::Status)? {
                         Some(frame) => frame,
@@ -932,6 +994,54 @@ impl AgentService {
                                 return Err(AgentServiceError::HeartbeatAckMismatch);
                             }
                             pending_heartbeat = None;
+                        }
+                        HubToAgent::RecoveryChallenge(recovery) => {
+                            verify_recovery_challenge(
+                                &recovery,
+                                &self.trusted_hub.verifier(),
+                                &session.device_id,
+                                session.generation,
+                                trusted_clock.now_ms(),
+                            )
+                            .map_err(AgentServiceError::OnlineRecovery)?;
+                            clear_authorization(&self.config.state_dir)
+                                .map_err(AgentServiceError::OnlineRecovery)?;
+                            store_challenge(&self.config.state_dir, &recovery)
+                                .map_err(AgentServiceError::OnlineRecovery)?;
+                            pending_recovery_request = None;
+                            tracing::warn!(
+                                event = "v2_recovery_challenge_received",
+                                operation_id = %recovery.operation_id,
+                                device_id = %session.device_id,
+                                generation = session.generation,
+                                quarantine_generation = recovery.quarantine_generation,
+                                outcome = "local_user_action_required",
+                                "Hub-signed online recovery challenge published for local user inspection"
+                            );
+                        }
+                        HubToAgent::RecoveryResolved(resolved) => {
+                            let expected_request_id = pending_recovery_request
+                                .as_deref()
+                                .ok_or(AgentServiceError::RecoveryResultMismatch)?;
+                            verify_recovery_resolved(
+                                &resolved,
+                                &self.trusted_hub.verifier(),
+                                expected_request_id,
+                                &session.device_id,
+                                session.generation,
+                            )
+                            .map_err(AgentServiceError::OnlineRecovery)?;
+                            clear_recovery_handoff(&self.config.state_dir)
+                                .map_err(AgentServiceError::OnlineRecovery)?;
+                            pending_recovery_request = None;
+                            tracing::info!(
+                                event = "v2_recovery_resolved",
+                                operation_id = %resolved.operation_id,
+                                device_id = %session.device_id,
+                                generation = session.generation,
+                                outcome = "resolved",
+                                "Hub durably resolved quarantine after local user authorization"
+                            );
                         }
                         HubToAgent::BackendSessionEnd(remote) => {
                             verify_remote_backend_session_end(
@@ -2093,11 +2203,13 @@ pub enum AgentServiceError {
     Backend(M1BackendError),
     Operation(AgentOperationError),
     Persistence(PersistenceError),
+    OnlineRecovery(RecoveryError),
     UnexpectedMessage {
         expected: &'static str,
         got: &'static str,
     },
     HeartbeatAckMismatch,
+    RecoveryResultMismatch,
     CancellationMismatch,
     AgentBusy,
     UnsupportedCommand,
@@ -2145,8 +2257,10 @@ impl SafeErrorCode for AgentServiceError {
             Self::Backend(error) => error.safe_error_code(),
             Self::Operation(_) => "operation_error",
             Self::Persistence(error) => error.safe_error_code(),
+            Self::OnlineRecovery(error) => error.safe_code(),
             Self::UnexpectedMessage { .. } => "unexpected_message",
             Self::HeartbeatAckMismatch => "heartbeat_ack_mismatch",
+            Self::RecoveryResultMismatch => "recovery_result_mismatch",
             Self::CancellationMismatch => "cancellation_mismatch",
             Self::AgentBusy => "agent_busy",
             Self::UnsupportedCommand => "unsupported_command",

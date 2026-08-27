@@ -616,3 +616,15 @@ All MCP clients connected to one V1 gateway ultimately share one serialized phys
 ## Reviewed single-Mac macOS deployment
 
 A trusted development Mac that intentionally co-locates Hub, external grant signer, Agent, and Cua should use the reviewed single-Mac profile rather than hand-written LaunchAgents. See [`v2/V2_SINGLE_MAC_PRODUCTION.md`](v2/V2_SINGLE_MAC_PRODUCTION.md). Its upgrade helper preserves Hub drain/quarantine semantics, archives a version-paired rollback asset, writes a payload-free runtime identity manifest, and requires a healthy read-only `v2_doctor` result after restart.
+
+## Local-user online quarantine recovery
+
+The optional online quarantine-recovery path is documented in [`v2/V2_ONLINE_RECOVERY.md`](v2/V2_ONLINE_RECOVERY.md). It does not expose recovery through northbound MCP and does not make the Agent device key a resolver credential.
+
+For macOS, install `v2_recover` plus the stable-signed `v2_recovery_enclave_helper` alongside `v2_agent`. Provision its Secure Enclave recovery key once from the logged-in Agent account into an owner-private sealed-key file, transfer only the exported P-256 public key through the authenticated administrative channel, and install it as `<HUB_STATE_DIR>/recovery-public-key.p256`. The Hub validates that file with the existing public trust-anchor symlink/permission rules and loads it only at startup. An absent verifier disables online recovery without changing fail-closed quarantine behavior.
+
+The existing `v2_maint` offline resolver remains required as break-glass for an unreachable Agent, unavailable recovery key, failed local user-presence authorization, or damaged online recovery transport.
+
+### Online recovery upgrade compatibility
+
+Online recovery is part of the versioned Hub-Agent application protocol. The current protocol schema is `HUB_AGENT_SCHEMA_VERSION = 4`; schema mismatch is rejected fail-closed. Deploy the matching Hub and Agent as a coordinated upgrade and do not assume mixed-version rolling operation across this boundary. This does not change V1 gateway compatibility.

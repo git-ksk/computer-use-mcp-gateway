@@ -30,6 +30,13 @@ fn single_mac_handoff_is_agent_owned_and_stably_codesigned_for_tcc() {
     assert!(upgrade.contains("certificate leaf[subject.OU]"));
     assert!(upgrade.contains("anchor apple generic"));
     assert!(upgrade.contains("com.github.git-ksk.cumg-v2-agent"));
+    assert!(upgrade.contains("com.github.git-ksk.cumg-v2-recover"));
+    assert!(upgrade.contains("recovery_cli_stable_codesign_failed"));
+    assert!(upgrade.contains("--bin v2_recover"));
+    assert!(upgrade.contains("build-macos-recovery-helper.sh"));
+    assert!(upgrade.contains("v2_recovery_enclave_helper"));
+    assert!(upgrade.contains("com.github.git-ksk.cumg-v2-recovery-helper"));
+    assert!(upgrade.contains("recovery_helper_stable_codesign_failed"));
     assert!(upgrade.contains("com.github.git-ksk.cumg-v2-handoff-webrtc-host"));
     assert!(upgrade.contains("CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE"));
     assert!(upgrade.contains("$ROOT\"/v2/handoff/*"));
@@ -74,7 +81,7 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(upgrade.contains("handoff_runtime_dependencies_install_or_symlink_validation_failed"));
     assert!(upgrade.contains("handoff_not_idle_or_status_unavailable"));
     assert!(upgrade.contains("hub_agent_schema_version"));
-    assert!(upgrade.contains("\"schema_version\": 2"));
+    assert!(upgrade.contains("\"schema_version\": 3"));
     assert!(upgrade.contains("--handoff-control-socket"));
     assert!(upgrade.contains("v2_handoff_runtime_cleanup.py"));
     assert!(upgrade.contains("--health-confirmed"));

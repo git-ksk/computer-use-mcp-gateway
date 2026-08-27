@@ -38,6 +38,11 @@ use crate::v2_m1_persistence::{
     CheckpointStore, HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError,
 };
 use crate::v2_observability::SafeErrorCode;
+use crate::v2_online_recovery::{
+    RecoveryAuditAssessment, RecoveryAuthorization, RecoveryChallenge, RecoveryError,
+    RecoveryResolved, RecoveryVerifier, build_recovery_challenge, build_recovery_resolved,
+    quarantine_fingerprint,
+};
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
@@ -140,6 +145,12 @@ struct LiveSession {
     supersede: watch::Sender<bool>,
 }
 
+#[derive(Default)]
+struct RecoveryRuntimeState {
+    pending: Option<RecoveryChallenge>,
+    last_resolved: Option<(RecoveryAuthorization, RecoveryResolved)>,
+}
+
 struct HubInner {
     config: HubServiceConfig,
     material: HubProvisionedMaterial,
@@ -152,6 +163,8 @@ struct HubInner {
     last_checkpoint_bytes: AtomicUsize,
     session_slots: Arc<Semaphore>,
     session_rate: crate::v2_limits::SlidingWindowRateLimit,
+    recovery_verifier: Option<RecoveryVerifier>,
+    recovery_runtime: Mutex<RecoveryRuntimeState>,
 }
 
 #[derive(Clone)]
@@ -316,6 +329,8 @@ impl SingleDeviceHub {
             .map_err(HubServiceError::StateDirectoryLock)?;
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "hub")
             .map_err(HubServiceError::Persistence)?;
+        let recovery_verifier = RecoveryVerifier::load_optional(&config.state_dir)
+            .map_err(HubServiceError::OnlineRecovery)?;
 
         let mut identity_registry = DeviceRegistry::default();
         let provisioned_device_id =
@@ -384,6 +399,8 @@ impl SingleDeviceHub {
             last_checkpoint_bytes: AtomicUsize::new(0),
             session_slots,
             session_rate,
+            recovery_verifier,
+            recovery_runtime: Mutex::new(RecoveryRuntimeState::default()),
         });
         let service = Self {
             inner: inner.clone(),
@@ -512,6 +529,9 @@ impl SingleDeviceHub {
             );
             let _ = prior.supersede.send(true);
         }
+
+        self.maybe_send_recovery_challenge(&outbound, session.generation, &session_clock)
+            .await?;
 
         let result = self
             .run_session_loop(
@@ -943,6 +963,12 @@ impl SingleDeviceHub {
                             )?;
                             send_hub(&outbound, HubToAgent::HeartbeatAck(ack)).await?;
                             heartbeat_deadline.as_mut().reset(tokio::time::Instant::now() + self.inner.config.heartbeat_timeout);
+                            self.maybe_send_recovery_challenge(
+                                &outbound,
+                                generation,
+                                session_clock,
+                            )
+                            .await?;
                         }
                         AgentToHub::Result(result) => {
                             self.handle_result(
@@ -987,6 +1013,15 @@ impl SingleDeviceHub {
                             };
                             let _ = reply.send(Ok(ack.ended));
                         }
+                        AgentToHub::RecoveryAuthorization(authorization) => {
+                            self.handle_recovery_authorization(
+                                authorization,
+                                &outbound,
+                                generation,
+                                session_clock,
+                            )
+                            .await?;
+                        }
                         AgentToHub::HandoffResponse(response) => {
                             {
                                 let persistent = self.inner.persistent.lock().await;
@@ -1011,9 +1046,11 @@ impl SingleDeviceHub {
                         AgentToHub::CancellationAck(ack) => {
                             self.handle_cancellation_ack(
                                 ack,
+                                &outbound,
                                 &hello,
                                 &challenge,
                                 generation,
+                                session_clock,
                                 &mut pending,
                                 &mut queue_order,
                                 &mut cancel_waiters,
@@ -1512,6 +1549,8 @@ impl SingleDeviceHub {
                 error_code = "backend_outcome_unproven",
                 "backend returned no proof of completion after a mutating dispatch; device quarantined"
             );
+            self.maybe_send_recovery_challenge(outbound, generation, session_clock)
+                .await?;
             return Ok(());
         }
 
@@ -1629,9 +1668,11 @@ impl SingleDeviceHub {
     async fn handle_cancellation_ack(
         &self,
         ack: RemoteCancellationAck,
+        outbound: &mpsc::Sender<Result<HubFrame, Status>>,
         hello: &AgentHello,
         challenge: &HubChallenge,
         generation: u64,
+        session_clock: &TrustedSessionClock,
         pending: &mut HashMap<String, PendingOperation>,
         queue_order: &mut VecDeque<String>,
         cancel_waiters: &mut HashMap<
@@ -1788,12 +1829,179 @@ impl SingleDeviceHub {
                     error_code = "cancellation_unproven",
                     "backend cancellation was propagated but side-effect interruption is unproven; device quarantined"
                 );
+                self.maybe_send_recovery_challenge(outbound, generation, session_clock)
+                    .await?;
             }
         }
         if let Some(waiter) = cancel_waiters.remove(&ack.operation_id) {
             let _ = waiter.send(Ok(ack.disposition));
         }
         Ok(())
+    }
+
+    async fn maybe_send_recovery_challenge(
+        &self,
+        outbound: &mpsc::Sender<Result<HubFrame, Status>>,
+        generation: u64,
+        session_clock: &TrustedSessionClock,
+    ) -> Result<(), HubServiceError> {
+        if self.inner.recovery_verifier.is_none() {
+            return Ok(());
+        }
+        let quarantine = {
+            let persistent = self.inner.persistent.lock().await;
+            persistent
+                .execution
+                .quarantine(&self.inner.device_id)
+                .cloned()
+        };
+        let Some(quarantine) = quarantine else {
+            return Ok(());
+        };
+        let now_ms = session_clock.now_ms();
+        let fingerprint = quarantine_fingerprint(&quarantine);
+        {
+            let runtime = self.inner.recovery_runtime.lock().await;
+            if runtime.pending.as_ref().is_some_and(|pending| {
+                pending.current_generation == generation
+                    && pending.quarantine_fingerprint == fingerprint
+                    && now_ms <= pending.expires_at_ms
+            }) {
+                return Ok(());
+            }
+        }
+        let challenge = build_recovery_challenge(
+            &self.inner.material.hub_identity,
+            &quarantine,
+            generation,
+            now_ms,
+        )
+        .map_err(HubServiceError::OnlineRecovery)?;
+        {
+            let mut runtime = self.inner.recovery_runtime.lock().await;
+            runtime.pending = Some(challenge.clone());
+            runtime.last_resolved = None;
+        }
+        send_hub(outbound, HubToAgent::RecoveryChallenge(challenge.clone())).await?;
+        tracing::warn!(
+            event = "v2_recovery_challenge_issued",
+            operation_id = %challenge.operation_id,
+            device_id = %challenge.device_id,
+            generation,
+            quarantine_generation = challenge.quarantine_generation,
+            outcome = "local_user_action_required",
+            "online recovery challenge issued for quarantined desktop"
+        );
+        Ok(())
+    }
+
+    async fn handle_recovery_authorization(
+        &self,
+        authorization: RecoveryAuthorization,
+        outbound: &mpsc::Sender<Result<HubFrame, Status>>,
+        generation: u64,
+        session_clock: &TrustedSessionClock,
+    ) -> Result<(), HubServiceError> {
+        let verifier =
+            self.inner
+                .recovery_verifier
+                .clone()
+                .ok_or(HubServiceError::OnlineRecovery(
+                    RecoveryError::KeyUnavailable,
+                ))?;
+
+        let (pending, duplicate_ack) = {
+            let runtime = self.inner.recovery_runtime.lock().await;
+            let duplicate = runtime
+                .last_resolved
+                .as_ref()
+                .filter(|(accepted, _)| accepted.request_id == authorization.request_id)
+                .cloned();
+            (runtime.pending.clone(), duplicate)
+        };
+        if let Some((accepted, ack)) = duplicate_ack {
+            if accepted != authorization {
+                return Err(HubServiceError::OnlineRecovery(
+                    RecoveryError::ChallengeMismatch,
+                ));
+            }
+            send_hub(outbound, HubToAgent::RecoveryResolved(ack)).await?;
+            return Ok(());
+        }
+        let pending = pending.ok_or(HubServiceError::OnlineRecovery(
+            RecoveryError::ChallengeMismatch,
+        ))?;
+        verifier
+            .verify_authorization(&pending, &authorization, session_clock.now_ms())
+            .map_err(HubServiceError::OnlineRecovery)?;
+        if authorization.current_generation != generation {
+            return Err(HubServiceError::StaleSession);
+        }
+
+        let resolved_at_ms = session_clock.now_ms();
+        {
+            let mut persistent = self.inner.persistent.lock().await;
+            let quarantine = persistent
+                .execution
+                .quarantine(&self.inner.device_id)
+                .cloned()
+                .ok_or(HubServiceError::OnlineRecovery(
+                    RecoveryError::ChallengeMismatch,
+                ))?;
+            if quarantine.operation_id != authorization.operation_id
+                || quarantine.device_generation != authorization.quarantine_generation
+                || quarantine_fingerprint(&quarantine) != authorization.quarantine_fingerprint
+            {
+                return Err(HubServiceError::OnlineRecovery(
+                    RecoveryError::ChallengeMismatch,
+                ));
+            }
+            let rollback = persistent.execution.snapshot_for_restart();
+            let resolver = OperationOwner::new("cumg://local-user-recovery", verifier.key_id())?;
+            persistent.execution.resolve_indeterminate(
+                &authorization.operation_id,
+                resolver,
+                authorization.decision.clone(),
+                authorization.evidence.clone(),
+                resolved_at_ms,
+            )?;
+            if let Err(error) = persist_locked(&self.inner, &persistent) {
+                persistent.execution = AuthoritativeOperationController::restore_after_restart(
+                    self.inner.config.admission_limits(),
+                    rollback,
+                )?;
+                return Err(error);
+            }
+        }
+
+        let ack = build_recovery_resolved(
+            &self.inner.material.hub_identity,
+            &authorization,
+            resolved_at_ms,
+        )
+        .map_err(HubServiceError::OnlineRecovery)?;
+        {
+            let mut runtime = self.inner.recovery_runtime.lock().await;
+            runtime.pending = None;
+            runtime.last_resolved = Some((authorization.clone(), ack.clone()));
+        }
+        crate::v2_observability::quarantine_resolved();
+        tracing::info!(
+            event = "v2_quarantine_resolved_online",
+            operation_id = %authorization.operation_id,
+            device_id = %authorization.device_id,
+            generation,
+            quarantine_generation = authorization.quarantine_generation,
+            recovery_key_id = %verifier.key_id(),
+            audit_assessment = match authorization.audit_assessment {
+                RecoveryAuditAssessment::Completed => "completed",
+                RecoveryAuditAssessment::NotExecuted => "not_executed",
+                RecoveryAuditAssessment::Inconclusive => "inconclusive",
+            },
+            outcome = crate::v2_observability::resolution_name(&authorization.decision),
+            "local-user-authorized online recovery durably cleared desktop quarantine"
+        );
+        send_hub(outbound, HubToAgent::RecoveryResolved(ack)).await
     }
 
     async fn ensure_current_generation(&self, generation: u64) -> Result<(), HubServiceError> {
@@ -2388,6 +2596,10 @@ impl HubHandle {
     }
 }
 
+#[cfg(test)]
+#[path = "v2_m1_hub_online_recovery_tests.rs"]
+mod online_recovery_tests;
+
 #[tonic::async_trait]
 impl AgentControl for SingleDeviceHub {
     type OpenSessionStream = Pin<Box<dyn Stream<Item = Result<HubFrame, Status>> + Send + 'static>>;
@@ -2659,6 +2871,7 @@ impl std::error::Error for HubCommandError {}
 pub enum HubServiceError {
     InvalidConfig(&'static str),
     Persistence(PersistenceError),
+    OnlineRecovery(RecoveryError),
     StateDirectoryLock(StateDirectoryLockError),
     Control(crate::v2_m0::ControlError),
     Execution(crate::v2_m0_execution::ExecutionError),
@@ -2720,6 +2933,7 @@ impl SafeErrorCode for HubServiceError {
         match self {
             Self::InvalidConfig(_) => "invalid_config",
             Self::Persistence(error) => error.safe_error_code(),
+            Self::OnlineRecovery(error) => error.safe_code(),
             Self::StateDirectoryLock(StateDirectoryLockError::Busy) => "state_directory_busy",
             Self::StateDirectoryLock(_) => "state_directory_lock_error",
             Self::Control(_) => "control_error",

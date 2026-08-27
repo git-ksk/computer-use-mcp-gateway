@@ -15,6 +15,7 @@ Status as of 2026-08-26:
 - **Privacy-safe northbound failures:** live control schema is **v9**. Expected execution-policy/runtime failures preserve bounded client-visible categories such as working-directory denial, timeout, program/environment policy, spawn failure, cancellation, `agent_offline`, and `device_indeterminate` while raw paths, commands, environment values, device identity, provider text, and OS error strings remain excluded. Unknown internal failures still collapse fail closed.
 - **Host reliability and diagnostics:** `v2_doctor` distinguishes a proven in-band diagnostic self-observation from real blocking quarantine without changing restart-safety state. Browser staging startup failures emit bounded local stage/I/O diagnostics. Controlled `StorageFull` injection proves Agent checkpoint persistence exhaustion can terminate the Agent fail closed and therefore surface remotely as `agent_offline`; the prior committed checkpoint/replay barriers remain authoritative, normal service-manager reconnect works after capacity returns, and `v2_doctor` exposes only coarse read-only state/temp capacity signals.
 - **Process/shell response-loss recovery:** `execute_process` and `shell` accept a stable caller-retained `operation_id`, and the Hub exposes read-only `get_operation` for owner/capability-scoped recovery without replay or Agent liveness. Proven terminal output is persisted before northbound delivery and survives Agent generation rollover in a bounded recovery archive (8 entries / 256 KiB encoded total). Unknown/evicted references never make the original operation retry-safe.
+- **Local-user online quarantine recovery:** implemented behind explicit recovery-key provisioning. The Agent device key is not recovery authority; a fresh Hub-signed challenge is resolved only by a separately pinned P-256 endpoint recovery key. The initial macOS signer uses a Secure Enclave key with user-presence access control. Automated protocol/persistence coverage is required, and trusted physical Secure Enclave deny/approve plus real ambiguous-operation no-replay acceptance remain the release gate.
 - **V1 compatibility:** V1 remains available for regression/reference and existing deployments. V1 regression/conformance coverage remains required during V2 work; the remaining #14/#15 observations are explicitly blocked on upstream Cua rather than treated as active CUMG release blockers.
 
 ## Active contracts
@@ -22,6 +23,7 @@ Status as of 2026-08-26:
 - [`V2_POSITIONING.md`](V2_POSITIONING.md) — canonical product boundary.
 - [`V2_P0_EXECUTION_SAFETY.md`](V2_P0_EXECUTION_SAFETY.md) — uncertainty-aware execution and no-auto-replay invariants.
 - [`V2_OPERATION_RECOVERY.md`](V2_OPERATION_RECOVERY.md) — durable bounded process/shell result recovery after northbound response loss.
+- [`V2_ONLINE_RECOVERY.md`](V2_ONLINE_RECOVERY.md) — local-user-authorized online resolution of durable desktop quarantine.
 - [`V2_INTERACTION_CONTEXT.md`](V2_INTERACTION_CONTEXT.md) — scoped interaction state and backend-reference ownership.
 - [`V2_GUI_SEMANTIC_CAPABILITIES.md`](V2_GUI_SEMANTIC_CAPABILITIES.md) — Desktop semantic surface.
 - [`V2_BROWSER_SEMANTIC_CAPABILITIES.md`](V2_BROWSER_SEMANTIC_CAPABILITIES.md) — Browser semantic surface and transfer boundary.
@@ -34,6 +36,7 @@ Status as of 2026-08-26:
 - [`acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) — Browser core closeout.
 - [`acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) — Browser transfer contract, threat controls, automated coverage, and trusted-Mac real-Cua evidence.
 - [`acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md`](acceptance/V2_LOCAL_DESKTOP_ACCEPTANCE.md) — trusted physical Desktop acceptance procedure/evidence.
+- [`acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md`](acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md) — automated and trusted-Mac acceptance gate for local-user online quarantine recovery.
 - [`acceptance/V2_M1_ACCEPTANCE.md`](acceptance/V2_M1_ACCEPTANCE.md) — earlier secure-Agent milestone acceptance retained as evidence.
 - [Issue #100](https://github.com/git-ksk/computer-use-mcp-gateway/issues/100) / draft PR #101 — pending trusted physical-macOS acceptance for the remaining `v0.3.0` blocker.
 

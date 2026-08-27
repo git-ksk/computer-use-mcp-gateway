@@ -334,3 +334,9 @@ P2 adds two focused unit regressions in addition to the existing P1 suites:
 The Cua adapter fixture also exercises the GUI semantic normalization boundary: backend `list_windows`, `launch_app`, `get_window_state`, and `verify_state` results are reduced to backend-neutral window/UI/verification types, semantic selectors map back into the backend adapter, and no generic raw-tool escape hatch is exposed northbound. A focused northbound regression verifies that a live `CapabilityAdvertisement` narrows semantic discovery while offline discovery retains the authorized contract and dispatch still fails closed.
 
 The existing `v2_p1_backend_portability` test remains the semantic guard: backend-specific cancellation behavior must converge on the same authoritative operation/quarantine/resolution model. Any P2 Computer Use backend change also requires the final main-only real-Cua regression because compile-time interface compatibility is not evidence of physical cancellation behavior. See [`V2_P2_REPLACEMENT_SEAMS.md`](v2/V2_P2_REPLACEMENT_SEAMS.md) and [`V2_GUI_SEMANTIC_CAPABILITIES.md`](v2/V2_GUI_SEMANTIC_CAPABILITIES.md).
+
+## V2 online quarantine recovery
+
+Permanent automated coverage is defined by [`v2/acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md`](v2/acceptance/V2_ONLINE_RECOVERY_ACCEPTANCE.md). It covers signed challenge/decision binding, stale generation and quarantine rejection, trust-anchor hardening, no-clobber local handoff, persistence-gated Hub resolution, idempotent identical delivery, conflicting-decision rejection, and restart/no-replay semantics.
+
+Hosted macOS CI compiles the CryptoKit Secure Enclave helper and runs protocol/state-machine tests, but it is not evidence that a physical Secure Enclave key produced the intended deployment-user Touch ID/password/Apple Watch user-presence interaction. Run the trusted physical Mac acceptance before enabling the online path in a release.

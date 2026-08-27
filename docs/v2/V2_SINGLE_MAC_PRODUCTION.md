@@ -66,17 +66,18 @@ Single-Mac maintenance is explicitly one-shot. Do **not** use `launchctl submit`
 
 Before any upgrade, both the wrapper and `v2-single-mac-upgrade.sh` inspect the current GUI launchd domain for known current/legacy CUMG maintenance labels. Any loaded job other than the wrapper's exact current label fails preflight with `stale_maintenance_jobs`; an active job is never auto-terminated. Use `scripts/v2_launchd_maintenance_job.py inspect` for privacy-bounded state/runs/last-exit diagnostics. After confirming a stale job is not running, `cleanup-stale` may boot it out and remove only a matching private temporary plist. The cleanup path refuses while any matching maintenance job is active.
 
-For signing, prefer the exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT`. The display-name `CUMG_V2_MACOS_CODESIGN_IDENTITY` remains a compatibility fallback only when it resolves to exactly one valid certificate. The helper verifies the selected certificate's exact Team ID **before signing**, then verifies the stable identifier/Team-ID designated requirement after signing. There is no ad-hoc fallback.
+For signing, prefer the exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT`. The display-name `CUMG_V2_MACOS_CODESIGN_IDENTITY` remains a compatibility fallback only when it resolves to exactly one valid certificate. The helper verifies the selected certificate's exact Team ID **before signing**, then verifies the stable identifier/Team-ID designated requirement after signing. There is no ad-hoc fallback. The same reviewed identity signs `v2_recover` with stable identifier `com.github.git-ksk.cumg-v2-recover`; this provides stable artifact identity for deployment/audit, while Secure Enclave user presence remains the actual recovery-authorization boundary.
+
 
 A successful upgrade performs this sequence:
 
 1. prove CUMG and Handoff source provenance, quarantine=0, loaded services, no conflicting known Hub/Agent launchd family, no stale CUMG maintenance job other than the exact current one-shot wrapper, and an idle Agent-owned Handoff status without printing locator/owner data;
-2. build all paired CUMG binaries from one merged CUMG commit and stage a private `runtime-<cumg>-<handoff>` Handoff generation from the exact reviewed Handoff `dist`, `package.json`, and lockfile plus the CUMG runtime host script; install only lockfile-pinned production dependencies with lifecycle scripts disabled, remove npm command-shim `.bin` links because runtime generations are symlink-free, reject any remaining dependency symlink, and prove the staged entrypoint imports under the configured Node executable before any service is stopped;
+2. build all paired CUMG binaries (including the local-user `v2_recover` CLI and its CryptoKit Secure Enclave helper) from one merged CUMG commit and stage a private `runtime-<cumg>-<handoff>` Handoff generation from the exact reviewed Handoff `dist`, `package.json`, and lockfile plus the CUMG runtime host script; install only lockfile-pinned production dependencies with lifecycle scripts disabled, remove npm command-shim `.bin` links because runtime generations are symlink-free, reject any remaining dependency symlink, and prove the staged entrypoint imports under the configured Node executable before any service is stopped;
 3. copy and stable-sign Handoff host helper(s) into that new generation; the live helper is not modified in place;
 4. create a private rollback bundle containing old binaries/configuration, the Handoff env file, helper copies, and a self-contained old Handoff generation including its runtime dependencies; an archive missing those dependencies remains an external-runtime reference and must not permit cleanup of that runtime; authoritative Hub/Agent state is copied only after drain;
 5. signal Hub first to close admission and drain, then unload Hub/Agent/signer, boot out and disable alternate known Hub/Agent labels without deleting their plists, and re-check stopped quarantine state;
 6. while stopped, atomically retarget the private Handoff env and Agent plist to the staged generation, then atomically replace the paired CUMG binaries;
-7. write `runtime-manifest.json` schema 2 with the merged CUMG source commit, exact Hub/Agent application-schema version, package version, and binary SHA-256 identities;
+7. write `runtime-manifest.json` schema 3 with the merged CUMG source commit, exact Hub/Agent application-schema version, package version, and binary SHA-256 identities;
 8. start signer -> Hub -> Agent, re-check that no conflicting known launchd family is active, and run `v2_doctor`, including the read-only Handoff status check;
 9. only after doctor is healthy, prune eligible unreferenced `runtime-*` code directories. Active runtime, legacy externally referenced rollback runtime, a bounded recent set, and any unsafe/symlink-bearing candidate are protected/refused. Checkpoint/key/env/audit/control/rollback data are outside the cleanup candidate set.
 
@@ -109,7 +110,7 @@ When the doctor itself is launched through the live single-Mac Agent using `exec
 
 For the standard profile it checks:
 
-- runtime manifest schema 2, exact Hub/Agent application-schema version, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, and `v2_grant_signer`;
+- runtime manifest schema 3, exact Hub/Agent application-schema version, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, `v2_recover`, `v2_recovery_enclave_helper`, and `v2_grant_signer`;
 - authoritative Hub checkpoint readability and current registry/capability schema;
 - exactly one enrolled single-Mac device and current generation;
 - Agent checkpoint readability and exact Hub/Agent generation pairing;
@@ -137,7 +138,7 @@ Before declaring a single-Mac upgrade healthy, require all of the following:
 - `v2_doctor` reports `overall=healthy`;
 - a fresh authenticated Agent generation is present after restart;
 - live quarantine remains zero;
-- the schema-2 runtime manifest verifies every installed paired binary and the exact Hub/Agent application schema;
+- the schema-3 runtime manifest verifies every installed paired binary and the exact Hub/Agent application schema;
 - Handoff reports idle with no recovery/resume/fault;
 - a harmless northbound semantic smoke reaches a durable terminal `Completed` state;
 - the old binary/state rollback pair remains retained until the operator-selected bake period completes.

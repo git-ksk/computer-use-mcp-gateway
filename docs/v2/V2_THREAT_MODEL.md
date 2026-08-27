@@ -269,3 +269,13 @@ The threat model still requires the deployment to preserve these external respon
 - an `indeterminate` operation must remain quarantined until a persistence-gated settlement exists. Network recovery, backend reconnect, or service restart alone is not settlement and is never permission to replay it. The only automatic exception is exact signed terminal evidence for the same prior dispatch binding; missing/mismatched evidence remains operator-required/fail-closed.
 
 These are deployment assumptions/residual risks, not missing V2-M1 protocol features. Multi-machine identity, fleet attestation, and additional native GUI backends remain intentionally deferred to later milestones.
+
+## Local-user online recovery authority
+
+Online quarantine recovery does not grant the Agent device identity administrative recovery authority. A compromised Agent remains able to lie about local desktop state, so an Agent/device signature alone cannot clear `DesktopQuarantine`.
+
+A deployment may explicitly provision a separate endpoint recovery verifier. The initial macOS provider keeps the corresponding P-256 private key in the Secure Enclave with user-presence/private-key-use access control and persists only its owner-private sealed Secure Enclave representation. The Hub signs a fresh short-lived challenge bound to the exact durable quarantine, historical operation generation, current authenticated Agent generation, and nonce. The local user's signed decision is accepted only while that challenge and the current quarantine fingerprint still match. The Agent transports the authorization but cannot construct a valid recovery signature itself.
+
+This is user-presence authorization, not cryptographic proof that an arbitrary GUI side effect did or did not occur. Because normal checkpoints intentionally exclude raw GUI payloads and screenshots, the generic initial audit assessment is `inconclusive`; the local user inspects the current desktop and chooses the exact resolution. A future automatic assessment must be capability-specific and must not widen the ordinary audit/privacy boundary.
+
+Resolution remains persistence-gated and never resumes the old operation. If the verifier is absent, the challenge is stale, the signature is invalid, the quarantine changed, or persistence fails, the device remains quarantined. The existing offline maintenance resolver remains the break-glass path. See [`V2_ONLINE_RECOVERY.md`](V2_ONLINE_RECOVERY.md).

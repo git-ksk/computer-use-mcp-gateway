@@ -79,3 +79,21 @@ Local structured tracing is always available through `RUST_LOG`. OTLP is opt-in 
 
 For one trusted development Mac running Hub + external signer + Agent locally, use the templates under [`launchd/single-mac/`](launchd/single-mac/) and the normative runbook [`../docs/v2/V2_SINGLE_MAC_PRODUCTION.md`](../docs/v2/V2_SINGLE_MAC_PRODUCTION.md). The profile is loopback-only, keeps grant signing external to the Hub, and pairs runtime upgrades with `v2_doctor` verification. `scripts/v2-single-mac-upgrade.sh` is for an already-installed profile; it is not a secret/enrollment bootstrapper.
 For an actual single-Mac cutover, invoke that helper through `scripts/v2_launchd_maintenance_job.py run-upgrade`; do not use `launchctl submit` as an ad-hoc one-shot mechanism. The wrapper explicitly uses `RunAtLoad=true` / `KeepAlive=false`, refuses stale maintenance jobs, never retries a non-zero upgrade, and cleans its temporary launchd job/plist before returning.
+
+## macOS local-user online quarantine recovery
+
+The macOS Agent remains a LaunchAgent in the interactive login session; online recovery does not add a daemon or a second service supervisor. The reviewed single-Mac upgrade helper builds, stable-signs, installs, rollback-archives, and runtime-manifest-verifies both `v2_recover` and `v2_recovery_enclave_helper` alongside the paired runtime binaries. Its local challenge/authorization handoff uses the same `CUMG_V2_STATE_DIR` configured for the LaunchAgent.
+
+Initialize the recovery key once as the Agent's logged-in user:
+
+```bash
+install -d -m 700 "$HOME/Library/Application Support/cumg-v2-agent/recovery"
+v2_recover init-key \
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
+  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-public-key.p256"
+```
+
+The private P-256 key remains in the Secure Enclave and requires user presence for signing. Only its bounded sealed representation is stored in the owner-private `--key-file`; `init-key` is create-new and refuses an existing key-file path. Move only the exported public key through the operator-authenticated provisioning channel and install it as `<HUB_STATE_DIR>/recovery-public-key.p256` with reviewed ownership/permissions. Restart the Hub so it explicitly loads the new recovery verifier.
+
+When a Hub-signed challenge is present, use `v2_recover status` and then `v2_recover resolve` as documented in [`../docs/v2/V2_ONLINE_RECOVERY.md`](../docs/v2/V2_ONLINE_RECOVERY.md). Keep `v2_maint` available for offline break-glass recovery.

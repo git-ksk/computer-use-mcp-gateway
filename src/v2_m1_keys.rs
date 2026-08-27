@@ -112,6 +112,12 @@ pub fn load_tls_root_der(path: &Path) -> Result<Vec<u8>, KeyMaterialError> {
     read_public_file(path, MAX_TLS_ROOT_BYTES)
 }
 
+/// Load bounded binary public trust material with the same symlink and
+/// writable-permission rejection used by Hub/grant/TLS trust anchors.
+pub fn load_public_trust_bytes(path: &Path, max_bytes: u64) -> Result<Vec<u8>, KeyMaterialError> {
+    read_public_file(path, max_bytes)
+}
+
 pub fn write_new_tls_root_der(path: &Path, value: &[u8]) -> Result<(), KeyMaterialError> {
     if value.is_empty() || u64::try_from(value.len()).unwrap_or(u64::MAX) > MAX_TLS_ROOT_BYTES {
         return Err(KeyMaterialError::FileTooLarge);
