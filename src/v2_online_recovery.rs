@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 1;
-pub const RECOVERY_CHALLENGE_TTL_MS: u64 = 120_000;
+pub const RECOVERY_CHALLENGE_TTL_MS: u64 = 300_000;
 pub const MAX_RECOVERY_EVIDENCE_BYTES: usize = 1024;
 pub const MAX_RECOVERY_FILE_BYTES: usize = 16 * 1024;
 pub const RECOVERY_PUBLIC_KEY_FILENAME: &str = "recovery-public-key.p256";
@@ -1086,6 +1086,7 @@ mod tests {
     fn challenge_is_hub_signed_and_generation_bound() {
         let hub = HubIdentity::generate();
         let challenge = build_recovery_challenge(&hub, &quarantine(), 5, 100).unwrap();
+        assert_eq!(challenge.expires_at_ms - challenge.issued_at_ms, 300_000);
         verify_recovery_challenge(&challenge, &hub.verifier(), "dev_test", 5, 101).unwrap();
         assert!(matches!(
             verify_recovery_challenge(&challenge, &hub.verifier(), "dev_test", 6, 101),

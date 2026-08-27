@@ -53,7 +53,7 @@ A challenge is bound to:
 - a fresh 32-byte nonce;
 - issue and expiry timestamps.
 
-The challenge lifetime is 120 seconds. Reconnect/generation change invalidates the local handoff and requires a fresh Hub challenge. Historical operation generation and current authenticated generation are deliberately distinct: generation is a stale-session fence, not recovery ownership.
+The challenge lifetime is 300 seconds (5 minutes). Reconnect/generation change invalidates the local handoff and requires a fresh Hub challenge. Historical operation generation and current authenticated generation are deliberately distinct: generation is a stale-session fence, not recovery ownership.
 
 The local authorization binds the exact challenge plus:
 
@@ -183,4 +183,4 @@ Before enabling the macOS online path in a release, a trusted physical Mac must 
 
 Online recovery is part of the current `HUB_AGENT_SCHEMA_VERSION = 4` application protocol. Schema validation remains fail-closed, so a deployment enabling this release must upgrade Hub and Agent as a coordinated pair rather than relying on mixed-version rolling compatibility. V1 gateway behavior is unchanged.
 
-A recovery challenge expires after 120 seconds. While the desktop remains quarantined, normal authenticated Agent heartbeats cause the Hub to re-check the pending challenge and issue a fresh nonce-bound challenge after expiry. An operator therefore does not need to restart the Hub or Agent merely because a local approval window elapsed. Receiving a fresh challenge invalidates the prior local authorization handoff.
+A recovery challenge expires after 300 seconds (5 minutes). While the desktop remains quarantined, normal authenticated Agent heartbeats cause the Hub to re-check the pending challenge and issue a fresh nonce-bound challenge after expiry. An operator therefore does not need to restart the Hub or Agent merely because a local approval window elapsed. Receiving a fresh challenge invalidates the prior local authorization handoff.

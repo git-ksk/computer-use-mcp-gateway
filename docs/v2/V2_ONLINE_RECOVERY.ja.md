@@ -43,7 +43,7 @@ Hub署名 RecoveryResolved ACK
 handoff削除。以後は新しいoperation IDのみ実行可能
 ```
 
-challengeは stable device ID、曖昧operation ID、実行時のhistorical generation、現在のauthenticated Agent generation、現在のquarantine fingerprint、fresh nonce、issued/expiry にbindingされます。有効期限は120秒です。reconnect/generation変更時はhandoffを破棄し、新しいchallengeが必要です。
+challengeは stable device ID、曖昧operation ID、実行時のhistorical generation、現在のauthenticated Agent generation、現在のquarantine fingerprint、fresh nonce、issued/expiry にbindingされます。有効期限は300秒（5分）です。reconnect/generation変更時はhandoffを破棄し、新しいchallengeが必要です。
 
 historical generationとcurrent generationは別物です。generationはstale-session fenceであり、recovery ownershipではありません。
 
@@ -136,4 +136,4 @@ sealed Secure Enclave recovery-key representation紛失、Agent接続不能、Se
 
 Online recoveryは現在の `HUB_AGENT_SCHEMA_VERSION = 4` application protocolの一部です。schema validationはfail-closedのままなので、このreleaseを有効にする際はHubとAgentを協調して更新し、mixed-version rolling compatibilityには依存しません。V1 gatewayの動作は変わりません。
 
-Recovery challengeは120秒で期限切れになります。desktopがquarantineのままなら、通常のauthenticated Agent heartbeatを契機にHubがpending challengeを再確認し、期限切れ後はfresh nonceを持つchallengeを再発行します。承認時間切れだけを理由にHub/Agentを再起動する必要はありません。fresh challenge受信時は以前のlocal authorization handoffを無効化します。
+Recovery challengeは300秒（5分）で期限切れになります。desktopがquarantineのままなら、通常のauthenticated Agent heartbeatを契機にHubがpending challengeを再確認し、期限切れ後はfresh nonceを持つchallengeを再発行します。承認時間切れだけを理由にHub/Agentを再起動する必要はありません。fresh challenge受信時は以前のlocal authorization handoffを無効化します。
