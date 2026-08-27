@@ -10,8 +10,8 @@ Before 1.0, only the latest released minor line is actively supported, as define
 
 | Version | Security support |
 | --- | --- |
-| `0.2.x` | Supported |
-| `< 0.2` | Not actively supported |
+| `0.3.x` | Supported |
+| `< 0.3` | Not actively supported |
 
 If a newer minor release exists, treat that latest minor line as the actively supported line even if this table has not yet been updated.
 

@@ -64,11 +64,36 @@ Retiring V1 is now a valid future simplification candidate, but removal must be 
 
 Until those conditions are met, keep V1 narrow and regression-only; do not expand it with new capabilities.
 
-## Next minor: admission-driven, not number-driven
+## Post-v0.3 productization sequence
 
-The next minor release is created only when accepted work changes or meaningfully expands the public contract, or when a deliberate pre-1.0 incompatibility is justified. Today that would normally be `0.3.0`, but the roadmap does not pre-commit a feature bundle to that number.
+CUMG is now past the initial V2 production-hardening release. Post-v0.3 work should move the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
 
-Candidate areas are evaluated independently.
+The working sequence is:
+
+- **`0.3.x` — Product Readiness & Stabilization:** compatible operator UX, configuration/least-privilege hardening, repeatable performance evidence, packaging/release hygiene, and fixes that do not require a new public contract. Current candidates include #109, #115, #104, #111, and the bounded investigation/documentation part of #96.
+- **`0.4.0` — Recovery & Reconciliation:** make ambiguous effectful work easier to reconcile without replay by extending durable operation identity/status (#103), adding explicit local-Human current-state acceptance for reviewed low-impact GUI ambiguity (#137), and separating permanent replay tombstones from bounded detailed retirement history (#136).
+- **`0.5.0` — Multi-principal Identity:** add provider-neutral OIDC/JWT caller identity (#139) while preserving the existing exact `principal -> device -> capability` authorizer and existing single-principal/introspection adapters.
+- **`0.6.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through bounded retrievable output (#83), ranged/deterministic filesystem observation (#105), and atomic workspace mutation under explicitly separate writable roots (#107).
+- **`0.7.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106) and separately sandboxed Playwright/E2E execution (#114), informed by the Unix containment investigation in #96 rather than by background-shell escape compatibility.
+
+The exact release number may still move if implementation evidence shows that two areas should be combined, split, deferred, or treated as compatible patch work. The dependency and safety boundary is more important than preserving the numbering.
+
+### Cross-cutting Product Readiness track
+
+Umbrella tracking: [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213). Split concrete implementation work into narrower issues as each sub-area becomes actionable.
+
+Productization is not complete merely because a capability works in source-tree dogfood. Every post-v0.3 milestone should improve or preserve the following product-level foundations:
+
+1. **Distribution and release integrity.** Source releases remain valid, but an installable product path should eventually provide reviewed per-platform artifacts, deterministic checksums, provenance/attestation, an SBOM plus third-party license/notice inventory, and platform signing/notarization where applicable. Release artifacts must contain only intended files and no credentials/private endpoints. Clean-machine artifact-install smoke should validate what users actually receive rather than only the source checkout.
+2. **Install, upgrade, and rollback.** Maintain an explicit supported path for first install, coordinated Hub/Agent/maintenance/helper upgrades, durable-state migration, and rollback. Version-paired components and checkpoint compatibility must remain explicit; incompatible mixed versions fail closed rather than attempting silent rolling compatibility. A release that changes durable or wire state should prove upgrade from the previous supported minor and document the safe rollback boundary.
+3. **First-run and configuration UX.** Keep one clear reference deployment per supported platform, validate configuration before effectful service start where practical, make missing/unsafe secrets and trust anchors actionable, and use `v2_doctor`/preflight-style checks so a new operator can distinguish configuration, permission, capacity, trust, and backend failures without reading internal state files. Safe defaults remain least-privilege and fail closed.
+4. **Operational readiness.** Treat service lifecycle, health/readiness, quarantine, recovery, TLS/key expiry, storage pressure, restart/drain, backup/restore, and incident runbooks as product behavior. Operator signals must be bounded and privacy-safe. A deployment should have a documented way to detect "needs operator action" without exposing raw desktop, command, credential, or identity content.
+5. **Reliability, performance, and resource budgets.** Maintain deterministic regression, soak, concurrency, restart/reconnect, fault-injection, and capacity evidence. #111 should establish reproducible latency/throughput distributions; future releases should also keep explicit CPU/RSS/disk/output/concurrency ceilings where those limits form part of safe operation. Workstation measurements are regression evidence, not production capacity marketing claims.
+6. **Security, privacy, and supply chain.** Preserve the threat model, exact capability authorization, no-auto-replay, secret isolation, key/certificate rotation, private vulnerability reporting, dependency review, CodeQL, and content-minimizing telemetry. New distribution automation must not weaken source/dependency provenance or turn signing infrastructure into runtime authority.
+7. **Compatibility, support, and deprecation.** Publish the supported CUMG minor line, tested OS/Cua/backend/deployment matrix, schema mismatch behavior, and migration/deprecation notes. Before 1.0 only the latest released minor is actively supported; compatibility claims must remain evidence-backed rather than inferred from nearby versions.
+8. **Onboarding and documentation.** A supported reference path should take an operator from installation to healthy diagnostics, a first read-only call, a deliberately authorized effectful call, and the documented recovery path without requiring repository archaeology. EN/JA normative documentation must remain aligned for security, deployment, versioning, and operator-critical behavior.
+
+These are cross-cutting gates rather than a promise to build a hosted dashboard, account system, auto-updater, generic device fleet, or remote-desktop product. A product feature is admitted only when it fits the existing CUMG boundary or that boundary is deliberately revised with evidence.
 
 ### `0.3.0` closeout: V2 Production Hardening
 
@@ -102,7 +127,7 @@ The original dependency sequence has completed through component migration:
 5. `#157` — fail closed on legacy/current launchd coexistence — **closed**;
 6. `#168` — dependency-complete, import-proven Handoff runtime packaging before production cutover — **closed**.
 
-Remaining upstream closeout is intentionally outside CUMG authority: `mcp-execution-handoff#85` needs the first-class Window same-LAN direct physical rerun, `#91` tracks Terminal mobile connection/status presentation, and `#46`/`#45` own final Target Surface terminology/API convergence. CUMG must continue consuming the first-class components without pre-empting those upstream naming decisions. WebRTC video-quality work remains an independent Handoff concern.
+The previously referenced upstream Handoff closeout (#45, #46, #85, and #91) is complete, as are the later LocalAuthentication lifecycle fixes #147/#149. CUMG should keep consuming upstream first-class components rather than forking their semantics. Remaining upstream UX polish such as `mcp-execution-handoff#150` stays an independent Handoff concern and is not a CUMG release blocker unless evidence shows it violates a CUMG safety/operability invariant.
 
 ### Operational dogfood follow-up after the production baseline
 
@@ -117,21 +142,20 @@ This queue records the practical result of continuing Handoff integration and ph
 
 ### Current open issue inventory
 
-The repository's open issues are intentionally classified below so an issue cannot silently fall out of roadmap visibility. Avoid a hard-coded count here because release-closeout issues can close at tag time; this inventory is a tracking map, not a promise that every item ships in the next release.
+The repository's open issues are intentionally classified by working milestone so work cannot silently fall out of roadmap visibility. These milestones are ordering/admission guidance, not a promise that every listed item ships together if evidence later requires a split or defer.
 
-- **`0.3.0` release closeout:** `#100` local-user-authorized online quarantine recovery is complete with trusted physical-macOS acceptance and no-replay restart durability evidence. `#120` owns only the final release/tag-time version/reference re-check and closes with the release.
-- **Recovery and indeterminate-state UX:** `#103` extends durable operation recovery to effectful Desktop/Browser calls; `#109` confirms durable Hub completion from the online-recovery CLI; `#115` makes indeterminate operations actionable without unsafe replay; `#136` separates permanent replay tombstones from bounded retirement audit history; `#137` explores local-human acceptance of current state for low-impact indeterminate GUI operations. None may weaken quarantine, replay fencing, or persistence-gated settlement.
-- **Runtime/process/filesystem hardening:** `#96` investigates deliberate Unix session-detachment escape from process-group supervision; `#104` separates filesystem observation roots from process working-directory roots. These are hardening follow-ups, not current `0.3.0` blockers.
-- **Bounded workspace/developer capabilities:** `#83` adds retrievable references for truncated shell/process output; `#105` adds ranged file reads and deterministic directory continuation; `#106` adds explicitly managed long-running development jobs; `#107` adds bounded atomic workspace mutation without requiring shell; `#114` adds sandboxed Playwright/E2E execution. Each requires an explicit capability boundary rather than inheriting unrestricted shell authority.
-- **Performance and repeatability:** `#111` adds a reproducible Gateway latency/concurrency benchmark. It is measurement infrastructure and does not redefine execution authority.
-- **Post-`0.3.0` identity expansion:** `#139` adds generic OIDC/JWT northbound identity for multi-principal authorization and remains deliberately sequenced after the production-hardening closeout.
-- **Upstream-blocked V1 compatibility:** `#14` (`get_screen_size` session/escalation) and `#15` (`list_apps` live-process discovery mismatch) remain blocked on upstream Cua. They are not active CUMG release blockers and may become no-longer-applicable if V1 is deliberately retired.
+- **`0.3.x — Product Readiness & Stabilization`:** #213 owns the cross-cutting product-readiness gate; #109 closes the online-recovery CLI confirmation gap; #115 makes `Indeterminate` operator UX actionable without replay; #104 separates filesystem observation roots from process cwd roots; #111 establishes repeatable latency/concurrency evidence; #96 investigates the exact Unix descendant-containment boundary.
+- **`0.4.0 — Recovery & Reconciliation`:** #103 extends durable operation identity/status to effectful Desktop/Browser calls; #137 adds reviewed local-Human acceptance of current state without rewriting historical truth; #136 separates permanent replay tombstones from bounded detailed retirement history.
+- **`0.5.0 — Multi-principal Identity`:** #139 adds generic provider-neutral OIDC/JWT identity while preserving the existing exact authorizer.
+- **`0.6.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
+- **`0.7.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle and #114 adds separately sandboxed Playwright/E2E execution.
+- **Upstream-blocked V1 compatibility:** #14 (`get_screen_size` session/escalation) and #15 (`list_apps` live-process discovery mismatch) remain blocked on upstream Cua and intentionally have no active post-v0.3 milestone. They may become no-longer-applicable if V1 is deliberately retired.
 
-The classifications above are ordering/admission guidance only. Severity and acceptance requirements remain authoritative in each issue. If an open issue is not represented in this inventory or another explicit roadmap section, the roadmap is stale and should be corrected before declaring documentation closeout.
+If an open issue is not represented in this inventory or another explicit roadmap section, treat the roadmap as stale and correct it before declaring milestone/release closeout.
 
-### Post-`0.3.0` candidate: multi-principal northbound identity
+### `0.5.0` candidate: multi-principal northbound identity
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) is deliberately **not** part of the `0.3.0` Production Hardening closeout. It is the next admitted northbound-authentication expansion candidate after that operational-readiness work is closed. The tracking milestone is `Post-v0.3 — Multi-principal Northbound Identity`; the milestone intentionally does not pre-assign a release number.
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) is deliberately **not** part of the `0.3.x` stabilization or `0.4.0` Recovery & Reconciliation contract. It is the working `0.5.0` northbound-authentication expansion: a provider-neutral signed-token path for deployments that need distinct authenticated principals. The exact release number remains subject to the admission/evidence rule above.
 
 The target architecture is:
 
@@ -233,6 +257,8 @@ The 1.0 decision is a compatibility commitment. Readiness is reached when the cr
 - control/capability schema upgrade and mismatch behavior is documented;
 - supported backend/deployment compatibility is documented and repeatably accepted;
 - governance, release, security, support, and deprecation rules have been exercised rather than only written down;
+- at least one documented install/upgrade/rollback path uses reviewed release artifacts rather than requiring ad-hoc source-tree assembly, and release integrity/provenance is reproducible;
+- first-run diagnostics, supported compatibility matrices, operational recovery, and resource/health signals are sufficiently clear that normal deployment does not depend on maintainer-only repository knowledge;
 - maintainers are prepared to preserve backward compatibility within 1.x.
 
 Remaining parity gaps do **not** automatically block 1.0. Each gap must instead be classified as supported, intentionally unsupported, deferred, or deprecated so users know the stable boundary.
