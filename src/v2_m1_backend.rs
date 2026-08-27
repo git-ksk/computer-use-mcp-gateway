@@ -409,7 +409,16 @@ impl CuaMcpAdapter {
                 ),
             };
         }
-        if let DeviceCommand::ExpandInteractionScope { context_id, .. } = command {
+        let context_session_to_refresh = match command {
+            DeviceCommand::ExpandInteractionScope { context_id, .. }
+            | DeviceCommand::VerifyUiStateContextual { context_id, .. } => Some(context_id),
+            _ => None,
+        };
+        if let Some(context_id) = context_session_to_refresh {
+            // Cua's session idle TTL is shorter than CUMG's InteractionContext lifetime.
+            // A Human handoff can therefore reclaim the backend session while the
+            // CUMG context remains valid. start_session is idempotent and revives
+            // only this already-admitted context at window scope before verification.
             let start_args = serde_json::json!({
                 "session": context_id,
                 "capture_scope": "auto",
@@ -2675,6 +2684,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{sleep, timeout};
 
+    fn fixture_python() -> String {
+        std::env::var("CUMG_TEST_PYTHON").unwrap_or_else(|_| "python3".into())
+    }
     async fn wait_for_file(path: &Path) {
         timeout(Duration::from_secs(5), async {
             while !path.exists() {
@@ -2691,7 +2703,7 @@ mod tests {
 
     fn fixture_with_timeout(args: Vec<String>, tool_timeout: Duration) -> CuaMcpAdapter {
         CuaMcpAdapter::new(
-            "python3",
+            fixture_python(),
             args,
             "1.0.0",
             "test",
@@ -4296,6 +4308,90 @@ mod tests {
         );
         adapter.shutdown().await.unwrap();
         let _ = fs::remove_file(marker);
+    }
+
+    #[tokio::test]
+    async fn contextual_verification_revives_reclaimed_cua_session_without_desktop_scope() {
+        let marker = transfer_state_dir("verify-session-refresh-marker");
+        let adapter = fixture(vec![
+            "scripts/mock_mcp_backend.py".into(),
+            "--args-marker".into(),
+            marker.to_string_lossy().into_owned(),
+        ]);
+        adapter.connect().await.unwrap();
+        let context_id = "ctx_0123456789abcdef0123456789abcdef";
+        adapter.end_interaction_session(context_id).await.unwrap();
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let outcome = adapter
+            .execute(
+                &DeviceCommand::VerifyUiStateContextual {
+                    context_id: context_id.into(),
+                    process_id: 101,
+                    window_id: 77,
+                    predicates: vec![UiPredicate::WindowExists { exists: true }],
+                    timeout_ms: 1_000,
+                    stable_samples: 1,
+                    include_screenshot: false,
+                },
+                cancel_rx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            BackendExecutionOutcome::Completed(DeviceResult::UiStateVerification {
+                status: VerificationStatus::Satisfied,
+                ..
+            })
+        ));
+
+        wait_for_file(&marker).await;
+        let recorded: Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(recorded["tool"], "start_session");
+        assert_eq!(recorded["arguments"]["session"], context_id);
+        assert_eq!(recorded["arguments"]["capture_scope"], "auto");
+
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_file(marker);
+    }
+
+    #[tokio::test]
+    async fn contextual_verification_refresh_failure_never_dispatches_verify_state() {
+        let verify_marker = transfer_state_dir("verify-after-refresh-failure-marker");
+        let adapter = fixture(vec![
+            "scripts/mock_mcp_backend.py".into(),
+            "--fail-start-session".into(),
+            "--verify-marker".into(),
+            verify_marker.to_string_lossy().into_owned(),
+        ]);
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let outcome = adapter
+            .execute(
+                &DeviceCommand::VerifyUiStateContextual {
+                    context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+                    process_id: 101,
+                    window_id: 77,
+                    predicates: vec![UiPredicate::WindowExists { exists: true }],
+                    timeout_ms: 1_000,
+                    stable_samples: 1,
+                    include_screenshot: false,
+                },
+                cancel_rx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BackendExecutionOutcome::BackendOutcomeIndeterminate
+        );
+        assert!(
+            !verify_marker.exists(),
+            "verification must not dispatch after session refresh failure"
+        );
+        adapter.shutdown().await.unwrap();
+        let _ = fs::remove_file(verify_marker);
     }
 
     #[tokio::test]

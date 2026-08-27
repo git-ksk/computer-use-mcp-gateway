@@ -497,6 +497,7 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let (server_shutdown_tx, mut server_shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(async move {
         Server::builder()
             .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
@@ -505,7 +506,16 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
                     .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
                     .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
             )
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, async move {
+                loop {
+                    if *server_shutdown_rx.borrow() {
+                        break;
+                    }
+                    if server_shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
             .await
     });
 
@@ -586,11 +596,30 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
     assert_eq!(completed.output.stdout, "done");
     assert!(handle.desktop_quarantine().await.is_none());
 
-    let _ = shutdown_tx.send(true);
-    tokio::time::timeout(Duration::from_secs(2), agent_task)
+    assert!(handle.close_live_session_for_shutdown().await);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle.is_online().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("drained Agent session did not close during planned shutdown"))?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !handle.is_online().await,
+        "draining Hub must reject Agent reconnect before process shutdown"
+    );
+    assert!(handle.desktop_quarantine().await.is_none());
+
+    let _ = server_shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), server)
         .await
-        .map_err(|_| anyhow!("Agent did not shut down"))???;
-    server.abort();
+        .map_err(|_| anyhow!("gRPC server did not exit after drained Agent stream closure"))???;
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), agent_task)
+        .await
+        .map_err(|_| anyhow!("Agent task did not terminate after planned Hub shutdown"))?;
     let _ = std::fs::remove_dir_all(hub_state);
     let _ = std::fs::remove_dir_all(agent_state);
     let _ = std::fs::remove_dir_all(fs_root);

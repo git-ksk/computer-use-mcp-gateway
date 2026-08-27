@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use computer_use_mcp_gateway::{
+    v2_agent_handoff::AgentHandoffCoordinator,
     v2_m0_trust::HubKeyRotation,
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig, CuaAgentConfig},
     v2_m1_keys::{load_agent_material, load_trusted_text, load_verifying_key},
+    v2_operator_handoff::{ManagedHandoffRuntimeConfig, ManagedOperatorHandoffAuthority},
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
@@ -69,6 +72,21 @@ struct Config {
     cua_connect_timeout_secs: u64,
     #[arg(long, env = "CUMG_V2_CUA_TOOL_TIMEOUT_SECS", default_value_t = 30)]
     cua_tool_timeout_secs: u64,
+    /// Absolute Node.js executable for the Agent-local canonical Handoff runtime.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_COMMAND")]
+    handoff_runtime_command: Option<PathBuf>,
+    /// Absolute CUMG Handoff runtime host script. The normal target is scripts/v2_handoff_runtime.mjs.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_SCRIPT")]
+    handoff_runtime_script: Option<PathBuf>,
+    /// Private Node --env-file containing only Handoff/runtime configuration and transport secrets.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_ENV_FILE")]
+    handoff_runtime_env_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS",
+        default_value_t = 2
+    )]
+    handoff_runtime_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -110,6 +128,56 @@ async fn main() -> Result<()> {
         reconnect_attempts: 3,
         reconnect_backoff: Duration::from_millis(200),
     });
+    let managed_handoff_fields = [
+        args.handoff_runtime_command.is_some(),
+        args.handoff_runtime_script.is_some(),
+        args.handoff_runtime_env_file.is_some(),
+    ];
+    anyhow::ensure!(
+        args.handoff_runtime_timeout_secs > 0,
+        "CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS must be greater than zero"
+    );
+    anyhow::ensure!(
+        !managed_handoff_fields
+            .into_iter()
+            .any(|configured| configured)
+            || managed_handoff_fields
+                .into_iter()
+                .all(|configured| configured),
+        "CUMG_V2_HANDOFF_RUNTIME_COMMAND, CUMG_V2_HANDOFF_RUNTIME_SCRIPT, and CUMG_V2_HANDOFF_RUNTIME_ENV_FILE must be configured together"
+    );
+    let handoff_runtime = if managed_handoff_fields
+        .into_iter()
+        .all(|configured| configured)
+    {
+        let config = ManagedHandoffRuntimeConfig::new(
+            args.handoff_runtime_command
+                .clone()
+                .expect("validated Agent Handoff runtime command"),
+            args.handoff_runtime_script
+                .clone()
+                .expect("validated Agent Handoff runtime script"),
+            args.handoff_runtime_env_file
+                .clone()
+                .expect("validated Agent Handoff runtime env file"),
+            Duration::from_secs(args.handoff_runtime_timeout_secs),
+        )
+        .context("invalid Agent-local managed Handoff runtime configuration")?;
+        let runtime = Arc::new(
+            ManagedOperatorHandoffAuthority::spawn(config)
+                .await
+                .context("failed to start Agent-local managed Handoff runtime")?,
+        );
+        info!(
+            event = "v2_agent_handoff_runtime_configured",
+            mode = "managed_stdio",
+            outcome = "ready",
+            "Agent-local canonical Handoff runtime configured"
+        );
+        Some(Arc::new(AgentHandoffCoordinator::new(runtime)))
+    } else {
+        None
+    };
     let config = AgentServiceConfig {
         hub_endpoint: args.hub_endpoint,
         hub_domain: args.hub_domain,
@@ -126,6 +194,9 @@ async fn main() -> Result<()> {
     };
     let mut agent =
         AgentService::new(config, material).context("invalid V2 Agent configuration")?;
+    if let Some(coordinator) = handoff_runtime.as_ref() {
+        agent = agent.with_handoff_coordinator(coordinator.clone());
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -135,5 +206,9 @@ async fn main() -> Result<()> {
         event = "v2_agent_start",
         "starting outbound V2 Agent service"
     );
-    agent.run(shutdown_rx).await.context("V2 Agent stopped")
+    let result = agent.run(shutdown_rx).await.context("V2 Agent stopped");
+    if let Some(runtime) = handoff_runtime.as_ref() {
+        runtime.shutdown().await;
+    }
+    result
 }

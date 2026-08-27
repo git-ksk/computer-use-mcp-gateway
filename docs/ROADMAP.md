@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-08-15: **V1 closed, V2 execution-safety baseline complete, current released version `v0.2.0`.**
+Status as of 2026-08-26: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.2.0`.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -41,17 +41,28 @@ The completed V1/V2 implementation history and acceptance evidence remain availa
 Current priorities:
 
 - preserve the authoritative operation/quarantine/resolution/no-auto-replay state machine;
-- keep control schema v8 and capability-advertisement schema v4 behavior explicit until a reviewed change requires otherwise;
+- keep live control schema v9 and capability-advertisement schema v5 behavior explicit; capability schema v5 is the reviewed change that adds the signed payload-free reconciliation-report boundary, and mixed versions fail closed;
 - keep Cua Driver upgrades as reviewed compatibility changes with pinned/repeatable evidence;
 - maintain security, dependency, documentation, packaging, CI, conformance, soak, and resource-regression quality;
-- investigate and close or explicitly document the remaining V1 compatibility/quality issues:
-  - issue #14 — read-only `get_screen_size` session/escalation semantics;
-  - issue #15 — inconsistent Cua Driver application/process discovery identity;
-  - issue #20 — portable behavior for the V1 idle resource quality gate without weakening Linux enforcement;
+- keep the remaining V1-only compatibility observations (#14 and #15) explicitly blocked on their upstream Cua issues rather than treating them as active CUMG release blockers;
 - fix compatible runtime/security/reliability defects as PATCH candidates;
 - keep docs-only/editorial work version-neutral unless an immutable corrected release snapshot is operationally necessary.
 
 A compatible fix merged after `v0.2.0` may contribute to a future `0.2.1`; the roadmap does not require a release merely because maintenance commits exist.
+
+### Legacy V1 retirement candidate
+
+`v1_gateway` remains in `main` for regression/reference and any still-existing legacy deployment. It is not a separately maintained `0.1.x` line and does not receive routine backports. V2 Hub + Agent is the recommended runtime.
+
+Retiring V1 is now a valid future simplification candidate, but removal must be deliberate rather than incidental maintenance. Before removal:
+
+- confirm no supported production deployment still depends on `v1_gateway`;
+- decide which V1 regression/conformance fixtures remain valuable as backend-contract tests and migrate or archive them intentionally;
+- resolve or close V1-only upstream-blocked issues such as #14/#15 as no longer applicable if the surface is retired;
+- remove V1 configuration/deployment documentation and compatibility claims coherently;
+- classify the removal as a pre-1.0 incompatible public-contract change and ship it only through an appropriate MINOR release with migration/release notes.
+
+Until those conditions are met, keep V1 narrow and regression-only; do not expand it with new capabilities.
 
 ## Next minor: admission-driven, not number-driven
 
@@ -59,29 +70,90 @@ The next minor release is created only when accepted work changes or meaningfull
 
 Candidate areas are evaluated independently.
 
-### `0.3.0` candidate: V2 Production Hardening
+### `0.3.0` closeout: V2 Production Hardening
 
-The current candidate theme for `0.3.0` is **V2 Production Hardening / Operational Readiness**: close the reliability, recoverability, observability, local-abuse, and trust-lifecycle gaps found during sustained V2 operation without weakening the authoritative operation/quarantine/no-auto-replay safety model.
+The original `0.3.0` Production Hardening / Operational Readiness baseline is implemented. Issues `#64` through `#73` are all closed and established the production recovery, shutdown, persistence, audit, local-abuse, trust-lifecycle, and signing-authority foundations without weakening the authoritative operation/quarantine/no-auto-replay model.
 
-The target issue set is `#64` through `#73`:
+The remaining explicit `0.3.0` release blocker is **#100 — local-user-authorized online quarantine recovery**. Its implementation exists in draft PR #101; release acceptance still requires the trusted physical-macOS Secure Enclave/user-presence flow and confirmation that a real ambiguous desktop operation is observed and resolved without replay.
 
-- recovery and restart safety: `#64` production quarantine resolution, `#65` SIGTERM plus bounded operation drain, `#72` operator-visible quarantine alerting;
-- persistence and incident closure: `#69` bounded in-generation checkpoint growth, `#73` persistence crash-loop root-cause confirmation or evidence-backed exclusion;
-- audit and local caller protection: `#70` northbound client correlation, `#71` loopback caller rate limiting/trust gate;
-- trust lifecycle: `#68` bounded Agent session lifetime and device-key rotation procedure, `#67` repeatable enrollment/trust-anchor lifecycle, `#66` grant-signing isolation/external signer boundary.
+`0.3.0` therefore does **not** absorb every issue discovered by later dogfood. New work blocks the release only when evidence shows that it violates an already-promised `0.3.0` safety/operability invariant or invalidates #100 acceptance. Otherwise it remains issue-driven follow-up hardening. This keeps release scope bounded while preserving fail-closed semantics.
 
-Implementation remains **issue-driven and PR-isolated**, in this preferred dependency order:
+The completed baseline was:
 
-1. `#65` planned-shutdown safety;
-2. `#69` and `#73` persistence boundedness and incident root cause;
-3. `#64` audited production quarantine resolution;
-4. `#72`, `#70`, and `#71` operator visibility, audit correlation, and local abuse resistance;
-5. `#68` and `#67` session/device/trust-anchor lifecycle;
-6. `#66` signing-authority isolation, after the lifecycle boundary is explicit.
+- recovery and restart safety: `#64`, `#65`, `#72`;
+- persistence and incident closure: `#69`, `#73`;
+- audit and local caller protection: `#70`, `#71`;
+- trust lifecycle and signing authority: `#68`, `#67`, `#66`.
 
-A change that is PATCH-compatible in isolation (for example `#65` or `#69`) may still ship first in `0.3.0` when no intervening `0.2.x` release is operationally necessary; SemVer classification is based on the release as a whole, not on forcing every included fix to require a minor bump. The milestone must not turn into one aggregate implementation PR: each issue retains its own acceptance evidence and review boundary.
+The existing release PR #99 predates substantial merged-main work. It must be refreshed or replaced from current `main` after #100 acceptance rather than merged as a stale release snapshot.
 
-`0.3.0` is not accepted merely because every issue is closed. Before release, the resulting public/operator contract must satisfy the minor-release acceptance gate below, and any scope that cannot preserve the documented V2 safety invariants must be deferred rather than weakened to meet the milestone.
+### First-class Human Handoff: integrated, now in dogfood hardening
+
+Physical CUMG + `mcp-execution-handoff` acceptance has proven the bounded OS-window lifecycle through Agent -> Human -> verifying -> explicit Agent resume, including direct/TURN transport fallback, fresh exact-window verification, restart/context-expiry/generation-rollover recovery, no automatic replay, and zero residual quarantine. The acceptance-only Unix-socket bridge is therefore no longer the intended long-term runtime architecture.
+
+Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) completed this integration and its merged-main physical OS-window acceptance. The topology is intentionally **first-class but optional**: ordinary CUMG capabilities do not require Handoff, but a deployment that enables Handoff must treat its authority decision as part of the execution boundary rather than as a best-effort sidecar. The controlled Agent owns the canonical Handoff FSM/checkpoint, WebRTC/TURN, capture, Human input, and local verification; the Hub retains CUMG authorization/ledger/quarantine and only a conservative pre-dispatch fence plus signed operator-control relay. Hub and Agent therefore do not run duplicate Handoff state machines. Live generation rollover uses an explicit same-surface `rebind_live`, and the final Agent gate re-validates the signed authority binding against the actual command immediately before Cua. Runtime/transport unavailability after Handoff is enabled must fail closed rather than silently bypass the coordinator. The legacy Unix bridge stays compatibility/regression-only.
+
+The original dependency sequence has completed through component migration:
+
+1. `#152` — first-class CUMG HandoffCoordinator and OS-window regression acceptance — **closed**;
+2. `mcp-execution-handoff#48` — bounded PTY semantic dogfood — **closed**;
+3. `mcp-execution-handoff#47` — reusable bounded OS/window primitives — **closed**;
+4. CUMG `#176` / `#177` — migrate Window and Terminal runtime composition to upstream `WindowHandoffAdapter` / `TerminalHandoffAdapter` — **merged**;
+5. `#157` — fail closed on legacy/current launchd coexistence — **closed**;
+6. `#168` — dependency-complete, import-proven Handoff runtime packaging before production cutover — **closed**.
+
+Remaining upstream closeout is intentionally outside CUMG authority: `mcp-execution-handoff#85` needs the first-class Window same-LAN direct physical rerun, `#91` tracks Terminal mobile connection/status presentation, and `#46`/`#45` own final Target Surface terminology/API convergence. CUMG must continue consuming the first-class components without pre-empting those upstream naming decisions. WebRTC video-quality work remains an independent Handoff concern.
+
+### Operational dogfood follow-up after the production baseline
+
+Sustained CUMG + Handoff dogfood after the original production-hardening baseline intentionally continued to exercise real failure/recovery paths. That work found additional issues without changing the core authority model. Track them as a stabilization queue rather than silently expanding the `0.3.0` release gate:
+
+- execution/recovery semantics: `#179` partial input effects, `#180` quarantine-safe evidence lane, `#181` privacy-preserving evidence envelope, `#133` first-class reconciliation-readiness audit, plus `#115`/`#136`/`#137` recovery/retirement UX work;
+- Handoff/operator lifecycle: `#184` in-band Handoff-begin self-interference and `#185` explicit one-shot single-Mac maintenance jobs;
+- diagnostics and host reliability: `#141` privacy-safe structured execution errors, `#143` privacy-safe browser-staging startup stage/I/O diagnostics, `#112` disk/temp-exhaustion fail-closed diagnostics and recovery, and `#194` `v2_doctor` self-observation;
+- each issue keeps its own severity, compatibility, tests, and acceptance boundary. A follow-up may be PATCH-compatible, admitted to a later minor, or deferred; none weakens quarantine/no-replay semantics to reduce backlog.
+
+This queue records the practical result of continuing Handoff integration and physical dogfood while #100 remained the known `0.3.0` blocker.
+
+### Current open issue inventory
+
+As of 2026-08-26 the repository has **18 open issues**. Every open issue is intentionally listed here so an issue cannot silently fall out of roadmap visibility. This inventory is a tracking snapshot, not a promise that every item ships in the next release; issue closure/opening must update this section or a nearby roadmap section in the same documentation pass.
+
+- **`0.3.0` release gate / closeout:** `#100` local-user-authorized online quarantine recovery is the only explicit runtime release blocker and still needs trusted physical-macOS acceptance; `#120` is release-document closeout and now retains only the final tag-time version/reference re-check.
+- **Recovery and indeterminate-state UX:** `#103` extends durable operation recovery to effectful Desktop/Browser calls; `#109` confirms durable Hub completion from the online-recovery CLI; `#115` makes indeterminate operations actionable without unsafe replay; `#136` separates permanent replay tombstones from bounded retirement audit history; `#137` explores local-human acceptance of current state for low-impact indeterminate GUI operations. None may weaken quarantine, replay fencing, or persistence-gated settlement.
+- **Runtime/process/filesystem hardening:** `#96` investigates deliberate Unix session-detachment escape from process-group supervision; `#104` separates filesystem observation roots from process working-directory roots. These are hardening follow-ups, not current `0.3.0` blockers.
+- **Bounded workspace/developer capabilities:** `#83` adds retrievable references for truncated shell/process output; `#105` adds ranged file reads and deterministic directory continuation; `#106` adds explicitly managed long-running development jobs; `#107` adds bounded atomic workspace mutation without requiring shell; `#114` adds sandboxed Playwright/E2E execution. Each requires an explicit capability boundary rather than inheriting unrestricted shell authority.
+- **Performance and repeatability:** `#111` adds a reproducible Gateway latency/concurrency benchmark. It is measurement infrastructure and does not redefine execution authority.
+- **Post-`0.3.0` identity expansion:** `#139` adds generic OIDC/JWT northbound identity for multi-principal authorization and remains deliberately sequenced after the production-hardening closeout.
+- **Upstream-blocked V1 compatibility:** `#14` (`get_screen_size` session/escalation) and `#15` (`list_apps` live-process discovery mismatch) remain blocked on upstream Cua. They are not active CUMG release blockers and may become no-longer-applicable if V1 is deliberately retired.
+
+The classifications above are ordering/admission guidance only. Severity and acceptance requirements remain authoritative in each issue. If an open issue is not represented in this inventory or another explicit roadmap section, the roadmap is stale and should be corrected before declaring documentation closeout.
+
+### Post-`0.3.0` candidate: multi-principal northbound identity
+
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) is deliberately **not** part of the `0.3.0` Production Hardening closeout. It is the next admitted northbound-authentication expansion candidate after that operational-readiness work is closed. The tracking milestone is `Post-v0.3 — Multi-principal Northbound Identity`; the milestone intentionally does not pre-assign a release number.
+
+The target architecture is:
+
+```text
+external OAuth/OIDC identity provider
+        |
+verified signed token (provider boundary)
+        |
+generic OIDC/JWT adapter
+        |
+AuthenticatedClientPrincipal { issuer, subject }
+        |
+DeviceCapabilityAuthorizer
+        |
+principal -> stable device -> exact DeviceCapability
+```
+
+The adapter must remain provider-neutral and fail closed. It verifies signature, issuer, audience, time claims, subject, algorithm policy, and bounded JWKS/metadata rotation before producing the existing CUMG principal. Caller-supplied identity headers and MCP `clientInfo` remain audit metadata only and never become authorization authority.
+
+This work does **not** make CUMG an identity provider, account database, session manager, or token issuer. Existing RFC 7662 introspection and the explicitly single-principal trusted-proxy adapter remain supported deployment choices. A signed-token deployment may remove a fixed-principal local proxy bridge when that bridge exists only to establish identity; a reverse proxy or tunnel may still remain for transport, origin hardening, rate limiting, or defense in depth.
+
+Acceptance requires at least two verified subjects receiving different exact device/capability decisions through the existing `DeviceCapabilityAuthorizer`, with bad signature/issuer/audience/time/key/subject/algorithm cases failing closed and no regression to the existing authentication adapters.
 
 ### Remaining semantic parity decisions
 

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 8;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
+pub const CONTROL_SCHEMA_VERSION: u16 = 9;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 5;
 /// First dedicated persisted registry schema. The numeric value intentionally
 /// matches the last historical control schema that was written into this field,
 /// so current rollback binaries can still read newly persisted checkpoints.
@@ -87,6 +87,24 @@ pub enum DeviceCapability {
 }
 
 impl DeviceCapability {
+    pub fn is_recovery_evidence_read_only(self) -> bool {
+        matches!(
+            self,
+            Self::ListApplications
+                | Self::ScreenGeometry
+                | Self::Screenshot
+                | Self::ReadFile
+                | Self::ListDirectory
+                | Self::ListWindows
+                | Self::InspectWindow
+                | Self::VerifyUiState
+                | Self::ClipboardRead
+                | Self::PointerPosition
+                | Self::CaptureRegion
+                | Self::BrowserInspect
+        )
+    }
+
     pub fn class(self) -> CapabilityClass {
         match self {
             Self::ListApplications
@@ -852,14 +870,24 @@ impl DeviceRegistry {
     pub(crate) fn from_persisted_snapshot(
         mut snapshot: DeviceRegistrySnapshot,
     ) -> Result<Self, ControlError> {
-        if snapshot.schema_version == DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION {
+        if snapshot.schema_version == DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION
+            && snapshot.devices.iter().all(|device| {
+                device.capabilities.as_ref().is_none_or(|capabilities| {
+                    capabilities.capability_schema_version == CAPABILITY_SCHEMA_VERSION
+                })
+            })
+        {
             return Self::from_snapshot(snapshot);
         }
 
+        // Registry schema 7 was already persisted while capability schema 4 was
+        // current. Treat that exact historical pairing like the older persisted
+        // formats: validate it, discard stale capability advertisements, and
+        // require the Agent to advertise the current schema after reconnect.
         let expected_capability_schema = match snapshot.schema_version {
             2 => 2,
             3 => 3,
-            4..=6 => 4,
+            4..=DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION => 4,
             got => return Err(ControlError::UnsupportedControlSchema { got }),
         };
         for device in &snapshot.devices {
@@ -1462,9 +1490,19 @@ pub enum DeviceErrorCode {
     IoFailure,
     InternalFailure,
     BackendOutcomeIndeterminate,
+    HandoffAuthoritySuspended,
+    HandoffRuntimeUnavailable,
+    HandoffVerificationUnavailable,
     EnvironmentKeyDenied,
     InvalidEnvironment,
     TooManyEnvironmentEntries,
+    WorkingDirectoryDenied,
+    WorkingDirectoryInvalid,
+    InvalidTimeout,
+    InvalidProgram,
+    ProgramDenied,
+    TooManyArguments,
+    ProcessSpawnFailed,
     BrowserRouteUnavailable,
     BrowserRequiresSetup,
     BrowserBindingAmbiguous,
@@ -1493,9 +1531,19 @@ impl DeviceErrorCode {
             Self::IoFailure => "io_failure",
             Self::InternalFailure => "internal_failure",
             Self::BackendOutcomeIndeterminate => "backend_outcome_indeterminate",
+            Self::HandoffAuthoritySuspended => "handoff_authority_suspended",
+            Self::HandoffRuntimeUnavailable => "handoff_runtime_unavailable",
+            Self::HandoffVerificationUnavailable => "handoff_verification_unavailable",
             Self::EnvironmentKeyDenied => "environment_key_denied",
             Self::InvalidEnvironment => "invalid_environment",
             Self::TooManyEnvironmentEntries => "too_many_environment_entries",
+            Self::WorkingDirectoryDenied => "working_directory_denied",
+            Self::WorkingDirectoryInvalid => "working_directory_invalid",
+            Self::InvalidTimeout => "invalid_timeout",
+            Self::InvalidProgram => "invalid_program",
+            Self::ProgramDenied => "program_denied",
+            Self::TooManyArguments => "too_many_arguments",
+            Self::ProcessSpawnFailed => "process_spawn_failed",
             Self::BrowserRouteUnavailable => "browser_route_unavailable",
             Self::BrowserRequiresSetup => "browser_requires_setup",
             Self::BrowserBindingAmbiguous => "browser_binding_ambiguous",
@@ -2180,6 +2228,29 @@ mod tests {
     }
 
     #[test]
+    fn process_policy_codes_have_closed_safe_wire_names() {
+        let cases = [
+            (
+                DeviceErrorCode::WorkingDirectoryDenied,
+                "working_directory_denied",
+            ),
+            (
+                DeviceErrorCode::WorkingDirectoryInvalid,
+                "working_directory_invalid",
+            ),
+            (DeviceErrorCode::InvalidTimeout, "invalid_timeout"),
+            (DeviceErrorCode::InvalidProgram, "invalid_program"),
+            (DeviceErrorCode::ProgramDenied, "program_denied"),
+            (DeviceErrorCode::TooManyArguments, "too_many_arguments"),
+            (DeviceErrorCode::ProcessSpawnFailed, "process_spawn_failed"),
+        ];
+        for (code, wire) in cases {
+            assert_eq!(code.safe_code(), wire);
+            assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(wire));
+        }
+    }
+
+    #[test]
     fn browser_refusal_codes_have_closed_safe_wire_names() {
         let cases = [
             (
@@ -2644,7 +2715,9 @@ mod tests {
         registry.connect(&device_id, capabilities(5)).unwrap();
         let current = registry.snapshot();
 
-        for (legacy_schema, legacy_capability_schema) in [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4)] {
+        for (legacy_schema, legacy_capability_schema) in
+            [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4), (7, 4)]
+        {
             let mut legacy = current.clone();
             legacy.schema_version = legacy_schema;
             legacy.devices[0]

@@ -181,6 +181,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(windows)]
+    use std::process::Command;
+
     fn temp_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -189,10 +192,34 @@ mod tests {
         std::env::temp_dir().join(format!("cumg-{label}-{unique}"))
     }
 
+    #[cfg(windows)]
+    fn lock_down_windows_test_directory(path: &Path) {
+        let identity = Command::new("whoami").output().expect("run whoami");
+        assert!(identity.status.success());
+        let identity = String::from_utf8(identity.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let output = Command::new("icacls.exe")
+            .arg(path)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{identity}:(OI)(CI)F"),
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "/Q",
+            ])
+            .output()
+            .expect("run icacls");
+        assert!(output.status.success());
+    }
     #[test]
     fn enrollment_bundle_is_repeatable_safe_and_matches_hub_registration() {
         let root = temp_dir("enrollment");
         fs::create_dir(&root).unwrap();
+        #[cfg(windows)]
+        lock_down_windows_test_directory(&root);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -200,13 +200,14 @@ fn resolve(
     );
     println!("current_generation={}", authorization.current_generation);
     println!("audit_assessment=inconclusive");
-    println!(
-        "decision={}",
-        match authorization.decision {
-            IndeterminateResolution::ConfirmedCompleted => "confirmed_completed",
-            IndeterminateResolution::ConfirmedNotExecuted => "confirmed_not_executed",
+    let decision_name = match authorization.decision {
+        IndeterminateResolution::ConfirmedCompleted => "confirmed_completed",
+        IndeterminateResolution::ConfirmedNotExecuted => "confirmed_not_executed",
+        IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+            return Err(anyhow::anyhow!("unsupported online recovery decision"));
         }
-    );
+    };
+    println!("decision={decision_name}");
     let key = MacRecoveryKey::load(&key_label).context("recovery key is not provisioned")?;
     let authorization = key
         .sign_authorization(authorization)

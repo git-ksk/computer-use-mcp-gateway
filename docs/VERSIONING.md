@@ -62,6 +62,14 @@ Project/crate versions, wire protocol schemas, capability-advertisement schemas,
 
 A backward-compatible persisted-state migration that restores an already-supported release line without changing wire/configuration behavior is PATCH-eligible. Introducing a new incompatible persisted-state shape, removing support for a previously documented persisted-state version, or requiring operator state transformation is a new compatibility boundary and normally requires a MINOR release before 1.0. This backward-compatible checkpoint migration therefore does **not** by itself require a MINOR version bump.
 
+## Durable-state writer compatibility and maintenance pairing
+
+The execution-safety durable-state schema is an operational compatibility boundary independent of the crate version. Offline recovery must not silently rewrite an older authoritative checkpoint into a newer representation merely because the operator happened to run a newer maintenance binary.
+
+`v2_maint resolve` therefore preserves the input checkpoint's supported writer contract, checks that the proposed post-resolution state is representable, and fails **before publication** when it is not. Packaged deployments must install `v2_hub` and `v2_maint` as a version-paired set from the same reviewed build/release artifact and upgrade the pair together. Keep the corresponding paired binaries with any rollback checkpoint that may be restored. A random newer source checkout is not a supported substitute for the maintenance binary paired with an older deployed Hub.
+
+Read-only inspection commands such as `inspect-quarantine` do not become recovery authority and may read a supported checkpoint without mutating it. For authority-bearing maintenance, if the intended Hub cannot consume the required durable representation, upgrade through the documented compatible Hub + maintenance path first; do not hand-edit state, force a schema downgrade, or move a release tag.
+
 ## `1.0.0` criteria
 
 `1.0.0` means **CUMG is willing to maintain a stable public compatibility contract**, not that every conceivable feature is implemented.

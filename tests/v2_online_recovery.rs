@@ -233,3 +233,17 @@ fn authorization_validation_separates_historical_and_current_generation() {
     .unwrap();
     validate_authorization_against_challenge(&challenge, &authorization, 101).unwrap();
 }
+#[test]
+fn online_recovery_rejects_offline_only_applied_uncommitted_resolution() {
+    let hub = HubIdentity::generate();
+    let quarantine = quarantine();
+    let challenge = build_recovery_challenge(&hub, &quarantine, 9, 100).unwrap();
+    let error = new_authorization(
+        &challenge,
+        RecoveryAuditAssessment::Inconclusive,
+        IndeterminateResolution::ConfirmedEffectAppliedUncommitted,
+        "local user inspected the current desktop",
+    )
+    .unwrap_err();
+    assert_eq!(error.safe_code(), "recovery_invalid_message");
+}

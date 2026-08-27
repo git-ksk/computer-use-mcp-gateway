@@ -17,7 +17,7 @@ async-trait = "0.1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 fs2 = "0.4"
 rand = "0.8"
-ring = "0.17"
+ring = "0.17.14"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 rmcp = { version = "=3.1.2", features = [
@@ -45,11 +45,25 @@ opentelemetry = { version = "0.32.0", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace", "metrics"] }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
+portable-pty = "0.9.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
 security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading"
+] }
 [dev-dependencies]
 pretty_assertions = "1"
 proptest = "1"

@@ -153,11 +153,24 @@ A result must additionally pass the existing connection-bound signature, device,
 - indeterminate reason;
 - quarantine timestamp.
 
-On Hub restart, dispatched/cancel-requested work is normalized to `Indeterminate`, and the quarantine survives. Reconnect or a higher Agent generation does not clear it.
+On Hub restart, dispatched/cancel-requested work is normalized to `Indeterminate`, and the quarantine survives. Reconnect or a higher Agent generation alone does not clear it. With execution-safety schema v4, a later authenticated generation may report payload-free authoritative terminal evidence for that exact prior dispatch; only an exact operation/device/original-generation/capability-revision/capability/dispatch-fence match can self-reconcile it, and no command is replayed.
 
 `HubHandle::resolve_indeterminate` is the semantic resolution API. It requires the exact operation ID, an explicit resolver identity, a decision (`ConfirmedCompleted` or `ConfirmedNotExecuted`), bounded evidence metadata, and a timestamp supplied by the Hub. It records `ResolutionRecord` and produces an `OperatorResolution` receipt. It never re-dispatches the old command.
 
 The resolution transition is **persistence-gated**: if its checkpoint cannot be written, CUMG rolls the in-memory controller back to the quarantined snapshot and returns an error. Reuse is therefore not authorized by a resolution that failed to become durable.
+
+Issue #124 adds an equally persistence-gated automatic settlement for transient response-loss/restart ambiguity. The Hub durably records a pre-send dispatch binding, while the Agent durably journals only bounded payload-free terminal proof generated after its normal execution path has already reached a definite terminal result. A fresh authenticated Agent generation re-signs that journal. Exact proof moves the reconciliation audit state `auto_reconciling -> auto_resolved`; the Hub commits the candidate terminal checkpoint before clearing live quarantine. Missing proof becomes `unrecoverable_evidence_gap`; stale/mismatched/non-authoritative proof requires operator resolution or fails closed. This is reconciliation of an already-executed operation, **not retry/replay**. Request fingerprints and observational checks remain non-authoritative.
+
+Issue #134 adds a third lifecycle operation for a different case: **retirement without outcome settlement**. Execution-safety schema v5 keeps the historical operation state `Indeterminate` and deliberately creates no terminal receipt. A separate durable `RetirementRecord` records `outcome=unknown`, the exact operation/device/original generation/capability, prior indeterminate/reconciliation state, reviewed policy, local-maintenance authority, strictly newer authorizing durable device generation, bounded reason metadata, timestamp, and `replayed=false`. Admission removes only the device-level quarantine and records the exact operation ID in a durable retired-indeterminate replay tombstone. That ID is never pruned by terminal-generation compaction and can never be re-admitted. The initial `TransientUiInteractionV1` policy allows only `Scroll` and `MovePointer`; all other capabilities fail closed. Offline maintenance must name that versioned policy explicitly, so a future allowlist/policy addition cannot silently widen an old runbook. Durable retirement records are capped at 64; reaching the cap fails closed with quarantine intact rather than allowing permanent replay tombstones to grow checkpoint state without bound. Retirement is rejected unless the old dispatch was recorded, no terminal receipt/result exists, reconciliation has already converged to `operator_required` or `unrecoverable_evidence_gap`, and the durable registry proves a newer device generation. It is exposed only through exclusive offline local maintenance and is not a northbound MCP capability.
+
+The semantic distinction is intentional:
+
+- **reconciliation** proves what happened and may produce a terminal state/receipt;
+- **retirement** does not know what happened, preserves `Indeterminate`, permanently abandons the old operation without replay, and may release quarantine only under reviewed policy;
+- **retry** is a new operation ID after normal authorization/admission;
+- **replay** is re-execution/resumption of the old operation ID and remains forbidden.
+
+A retirement checkpoint is persistence-gated exactly like other authority-bearing recovery. A failed publication leaves the older quarantined checkpoint authoritative. Because v4 cannot represent retired-indeterminate tombstones/audit truth, successful retirement upgrades the nested execution-safety checkpoint to schema v5 and cannot be safely downgraded without restoring the pre-retirement checkpoint (which necessarily restores quarantine).
 
 This pass deliberately does **not** add another generic admin-auth protocol. `HubHandle` is a trusted in-process API. A future standalone remote operator/recovery surface must authenticate and authorize the resolver before calling it; merely possessing a northbound MCP principal must not imply recovery authority.
 
@@ -174,7 +187,7 @@ This pass deliberately does **not** add another generic admin-auth protocol. `Hu
 
 A race discovered by the mixed shell+Cua E2E was fixed during this pass: the Agent previously reconnected immediately when a Cua cancellation worker returned indeterminate, which could close the gRPC stream before the already-queued signed `IndeterminateAfterPropagation` acknowledgement was flushed. Cancellation-propagated ambiguity now keeps that session alive after the signed quarantine acknowledgement; autonomous provider timeout still reconnects to force unknown-result handling.
 
-Northbound MCP also distinguishes **protocol/input errors** from **runtime operation outcomes**. Authentication, malformed arguments, invalid context/ref use, and schema violations remain MCP/JSON-RPC errors. Once an operation has entered the execution path, a refusal, backend failure, or indeterminate result is returned as a bounded `CallToolResult` with `isError=true`, a closed CUMG code, and `retry_safe=false`. Provider exception text (including task-group/`ExceptionGroup` details) is not part of the northbound contract.
+Northbound MCP also distinguishes **protocol/input errors** from **runtime operation outcomes**. Authentication, malformed arguments, invalid context/ref use, and schema violations remain MCP/JSON-RPC errors. Once an operation has entered the execution path, a refusal, backend failure, or indeterminate result is returned as a bounded `CallToolResult` with `isError=true`, a closed CUMG code, and `retry_safe=false`. Definite process/shell validation and spawn failures retain only reviewed privacy-safe categories (for example `working_directory_denied`, `invalid_timeout`, `program_denied`, and `process_spawn_failed`); they never echo the requested/allowed path, argv, environment contents, or raw OS error. Native runtime timeout/cancellation still use proven process-termination outcomes, and unknown post-dispatch effects still become indeterminate/quarantined rather than a retryable policy error. Provider exception text (including task-group/`ExceptionGroup` details) is not part of the northbound contract.
 
 ## 8. One desktop boundary for shell/process and Cua
 
@@ -228,6 +241,8 @@ There is intentionally no automatic outer Hub v4 -> v5 migration. Loading an inc
 | network partition/result-loss + Hub/Agent restart race | `tests/v2_m1_partition_recovery.rs` aborts Agent after dispatch while the local side effect can still complete, restarts `SingleDeviceHub` from the durable quarantine checkpoint, then reconnects a newer Agent generation |
 | shell + GUI same ownership boundary | `tests/v2_m1_desktop_boundary_e2e.rs` full Hub-Agent TLS/gRPC path |
 | real Cua cancellation regression | `tests/v2_m1_cua_cancellation_e2e.rs` on operator-controlled macOS with Cua Driver |
+| authoritative self-reconciliation (#124) | schema-v4 controller/transport/persistence regressions cover Hub restart after dispatch, result-delivery loss, exact terminal proof, stale generation/device/capability/revision/fence mismatch, missing evidence escalation, payload-free Agent restart journal, fresh-session signature binding, and checkpoint-before-live-clear ordering |
+| unknown-outcome retirement (#134) | schema-v5 controller/admission/maintenance regressions cover legacy scroll ambiguity, durable unknown outcome, permanent old-ID tombstone, newer-generation fence, explicit versioned policy pinning, duplicate/conflicting transition rejection, high-impact policy refusal, bounded retirement capacity, restart persistence, privacy-bounded history, and failed checkpoint publication leaving quarantine authoritative |
 | real Cua post-effect backend-error regression | `scripts/v2_issue47_browser_alert_acceptance.sh`: isolated Chrome alert side effect followed by provider error must classify as `BackendOutcomeIndeterminate` |
 
 Final acceptance on the P0 tree passed:
@@ -252,8 +267,8 @@ The P0 implementation was reviewed against these failure classes:
 
 - **competing principal:** owner mismatch rejects cancel/finalize; queued work is independently identified and is cancelled if the active desktop becomes ambiguous;
 - **stale Agent/worker:** connection signature + device generation + worker generation + operation identity fence finalization;
-- **lost response/network partition:** dispatch is durable before send, so missing result cannot revert to not-started; Hub quarantines;
-- **Hub restart:** runnable in-flight work is never restored; ambiguous dispatch becomes quarantine;
+- **lost response/network partition:** dispatch is durable before send, so missing result cannot revert to not-started; Hub quarantines. A later exact signed terminal proof may settle the same old dispatch without replay; otherwise quarantine remains;
+- **Hub restart:** runnable in-flight work is never restored; ambiguous dispatch becomes quarantine. Schema-v4 dispatch binding survives restart and may be matched only by authoritative terminal evidence from the exact old operation;
 - **Agent restart:** consumed grants and terminal/active replay barriers remain persisted; old worker completion cannot be accepted into a new generation;
 - **late cancellation acknowledgement:** cannot mutate terminal/quarantined state;
 - **duplicate finalization:** illegal after first terminal transition;

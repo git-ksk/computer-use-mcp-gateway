@@ -1,0 +1,12 @@
+{
+  "component": "proxy",
+  "executable": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\bin\\caddy.exe",
+  "workingDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway",
+  "logDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\logs",
+  "restartDelaySeconds": 2,
+  "waitForTcp": "127.0.0.1:8102",
+  "arguments": [
+    "run", "--config", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\run\\Caddyfile",
+    "--envfile", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\run\\caddy.env"
+  ]
+}

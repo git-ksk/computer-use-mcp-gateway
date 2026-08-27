@@ -307,6 +307,9 @@ pub const fn resolution_name(resolution: &IndeterminateResolution) -> &'static s
     match resolution {
         IndeterminateResolution::ConfirmedCompleted => "confirmed_completed",
         IndeterminateResolution::ConfirmedNotExecuted => "confirmed_not_executed",
+        IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+            "confirmed_effect_applied_uncommitted"
+        }
     }
 }
 

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.git-ksk.cumg-v2-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BINARY_DIR@/v2_agent</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CUMG_V2_HUB_ENDPOINT</key><string>https://127.0.0.1:7443</string>
+    <key>CUMG_V2_HUB_DOMAIN</key><string>localhost</string>
+    <key>CUMG_V2_DEVICE_ID</key><string>REPLACE_WITH_STABLE_DEVICE_ID</string>
+    <key>CUMG_V2_DEVICE_SECRET_FILE</key><string>@ROOT@/v2/secrets/device.key</string>
+    <key>CUMG_V2_HUB_PUBLIC_KEY_FILE</key><string>@ROOT@/v2/trust/hub.pub</string>
+    <key>CUMG_V2_GRANT_PUBLIC_KEY_FILE</key><string>@ROOT@/v2/trust/grant.pub</string>
+    <key>CUMG_V2_TLS_ROOT_DER_FILE</key><string>@ROOT@/v2/trust/tls-root.der</string>
+    <key>CUMG_V2_STATE_DIR</key><string>@ROOT@/v2/state/agent</string>
+    <key>CUMG_V2_ALLOWED_CWD_ROOTS</key><string>@HOME@,/private/tmp</string>
+    <key>CUMG_V2_CUA_COMMAND</key><string>@HOME@/.local/bin/cua-driver</string>
+    <key>CUMG_V2_CUA_ARGS</key><string>mcp</string>
+    <key>CUMG_V2_CUA_BACKEND_VERSION</key><string>0.19.3</string>
+    <key>CUMG_V2_HANDOFF_RUNTIME_COMMAND</key><string>@HANDOFF_RUNTIME_COMMAND@</string>
+    <key>CUMG_V2_HANDOFF_RUNTIME_SCRIPT</key><string>@HANDOFF_RUNTIME_SCRIPT@</string>
+    <key>CUMG_V2_HANDOFF_RUNTIME_ENV_FILE</key><string>@HANDOFF_RUNTIME_ENV_FILE@</string>
+    <key>CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS</key><string>5</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>ThrottleInterval</key><integer>2</integer>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/computer-use-mcp-gateway-v2/agent.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/computer-use-mcp-gateway-v2/agent.err.log</string>
+</dict>
+</plist>

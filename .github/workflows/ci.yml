@@ -38,7 +38,13 @@ jobs:
         run: cargo test --locked
 
       - name: Python harness syntax
-        run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_cua_mcp_backend.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_conformance.py
+        run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_cua_mcp_backend.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_conformance.py scripts/v2_handoff_runtime_cleanup.py scripts/v2_handoff_runtime_preflight.py scripts/v2_launchd_topology_guard.py scripts/v2_launchd_maintenance_job.py scripts/tests/test_v1_quality_gate.py scripts/tests/test_v2_handoff_runtime_cleanup.py scripts/tests/test_v2_handoff_runtime_preflight.py scripts/tests/test_v2_launchd_topology_guard.py scripts/tests/test_v2_launchd_maintenance_job.py
+
+      - name: Python harness tests
+        run: python3 -m unittest scripts/tests/test_v1_quality_gate.py scripts/tests/test_v2_handoff_runtime_cleanup.py scripts/tests/test_v2_handoff_runtime_preflight.py scripts/tests/test_v2_launchd_topology_guard.py scripts/tests/test_v2_launchd_maintenance_job.py
+
+      - name: Operator Handoff bridge tests
+        run: node --test scripts/tests/v2_operator_handoff_bridge.test.mjs
 
       - name: Build V1 gateway for legacy quality gate
         run: cargo build --locked --bin v1_gateway

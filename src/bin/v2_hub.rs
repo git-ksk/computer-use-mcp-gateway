@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
+#[cfg(unix)]
+use computer_use_mcp_gateway::v2_handoff_control::UnixHandoffControlServer;
 use computer_use_mcp_gateway::{
     v2_grant_signer::HubGrantSigner,
+    v2_handoff_coordinator::HandoffCoordinator,
     v2_m0_trust::DeviceKeyRotation,
     v2_m1_grpc::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
@@ -19,7 +22,7 @@ use computer_use_mcp_gateway::{
         OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp, build_northbound_router,
         build_trusted_proxy_router,
     },
-    v2_usage::{McpUsageController, UsageManager},
+    v2_operator_handoff::UnixOperatorHandoffAuthority,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch};
@@ -28,6 +31,8 @@ use tracing::{info, warn};
 
 const MAX_OAUTH_SECRET_BYTES: u64 = 16 * 1024;
 const MAX_TRUSTED_PROXY_SECRET_BYTES: u64 = 256;
+const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
+const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
@@ -123,6 +128,35 @@ struct Args {
     /// Integrity-protected JSON principal -> device -> exact-capability mapping.
     #[arg(long, env = "CUMG_V2_NORTHBOUND_POLICY_FILE")]
     northbound_policy_file: Option<PathBuf>,
+    /// Compatibility-only local Unix socket for the acceptance/regression Handoff bridge.
+    /// Mutually exclusive with the first-class managed Handoff runtime.
+    #[arg(long, env = "CUMG_V2_OPERATOR_HANDOFF_SOCKET")]
+    operator_handoff_socket: Option<PathBuf>,
+    /// Legacy Hub-owned Handoff runtime setting. First-class Handoff now runs on the Agent;
+    /// configuring any of these Hub runtime fields is refused rather than silently spawning it here.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_COMMAND")]
+    handoff_runtime_command: Option<PathBuf>,
+    /// Absolute CUMG Handoff runtime host script. The normal target is scripts/v2_handoff_runtime.mjs.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_SCRIPT")]
+    handoff_runtime_script: Option<PathBuf>,
+    /// Private Node --env-file containing only Handoff/runtime configuration and transport secrets.
+    #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_ENV_FILE")]
+    handoff_runtime_env_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS",
+        default_value_t = 2
+    )]
+    handoff_runtime_timeout_secs: u64,
+    /// Private local operator socket for typed Handoff lifecycle control. This is never MCP.
+    /// The Hub owns only this local relay; the canonical Handoff runtime/FSM runs on the Agent.
+    #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
+    handoff_control_socket: Option<PathBuf>,
+    /// Optional private key material used only to HMAC canonical shell/process requests for
+    /// privacy-preserving same/different reconciliation. The raw key and fingerprint are never
+    /// emitted by normal audit surfaces.
+    #[arg(long, env = "CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE")]
+    audit_fingerprint_secret_file: Option<PathBuf>,
     /// Fixed authenticated principal for an explicitly single-principal trusted-proxy deployment.
     /// Must be used only with a loopback listener reachable through the reviewed proxy/tunnel.
     #[arg(long, env = "CUMG_V2_TRUSTED_PROXY_ISSUER")]
@@ -159,12 +193,6 @@ struct Args {
         default_value_t = 120
     )]
     max_northbound_requests_per_minute: usize,
-    /// Optional loopback-only mcp-usage-control sidecar endpoint. When omitted,
-    /// V2 uses the no-op accounting controller and preserves pre-integration behavior.
-    #[arg(long, env = "CUMG_V2_USAGE_ENDPOINT")]
-    usage_endpoint: Option<String>,
-    #[arg(long, env = "CUMG_V2_USAGE_TIMEOUT_SECS", default_value_t = 2)]
-    usage_timeout_secs: u64,
 }
 
 struct NorthboundRuntime {
@@ -215,8 +243,8 @@ async fn main() -> Result<()> {
         "CUMG_V2_OAUTH_INTROSPECTION_TIMEOUT_SECS must be greater than zero"
     );
     ensure!(
-        args.usage_timeout_secs > 0,
-        "CUMG_V2_USAGE_TIMEOUT_SECS must be greater than zero"
+        args.handoff_runtime_timeout_secs > 0,
+        "CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS must be greater than zero"
     );
 
     // Install the OS signal handlers before secret/checkpoint loading so an
@@ -304,19 +332,76 @@ async fn main() -> Result<()> {
     .context("failed to initialize V2 Hub state")?;
     let device_id = hub.device_id().to_owned();
     let shutdown_handle = handle.clone();
-    let northbound = build_northbound_runtime(&args, handle, &device_id)?;
+    let handoff_coordinator = build_handoff_coordinator(&args, handle.clone()).await?;
+    let northbound = build_northbound_runtime(
+        &args,
+        handle.clone(),
+        &device_id,
+        handoff_coordinator.clone(),
+    )?;
+
+    #[cfg(unix)]
+    let handoff_control_server = if let Some(path) = args.handoff_control_socket.as_ref() {
+        Some(
+            UnixHandoffControlServer::bind(path)
+                .context("failed to bind private Handoff control socket")?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    ensure!(
+        args.handoff_control_socket.is_none(),
+        "CUMG_V2_HANDOFF_CONTROL_SOCKET is supported only on Unix hosts"
+    );
 
     info!(
         event = "v2_hub_start",
         bind = %args.bind,
         device_id = %device_id,
         northbound_mcp_enabled = northbound.is_some(),
-        usage_accounting_enabled = args.usage_endpoint.is_some(),
         "starting single-device V2 Hub"
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    #[cfg(unix)]
+    let handoff_control_task = if let Some(server) = handoff_control_server {
+        let coordinator = handoff_coordinator
+            .as_ref()
+            .expect("validated Handoff control socket requires managed coordinator")
+            .clone();
+        let control_hub = handle.clone();
+        let control_shutdown = shutdown_rx.clone();
+        let task = tokio::spawn(async move {
+            match server
+                .serve(coordinator, control_hub, control_shutdown)
+                .await
+            {
+                Ok(()) => info!(
+                    event = "v2_handoff_control_stopped",
+                    outcome = "shutdown",
+                    "private Handoff operator control socket stopped"
+                ),
+                Err(error) => tracing::error!(
+                    event = "v2_handoff_control_failed",
+                    outcome = "unavailable",
+                    error = %error,
+                    "private Handoff operator control socket failed; authority semantics remain fail-closed in the managed runtime"
+                ),
+            }
+        });
+        info!(
+            event = "v2_handoff_control_started",
+            mode = "local_unix",
+            outcome = "ready",
+            "private Handoff operator control socket started outside northbound MCP"
+        );
+        Some(task)
+    } else {
+        None
+    };
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
+    let handoff_shutdown = handoff_coordinator.clone();
     tokio::spawn(async move {
         let signal = signal_rx.await.unwrap_or("signal_listener_closed");
         let first = shutdown_handle.begin_shutdown_drain();
@@ -345,6 +430,23 @@ async fn main() -> Result<()> {
                     "Hub shutdown drain timed out; remaining dispatched work will retain fail-closed restart semantics"
                 );
             }
+        }
+        let session_close_requested = shutdown_handle.close_live_session_for_shutdown().await;
+        info!(
+            event = "v2_hub_shutdown_agent_session_close",
+            signal,
+            session_close_requested,
+            outcome = "shutdown",
+            "Hub shutdown requested closure of the current Agent stream after bounded drain"
+        );
+        if let Some(coordinator) = handoff_shutdown.as_ref() {
+            coordinator.shutdown().await;
+            info!(
+                event = "v2_handoff_runtime_shutdown",
+                signal,
+                outcome = "fenced",
+                "Handoff runtime stopped after admitted Agent work drained"
+            );
         }
         let _ = shutdown_tx.send(true);
     });
@@ -391,13 +493,64 @@ async fn main() -> Result<()> {
     } else {
         grpc.await.context("V2 Hub gRPC server failed")?;
     }
+    #[cfg(unix)]
+    if let Some(task) = handoff_control_task {
+        task.await
+            .context("private Handoff control task failed during shutdown")?;
+    }
     Ok(())
+}
+
+async fn build_handoff_coordinator(
+    args: &Args,
+    hub: computer_use_mcp_gateway::v2_m1_hub::HubHandle,
+) -> Result<Option<Arc<HandoffCoordinator>>> {
+    let legacy_managed_fields = [
+        args.handoff_runtime_command.is_some(),
+        args.handoff_runtime_script.is_some(),
+        args.handoff_runtime_env_file.is_some(),
+    ];
+    ensure!(
+        !legacy_managed_fields
+            .into_iter()
+            .any(|configured| configured),
+        "Hub-owned CUMG_V2_HANDOFF_RUNTIME_* configuration is no longer supported; configure the managed Handoff runtime on v2_agent"
+    );
+    ensure!(
+        !(args.handoff_control_socket.is_some() && args.operator_handoff_socket.is_some()),
+        "first-class Agent-owned Handoff and CUMG_V2_OPERATOR_HANDOFF_SOCKET are mutually exclusive"
+    );
+
+    if args.handoff_control_socket.is_some() {
+        info!(
+            event = "v2_handoff_runtime_configured",
+            mode = "agent_owned_remote",
+            outcome = "ready",
+            "first-class Handoff coordination routes to the controlled Agent"
+        );
+        return Ok(Some(Arc::new(HandoffCoordinator::agent_owned(hub))));
+    }
+
+    if let Some(path) = args.operator_handoff_socket.as_ref() {
+        warn!(
+            event = "v2_handoff_runtime_configured",
+            mode = "legacy_unix_bridge",
+            outcome = "compatibility_only",
+            "acceptance-only Unix Handoff bridge remains enabled as a compatibility backend"
+        );
+        let authority = UnixOperatorHandoffAuthority::new(path.clone())
+            .context("invalid CUMG_V2_OPERATOR_HANDOFF_SOCKET")?;
+        return Ok(Some(Arc::new(HandoffCoordinator::new(Arc::new(authority)))));
+    }
+
+    Ok(None)
 }
 
 fn build_northbound_runtime(
     args: &Args,
     handle: computer_use_mcp_gateway::v2_m1_hub::HubHandle,
     device_id: &str,
+    handoff_coordinator: Option<Arc<HandoffCoordinator>>,
 ) -> Result<Option<NorthboundRuntime>> {
     let oauth_configured = [
         args.oauth_authorization_server.is_some(),
@@ -418,7 +571,6 @@ fn build_northbound_runtime(
     let configured = [
         args.mcp_resource.is_some(),
         args.northbound_policy_file.is_some(),
-        args.usage_endpoint.is_some(),
         oauth_configured,
         trusted_proxy_configured,
     ]
@@ -443,19 +595,24 @@ fn build_northbound_runtime(
         .context("CUMG_V2_NORTHBOUND_POLICY_FILE is required")?;
     let policy_text = load_trusted_text(policy_file, MAX_NORTHBOUND_POLICY_BYTES)
         .context("failed to load northbound authorization policy")?;
-    let usage = if let Some(endpoint) = args.usage_endpoint.as_deref() {
-        UsageManager::new(Arc::new(
-            McpUsageController::new(endpoint, Duration::from_secs(args.usage_timeout_secs))
-                .context("invalid loopback MCPUsage sidecar configuration")?,
-        ))
-    } else {
-        UsageManager::noop()
-    };
     let overload = computer_use_mcp_gateway::v2_limits::HttpOverloadGuard::new(
         args.max_northbound_concurrency,
         args.max_northbound_requests_per_minute,
     )
     .context("invalid V2 northbound connection/rate limits")?;
+    let audit_fingerprint_secret: Option<Arc<[u8]>> = args
+        .audit_fingerprint_secret_file
+        .as_ref()
+        .map(|path| {
+            let secret = load_secret_text(path, MAX_AUDIT_FINGERPRINT_SECRET_BYTES)
+                .context("failed to load audit fingerprint secret")?;
+            ensure!(
+                secret.len() >= MIN_AUDIT_FINGERPRINT_SECRET_BYTES,
+                "CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE must contain at least 32 bytes"
+            );
+            Ok::<Arc<[u8]>, anyhow::Error>(Arc::from(secret.into_bytes()))
+        })
+        .transpose()?;
 
     let (router, resource, metadata_url, auth_mode) = if trusted_proxy_configured {
         let issuer = required(&args.trusted_proxy_issuer, "CUMG_V2_TRUSTED_PROXY_ISSUER")?;
@@ -488,18 +645,22 @@ fn build_northbound_runtime(
             .build_policy(proxy_config.issuer(), device_id)
             .context("invalid northbound principal/device/capability policy")?;
         let resource = proxy_config.resource().to_owned();
-        let router = build_trusted_proxy_router(
-            V2NorthboundMcp::new_with_usage(handle, policy, usage),
-            proxy_config,
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            overload,
-            computer_use_mcp_gateway::v2_limits::enforce_http_limits,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            peer_guard,
-            computer_use_mcp_gateway::v2_limits::enforce_trusted_proxy_loopback,
-        ));
+        let mut service = V2NorthboundMcp::new(handle, policy);
+        if let Some(secret) = audit_fingerprint_secret.clone() {
+            service = service.with_request_fingerprint_secret(secret);
+        }
+        if let Some(coordinator) = handoff_coordinator.as_ref() {
+            service = service.with_handoff_coordinator(coordinator.clone());
+        }
+        let router = build_trusted_proxy_router(service, proxy_config)
+            .layer(axum::middleware::from_fn_with_state(
+                overload,
+                computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                peer_guard,
+                computer_use_mcp_gateway::v2_limits::enforce_trusted_proxy_loopback,
+            ));
         (router, resource, None, "trusted_proxy_fixed_principal")
     } else {
         let authorization_server = required(
@@ -542,15 +703,19 @@ fn build_northbound_runtime(
             .context("invalid OAuth token introspection configuration")?;
         let metadata_url = mcp_config.metadata_url().to_owned();
         let resource = mcp_config.resource().to_owned();
-        let router = build_northbound_router(
-            V2NorthboundMcp::new_with_usage(handle, policy, usage),
-            mcp_config,
-            Arc::new(verifier),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            overload,
-            computer_use_mcp_gateway::v2_limits::enforce_http_limits,
-        ));
+        let mut service = V2NorthboundMcp::new(handle, policy);
+        if let Some(secret) = audit_fingerprint_secret.clone() {
+            service = service.with_request_fingerprint_secret(secret);
+        }
+        if let Some(coordinator) = handoff_coordinator.as_ref() {
+            service = service.with_handoff_coordinator(coordinator.clone());
+        }
+        let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
+            axum::middleware::from_fn_with_state(
+                overload,
+                computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+            ),
+        );
         (router, resource, Some(metadata_url), "oauth_introspection")
     };
 

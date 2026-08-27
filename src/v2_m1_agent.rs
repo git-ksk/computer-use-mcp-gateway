@@ -5,23 +5,30 @@
 //! reconnect, grant validation, replay barriers, direct process execution, and
 //! cancellation. An optional external Cua MCP adapter adds typed GUI capabilities.
 
+use crate::v2_agent_handoff::{AgentHandoffCoordinator, AgentHandoffSessionFence};
 use crate::v2_browser_execute::BrowserRefusalReason;
 use crate::v2_browser_staging::{
-    BrowserDownloadStagingBroker, BrowserDownloadStagingError, BrowserUploadStagingBroker,
-    BrowserUploadStagingError,
+    BrowserDownloadStagingBroker, BrowserDownloadStagingError, BrowserStagingStartupError,
+    BrowserUploadStagingBroker, BrowserUploadStagingError,
+};
+use crate::v2_execution_safety::{
+    AgentTerminalEvidence, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES, terminal_evidence_for_device_result,
 };
 use crate::v2_m0::{
-    CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement,
+    CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CapabilityClass,
     CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
-    DeviceSession, GrantLedger,
+    DeviceSession, GrantLedger, VerificationStatus,
 };
 use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubToAgent,
-    RemoteBackendSessionEnd, TrustedSessionClock, build_agent_heartbeat, build_agent_proof,
-    build_remote_backend_session_ended, build_remote_cancellation_ack, build_remote_result,
+    RemoteBackendSessionEnd, RemoteHandoffErrorCode, RemoteHandoffResponseKind,
+    TrustedSessionClock, build_agent_heartbeat, build_agent_proof,
+    build_remote_backend_session_ended, build_remote_cancellation_ack,
+    build_remote_handoff_response, build_remote_reconciliation_report, build_remote_result,
     verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_backend_session_end,
-    verify_remote_cancel, verify_remote_command, verify_session_accepted,
+    verify_remote_cancel, verify_remote_command, verify_remote_handoff_request,
+    verify_session_accepted,
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
@@ -34,13 +41,18 @@ use crate::v2_m1_grpc::{
 };
 use crate::v2_m1_keys::AgentProvisionedMaterial;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, PersistenceError};
-use crate::v2_m1_process::{ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy};
+use crate::v2_m1_process::{
+    ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy, ProcessUnprovenStage,
+};
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryError, clear_authorization, clear_recovery_handoff, load_authorization, load_challenge,
     store_challenge, validate_authorization_against_challenge, verify_recovery_challenge,
     verify_recovery_resolved,
+};
+use crate::v2_operator_handoff::{
+    VerificationToken, is_exact_verification_candidate, is_phase1_protected_command,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::VecDeque;
@@ -154,9 +166,11 @@ pub struct AgentService {
     browser_upload_staging: BrowserUploadStagingBroker,
     browser_download_staging: BrowserDownloadStagingBroker,
     computer_use: Option<Arc<dyn ComputerUseBackendAdapter>>,
+    handoff: Option<Arc<AgentHandoffCoordinator>>,
     trusted_hub: TrustedHubIdentity,
     grants: GrantLedger,
     execution: AgentExecutionGate,
+    terminal_evidence: VecDeque<AgentTerminalEvidence>,
     checkpoint: CheckpointStore,
 }
 
@@ -229,44 +243,70 @@ impl AgentService {
         // Browser transfer staging is created only after that reviewed root exists.
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
             .map_err(AgentServiceError::Persistence)?;
-        let (trusted_hub, grants, execution) =
-            match checkpoint.load_latest::<AgentPersistentState>() {
-                Ok(state) => {
-                    let (device_id, mut trusted_hub, mut grants, execution) =
-                        state.restore().map_err(AgentServiceError::Persistence)?;
-                    if device_id != config.device_id {
-                        return Err(AgentServiceError::CheckpointIdentityMismatch);
-                    }
+        let (trusted_hub, grants, execution, terminal_evidence) = match checkpoint
+            .load_latest::<AgentPersistentState>(
+        ) {
+            Ok(state) => {
+                let (device_id, mut trusted_hub, mut grants, execution, terminal_evidence) = state
+                    .restore_with_terminal_evidence()
+                    .map_err(AgentServiceError::Persistence)?;
+                if device_id != config.device_id {
+                    return Err(AgentServiceError::CheckpointIdentityMismatch);
+                }
+                if trusted_hub.verifier() != material.trusted_hub {
+                    let rotation = material
+                        .hub_rotation
+                        .as_ref()
+                        .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
+                    trusted_hub
+                        .apply_rotation(rotation)
+                        .map_err(AgentServiceError::Trust)?;
                     if trusted_hub.verifier() != material.trusted_hub {
-                        let rotation = material
-                            .hub_rotation
-                            .as_ref()
-                            .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
-                        trusted_hub
-                            .apply_rotation(rotation)
-                            .map_err(AgentServiceError::Trust)?;
-                        if trusted_hub.verifier() != material.trusted_hub {
-                            return Err(AgentServiceError::CheckpointTrustMismatch);
-                        }
+                        return Err(AgentServiceError::CheckpointTrustMismatch);
                     }
-                    reconcile_grant_verifiers(&mut grants, &material);
-                    (trusted_hub, grants, execution)
                 }
-                Err(PersistenceError::NoCheckpoint) => {
-                    let mut grants = GrantLedger::new(material.grant_verifier);
-                    reconcile_grant_verifiers(&mut grants, &material);
-                    (
-                        TrustedHubIdentity::new(material.trusted_hub),
-                        grants,
-                        AgentExecutionGate::default(),
-                    )
-                }
-                Err(error) => return Err(AgentServiceError::Persistence(error)),
-            };
-        let browser_upload_staging = BrowserUploadStagingBroker::new(&config.state_dir)
-            .map_err(AgentServiceError::BrowserUploadStaging)?;
-        let browser_download_staging = BrowserDownloadStagingBroker::new(&config.state_dir)
-            .map_err(AgentServiceError::BrowserDownloadStaging)?;
+                reconcile_grant_verifiers(&mut grants, &material);
+                (
+                    trusted_hub,
+                    grants,
+                    execution,
+                    terminal_evidence.into_iter().collect(),
+                )
+            }
+            Err(PersistenceError::NoCheckpoint) => {
+                let mut grants = GrantLedger::new(material.grant_verifier);
+                reconcile_grant_verifiers(&mut grants, &material);
+                (
+                    TrustedHubIdentity::new(material.trusted_hub),
+                    grants,
+                    AgentExecutionGate::default(),
+                    VecDeque::new(),
+                )
+            }
+            Err(error) => return Err(AgentServiceError::Persistence(error)),
+        };
+        let browser_upload_staging = match BrowserUploadStagingBroker::new(&config.state_dir) {
+            Ok(staging) => staging,
+            Err(error) => {
+                emit_browser_staging_startup_failure(
+                    "upload",
+                    error.upload_safe_error_code(),
+                    &error,
+                );
+                return Err(AgentServiceError::BrowserUploadStagingStartup(error));
+            }
+        };
+        let browser_download_staging = match BrowserDownloadStagingBroker::new(&config.state_dir) {
+            Ok(staging) => staging,
+            Err(error) => {
+                emit_browser_staging_startup_failure(
+                    "download",
+                    error.download_safe_error_code(),
+                    &error,
+                );
+                return Err(AgentServiceError::BrowserDownloadStagingStartup(error));
+            }
+        };
         let service = Self {
             config,
             material,
@@ -276,9 +316,11 @@ impl AgentService {
             browser_upload_staging,
             browser_download_staging,
             computer_use,
+            handoff: None,
             trusted_hub,
             grants,
             execution,
+            terminal_evidence,
             checkpoint,
         };
         // Establish a baseline checkpoint before accepting any command.
@@ -286,12 +328,19 @@ impl AgentService {
         Ok(service)
     }
 
+    pub fn with_handoff_coordinator(mut self, coordinator: Arc<AgentHandoffCoordinator>) -> Self {
+        self.handoff = Some(coordinator);
+        self
+    }
+
     fn persist_state(&self) -> Result<(), AgentServiceError> {
-        let state = AgentPersistentState::capture(
+        let terminal_evidence: Vec<_> = self.terminal_evidence.iter().cloned().collect();
+        let state = AgentPersistentState::capture_with_terminal_evidence(
             self.config.device_id.clone(),
             &self.trusted_hub,
             &self.grants,
             &self.execution,
+            &terminal_evidence,
         )
         .map_err(|error| {
             record_agent_persistence_failure(&self.config.device_id, &error);
@@ -541,6 +590,15 @@ impl AgentService {
         // Persist the generation rollover before accepting work so replay
         // tombstones from prior generations can be safely discarded on disk.
         self.persist_state()?;
+        let report = build_remote_reconciliation_report(
+            &self.material.device_identity,
+            &hello,
+            &challenge,
+            session.generation,
+            self.terminal_evidence.iter().cloned().collect(),
+        )
+        .map_err(AgentServiceError::Protocol)?;
+        send_agent(&outbound_tx, AgentToHub::ReconciliationReport(report)).await?;
         // Staged upload handles never survive an Agent transport generation.
         self.browser_upload_staging
             .cleanup_all()
@@ -596,14 +654,28 @@ impl AgentService {
                 tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+                        terminate_active(
+                            &mut active,
+                            &mut operation_done_rx,
+                            &mut self.execution,
+                            &mut self.terminal_evidence,
+                            &session.device_id,
+                        )
+                        .await?;
                         self.persist_state()?;
                         return Ok(SessionExit::Shutdown);
                     }
                 }
                 _ = heartbeat.tick() => {
                     if pending_heartbeat.as_ref().is_some_and(|(_, sent)| sent.elapsed() >= heartbeat_deadline) {
-                        terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+                        terminate_active(
+                            &mut active,
+                            &mut operation_done_rx,
+                            &mut self.execution,
+                            &mut self.terminal_evidence,
+                            &session.device_id,
+                        )
+                        .await?;
                         self.persist_state()?;
                         tracing::warn!(
                             event = "v2_agent_heartbeat_timeout",
@@ -639,10 +711,9 @@ impl AgentService {
                     }
                     self.execution.finish(&completion.operation_id)
                         .map_err(AgentServiceError::Execution)?;
-                    self.persist_state()?;
                     match completion.outcome {
                         AgentOperationOutcome::Result(result) => {
-                            let device_result = match result {
+                            let mut device_result = match result {
                                 Ok(result) => result,
                                 Err(error) => {
                                     tracing::warn!(
@@ -659,6 +730,53 @@ impl AgentService {
                                     }
                                 }
                             };
+                            if let Some(verification) = expected.handoff_verification.as_ref() {
+                                let satisfied = matches!(
+                                    device_result,
+                                    DeviceResult::UiStateVerification {
+                                        status: VerificationStatus::Satisfied,
+                                        ..
+                                    }
+                                );
+                                let reported = match self.handoff.as_ref() {
+                                    Some(coordinator) => coordinator
+                                        .report_verification_local(
+                                            verification.authority.clone(),
+                                            verification.token.clone(),
+                                            satisfied,
+                                            AgentHandoffSessionFence::for_device(
+                                                    &session.device_id,
+                                                    session.generation,
+                                                    session.capabilities.revision,
+                                                ),
+                                        )
+                                        .await
+                                        .is_ok(),
+                                    None => false,
+                                };
+                                if !reported
+                                    && !matches!(
+                                        device_result,
+                                        DeviceResult::Error {
+                                            code: DeviceErrorCode::BackendOutcomeIndeterminate
+                                        }
+                                    )
+                                {
+                                    device_result = DeviceResult::Error {
+                                        code: DeviceErrorCode::HandoffVerificationUnavailable,
+                                    };
+                                }
+                            }
+                            record_terminal_evidence(
+                                &mut self.terminal_evidence,
+                                &session.device_id,
+                                &expected,
+                                &device_result,
+                            )?;
+                            // Persist both the replay tombstone and payload-free terminal proof
+                            // before attempting result delivery. A lost transport can therefore
+                            // recover evidence without re-executing the operation.
+                            self.persist_state()?;
                             let result = CommandResultEnvelope {
                                 schema_version: CONTROL_SCHEMA_VERSION,
                                 device_id: session.device_id.clone(),
@@ -676,6 +794,10 @@ impl AgentService {
                             send_agent(&outbound_tx, AgentToHub::Result(signed)).await?;
                         }
                         AgentOperationOutcome::Indeterminate(cause) => {
+                            // No authoritative terminal proof exists for an indeterminate
+                            // outcome. Persist only the replay barrier; never manufacture
+                            // reconciliation evidence from timeout/cancellation heuristics.
+                            self.persist_state()?;
                             match cause {
                                 AgentIndeterminateCause::CancellationPropagated => {
                                     // The cancellation branch already queued a signed
@@ -710,6 +832,25 @@ impl AgentService {
                                         indeterminate_reason = "backend_timed_out",
                                         error_code = "backend_timeout_ambiguous",
                                         "backend timed out with ambiguous outcome; reconnecting without a success result"
+                                    );
+                                    return Ok(SessionExit::Reconnect);
+                                }
+                                AgentIndeterminateCause::ProcessOutcomeUnproven(stage) => {
+                                    // The process/shell operation was dispatched to its local
+                                    // worker, but the Agent cannot prove the spawn/terminal boundary
+                                    // strongly enough to publish an ordinary result. Close
+                                    // this authenticated generation so the Hub's existing
+                                    // connection-loss path durably quarantines the operation.
+                                    tracing::warn!(
+                                        event = "v2_agent_process_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "indeterminate",
+                                        indeterminate_reason = "process_outcome_unproven",
+                                        failure_stage = stage.as_str(),
+                                        error_code = "process_outcome_unproven",
+                                        "process/shell terminality is unproven after spawn; reconnecting without a terminal result"
                                     );
                                     return Ok(SessionExit::Reconnect);
                                 }
@@ -781,12 +922,68 @@ impl AgentService {
                     let frame = match message.map_err(AgentServiceError::Status)? {
                         Some(frame) => frame,
                         None => {
-                            terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+                            terminate_active(
+                            &mut active,
+                            &mut operation_done_rx,
+                            &mut self.execution,
+                            &mut self.terminal_evidence,
+                            &session.device_id,
+                        )
+                        .await?;
                             self.persist_state()?;
                             return Ok(SessionExit::Reconnect);
                         }
                     };
                     match decode_hub_frame(frame).map_err(AgentServiceError::Carrier)? {
+                        HubToAgent::HandoffRequest(remote) => {
+                            verify_remote_handoff_request(
+                                &hello,
+                                &challenge,
+                                &remote,
+                                &self.trusted_hub.verifier(),
+                            )
+                            .map_err(AgentServiceError::Protocol)?;
+                            if remote.device_generation != session.generation {
+                                return Err(AgentServiceError::Control(
+                                    crate::v2_m0::ControlError::StaleDeviceGeneration {
+                                        expected: session.generation,
+                                        got: remote.device_generation,
+                                    },
+                                ));
+                            }
+                            let requires_idle = remote.request.requires_agent_idle();
+                            let response = if requires_idle && active.is_some() {
+                                RemoteHandoffResponseKind::Rejected {
+                                    code: RemoteHandoffErrorCode::Rejected,
+                                }
+                            } else if let Some(coordinator) = self.handoff.as_ref() {
+                                coordinator
+                                    .handle_remote(
+                                        remote.request,
+                                        AgentHandoffSessionFence::for_device(
+                                                    &session.device_id,
+                                                    session.generation,
+                                                    session.capabilities.revision,
+                                                ),
+                                    )
+                                    .await
+                            } else {
+                                RemoteHandoffResponseKind::Rejected {
+                                    code: RemoteHandoffErrorCode::Unsupported,
+                                }
+                            };
+                            let response = build_remote_handoff_response(
+                                &self.material.device_identity,
+                                &hello,
+                                &challenge,
+                                session.device_id.clone(),
+                                session.generation,
+                                remote.request_id,
+                                response,
+                            )
+                            .map_err(AgentServiceError::Protocol)?;
+                            send_agent(&outbound_tx, AgentToHub::HandoffResponse(response)).await?;
+                        }
                         HubToAgent::HeartbeatAck(ack) => {
                             verify_hub_heartbeat_ack(&hello, &challenge, &ack, &self.trusted_hub.verifier())
                                 .map_err(AgentServiceError::Protocol)?;
@@ -882,10 +1079,13 @@ impl AgentService {
                                 .map_err(AgentServiceError::Protocol)?;
                             crate::v2_m0::validate_command_session(&remote.command, &session)
                                 .map_err(AgentServiceError::Control)?;
+                            let capability = remote.command.command.capability();
+                            let capability_revision = remote.command.capability_revision;
+                            let dispatch_grant_id = remote.grant.payload.grant_id.clone();
                             self.grants.authorize_device_capability_once(
                                 &remote.grant,
                                 &session.device_id,
-                                remote.command.command.capability(),
+                                capability,
                                 trusted_clock.now_ms(),
                             ).map_err(AgentServiceError::Control)?;
                             self.persist_state()?;
@@ -898,13 +1098,148 @@ impl AgentService {
                                 operation_id: remote.command.operation_id.clone(),
                             };
                             self.execution.begin(operation).map_err(AgentServiceError::Execution)?;
-                            // Persist the active operation before starting any local work. A crash
-                            // after this fsync restores the operation ID as terminal.
+                            // Persist the replay barrier before consulting Handoff. A crash or
+                            // runtime failure after this point can never make the Hub-dispatched
+                            // operation runnable again on this Agent generation.
                             self.persist_state()?;
                             let operation_id = remote.command.operation_id.clone();
                             let worker_operation_id = operation_id.clone();
                             let worker_generation = session.generation;
                             let done = operation_done_tx.clone();
+
+                            // Agent-owned final authority gate. This is intentionally after grant
+                            // consumption/replay persistence but before any local Computer Use
+                            // backend call, closing the Hub-admission -> Human-claim TOCTOU window.
+                            let protected = is_phase1_protected_command(&remote.command.command);
+                            let handoff_verification = if protected {
+                                match (self.handoff.as_ref(), remote.handoff.clone()) {
+                                    (Some(coordinator), Some(authority)) => {
+                                        match coordinator
+                                            .final_admit(
+                                                authority.clone(),
+                                                &remote.command.command,
+                                                AgentHandoffSessionFence::for_device(
+                                                    &session.device_id,
+                                                    session.generation,
+                                                    session.capabilities.revision,
+                                                ),
+                                            )
+                                            .await
+                                        {
+                                            Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Allow) => None,
+                                            Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Verification(token))
+                                                if is_exact_verification_candidate(&remote.command.command) =>
+                                            {
+                                                Some(PendingHandoffVerification { authority, token })
+                                            }
+                                            Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Deny)
+                                            | Ok(crate::v2_operator_handoff::AgentAuthorityDecision::Verification(_)) => {
+                                                let terminal = ActiveOperation {
+                                                    operation_id: operation_id.clone(),
+                                                    device_generation: session.generation,
+                                                    capability_revision,
+                                                    capability,
+                                                    dispatch_grant_id: dispatch_grant_id.clone(),
+                                                    handoff_verification: None,
+                                                    cancellation: ActiveCancellation::None,
+                                                };
+                                                self.execution.finish(&operation_id)
+                                                    .map_err(AgentServiceError::Execution)?;
+                                                let device_result = DeviceResult::Error {
+                                                    code: DeviceErrorCode::HandoffAuthoritySuspended,
+                                                };
+                                                record_terminal_evidence(
+                                                    &mut self.terminal_evidence,
+                                                    &session.device_id,
+                                                    &terminal,
+                                                    &device_result,
+                                                )?;
+                                                self.persist_state()?;
+                                                send_terminal_result(
+                                                    &self.material.device_identity,
+                                                    &hello,
+                                                    &challenge,
+                                                    &outbound_tx,
+                                                    &session,
+                                                    operation_id,
+                                                    device_result,
+                                                ).await?;
+                                                continue;
+                                            }
+                                            Err(_) => {
+                                                let terminal = ActiveOperation {
+                                                    operation_id: operation_id.clone(),
+                                                    device_generation: session.generation,
+                                                    capability_revision,
+                                                    capability,
+                                                    dispatch_grant_id: dispatch_grant_id.clone(),
+                                                    handoff_verification: None,
+                                                    cancellation: ActiveCancellation::None,
+                                                };
+                                                self.execution.finish(&operation_id)
+                                                    .map_err(AgentServiceError::Execution)?;
+                                                let device_result = DeviceResult::Error {
+                                                    code: DeviceErrorCode::HandoffRuntimeUnavailable,
+                                                };
+                                                record_terminal_evidence(
+                                                    &mut self.terminal_evidence,
+                                                    &session.device_id,
+                                                    &terminal,
+                                                    &device_result,
+                                                )?;
+                                                self.persist_state()?;
+                                                send_terminal_result(
+                                                    &self.material.device_identity,
+                                                    &hello,
+                                                    &challenge,
+                                                    &outbound_tx,
+                                                    &session,
+                                                    operation_id,
+                                                    device_result,
+                                                ).await?;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    (Some(_), None) | (None, Some(_)) => {
+                                        let terminal = ActiveOperation {
+                                            operation_id: operation_id.clone(),
+                                            device_generation: session.generation,
+                                            capability_revision,
+                                            capability,
+                                            dispatch_grant_id: dispatch_grant_id.clone(),
+                                            handoff_verification: None,
+                                            cancellation: ActiveCancellation::None,
+                                        };
+                                        self.execution.finish(&operation_id)
+                                            .map_err(AgentServiceError::Execution)?;
+                                        let device_result = DeviceResult::Error {
+                                            code: DeviceErrorCode::HandoffRuntimeUnavailable,
+                                        };
+                                        record_terminal_evidence(
+                                            &mut self.terminal_evidence,
+                                            &session.device_id,
+                                            &terminal,
+                                            &device_result,
+                                        )?;
+                                        self.persist_state()?;
+                                        send_terminal_result(
+                                            &self.material.device_identity,
+                                            &hello,
+                                            &challenge,
+                                            &outbound_tx,
+                                            &session,
+                                            operation_id,
+                                            device_result,
+                                        ).await?;
+                                        continue;
+                                    }
+                                    (None, None) => None,
+                                }
+                            } else {
+                                None
+                            };
+
                             let cancellation = match remote.command.command {
                                 DeviceCommand::ExecuteProcess { request } => {
                                     let cancellation = ProcessCancellation::default();
@@ -913,13 +1248,11 @@ impl AgentService {
                                     tokio::spawn(async move {
                                         let result = tokio::task::spawn_blocking(move || {
                                             executor.execute(&request, &worker_cancel)
-                                        }).await
-                                            .map_err(|_| AgentOperationError::WorkerPanicked)
-                                            .and_then(|result| result.map(|output| DeviceResult::Process { output }).map_err(AgentOperationError::Process));
+                                        }).await;
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
                                             device_generation: worker_generation,
-                                            outcome: AgentOperationOutcome::Result(result),
+                                            outcome: process_operation_outcome(result),
                                         }).await;
                                     });
                                     ActiveCancellation::Process(cancellation)
@@ -931,13 +1264,11 @@ impl AgentService {
                                     tokio::spawn(async move {
                                         let result = tokio::task::spawn_blocking(move || {
                                             shell.execute(&request, &worker_cancel)
-                                        }).await
-                                            .map_err(|_| AgentOperationError::WorkerPanicked)
-                                            .and_then(|result| result.map(|output| DeviceResult::Shell { output }).map_err(AgentOperationError::Shell));
+                                        }).await;
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
                                             device_generation: worker_generation,
-                                            outcome: AgentOperationOutcome::Result(result),
+                                            outcome: shell_operation_outcome(result),
                                         }).await;
                                     });
                                     ActiveCancellation::Process(cancellation)
@@ -1070,6 +1401,10 @@ impl AgentService {
                             active = Some(ActiveOperation {
                                 operation_id,
                                 device_generation: session.generation,
+                                capability_revision,
+                                capability,
+                                dispatch_grant_id,
+                                handoff_verification,
                                 cancellation,
                             });
                         }
@@ -1127,7 +1462,14 @@ impl AgentService {
         // child before returning an error, then persist the terminal replay
         // barrier before the outer lifecycle can reconnect or exit.
         if session_result.is_err() && active.is_some() {
-            terminate_active(&mut active, &mut operation_done_rx, &mut self.execution).await?;
+            terminate_active(
+                &mut active,
+                &mut operation_done_rx,
+                &mut self.execution,
+                &mut self.terminal_evidence,
+                &session.device_id,
+            )
+            .await?;
             self.persist_state()?;
         }
         session_result
@@ -1140,14 +1482,21 @@ enum SessionExit {
     Shutdown,
 }
 
-#[derive(Debug)]
 struct ActiveOperation {
     operation_id: String,
     device_generation: u64,
+    capability_revision: u64,
+    capability: DeviceCapability,
+    dispatch_grant_id: String,
+    handoff_verification: Option<PendingHandoffVerification>,
     cancellation: ActiveCancellation,
 }
 
-#[derive(Debug)]
+struct PendingHandoffVerification {
+    authority: crate::v2_m0_transport::RemoteHandoffAuthority,
+    token: VerificationToken,
+}
+
 enum ActiveCancellation {
     Process(ProcessCancellation),
     Backend(watch::Sender<bool>),
@@ -1164,6 +1513,7 @@ enum AgentOperationOutcome {
 enum AgentIndeterminateCause {
     CancellationPropagated,
     BackendTimedOut,
+    ProcessOutcomeUnproven(ProcessUnprovenStage),
 }
 
 #[derive(Debug)]
@@ -1171,6 +1521,40 @@ struct OperationCompletion {
     operation_id: String,
     device_generation: u64,
     outcome: AgentOperationOutcome,
+}
+
+fn process_operation_outcome(
+    result: Result<Result<crate::v2_m0::ProcessOutput, ProcessError>, tokio::task::JoinError>,
+) -> AgentOperationOutcome {
+    match result {
+        Ok(Ok(output)) => AgentOperationOutcome::Result(Ok(DeviceResult::Process { output })),
+        Ok(Err(error)) => match error.outcome_unproven_stage() {
+            Some(stage) => AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
+            ),
+            None => AgentOperationOutcome::Result(Err(AgentOperationError::Process(error))),
+        },
+        Err(_) => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::ProcessOutcomeUnproven(ProcessUnprovenStage::Worker),
+        ),
+    }
+}
+
+fn shell_operation_outcome(
+    result: Result<Result<crate::v2_m0::ProcessOutput, ShellError>, tokio::task::JoinError>,
+) -> AgentOperationOutcome {
+    match result {
+        Ok(Ok(output)) => AgentOperationOutcome::Result(Ok(DeviceResult::Shell { output })),
+        Ok(Err(error)) => match error.outcome_unproven_stage() {
+            Some(stage) => AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
+            ),
+            None => AgentOperationOutcome::Result(Err(AgentOperationError::Shell(error))),
+        },
+        Err(_) => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::ProcessOutcomeUnproven(ProcessUnprovenStage::Worker),
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -1184,10 +1568,60 @@ pub enum AgentOperationError {
     WorkerPanicked,
 }
 
+fn normalized_device_result(result: &Result<DeviceResult, AgentOperationError>) -> DeviceResult {
+    match result {
+        Ok(result) => result.clone(),
+        Err(error) => DeviceResult::Error {
+            code: operation_error_code(error),
+        },
+    }
+}
+
+fn record_terminal_evidence(
+    journal: &mut VecDeque<AgentTerminalEvidence>,
+    device_id: &str,
+    operation: &ActiveOperation,
+    device_result: &DeviceResult,
+) -> Result<(), AgentServiceError> {
+    if operation.capability.class() == CapabilityClass::Observe {
+        return Ok(());
+    }
+    let Some((terminal_state, evidence)) = terminal_evidence_for_device_result(device_result)
+    else {
+        return Ok(());
+    };
+    let entry = AgentTerminalEvidence {
+        operation: OperationRef {
+            device_id: device_id.to_owned(),
+            device_generation: operation.device_generation,
+            operation_id: operation.operation_id.clone(),
+        },
+        capability_revision: operation.capability_revision,
+        capability: operation.capability,
+        dispatch_grant_id: operation.dispatch_grant_id.clone(),
+        terminal_state,
+        evidence,
+    };
+    entry.validate().map_err(AgentServiceError::Execution)?;
+    if journal
+        .iter()
+        .any(|existing| existing.operation.operation_id == entry.operation.operation_id)
+    {
+        return Ok(());
+    }
+    journal.push_back(entry);
+    while journal.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES {
+        journal.pop_front();
+    }
+    Ok(())
+}
+
 async fn terminate_active(
     active: &mut Option<ActiveOperation>,
     operation_done_rx: &mut mpsc::Receiver<OperationCompletion>,
     execution: &mut AgentExecutionGate,
+    terminal_evidence: &mut VecDeque<AgentTerminalEvidence>,
+    device_id: &str,
 ) -> Result<(), AgentServiceError> {
     let Some(operation) = active.take() else {
         return Ok(());
@@ -1207,6 +1641,13 @@ async fn terminate_active(
         || completion.device_generation != operation.device_generation
     {
         return Err(AgentServiceError::OperationStateMismatch);
+    }
+    // If the worker already reached the same terminal result that the normal
+    // protocol would accept, retain only its payload-free proof. Otherwise the
+    // disconnect remains ambiguous and no evidence is manufactured.
+    if let AgentOperationOutcome::Result(result) = &completion.outcome {
+        let device_result = normalized_device_result(result);
+        record_terminal_evidence(terminal_evidence, device_id, &operation, &device_result)?;
     }
     // Process descendants have been killed/waited by ProcessExecutor. Read-only
     // filesystem operations are bounded and awaited before the replay ID is
@@ -1242,12 +1683,21 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         {
             DeviceErrorCode::NotFound
         }
+        AgentOperationError::Process(ProcessError::OutcomeUnproven(_))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::OutcomeUnproven(_))) => {
+            // Defense in depth: normal process/shell workers intercept this before
+            // constructing a DeviceResult. If a future path bypasses that helper,
+            // the wire fallback must still enter Hub indeterminate/quarantine.
+            DeviceErrorCode::BackendOutcomeIndeterminate
+        }
         AgentOperationError::Filesystem(FilesystemError::Io(_))
         | AgentOperationError::Process(ProcessError::Io(_))
-        | AgentOperationError::Process(ProcessError::Spawn(_))
-        | AgentOperationError::Shell(ShellError::Process(ProcessError::Io(_)))
-        | AgentOperationError::Shell(ShellError::Process(ProcessError::Spawn(_))) => {
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Io(_))) => {
             DeviceErrorCode::IoFailure
+        }
+        AgentOperationError::Process(ProcessError::Spawn(_))
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::Spawn(_))) => {
+            DeviceErrorCode::ProcessSpawnFailed
         }
         AgentOperationError::Process(ProcessError::EnvironmentKeyDenied(_))
         | AgentOperationError::Shell(ShellError::Process(ProcessError::EnvironmentKeyDenied(_))) => {
@@ -1261,9 +1711,50 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         | AgentOperationError::Shell(ShellError::Process(
             ProcessError::TooManyEnvironmentEntries,
         )) => DeviceErrorCode::TooManyEnvironmentEntries,
-        AgentOperationError::Filesystem(_)
-        | AgentOperationError::Process(_)
-        | AgentOperationError::Shell(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Process(ProcessError::WorkingDirectoryDenied)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::WorkingDirectoryDenied)) => {
+            DeviceErrorCode::WorkingDirectoryDenied
+        }
+        AgentOperationError::Process(ProcessError::WorkingDirectoryNotDirectory)
+        | AgentOperationError::Shell(ShellError::Process(
+            ProcessError::WorkingDirectoryNotDirectory,
+        )) => DeviceErrorCode::WorkingDirectoryInvalid,
+        AgentOperationError::Process(ProcessError::InvalidTimeout)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidTimeout)) => {
+            DeviceErrorCode::InvalidTimeout
+        }
+        AgentOperationError::Process(ProcessError::InvalidProgram)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidProgram)) => {
+            DeviceErrorCode::InvalidProgram
+        }
+        AgentOperationError::Process(ProcessError::ShellProgramDenied)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::ShellProgramDenied)) => {
+            DeviceErrorCode::ProgramDenied
+        }
+        AgentOperationError::Process(ProcessError::TooManyArguments)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::TooManyArguments)) => {
+            DeviceErrorCode::TooManyArguments
+        }
+        AgentOperationError::Process(ProcessError::InvalidRequest)
+        | AgentOperationError::Shell(ShellError::InvalidCommand | ShellError::CommandTooLarge)
+        | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidRequest))
+        | AgentOperationError::Filesystem(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Process(
+            ProcessError::NoAllowedWorkingDirectories
+            | ProcessError::InvalidPolicyLimit
+            | ProcessError::ShellUnsupportedPlatform
+            | ProcessError::PipeUnavailable
+            | ProcessError::ReaderPanicked
+            | ProcessError::Execution(_),
+        )
+        | AgentOperationError::Shell(ShellError::Process(
+            ProcessError::NoAllowedWorkingDirectories
+            | ProcessError::InvalidPolicyLimit
+            | ProcessError::ShellUnsupportedPlatform
+            | ProcessError::PipeUnavailable
+            | ProcessError::ReaderPanicked
+            | ProcessError::Execution(_),
+        )) => DeviceErrorCode::InternalFailure,
         AgentOperationError::BrowserUploadStaging(
             BrowserUploadStagingError::UnknownHandle
             | BrowserUploadStagingError::ContextMismatch
@@ -1605,9 +2096,35 @@ fn record_agent_persistence_failure(device_id: &str, error: &PersistenceError) {
         device_id,
         outcome = "failed",
         error_code = error.safe_error_code(),
+        io_class = error.io_class(),
+        resource_exhausted = error.is_resource_exhaustion(),
         component = "agent",
+        agent_availability = "fail_closed_exit",
+        service_manager_retry = "external",
         "Agent checkpoint persistence failed"
     );
+}
+
+async fn send_terminal_result(
+    identity: &crate::v2_m0::DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    sender: &mpsc::Sender<crate::v2_m1_grpc::proto::AgentFrame>,
+    session: &DeviceSession,
+    operation_id: String,
+    device_result: DeviceResult,
+) -> Result<(), AgentServiceError> {
+    let result = CommandResultEnvelope {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        device_id: session.device_id.clone(),
+        device_generation: session.generation,
+        capability_revision: session.capabilities.revision,
+        operation_id,
+        result: device_result,
+    };
+    let signed = build_remote_result(identity, hello, challenge, result)
+        .map_err(AgentServiceError::Protocol)?;
+    send_agent(sender, AgentToHub::Result(signed)).await
 }
 
 async fn send_agent(
@@ -1649,6 +2166,25 @@ fn der_certificate_to_pem(der: &[u8]) -> Vec<u8> {
     pem.into_bytes()
 }
 
+fn emit_browser_staging_startup_failure(
+    staging_direction: &'static str,
+    io_safe_code: &'static str,
+    error: &BrowserStagingStartupError,
+) {
+    let safe_error_code = io_safe_code;
+    tracing::error!(
+        event = "v2_agent_browser_staging_startup_failed",
+        staging_direction,
+        stage = error.stage(),
+        failure_class = error.failure_class(),
+        io_class = error.io_class(),
+        error_code = safe_error_code,
+        agent_startup = "refused",
+        service_manager_retry = "external",
+        "browser staging initialization failed; Agent startup remains fail-closed"
+    );
+}
+
 pub enum AgentServiceError {
     InvalidConfig(&'static str),
     Transport(tonic::transport::Error),
@@ -1660,6 +2196,8 @@ pub enum AgentServiceError {
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
     Filesystem(FilesystemError),
+    BrowserUploadStagingStartup(BrowserStagingStartupError),
+    BrowserDownloadStagingStartup(BrowserStagingStartupError),
     BrowserUploadStaging(BrowserUploadStagingError),
     BrowserDownloadStaging(BrowserDownloadStagingError),
     Backend(M1BackendError),
@@ -1712,6 +2250,8 @@ impl SafeErrorCode for AgentServiceError {
             Self::Execution(_) => "execution_error",
             Self::Process(_) => "process_error",
             Self::Filesystem(_) => "filesystem_error",
+            Self::BrowserUploadStagingStartup(error) => error.upload_safe_error_code(),
+            Self::BrowserDownloadStagingStartup(error) => error.download_safe_error_code(),
             Self::BrowserUploadStaging(error) => error.safe_error_code(),
             Self::BrowserDownloadStaging(error) => error.safe_error_code(),
             Self::Backend(error) => error.safe_error_code(),
@@ -1761,6 +2301,118 @@ impl std::error::Error for AgentServiceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_full_persistence_failure_is_bounded_and_forces_fail_closed_exit() {
+        let error = AgentServiceError::Persistence(PersistenceError::Io(std::io::Error::from(
+            std::io::ErrorKind::StorageFull,
+        )));
+        assert_eq!(error.safe_error_code(), "persistence_resource_exhausted");
+        assert!(!error.reconnectable());
+        assert_eq!(format!("{error:?}"), "persistence_resource_exhausted");
+    }
+
+    #[test]
+    fn process_terminal_proof_classification_controls_indeterminate_routing() {
+        let ordinary = process_operation_outcome(Ok(Err(ProcessError::Io(std::io::Error::other(
+            "terminal reader failure",
+        )))));
+        assert!(matches!(
+            ordinary,
+            AgentOperationOutcome::Result(Err(AgentOperationError::Process(_)))
+        ));
+
+        let unproven = process_operation_outcome(Ok(Err(ProcessError::OutcomeUnproven(
+            ProcessUnprovenStage::Wait,
+        ))));
+        assert!(matches!(
+            unproven,
+            AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
+                ProcessUnprovenStage::Wait
+            ))
+        ));
+
+        let shell_unproven = shell_operation_outcome(Ok(Err(ShellError::Process(
+            ProcessError::OutcomeUnproven(ProcessUnprovenStage::Termination),
+        ))));
+        assert!(matches!(
+            shell_unproven,
+            AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
+                ProcessUnprovenStage::Termination
+            ))
+        ));
+        let leaked =
+            AgentOperationError::Process(ProcessError::OutcomeUnproven(ProcessUnprovenStage::Poll));
+        assert_eq!(
+            operation_error_code(&leaked),
+            DeviceErrorCode::BackendOutcomeIndeterminate
+        );
+    }
+
+    #[tokio::test]
+    async fn process_worker_panic_is_fail_closed_indeterminate() {
+        let joined =
+            tokio::task::spawn_blocking(|| -> Result<crate::v2_m0::ProcessOutput, ProcessError> {
+                panic!("injected process worker panic");
+            })
+            .await;
+        assert!(matches!(
+            process_operation_outcome(joined),
+            AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
+                ProcessUnprovenStage::Worker
+            ))
+        ));
+    }
+
+    #[test]
+    fn process_policy_errors_preserve_safe_categories_through_shell_wrapping() {
+        let cases = [
+            (
+                AgentOperationError::Process(ProcessError::WorkingDirectoryDenied),
+                DeviceErrorCode::WorkingDirectoryDenied,
+            ),
+            (
+                AgentOperationError::Shell(ShellError::Process(
+                    ProcessError::WorkingDirectoryDenied,
+                )),
+                DeviceErrorCode::WorkingDirectoryDenied,
+            ),
+            (
+                AgentOperationError::Process(ProcessError::InvalidTimeout),
+                DeviceErrorCode::InvalidTimeout,
+            ),
+            (
+                AgentOperationError::Process(ProcessError::ShellProgramDenied),
+                DeviceErrorCode::ProgramDenied,
+            ),
+            (
+                AgentOperationError::Process(ProcessError::Spawn(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "PRIVATE_HOST_PATH",
+                ))),
+                DeviceErrorCode::ProcessSpawnFailed,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(operation_error_code(&error), expected);
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("PRIVATE_HOST_PATH"));
+        }
+    }
+
+    #[test]
+    fn executor_internal_failures_remain_generic_fail_closed() {
+        for error in [
+            AgentOperationError::Process(ProcessError::PipeUnavailable),
+            AgentOperationError::Process(ProcessError::ReaderPanicked),
+            AgentOperationError::Process(ProcessError::InvalidPolicyLimit),
+        ] {
+            assert_eq!(
+                operation_error_code(&error),
+                DeviceErrorCode::InternalFailure
+            );
+        }
+    }
 
     #[test]
     fn environment_policy_errors_map_to_stable_device_codes_without_values() {
@@ -2006,6 +2658,81 @@ mod tests {
         let keys = retired.grants.snapshot().verifier_keys;
         assert_eq!(keys, vec![new_grant.verifier().to_bytes()]);
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn terminal_proof_is_persisted_before_remote_result_delivery() {
+        let source = include_str!("v2_m1_agent.rs");
+        let start = source
+            .find("record_terminal_evidence(\n                                &mut self.terminal_evidence")
+            .unwrap();
+        let end = source[start..]
+            .find("AgentOperationOutcome::Indeterminate")
+            .map(|offset| start + offset)
+            .unwrap();
+        let block = &source[start..end];
+        let persist = block.find("self.persist_state()?").unwrap();
+        let send = block
+            .find("send_agent(&outbound_tx, AgentToHub::Result(signed)).await?")
+            .unwrap();
+        assert!(
+            persist < send,
+            "terminal proof must be durable before response delivery"
+        );
+    }
+
+    #[test]
+    fn terminal_journal_records_only_authoritative_payload_free_effectful_proof() {
+        let active = ActiveOperation {
+            operation_id: "op-journal".into(),
+            device_generation: 4,
+            capability_revision: 12,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: "grant_journal_fence".into(),
+            handoff_verification: None,
+            cancellation: ActiveCancellation::None,
+        };
+        let result = DeviceResult::Shell {
+            output: crate::v2_m0::ProcessOutput {
+                exit_code: Some(0),
+                stdout: "RAW_SECRET_RESULT_MARKER".into(),
+                stderr: "RAW_SECRET_ERROR_MARKER".into(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                timed_out: false,
+                cancelled: false,
+                duration_ms: 1,
+            },
+        };
+        let mut journal = VecDeque::new();
+        record_terminal_evidence(&mut journal, "dev-a", &active, &result).unwrap();
+        assert_eq!(journal.len(), 1);
+        let encoded = serde_json::to_string(&journal).unwrap();
+        assert!(!encoded.contains("RAW_SECRET_RESULT_MARKER"));
+        assert!(!encoded.contains("RAW_SECRET_ERROR_MARKER"));
+        assert_eq!(journal[0].operation.operation_id, "op-journal");
+        assert_eq!(journal[0].capability, DeviceCapability::Shell);
+
+        let mut indeterminate = journal.clone();
+        let active = ActiveOperation {
+            operation_id: "op-no-proof".into(),
+            device_generation: 4,
+            capability_revision: 12,
+            capability: DeviceCapability::PointerClick,
+            dispatch_grant_id: "grant_no_proof".into(),
+            handoff_verification: None,
+            cancellation: ActiveCancellation::None,
+        };
+        record_terminal_evidence(
+            &mut indeterminate,
+            "dev-a",
+            &active,
+            &DeviceResult::Error {
+                code: DeviceErrorCode::BackendOutcomeIndeterminate,
+            },
+        )
+        .unwrap();
+        assert_eq!(indeterminate.len(), journal.len());
     }
 
     #[test]

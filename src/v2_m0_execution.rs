@@ -59,6 +59,10 @@ pub enum CompletionDecision {
 pub enum IndeterminateResolution {
     ConfirmedCompleted,
     ConfirmedNotExecuted,
+    /// Independent evidence proves the input side effect was applied, but a
+    /// distinct submit/commit action did not occur. This is terminal for the
+    /// original input operation and never authorizes replay.
+    ConfirmedEffectAppliedUncommitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,15 +87,19 @@ pub struct HubOperationSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubAdmissionSnapshot {
     pub operations: Vec<HubOperationSnapshot>,
+    #[serde(default)]
+    pub retired_indeterminate_operation_ids: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HubAdmissionController {
     limits: AdmissionLimits,
     active_by_device: HashMap<String, String>,
     operations: HashMap<String, HubOperation>,
     queued_by_device: HashMap<String, VecDeque<OperationRef>>,
     blocked_by_indeterminate: HashMap<String, String>,
+    retired_indeterminate: HashSet<String>,
+    recovery_read_only_operations: HashSet<String>,
 }
 
 impl HubAdmissionController {
@@ -102,6 +110,8 @@ impl HubAdmissionController {
             operations: HashMap::new(),
             queued_by_device: HashMap::new(),
             blocked_by_indeterminate: HashMap::new(),
+            retired_indeterminate: HashSet::new(),
+            recovery_read_only_operations: HashSet::new(),
         })
     }
 
@@ -109,17 +119,27 @@ impl HubAdmissionController {
         let mut operations: Vec<_> = self
             .operations
             .values()
-            .map(|operation| HubOperationSnapshot {
-                operation: operation.operation.clone(),
-                state: match operation.state {
-                    HubOperationState::Queued | HubOperationState::ActiveNotDispatched => {
-                        HubOperationState::Cancelled
-                    }
-                    HubOperationState::Dispatched | HubOperationState::CancelRequested => {
-                        HubOperationState::Indeterminate
-                    }
-                    terminal => terminal,
-                },
+            .map(|operation| {
+                let recovery_read_only = self
+                    .recovery_read_only_operations
+                    .contains(&operation.operation.operation_id);
+                HubOperationSnapshot {
+                    operation: operation.operation.clone(),
+                    state: match operation.state {
+                        HubOperationState::Queued | HubOperationState::ActiveNotDispatched => {
+                            HubOperationState::Cancelled
+                        }
+                        HubOperationState::Dispatched | HubOperationState::CancelRequested
+                            if recovery_read_only =>
+                        {
+                            HubOperationState::Failed
+                        }
+                        HubOperationState::Dispatched | HubOperationState::CancelRequested => {
+                            HubOperationState::Indeterminate
+                        }
+                        terminal => terminal,
+                    },
+                }
             })
             .collect();
         operations.sort_by(|left, right| {
@@ -127,13 +147,31 @@ impl HubAdmissionController {
                 .operation_id
                 .cmp(&right.operation.operation_id)
         });
-        HubAdmissionSnapshot { operations }
+        let mut retired_indeterminate_operation_ids: Vec<_> =
+            self.retired_indeterminate.iter().cloned().collect();
+        retired_indeterminate_operation_ids.sort();
+        HubAdmissionSnapshot {
+            operations,
+            retired_indeterminate_operation_ids,
+        }
     }
 
     pub fn restore_after_restart(
         limits: AdmissionLimits,
         snapshot: HubAdmissionSnapshot,
     ) -> Result<Self, ExecutionError> {
+        let retired_indeterminate: HashSet<_> = snapshot
+            .retired_indeterminate_operation_ids
+            .iter()
+            .cloned()
+            .collect();
+        if retired_indeterminate.len() != snapshot.retired_indeterminate_operation_ids.len()
+            || retired_indeterminate
+                .iter()
+                .any(|operation_id| operation_id.trim().is_empty())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
         let mut controller = Self::new(limits)?;
         for persisted in snapshot.operations {
             if !matches!(
@@ -152,6 +190,7 @@ impl HubAdmissionController {
                 return Err(ExecutionError::InvalidSnapshot);
             }
             if persisted.state == HubOperationState::Indeterminate
+                && !retired_indeterminate.contains(&persisted.operation.operation_id)
                 && controller
                     .blocked_by_indeterminate
                     .insert(
@@ -170,6 +209,15 @@ impl HubAdmissionController {
                 },
             );
         }
+        if retired_indeterminate.iter().any(|operation_id| {
+            controller
+                .operations
+                .get(operation_id)
+                .is_none_or(|operation| operation.state != HubOperationState::Indeterminate)
+        }) {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        controller.retired_indeterminate = retired_indeterminate;
         Ok(controller)
     }
 
@@ -210,6 +258,37 @@ impl HubAdmissionController {
             },
         );
         Ok(AdmissionDecision::Queued { position })
+    }
+
+    pub fn admit_recovery_read_only(
+        &mut self,
+        operation: OperationRef,
+    ) -> Result<AdmissionDecision, ExecutionError> {
+        if operation.operation_id.trim().is_empty() || operation.device_id.trim().is_empty() {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        if self.operations.contains_key(&operation.operation_id) {
+            return Err(ExecutionError::OperationReplay);
+        }
+        if !self
+            .blocked_by_indeterminate
+            .contains_key(&operation.device_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        if self.active_by_device.contains_key(&operation.device_id)
+            || self.active_by_device.len() >= self.limits.max_global_active
+        {
+            return Err(ExecutionError::BackpressureRejected);
+        }
+        self.start(operation.clone());
+        self.recovery_read_only_operations
+            .insert(operation.operation_id.clone());
+        Ok(AdmissionDecision::StartNow(operation))
+    }
+
+    pub fn is_recovery_read_only(&self, operation_id: &str) -> bool {
+        self.recovery_read_only_operations.contains(operation_id)
     }
 
     pub fn mark_dispatched(&mut self, operation_id: &str) -> Result<(), ExecutionError> {
@@ -260,6 +339,7 @@ impl HubAdmissionController {
                     .expect("operation was resolved above")
                     .state = HubOperationState::Cancelled;
                 self.active_by_device.remove(&device_id);
+                self.recovery_read_only_operations.remove(operation_id);
                 let next = self
                     .start_next_for_available_capacity(Some(&device_id))
                     .map_or(CompletionDecision::Idle, CompletionDecision::StartNext);
@@ -325,6 +405,33 @@ impl HubAdmissionController {
         operation.state = terminal;
         let device_id = operation.operation.device_id.clone();
         self.active_by_device.remove(&device_id);
+        self.recovery_read_only_operations.remove(operation_id);
+        Ok(self
+            .start_next_for_available_capacity(Some(&device_id))
+            .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
+    }
+
+    pub fn fail_recovery_read_only(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<CompletionDecision, ExecutionError> {
+        if !self.recovery_read_only_operations.contains(operation_id) {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let operation = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if !matches!(
+            operation.state,
+            HubOperationState::Dispatched | HubOperationState::CancelRequested
+        ) {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        operation.state = HubOperationState::Failed;
+        let device_id = operation.operation.device_id.clone();
+        self.active_by_device.remove(&device_id);
+        self.recovery_read_only_operations.remove(operation_id);
         Ok(self
             .start_next_for_available_capacity(Some(&device_id))
             .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
@@ -341,6 +448,9 @@ impl HubAdmissionController {
         &mut self,
         operation_id: &str,
     ) -> Result<CompletionDecision, ExecutionError> {
+        if self.recovery_read_only_operations.contains(operation_id) {
+            return Err(ExecutionError::InvalidTransition);
+        }
         let operation = self
             .operations
             .get_mut(operation_id)
@@ -380,9 +490,81 @@ impl HubAdmissionController {
             return Err(ExecutionError::InvalidTransition);
         }
         operation.state = match resolution {
-            IndeterminateResolution::ConfirmedCompleted => HubOperationState::Completed,
+            IndeterminateResolution::ConfirmedCompleted
+            | IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+                HubOperationState::Completed
+            }
             IndeterminateResolution::ConfirmedNotExecuted => HubOperationState::Cancelled,
         };
+        self.blocked_by_indeterminate.remove(&device_id);
+        Ok(self
+            .start_next_for_available_capacity(Some(&device_id))
+            .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
+    }
+
+    /// Retire an indeterminate operation without claiming a historical execution
+    /// outcome. The exact operation ID remains in the admission ledger forever,
+    /// but it no longer blocks new work for the device. This transition never
+    /// dispatches, retries, resumes, or reconstructs the old operation.
+    pub fn retire_indeterminate(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<CompletionDecision, ExecutionError> {
+        let operation = self
+            .operations
+            .get(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if operation.state != HubOperationState::Indeterminate
+            || self.retired_indeterminate.contains(operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let device_id = operation.operation.device_id.clone();
+        if self
+            .blocked_by_indeterminate
+            .get(&device_id)
+            .is_none_or(|blocked| blocked != operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        self.blocked_by_indeterminate.remove(&device_id);
+        self.retired_indeterminate.insert(operation_id.to_owned());
+        Ok(self
+            .start_next_for_available_capacity(Some(&device_id))
+            .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
+    }
+
+    /// Settle an indeterminate operation from already-authoritative terminal
+    /// evidence. This never dispatches or retries work; it only changes the
+    /// existing quarantined operation to the exact terminal state proved by
+    /// the normal execution protocol.
+    pub fn reconcile_indeterminate_terminal(
+        &mut self,
+        operation_id: &str,
+        terminal: HubOperationState,
+    ) -> Result<CompletionDecision, ExecutionError> {
+        if !matches!(
+            terminal,
+            HubOperationState::Completed | HubOperationState::Failed | HubOperationState::Cancelled
+        ) {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let operation = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if operation.state != HubOperationState::Indeterminate {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let device_id = operation.operation.device_id.clone();
+        if self
+            .blocked_by_indeterminate
+            .get(&device_id)
+            .is_none_or(|blocked| blocked != operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        operation.state = terminal;
         self.blocked_by_indeterminate.remove(&device_id);
         Ok(self
             .start_next_for_available_capacity(Some(&device_id))
@@ -419,6 +601,7 @@ impl HubAdmissionController {
         let count = remove.len();
         for operation_id in remove {
             self.operations.remove(&operation_id);
+            self.recovery_read_only_operations.remove(&operation_id);
         }
         Ok(count)
     }
@@ -786,6 +969,76 @@ mod tests {
     }
 
     #[test]
+    fn quarantined_device_allows_only_explicit_recovery_read_lane() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 0,
+        };
+        let mut hub = HubAdmissionController::new(limits).unwrap();
+        hub.admit(op("dev-a", 1, "ambiguous")).unwrap();
+        hub.mark_dispatched("ambiguous").unwrap();
+        hub.mark_indeterminate("ambiguous").unwrap();
+
+        assert_eq!(
+            hub.admit(op("dev-a", 2, "mutation")),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "ambiguous".into()
+            })
+        );
+        assert!(matches!(
+            hub.admit_recovery_read_only(op("dev-a", 2, "evidence"))
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        assert!(hub.is_recovery_read_only("evidence"));
+        assert_eq!(
+            hub.admit_recovery_read_only(op("dev-a", 2, "evidence-2")),
+            Err(ExecutionError::BackpressureRejected)
+        );
+        hub.mark_dispatched("evidence").unwrap();
+        assert_eq!(
+            hub.fail_recovery_read_only("evidence").unwrap(),
+            CompletionDecision::Idle
+        );
+        assert_eq!(hub.state("evidence"), Some(HubOperationState::Failed));
+        assert_eq!(
+            hub.admit(op("dev-a", 2, "still-blocked")),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "ambiguous".into()
+            })
+        );
+    }
+
+    #[test]
+    fn recovery_read_restart_fails_terminal_without_replacing_existing_quarantine() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 0,
+        };
+        let mut hub = HubAdmissionController::new(limits).unwrap();
+        hub.admit(op("dev-a", 1, "ambiguous")).unwrap();
+        hub.mark_dispatched("ambiguous").unwrap();
+        hub.mark_indeterminate("ambiguous").unwrap();
+        hub.admit_recovery_read_only(op("dev-a", 2, "evidence"))
+            .unwrap();
+        hub.mark_dispatched("evidence").unwrap();
+
+        let snapshot = hub.snapshot_for_restart();
+        let mut restored = HubAdmissionController::restore_after_restart(limits, snapshot).unwrap();
+        assert_eq!(
+            restored.state("ambiguous"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert_eq!(restored.state("evidence"), Some(HubOperationState::Failed));
+        assert_eq!(
+            restored.admit(op("dev-a", 3, "mutation")),
+            Err(ExecutionError::DeviceIndeterminate {
+                operation_id: "ambiguous".into()
+            })
+        );
+    }
+
+    #[test]
     fn hub_terminal_tombstones_are_pruned_by_generation_but_indeterminate_is_retained() {
         let limits = AdmissionLimits {
             max_global_active: 1,
@@ -815,6 +1068,62 @@ mod tests {
             Err(ExecutionError::DeviceIndeterminate {
                 operation_id: "ambiguous".into()
             })
+        );
+    }
+
+    #[test]
+    fn retired_indeterminate_remains_unknown_tombstoned_and_unblocked_across_restart() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 0,
+        };
+        let mut hub = HubAdmissionController::new(limits).unwrap();
+        hub.admit(op("dev-a", 4, "legacy-scroll")).unwrap();
+        hub.mark_dispatched("legacy-scroll").unwrap();
+        hub.mark_indeterminate("legacy-scroll").unwrap();
+
+        assert_eq!(
+            hub.retire_indeterminate("legacy-scroll").unwrap(),
+            CompletionDecision::Idle
+        );
+        assert_eq!(
+            hub.state("legacy-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert_eq!(
+            hub.admit(op("dev-a", 5, "legacy-scroll")),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert!(matches!(
+            hub.admit(op("dev-a", 5, "fresh-after-retirement")).unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+
+        hub.mark_dispatched("fresh-after-retirement").unwrap();
+        hub.complete("fresh-after-retirement", false).unwrap();
+        let snapshot = hub.snapshot_for_restart();
+        assert_eq!(
+            snapshot.retired_indeterminate_operation_ids,
+            vec!["legacy-scroll".to_owned()]
+        );
+        let mut restored = HubAdmissionController::restore_after_restart(limits, snapshot).unwrap();
+        assert_eq!(
+            restored.state("legacy-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(matches!(
+            restored
+                .admit(op("dev-a", 6, "fresh-after-restart"))
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        assert_eq!(
+            restored.admit(op("dev-a", 6, "legacy-scroll")),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert_eq!(
+            restored.retire_indeterminate("legacy-scroll"),
+            Err(ExecutionError::InvalidTransition)
         );
     }
 

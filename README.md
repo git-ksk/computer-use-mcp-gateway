@@ -32,7 +32,7 @@ V2 Agent
 Computer-use backend (Cua Driver today)
 ```
 
-The Hub owns admission, authorization, operation state, replay barriers, and durable `indeterminate` quarantine. The Agent owns the authenticated device session and local execution boundary. Optional usage accounting is separate accounting authority and cannot authorize execution, clear quarantine, or permit replay.
+The Hub owns admission, authorization, operation state, replay barriers, and durable `indeterminate` quarantine. The Agent owns the authenticated device session and local execution boundary. Deployment-specific quota, billing, or usage controls belong outside CUMG and do not gain execution, replay, quarantine, or recovery authority.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the canonical V2 boundary in [`docs/v2/V2_POSITIONING.md`](docs/v2/V2_POSITIONING.md).
 
@@ -81,6 +81,8 @@ CUMG is fail-closed around the capabilities that can change a desktop. In partic
 
 These controls do not replace OS permissions, endpoint hardening, secret custody, network controls, or deployment-specific monitoring. Read [`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/v2/V2_THREAT_MODEL.md`](docs/v2/V2_THREAT_MODEL.md) before exposing a sensitive desktop remotely.
 
+If a V2 caller receives `device_indeterminate`, **do not retry the old operation**. The response's `blocking_operation_id` identifies the earlier ambiguous operation already quarantining the device. Follow the read-only inspection/reconciliation flow in [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) before any authority-bearing recovery; offline resolution uses a version-paired `v2_hub` / `v2_maint` set and stops the Hub only for the mutation step.
+
 ## V2 status
 
 The active implementation is tracked by capability rather than by internal milestone names:
@@ -90,9 +92,12 @@ The active implementation is tracked by capability rather than by internal miles
 | Desktop semantic path | Complete / accepted |
 | Browser core | Complete / accepted |
 | Browser transfer (upload/download) | Complete / accepted |
+| Optional Human Handoff coordination | First-class / accepted in CUMG; Window + Terminal consume upstream Handoff components |
 | V1 regression/conformance | Required and preserved |
 
 Browser core covers the typed prepare, bind, inspect, navigate, click, type, dialog, and pointer paths while preserving opaque CUMG references and exact-or-refuse execution semantics. Browser transfer adds bounded staged upload/download with context-scoped references, Agent-private filesystem staging, exact capability checks, and fail-closed handling of stale references, path escape, partial completion, timeout, and cancellation.
+
+When optional Human Handoff is enabled, CUMG treats upstream Handoff authority as part of the Agent execution boundary rather than as a best-effort sidecar. Window integration now consumes `WindowHandoffAdapter`; Terminal/PTY integration consumes `TerminalHandoffAdapter` and no longer imports Handoff's experimental Terminal authority/WebRTC modules directly. CUMG still owns authorization, operation/quarantine semantics, PTY/process containment, and fresh semantic verification. Upstream Window issue #85 remains open for a first-class same-LAN direct physical rerun; that does not reopen CUMG #152 or the completed Terminal integration.
 
 See [`docs/v2/STATUS.md`](docs/v2/STATUS.md) for the current map, [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md) for Browser core evidence, [`docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) for Browser transfer evidence, and [`docs/README.md`](docs/README.md) for how active specs, acceptance evidence, and archived decision records are organized.
 

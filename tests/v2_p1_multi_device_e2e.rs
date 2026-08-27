@@ -381,9 +381,36 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
     assert_eq!(line_count(&drag_marker)?, 1);
     assert_eq!(line_count(&cancel_marker)?, 1);
 
+    let recovery_read = handle_a
+        .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+        .await?
+        .wait()
+        .await?;
+    assert!(matches!(
+        recovery_read.result,
+        DeviceResult::ScreenGeometry { .. }
+    ));
+    assert_eq!(
+        handle_a
+            .desktop_quarantine()
+            .await
+            .expect("recovery read must preserve Device A quarantine")
+            .operation_id,
+        ambiguous_a
+    );
     assert!(matches!(
         handle_a
-            .start_command_as(bob.clone(), DeviceCommand::ScreenGeometry)
+            .start_command_as(
+                bob.clone(),
+                DeviceCommand::Shell {
+                    request: ShellRequest {
+                        command: "printf must-not-dispatch".into(),
+                        cwd: cwd.to_string_lossy().into_owned(),
+                        env: vec![],
+                        timeout_ms: 2_000,
+                    },
+                },
+            )
             .await?
             .wait()
             .await,

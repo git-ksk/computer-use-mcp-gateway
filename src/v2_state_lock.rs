@@ -1,17 +1,25 @@
 //! Exclusive ownership of a V2 Hub state directory.
 
 use fs2::FileExt as _;
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 
 const STATE_LOCK_FILE: &str = ".cumg-v2-state.lock";
 
 #[derive(Debug)]
 pub struct StateDirectoryLock {
     file: File,
+    #[cfg(windows)]
+    process_key: PathBuf,
 }
 
 impl StateDirectoryLock {
@@ -44,12 +52,25 @@ impl StateDirectoryLock {
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(StateDirectoryLockError::UnsafePermissions);
         }
+
+        #[cfg(windows)]
+        let process_key = reserve_process_lock(directory)?;
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(Self { file }),
+            Ok(()) => Ok(Self {
+                file,
+                #[cfg(windows)]
+                process_key,
+            }),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(windows)]
+                release_process_lock(&process_key);
                 Err(StateDirectoryLockError::Busy)
             }
-            Err(error) => Err(StateDirectoryLockError::Io(error)),
+            Err(error) => {
+                #[cfg(windows)]
+                release_process_lock(&process_key);
+                Err(StateDirectoryLockError::Io(error))
+            }
         }
     }
 }
@@ -57,6 +78,34 @@ impl StateDirectoryLock {
 impl Drop for StateDirectoryLock {
     fn drop(&mut self) {
         let _ = fs2::FileExt::unlock(&self.file);
+        #[cfg(windows)]
+        release_process_lock(&self.process_key);
+    }
+}
+
+#[cfg(windows)]
+static PROCESS_LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(windows)]
+fn reserve_process_lock(directory: &Path) -> Result<PathBuf, StateDirectoryLockError> {
+    let key = fs::canonicalize(directory).map_err(StateDirectoryLockError::Io)?;
+    let locks = PROCESS_LOCKS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !locks.insert(key.clone()) {
+        return Err(StateDirectoryLockError::Busy);
+    }
+    Ok(key)
+}
+
+#[cfg(windows)]
+fn release_process_lock(key: &Path) {
+    if let Some(locks) = PROCESS_LOCKS.get() {
+        let mut locks = locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.remove(key);
     }
 }
 

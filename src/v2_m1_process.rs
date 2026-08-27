@@ -10,11 +10,11 @@
 use crate::v2_m0::{ProcessEnvVar, ProcessOutput, ProcessRequest, ShellRequest};
 use crate::v2_m0_execution::{AgentExecutionGate, ExecutionError, OperationRef};
 use crate::v2_observability::SafeErrorCode;
-use process_wrap::std::CommandWrap;
 #[cfg(windows)]
 use process_wrap::std::JobObject;
 #[cfg(unix)]
 use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
@@ -287,11 +287,47 @@ impl ProcessExecutor {
         #[cfg(windows)]
         command.wrap(JobObject);
         let mut child = command.spawn().map_err(ProcessError::Spawn)?;
-        let stdout = child.stdout().take().ok_or(ProcessError::PipeUnavailable)?;
-        let stderr = child.stderr().take().ok_or(ProcessError::PipeUnavailable)?;
+        let stdout = match child.stdout().take() {
+            Some(stdout) => stdout,
+            None => {
+                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::PipeSetup)?;
+                return Err(ProcessError::PipeUnavailable);
+            }
+        };
+        let stderr = match child.stderr().take() {
+            Some(stderr) => stderr,
+            None => {
+                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::PipeSetup)?;
+                return Err(ProcessError::PipeUnavailable);
+            }
+        };
         let max = self.policy.max_output_bytes_per_stream;
-        let stdout_reader = thread::spawn(move || drain_bounded(stdout, max));
-        let stderr_reader = thread::spawn(move || drain_bounded(stderr, max));
+        let stdout_reader = match thread::Builder::new()
+            .name("cumg-process-stdout".into())
+            .spawn(move || drain_bounded(stdout, max))
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::ReaderSetup)?;
+                return Err(ProcessError::Io(error));
+            }
+        };
+        let stderr_reader = match thread::Builder::new()
+            .name("cumg-process-stderr".into())
+            .spawn(move || drain_bounded(stderr, max))
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                match prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::ReaderSetup)
+                {
+                    Ok(_) => {
+                        let _ = stdout_reader.join();
+                        return Err(ProcessError::Io(error));
+                    }
+                    Err(unproven) => return Err(unproven),
+                }
+            }
+        };
 
         let timeout = Duration::from_millis(timeout_ms);
         let mut timed_out = false;
@@ -299,19 +335,35 @@ impl ProcessExecutor {
         let status = loop {
             if cancellation.is_cancelled() {
                 cancelled = true;
-                child.start_kill().map_err(ProcessError::Io)?;
-                break child.wait().map_err(ProcessError::Io)?;
+                break prove_process_domain_terminal(
+                    &mut *child,
+                    ProcessUnprovenStage::Termination,
+                )?;
             }
             if started.elapsed() >= timeout {
                 timed_out = true;
-                child.start_kill().map_err(ProcessError::Io)?;
-                break child.wait().map_err(ProcessError::Io)?;
+                break prove_process_domain_terminal(
+                    &mut *child,
+                    ProcessUnprovenStage::Termination,
+                )?;
             }
-            if let Some(status) = child.try_wait().map_err(ProcessError::Io)? {
-                // Bounded Agent operations are not service launchers. Clean up
-                // anything still attached to the process group / Job Object.
-                let _ = child.start_kill();
-                break status;
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Preserve the existing bounded-operation lifecycle contract:
+                    // once the direct operation reports terminal, best-effort kill
+                    // anything still attached to the process group / Job Object.
+                    // #102 changes only error paths where terminality is unproven.
+                    let _ = child.start_kill();
+                    break status;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // Polling failed after spawn. Stop the process domain and only
+                    // surface an ordinary I/O failure if termination is proven.
+                    // Otherwise the caller-visible outcome must remain unknown.
+                    prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::Poll)?;
+                    return Err(ProcessError::Io(error));
+                }
             }
             thread::sleep(self.policy.poll_interval);
         };
@@ -344,8 +396,9 @@ impl ProcessExecutor {
         let operation_id = operation.operation_id.clone();
         gate.begin(operation).map_err(ProcessError::Execution)?;
         let result = self.execute(request, cancellation);
-        // A process operation is terminal after the direct child has been waited,
-        // including timeout/cancellation. Never make the operation ID replayable.
+        // Once an operation ID has entered the Agent gate, it must never become
+        // replayable. A proven terminal result and an unproven post-spawn outcome
+        // both become replay tombstones; the latter is reconciled by Hub quarantine.
         gate.finish(&operation_id)
             .map_err(ProcessError::Execution)?;
         result
@@ -421,6 +474,52 @@ struct BoundedBytes {
     truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessUnprovenStage {
+    PipeSetup,
+    ReaderSetup,
+    Poll,
+    Termination,
+    Wait,
+    Worker,
+}
+
+impl ProcessUnprovenStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PipeSetup => "pipe_setup",
+            Self::ReaderSetup => "reader_setup",
+            Self::Poll => "poll",
+            Self::Termination => "termination",
+            Self::Wait => "wait",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+fn prove_process_domain_terminal(
+    child: &mut dyn ChildWrapper,
+    failure_stage: ProcessUnprovenStage,
+) -> Result<std::process::ExitStatus, ProcessError> {
+    match child.start_kill() {
+        Ok(()) => child
+            .wait()
+            .map_err(|_| ProcessError::OutcomeUnproven(ProcessUnprovenStage::Wait)),
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                // A kill can race with natural process-group exit. The Unix
+                // ProcessGroup wrapper only returns Some once the group is empty,
+                // so this is sufficient terminal proof without widening trust.
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Ok(status);
+                }
+            }
+            Err(ProcessError::OutcomeUnproven(failure_stage))
+        }
+    }
+}
+
 fn drain_bounded<R: Read>(mut reader: R, max: usize) -> Result<BoundedBytes, ProcessError> {
     let mut kept = Vec::with_capacity(max.min(4096));
     let mut truncated = false;
@@ -461,6 +560,7 @@ pub enum ProcessError {
     PipeUnavailable,
     ReaderPanicked,
     Io(std::io::Error),
+    OutcomeUnproven(ProcessUnprovenStage),
     Execution(ExecutionError),
 }
 
@@ -484,7 +584,17 @@ impl SafeErrorCode for ProcessError {
             Self::PipeUnavailable => "process_pipe_unavailable",
             Self::ReaderPanicked => "process_reader_panicked",
             Self::Io(_) => "process_io",
+            Self::OutcomeUnproven(_) => "process_outcome_unproven",
             Self::Execution(_) => "process_execution",
+        }
+    }
+}
+
+impl ProcessError {
+    pub(crate) fn outcome_unproven_stage(&self) -> Option<ProcessUnprovenStage> {
+        match self {
+            Self::OutcomeUnproven(stage) => Some(*stage),
+            _ => None,
         }
     }
 }
@@ -530,6 +640,130 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FaultChild {
+        kill_fails: bool,
+        wait_fails: bool,
+        try_wait_fails: bool,
+        try_wait_terminal: bool,
+    }
+
+    impl ChildWrapper for FaultChild {
+        fn inner(&self) -> &dyn ChildWrapper {
+            self
+        }
+
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            self
+        }
+
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            self
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            if self.kill_fails {
+                Err(std::io::Error::other("injected kill failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            if self.try_wait_fails {
+                Err(std::io::Error::other("injected try_wait failure"))
+            } else if self.try_wait_terminal {
+                Ok(Some(success_status()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            if self.wait_fails {
+                Err(std::io::Error::other("injected wait failure"))
+            } else {
+                Ok(success_status())
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn success_status() -> std::process::ExitStatus {
+        Command::new("true").status().unwrap()
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected reader failure"))
+        }
+    }
+
+    #[test]
+    fn failed_termination_without_terminal_proof_is_indeterminate() {
+        let mut child = FaultChild {
+            kill_fails: true,
+            wait_fails: false,
+            try_wait_fails: false,
+            try_wait_terminal: false,
+        };
+        assert!(matches!(
+            prove_process_domain_terminal(&mut child, ProcessUnprovenStage::Termination),
+            Err(ProcessError::OutcomeUnproven(
+                ProcessUnprovenStage::Termination
+            ))
+        ));
+    }
+
+    #[test]
+    fn failed_wait_after_successful_termination_is_indeterminate() {
+        let mut child = FaultChild {
+            kill_fails: false,
+            wait_fails: true,
+            try_wait_fails: false,
+            try_wait_terminal: false,
+        };
+        assert!(matches!(
+            prove_process_domain_terminal(&mut child, ProcessUnprovenStage::Termination),
+            Err(ProcessError::OutcomeUnproven(ProcessUnprovenStage::Wait))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_race_with_already_empty_process_group_still_proves_terminal() {
+        let mut child = FaultChild {
+            kill_fails: true,
+            wait_fails: false,
+            try_wait_fails: false,
+            try_wait_terminal: true,
+        };
+        assert!(
+            prove_process_domain_terminal(&mut child, ProcessUnprovenStage::Termination).is_ok()
+        );
+    }
+
+    #[test]
+    fn output_reader_failure_remains_terminal_error_category() {
+        let error = drain_bounded(FailingReader, 16).unwrap_err();
+        assert!(matches!(error, ProcessError::Io(_)));
+        assert_eq!(error.outcome_unproven_stage(), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn structured_argv_executes_without_shell_and_bounds_output() {
@@ -549,6 +783,27 @@ mod tests {
         assert_eq!(output.stdout, "01234567");
         assert!(output.stdout_truncated);
         assert!(!output.timed_out && !output.cancelled);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn definite_spawn_failure_is_not_indeterminate() {
+        let root = temp_root("spawn-failure");
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+        let missing = root.join("definitely-not-a-cumg-program");
+        let request = ProcessRequest {
+            program: missing.to_string_lossy().into_owned(),
+            args: vec![],
+            cwd: root.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        };
+        let error = executor
+            .execute(&request, &ProcessCancellation::default())
+            .unwrap_err();
+        assert!(matches!(error, ProcessError::Spawn(_)));
+        assert_eq!(error.outcome_unproven_stage(), None);
         fs::remove_dir_all(root).unwrap();
     }
 

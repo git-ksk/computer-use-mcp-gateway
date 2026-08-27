@@ -8,7 +8,8 @@ use computer_use_mcp_gateway::{
     },
     v2_m0_transport::{
         AgentToHub, CancellationDisposition, HubIdentity, HubToAgent, verify_agent_heartbeat,
-        verify_agent_proof, verify_remote_cancellation_ack, verify_remote_result,
+        verify_agent_proof, verify_remote_cancellation_ack, verify_remote_reconciliation_report,
+        verify_remote_result,
     },
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig},
@@ -47,6 +48,7 @@ struct Evidence {
     generations: Vec<u64>,
     cancellation_ack: bool,
     cancelled_result: bool,
+    reconciliation_report: bool,
 }
 
 #[derive(Clone)]
@@ -129,6 +131,55 @@ impl AgentControl for LifecycleHub {
                 if session_index == 0 {
                     // Deliberately end the first authenticated stream. The Agent must
                     // reconnect outbound and must not reuse generation 1.
+                    return Ok(());
+                }
+
+                let reconciliation = match decode_agent_frame(
+                    inbound
+                        .message()
+                        .await?
+                        .ok_or_else(|| anyhow!("missing reconciliation report"))?,
+                )? {
+                    AgentToHub::ReconciliationReport(report) => report,
+                    other => bail!("expected reconciliation report, got {other:?}"),
+                };
+                {
+                    let registry = state
+                        .registry
+                        .lock()
+                        .map_err(|_| anyhow!("registry poisoned"))?;
+                    verify_remote_reconciliation_report(
+                        &registry,
+                        &hello,
+                        &challenge,
+                        &reconciliation,
+                    )?;
+                }
+                if reconciliation.reporting_generation != session.generation {
+                    bail!("reconciliation report used stale reporting generation");
+                }
+                if session_index == 2 {
+                    let proof = reconciliation
+                        .terminal_evidence
+                        .iter()
+                        .find(|proof| proof.operation.operation_id == "agent-service-cancel-sleep")
+                        .ok_or_else(|| anyhow!("missing authoritative terminal proof after response loss"))?;
+                    if proof.operation.device_generation != 2
+                        || proof.capability
+                            != computer_use_mcp_gateway::v2_m0::DeviceCapability::ExecuteProcess
+                        || proof.terminal_state
+                            != computer_use_mcp_gateway::v2_m0_execution::HubOperationState::Cancelled
+                        || proof.evidence
+                            != computer_use_mcp_gateway::v2_execution_safety::ExecutionEvidence::ProvenProcessTermination
+                    {
+                        bail!("unexpected terminal reconciliation proof");
+                    }
+                    state
+                        .evidence
+                        .lock()
+                        .map_err(|_| anyhow!("evidence poisoned"))?
+                        .reconciliation_report = true;
+                    let _ = state.shutdown.send(true);
                     return Ok(());
                 }
 
@@ -266,7 +317,9 @@ impl AgentControl for LifecycleHub {
                     evidence.cancellation_ack = saw_ack;
                     evidence.cancelled_result = saw_result;
                 }
-                let _ = state.shutdown.send(true);
+                // Close generation 2 after receiving the authoritative terminal
+                // result. The Agent must reconnect and re-report only the bounded
+                // payload-free proof; it must never execute the command again.
                 Ok(())
             }
             .await;
@@ -355,9 +408,10 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
         .map_err(|_| anyhow!("Agent service lifecycle timed out"))??;
 
     let observed = evidence.lock().map_err(|_| anyhow!("evidence poisoned"))?;
-    assert_eq!(observed.generations, vec![1, 2]);
+    assert_eq!(observed.generations, vec![1, 2, 3]);
     assert!(observed.cancellation_ack && observed.cancelled_result);
-    assert_eq!(sessions.load(Ordering::SeqCst), 2);
+    assert!(observed.reconciliation_report);
+    assert_eq!(sessions.load(Ordering::SeqCst), 3);
     drop(observed);
 
     let checkpoint = CheckpointStore::new(&state_dir, "agent")?;
@@ -366,10 +420,9 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
     assert!(!persisted.grant_ledger.consumed_grants.is_empty());
     assert!(
         persisted
-            .execution
-            .terminal_operation_ids
+            .terminal_evidence
             .iter()
-            .any(|id| id == "agent-service-cancel-sleep")
+            .any(|proof| proof.operation.operation_id == "agent-service-cancel-sleep")
     );
     // Constructor restore is the actual process-restart boundary used by v2_agent.
     let _restored_agent = AgentService::new(restart_config, material_for_restart)?;

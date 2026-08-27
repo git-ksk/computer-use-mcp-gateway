@@ -8,7 +8,10 @@
 //! permissions, malformed state, and unsupported schema versions instead of
 //! silently falling back from a malformed committed checkpoint.
 
-use crate::v2_execution_safety::{AuthoritativeOperationController, AuthoritativeSafetySnapshot};
+use crate::v2_execution_safety::{
+    AgentTerminalEvidence, AuthoritativeOperationController, AuthoritativeSafetySnapshot,
+    MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES,
+};
 use crate::v2_m0::{DeviceRegistry, DeviceRegistrySnapshot, GrantLedger, GrantLedgerSnapshot};
 use crate::v2_m0_execution::{AdmissionLimits, AgentExecutionGate, AgentExecutionSnapshot};
 use crate::v2_m0_trust::TrustedHubIdentity;
@@ -36,6 +39,8 @@ pub struct AgentPersistentState {
     pub trusted_hub_epoch: u64,
     pub grant_ledger: GrantLedgerSnapshot,
     pub execution: AgentExecutionSnapshot,
+    #[serde(default)]
+    pub terminal_evidence: Vec<AgentTerminalEvidence>,
 }
 
 impl AgentPersistentState {
@@ -45,8 +50,23 @@ impl AgentPersistentState {
         grant_ledger: &GrantLedger,
         execution: &AgentExecutionGate,
     ) -> Result<Self, PersistenceError> {
+        Self::capture_with_terminal_evidence(device_id, trusted_hub, grant_ledger, execution, &[])
+    }
+
+    pub fn capture_with_terminal_evidence(
+        device_id: impl Into<String>,
+        trusted_hub: &TrustedHubIdentity,
+        grant_ledger: &GrantLedger,
+        execution: &AgentExecutionGate,
+        terminal_evidence: &[AgentTerminalEvidence],
+    ) -> Result<Self, PersistenceError> {
         let device_id = device_id.into();
-        if device_id.trim().is_empty() {
+        if device_id.trim().is_empty()
+            || terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
+            || terminal_evidence
+                .iter()
+                .any(|entry| entry.validate().is_err())
+        {
             return Err(PersistenceError::InvalidState);
         }
         Ok(Self {
@@ -56,6 +76,7 @@ impl AgentPersistentState {
             trusted_hub_epoch: trusted_hub.epoch(),
             grant_ledger: grant_ledger.snapshot(),
             execution: execution.snapshot_for_restart(),
+            terminal_evidence: terminal_evidence.to_vec(),
         })
     }
 
@@ -63,8 +84,31 @@ impl AgentPersistentState {
         self,
     ) -> Result<(String, TrustedHubIdentity, GrantLedger, AgentExecutionGate), PersistenceError>
     {
+        let (device_id, trusted_hub, grant_ledger, execution, _) =
+            self.restore_with_terminal_evidence()?;
+        Ok((device_id, trusted_hub, grant_ledger, execution))
+    }
+
+    pub fn restore_with_terminal_evidence(
+        self,
+    ) -> Result<
+        (
+            String,
+            TrustedHubIdentity,
+            GrantLedger,
+            AgentExecutionGate,
+            Vec<AgentTerminalEvidence>,
+        ),
+        PersistenceError,
+    > {
         validate_state_schema(self.schema_version)?;
-        if self.device_id.trim().is_empty() {
+        if self.device_id.trim().is_empty()
+            || self.terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
+            || self
+                .terminal_evidence
+                .iter()
+                .any(|entry| entry.validate().is_err())
+        {
             return Err(PersistenceError::InvalidState);
         }
         let hub_key = VerifyingKey::from_bytes(&self.trusted_hub_public_key)
@@ -75,7 +119,13 @@ impl AgentPersistentState {
             .map_err(PersistenceError::Control)?;
         let execution = AgentExecutionGate::restore_after_restart(self.execution)
             .map_err(PersistenceError::Execution)?;
-        Ok((self.device_id, trusted_hub, grant_ledger, execution))
+        Ok((
+            self.device_id,
+            trusted_hub,
+            grant_ledger,
+            execution,
+            self.terminal_evidence,
+        ))
     }
 }
 
@@ -112,6 +162,20 @@ impl HubPersistentState {
         let execution =
             AuthoritativeOperationController::restore_after_restart(limits, self.execution)
                 .map_err(PersistenceError::Execution)?;
+        let registry_snapshot = registry.snapshot();
+        if execution.retirements().iter().any(|retirement| {
+            registry_snapshot
+                .devices
+                .iter()
+                .find(|device| device.device_id == retirement.operation.device_id)
+                .is_none_or(|device| {
+                    device.generation < retirement.authorized_device_generation
+                        || retirement.authorized_device_generation
+                            <= retirement.operation.device_generation
+                })
+        }) {
+            return Err(PersistenceError::InvalidState);
+        }
         Ok((registry, execution))
     }
 }
@@ -408,9 +472,48 @@ pub enum PersistenceError {
     InvalidState,
 }
 
+impl PersistenceError {
+    pub fn io_class(&self) -> &'static str {
+        match self {
+            Self::Io(error) => bounded_io_class(error.kind()),
+            _ => "not_applicable",
+        }
+    }
+
+    pub fn is_resource_exhaustion(&self) -> bool {
+        matches!(
+            self,
+            Self::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::OutOfMemory
+                )
+        )
+    }
+}
+
+fn bounded_io_class(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::WouldBlock => "would_block",
+        std::io::ErrorKind::InvalidInput => "invalid_input",
+        std::io::ErrorKind::InvalidData => "invalid_data",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::WriteZero => "write_zero",
+        std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        std::io::ErrorKind::OutOfMemory => "out_of_memory",
+        std::io::ErrorKind::StorageFull => "storage_full",
+        _ => "other",
+    }
+}
+
 impl SafeErrorCode for PersistenceError {
     fn safe_error_code(&self) -> &'static str {
         match self {
+            Self::Io(_) if self.is_resource_exhaustion() => "persistence_resource_exhausted",
             Self::Io(_) => "persistence_io",
             Self::Serialization(_) => "persistence_serialization",
             Self::Control(_) => "persistence_control_state",
@@ -705,6 +808,51 @@ mod tests {
     }
 
     #[test]
+    fn agent_terminal_evidence_survives_restart_without_raw_result_payload() {
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let execution = AgentExecutionGate::default();
+        let evidence = AgentTerminalEvidence {
+            operation: OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 2,
+                operation_id: "op-terminal-proof".into(),
+            },
+            capability_revision: 9,
+            capability: DeviceCapability::Shell,
+            dispatch_grant_id: "grant_terminal_proof".into(),
+            terminal_state: crate::v2_m0_execution::HubOperationState::Completed,
+            evidence: ExecutionEvidence::VerifiedAgentResult,
+        };
+        let state = AgentPersistentState::capture_with_terminal_evidence(
+            "dev-a",
+            &trusted_hub,
+            &grants,
+            &execution,
+            std::slice::from_ref(&evidence),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&state).unwrap();
+        for forbidden in [
+            "\"command\":",
+            "\"stdout\":",
+            "\"stderr\":",
+            "\"cwd\":",
+            "\"env\":",
+            "\"result\":",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "persisted terminal evidence leaked {forbidden}"
+            );
+        }
+        let (_, _, _, _, restored_evidence) = state.restore_with_terminal_evidence().unwrap();
+        assert_eq!(restored_evidence, vec![evidence]);
+    }
+
+    #[test]
     fn historical_agent_checkpoint_preserves_grant_and_operation_replay_barriers() {
         let hub = HubIdentity::generate();
         let trusted_hub = TrustedHubIdentity::new(hub.verifier());
@@ -978,6 +1126,68 @@ mod tests {
         let result: Result<serde_json::Value, _> = store.load_latest();
         assert!(matches!(result, Err(PersistenceError::UnsafePermissions)));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn agent_checkpoint_storage_full_preserves_replay_barrier_and_recovers_after_capacity_returns()
+    {
+        let directory = temp_directory("agent-storage-full-recovery");
+        let store = CheckpointStore::new(&directory, "agent").unwrap();
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let mut execution = AgentExecutionGate::default();
+        execution
+            .begin(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 7,
+                operation_id: "op-before-storage-full".into(),
+            })
+            .unwrap();
+        let committed =
+            AgentPersistentState::capture("dev-a", &trusted_hub, &grants, &execution).unwrap();
+        store.save(&committed).unwrap();
+
+        let failed = store
+            .save_with_size_inner(&committed, |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            })
+            .unwrap_err();
+        assert_eq!(failed.safe_error_code(), "persistence_resource_exhausted");
+        assert_eq!(failed.io_class(), "storage_full");
+        assert!(failed.is_resource_exhaustion());
+
+        // The failed candidate never becomes authoritative. Restart restores the last
+        // committed replay barrier, so the exact operation cannot be automatically replayed.
+        let restarted = CheckpointStore::new(&directory, "agent").unwrap();
+        let restored: AgentPersistentState = restarted.load_latest().unwrap();
+        let (_, _, _, mut restored_execution) = restored.restore().unwrap();
+        assert_eq!(
+            restored_execution.begin(OperationRef {
+                device_id: "dev-a".into(),
+                device_generation: 7,
+                operation_id: "op-before-storage-full".into(),
+            }),
+            Err(crate::v2_m0_execution::ExecutionError::OperationReplay)
+        );
+
+        // Once capacity is available again, the same store can commit normally without any
+        // special replay or state repair path.
+        store.save(&committed).unwrap();
+        let recovered: AgentPersistentState = store.load_latest().unwrap();
+        assert_eq!(recovered.device_id, "dev-a");
+        assert_eq!(recovered.execution.replay_generation, Some(7));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn persistence_resource_exhaustion_formatting_is_bounded() {
+        let error = PersistenceError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert_eq!(error.safe_error_code(), "persistence_resource_exhausted");
+        assert_eq!(error.io_class(), "storage_full");
+        assert_eq!(format!("{error:?}"), "persistence_resource_exhausted");
+        assert_eq!(error.to_string(), "persistence_resource_exhausted");
     }
 
     #[test]

@@ -124,7 +124,7 @@ Known parity gaps are explicit rather than hidden behind passthrough behavior:
 - `ClipboardWrite` currently supports plain text only. V1/Cua image and file clipboard writes are **not** implemented in V2.
 - `LaunchApplication` does not currently expose V1/Cua `additional_arguments` or `webkit_inspector_port`.
 
-`CONTROL_SCHEMA_VERSION` is version 8 and `CAPABILITY_SCHEMA_VERSION` remains version 4. Control
+`CONTROL_SCHEMA_VERSION` is version 9 and `CAPABILITY_SCHEMA_VERSION` is version 5. Capability schema v5 adds the signed, payload-free Agent reconciliation-report boundary used after a fresh authenticated generation; mixed v4/v5 peers fail the capability-advertisement handshake closed instead of partially interpreting the stream. Control
 schema mismatches and capability-advertisement schema mismatches fail closed. Ordinary signed Hub/Agent messages retain the 64 KiB application bound, while bounded
 image/UI/clipboard/region observations use the reviewed large-result allowance. Clipboard plain text
 is capped at 1 MiB.

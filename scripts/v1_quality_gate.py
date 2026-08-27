@@ -6,11 +6,13 @@ covers the northbound Streamable HTTP server, gateway policy, backend MCP stdio
 adapter, serialization, response forwarding, and backend health metrics without
 touching a desktop.
 
-Resource measurement is intentionally Linux-only. The idle regression gate
-measures the gateway PID, while `/healthz` independently reports the owned
-backend child process CPU time and RSS after this diagnostic fixture explicitly
-opts into detailed health metadata. Thresholds are generous regression guards
-rather than marketing performance claims.
+The idle CPU/RSS regression gate is enforced on Linux, where `/proc` provides
+the stable process counters used by this fixture. Other platforms explicitly
+report the idle gate as skipped after the portable health and 100-call soak
+checks pass. `/healthz` independently reports the owned backend child process
+CPU time and RSS after this diagnostic fixture explicitly opts into detailed
+health metadata. Thresholds are generous regression guards rather than
+marketing performance claims.
 """
 
 from __future__ import annotations
@@ -234,9 +236,15 @@ def proc_rss_mib(pid: int) -> float:
     raise RuntimeError("VmRSS missing from /proc status")
 
 
-def run_idle_resource_gate(pid: int) -> None:
-    if not sys.platform.startswith("linux"):
-        raise RuntimeError("idle resource gate currently requires Linux /proc")
+def run_idle_resource_gate(pid: int, platform: str | None = None) -> None:
+    actual_platform = platform or sys.platform
+    if not actual_platform.startswith("linux"):
+        print(
+            "idle resource gate SKIP: "
+            f"platform={actual_platform} reason=Linux /proc required; "
+            "portable health/soak checks passed"
+        )
+        return
 
     time.sleep(1.0)
     ticks_per_second = os.sysconf("SC_CLK_TCK")

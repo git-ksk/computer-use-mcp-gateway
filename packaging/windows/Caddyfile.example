@@ -1,0 +1,11 @@
+{
+    admin off
+    auto_https off
+}
+
+http://127.0.0.1:8103 {
+    reverse_proxy 127.0.0.1:8102 {
+        header_up -X-CUMG-Trusted-Proxy-Token
+        header_up X-CUMG-Trusted-Proxy-Token "{env.CUMG_TRUSTED_PROXY_TOKEN}"
+    }
+}

@@ -1,6 +1,0 @@
-# Install as /etc/systemd/system/cumg-v2-hub.service.d/usage.conf only when
-# optional MemoryUsageStore accounting is enabled. Coupling the lifecycle makes
-# an explicit Hub restart also recreate the process-local MemoryUsageStore.
-[Unit]
-Requires=cumg-v2-usage-sidecar.service
-After=cumg-v2-usage-sidecar.service

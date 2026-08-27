@@ -6,9 +6,10 @@
 //! future authenticated northbound MCP layer can call without depending on gRPC.
 
 use crate::v2_execution_safety::{
-    AuthoritativeOperationController, DesktopQuarantine, ExecutionEvidence, ExecutionReceipt,
-    IndeterminateReason, OperationOwner, OperationRecoverySnapshot, RecoverableOperationResult,
-    ResolutionRecord,
+    AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
+    OperationAdmissionMetadata, OperationDispatchBinding, OperationExecutionLane, OperationOwner,
+    OperationRecoverySnapshot, ReconciliationStatus, RecoverableOperationResult, ResolutionRecord,
+    terminal_evidence_for_device_result,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -22,9 +23,11 @@ use crate::v2_m0_execution::{
 };
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubIdentity, HubToAgent,
-    RemoteCancellationAck, RemoteResult, TrustedSessionClock, verify_agent_heartbeat,
-    verify_agent_proof, verify_remote_backend_session_ended, verify_remote_cancellation_ack,
-    verify_remote_result,
+    RemoteCancellationAck, RemoteHandoffAuthority, RemoteHandoffRequestKind,
+    RemoteHandoffResponseKind, RemoteReconciliationReport, RemoteResult, TrustedSessionClock,
+    verify_agent_heartbeat, verify_agent_proof, verify_remote_backend_session_ended,
+    verify_remote_cancellation_ack, verify_remote_handoff_response,
+    verify_remote_reconciliation_report, verify_remote_result,
 };
 use crate::v2_m0_trust::{DeviceKeyRotation, apply_device_key_rotation};
 use crate::v2_m1_grpc::{
@@ -41,7 +44,6 @@ use crate::v2_online_recovery::{
     quarantine_fingerprint,
 };
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
-use crate::v2_usage::UsageLease;
 use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
 use std::collections::{HashMap, VecDeque};
@@ -138,6 +140,7 @@ struct PersistentHubState {
 #[derive(Clone)]
 struct LiveSession {
     generation: u64,
+    capability_revision: u64,
     command_tx: mpsc::Sender<HubRequest>,
     supersede: watch::Sender<bool>,
 }
@@ -253,9 +256,15 @@ enum HubRequest {
     Execute {
         operation_id: String,
         owner: OperationOwner,
-        command: DeviceCommand,
-        usage: Option<UsageLease>,
+        command: Box<DeviceCommand>,
+        metadata: Box<OperationAdmissionMetadata>,
+        handoff: Option<RemoteHandoffAuthority>,
         reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
+    },
+    Handoff {
+        request_id: String,
+        request: RemoteHandoffRequestKind,
+        reply: oneshot::Sender<Result<RemoteHandoffResponseKind, HubCommandError>>,
     },
     Cancel {
         operation_id: String,
@@ -271,7 +280,7 @@ enum HubRequest {
 struct PendingOperation {
     owner: OperationOwner,
     command: DeviceCommand,
-    usage: Option<UsageLease>,
+    handoff: Option<RemoteHandoffAuthority>,
     envelope: Option<CommandEnvelope>,
     reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
 }
@@ -279,6 +288,35 @@ struct PendingOperation {
 enum DispatchOutcome {
     Sent,
     Rejected(CompletionDecision),
+}
+
+enum CommandSessionFence {
+    None,
+    Session {
+        generation: u64,
+        capability_revision: u64,
+    },
+    Handoff(RemoteHandoffAuthority),
+}
+
+impl CommandSessionFence {
+    fn expected_session(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::None => None,
+            Self::Session {
+                generation,
+                capability_revision,
+            } => Some((*generation, *capability_revision)),
+            Self::Handoff(authority) => Some((authority.generation, authority.capability_revision)),
+        }
+    }
+
+    fn handoff(self) -> Option<RemoteHandoffAuthority> {
+        match self {
+            Self::Handoff(authority) => Some(authority),
+            Self::None | Self::Session { .. } => None,
+        }
+    }
 }
 
 impl SingleDeviceHub {
@@ -394,6 +432,16 @@ impl SingleDeviceHub {
             AgentToHub::Hello(hello) => hello,
             other => return Err(unexpected_agent_message("hello", &other)),
         };
+        if self.inner.draining.load(Ordering::Acquire) {
+            tracing::info!(
+                event = "v2_agent_session_rejected",
+                device_id = %self.inner.device_id,
+                outcome = "rejected",
+                error_code = "state_busy",
+                "Agent session rejected because Hub shutdown drain is active"
+            );
+            return Err(HubServiceError::StateBusy);
+        }
         if hello.device_id != self.inner.device_id {
             crate::v2_observability::agent_session_rejected(
                 crate::v2_observability::SessionRejectReason::WrongDevice,
@@ -466,6 +514,7 @@ impl SingleDeviceHub {
             let mut live = self.inner.live.lock().await;
             live.replace(LiveSession {
                 generation: session.generation,
+                capability_revision: session.capabilities.revision,
                 command_tx,
                 supersede: supersede_tx,
             })
@@ -524,6 +573,10 @@ impl SingleDeviceHub {
             String,
             oneshot::Sender<Result<bool, HubCommandError>>,
         > = HashMap::new();
+        let mut handoff_waiters: HashMap<
+            String,
+            oneshot::Sender<Result<RemoteHandoffResponseKind, HubCommandError>>,
+        > = HashMap::new();
         let heartbeat_deadline = tokio::time::sleep(self.inner.config.heartbeat_timeout);
         tokio::pin!(heartbeat_deadline);
         let reauth_deadline = tokio::time::sleep(
@@ -557,6 +610,7 @@ impl SingleDeviceHub {
                 && pending.is_empty()
                 && cancel_waiters.is_empty()
                 && backend_session_end_waiters.is_empty()
+                && handoff_waiters.is_empty()
             {
                 tracing::info!(
                     event = "v2_agent_session_reauth",
@@ -629,7 +683,14 @@ impl SingleDeviceHub {
                         return Ok(());
                     };
                     match request {
-                        HubRequest::Execute { operation_id, owner, command, usage, reply } => {
+                        HubRequest::Execute {
+                            operation_id,
+                            owner,
+                            command,
+                            metadata,
+                            handoff,
+                            reply,
+                        } => {
                             if self.inner.draining.load(Ordering::Acquire) {
                                 tracing::info!(
                                     event = "v2_operation_rejected",
@@ -683,20 +744,24 @@ impl SingleDeviceHub {
                             };
                             let decision = {
                                 let mut persistent = self.inner.persistent.lock().await;
-                                match persistent.execution.prepare(
+                                match persistent.execution.prepare_with_metadata(
                                     operation,
                                     owner.clone(),
                                     command.capability(),
+                                    *metadata,
                                     unix_time_ms()?,
                                 ) {
                                     Ok(decision) => {
+                                        let recovery_evidence_read = persistent
+                                            .execution
+                                            .is_recovery_evidence_read(&operation_id);
                                         persist_locked(&self.inner, &persistent)?;
-                                        Ok(decision)
+                                        Ok((decision, recovery_evidence_read))
                                     }
                                     Err(error) => Err(command_error_from_execution(error)),
                                 }
                             };
-                            let decision = match decision {
+                            let (decision, recovery_evidence_read) = match decision {
                                 Ok(decision) => decision,
                                 Err(error) => {
                                     tracing::warn!(
@@ -724,12 +789,17 @@ impl SingleDeviceHub {
                                 generation,
                                 capability = crate::v2_observability::capability_name(command.capability()),
                                 outcome = admission_outcome,
+                                execution_lane = if recovery_evidence_read {
+                                    "recovery_evidence_read"
+                                } else {
+                                    "normal"
+                                },
                                 "operation admitted"
                             );
                             pending.insert(operation_id.clone(), PendingOperation {
                                 owner,
-                                command,
-                                usage,
+                                command: *command,
+                                handoff,
                                 envelope: None,
                                 reply,
                             });
@@ -760,6 +830,22 @@ impl SingleDeviceHub {
                                 }
                                 AdmissionDecision::Queued { .. } => queue_order.push_back(operation_id),
                             }
+                        }
+                        HubRequest::Handoff { request_id, request, reply } => {
+                            if handoff_waiters.contains_key(&request_id) {
+                                let _ = reply.send(Err(HubCommandError::Rejected));
+                                continue;
+                            }
+                            let remote = self.inner.material.hub_identity.remote_handoff_request(
+                                &hello,
+                                &challenge,
+                                self.inner.device_id.clone(),
+                                generation,
+                                request_id.clone(),
+                                request,
+                            )?;
+                            handoff_waiters.insert(request_id, reply);
+                            send_hub(&outbound, HubToAgent::HandoffRequest(remote)).await?;
                         }
                         HubRequest::Cancel { operation_id, owner, reply } => {
                             let decision = {
@@ -897,6 +983,15 @@ impl SingleDeviceHub {
                                 &mut queue_order,
                             ).await?;
                         }
+                        AgentToHub::ReconciliationReport(report) => {
+                            self.handle_reconciliation_report(
+                                report,
+                                &hello,
+                                &challenge,
+                                generation,
+                            )
+                            .await?;
+                        }
                         AgentToHub::BackendSessionEnded(ack) => {
                             {
                                 let persistent = self.inner.persistent.lock().await;
@@ -926,6 +1021,27 @@ impl SingleDeviceHub {
                                 session_clock,
                             )
                             .await?;
+                        }
+                        AgentToHub::HandoffResponse(response) => {
+                            {
+                                let persistent = self.inner.persistent.lock().await;
+                                verify_remote_handoff_response(
+                                    &persistent.registry,
+                                    &hello,
+                                    &challenge,
+                                    &response,
+                                )?;
+                            }
+                            if response.device_generation != generation {
+                                return Err(HubServiceError::StaleSession);
+                            }
+                            let Some(reply) = handoff_waiters.remove(&response.request_id) else {
+                                return Err(HubServiceError::UnexpectedMessage {
+                                    expected: "handoff_response",
+                                    got: "unmatched_handoff_response",
+                                });
+                            };
+                            let _ = reply.send(Ok(response.response));
                         }
                         AgentToHub::CancellationAck(ack) => {
                             self.handle_cancellation_ack(
@@ -959,14 +1075,14 @@ impl SingleDeviceHub {
         operation_id: &str,
         pending: &mut HashMap<String, PendingOperation>,
     ) -> Result<DispatchOutcome, HubServiceError> {
-        let (owner, device_command, usage) = {
+        let (owner, device_command, handoff) = {
             let operation = pending
                 .get(operation_id)
                 .ok_or(HubServiceError::PendingOperationMissing)?;
             (
                 operation.owner.clone(),
                 operation.command.clone(),
-                operation.usage.clone(),
+                operation.handoff.clone(),
             )
         };
         if self.inner.draining.load(Ordering::Acquire) {
@@ -1004,52 +1120,21 @@ impl SingleDeviceHub {
                     .await;
             }
         };
-        let remote = self.inner.material.hub_identity.remote_command(
-            hello,
-            challenge,
-            command.clone(),
-            grant,
-        )?;
+        let dispatch_binding = if command.command.is_read_only() {
+            None
+        } else {
+            Some(OperationDispatchBinding::new(
+                capability_revision,
+                grant.payload.grant_id.clone(),
+            )?)
+        };
+        let remote = self
+            .inner
+            .material
+            .hub_identity
+            .remote_command_with_handoff(hello, challenge, command.clone(), grant, handoff)?;
 
-        // Usage accounting is deliberately outside the authoritative execution
-        // controller. It is marked liable only after CUMG admission has selected
-        // this operation for execution and before either the durable Dispatched
-        // transition or any Agent-visible bytes can occur.
-        if let Some(usage) = usage.as_ref()
-            && let Err(error) = usage.mark_liable().await
-        {
-            tracing::warn!(
-                event = "v2_usage_mark_liable_failed",
-                operation_id,
-                device_id = %self.inner.device_id,
-                generation,
-                outcome = "cancelled_before_dispatch",
-                error_code = error.safe_error_code(),
-                "usage liability transition failed; Agent dispatch blocked"
-            );
-            let next = {
-                let mut persistent = self.inner.persistent.lock().await;
-                let decision = persistent.execution.request_cancel(
-                    operation_id,
-                    &owner,
-                    generation,
-                    unix_time_ms()?,
-                )?;
-                persist_locked(&self.inner, &persistent)?;
-                match decision {
-                    CancellationDecision::CancelledBeforeDispatch { next } => next,
-                    _ => return Err(HubServiceError::StateBusy),
-                }
-            };
-            if let Some(operation) = pending.remove(operation_id) {
-                let _ = operation.reply.send(Err(HubCommandError::UsageUnavailable));
-            }
-            return Ok(DispatchOutcome::Rejected(next));
-        }
-
-        // A shutdown signal may arrive while usage accounting is awaiting its
-        // pre-dispatch liability transition. Re-check the drain gate before the
-        // durable side-effect boundary so such work remains provably unexecuted.
+        // Re-check the drain gate immediately before the durable side-effect boundary.
         if self.inner.draining.load(Ordering::Acquire) {
             return self
                 .cancel_for_shutdown_drain(operation_id, &owner, generation, pending)
@@ -1061,10 +1146,11 @@ impl SingleDeviceHub {
         // restore a command that may have executed as runnable.
         {
             let mut persistent = self.inner.persistent.lock().await;
-            persistent.execution.mark_dispatched(
+            persistent.execution.mark_dispatched_with_binding(
                 operation_id,
                 &owner,
                 generation,
+                dispatch_binding,
                 unix_time_ms()?,
             )?;
             persist_locked(&self.inner, &persistent)?;
@@ -1075,9 +1161,6 @@ impl SingleDeviceHub {
             .ok_or(HubServiceError::PendingOperationMissing)?
             .envelope = Some(command);
         send_hub(outbound, HubToAgent::Command(remote)).await?;
-        if let Some(usage) = usage.as_ref() {
-            usage.mark_dispatched();
-        }
         tracing::info!(
             event = "v2_operation_dispatched",
             operation_id,
@@ -1174,6 +1257,142 @@ impl SingleDeviceHub {
         Ok(DispatchOutcome::Rejected(next))
     }
 
+    async fn handle_reconciliation_report(
+        &self,
+        report: RemoteReconciliationReport,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        generation: u64,
+    ) -> Result<(), HubServiceError> {
+        if report.reporting_generation != generation {
+            return Err(HubServiceError::StaleSession);
+        }
+        let now_ms = unix_time_ms()?;
+        let mut persistent = self.inner.persistent.lock().await;
+        verify_remote_reconciliation_report(&persistent.registry, hello, challenge, &report)?;
+
+        // Reconciliation is deliberately transactional with respect to durable Hub
+        // state. The live authoritative controller is not changed until a complete
+        // candidate state has been committed to disk.
+        let mut candidate = persistent.execution.clone();
+        let mut resolved = Vec::new();
+        let mut operator_required = Vec::new();
+
+        for evidence in &report.terminal_evidence {
+            let operation_id = evidence.operation.operation_id.as_str();
+            if candidate.state(operation_id) != Some(HubOperationState::Indeterminate) {
+                // Old evidence can remain in the bounded Agent journal across later
+                // reconnects. A terminal/unknown operation is therefore an
+                // idempotent stale duplicate, never a reason to replay or mutate.
+                continue;
+            }
+
+            if evidence.operation.device_id != self.inner.device_id
+                || evidence.operation.device_generation >= generation
+            {
+                candidate.mark_reconciliation_operator_required(operation_id)?;
+                operator_required.push(operation_id.to_owned());
+                continue;
+            }
+
+            match candidate.reconcile_authoritative_terminal(evidence, now_ms) {
+                Ok((_next, receipt)) => {
+                    resolved.push((
+                        operation_id.to_owned(),
+                        evidence.capability,
+                        receipt.terminal_state,
+                    ));
+                }
+                Err(crate::v2_m0_execution::ExecutionError::OwnershipFenceMismatch)
+                | Err(crate::v2_m0_execution::ExecutionError::InvalidOperation)
+                | Err(crate::v2_m0_execution::ExecutionError::InvalidTransition) => {
+                    // A signed Agent claim that does not exactly bind to the Hub's
+                    // operation/device/generation/fence/capability record is not
+                    // authoritative for this quarantine. Escalate; never retry.
+                    candidate.mark_reconciliation_operator_required(operation_id)?;
+                    operator_required.push(operation_id.to_owned());
+                }
+                Err(error) => return Err(HubServiceError::Execution(error)),
+            }
+        }
+
+        // The report is the Agent's complete bounded authoritative journal for
+        // this newly authenticated session. If an auto-reconciling quarantine has
+        // no exact proof in it, no protocol-defined proof source remains in this
+        // Agent state; retain quarantine and surface an explicit evidence gap.
+        let remaining = candidate.quarantine_inspections()?;
+        let mut evidence_gaps = Vec::new();
+        for inspection in remaining {
+            if inspection.operation.device_id == self.inner.device_id
+                && inspection.reconciliation_status == ReconciliationStatus::AutoReconciling
+            {
+                candidate.mark_reconciliation_evidence_gap(&inspection.operation.operation_id)?;
+                evidence_gaps.push(inspection.operation.operation_id);
+            }
+        }
+
+        let state = HubPersistentState::capture(&persistent.registry, &candidate);
+        let checkpoint_bytes = match self.inner.checkpoint.save_with_size(&state) {
+            Ok((_, checkpoint_bytes)) => checkpoint_bytes,
+            Err(error) => {
+                crate::v2_observability::persistence_failure(
+                    crate::v2_observability::PersistenceComponent::Hub,
+                );
+                tracing::error!(
+                    event = "v2_persistence_failure",
+                    device_id = %self.inner.device_id,
+                    outcome = "failed",
+                    error_code = error.safe_error_code(),
+                    component = "hub",
+                    "Hub reconciliation checkpoint persistence failed"
+                );
+                return Err(HubServiceError::Persistence(error));
+            }
+        };
+        self.inner
+            .last_checkpoint_bytes
+            .store(checkpoint_bytes, Ordering::Release);
+        // Only now can quarantine disappear from the live authoritative state.
+        persistent.execution = candidate;
+        drop(persistent);
+
+        for (operation_id, capability, terminal_state) in resolved {
+            tracing::info!(
+                event = "v2_operation_auto_resolved",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                capability = crate::v2_observability::capability_name(capability),
+                terminal_state = ?terminal_state,
+                outcome = "auto_resolved",
+                "authoritative Agent terminal evidence reconciled quarantined operation without replay"
+            );
+        }
+        for operation_id in operator_required {
+            tracing::warn!(
+                event = "v2_operation_reconciliation_operator_required",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "operator_required",
+                error_code = "reconciliation_binding_mismatch",
+                "signed reconciliation evidence did not match the exact Hub authority binding; quarantine retained"
+            );
+        }
+        for operation_id in evidence_gaps {
+            tracing::warn!(
+                event = "v2_operation_reconciliation_evidence_gap",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "unrecoverable_evidence_gap",
+                error_code = "reconciliation_evidence_unavailable",
+                "Agent journal has no authoritative terminal proof for quarantined operation; quarantine retained"
+            );
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_result(
         &self,
@@ -1223,6 +1442,54 @@ impl SingleDeviceHub {
                 code: crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate
             }
         ) {
+            let recovery_evidence_read = {
+                let persistent = self.inner.persistent.lock().await;
+                persistent
+                    .execution
+                    .is_recovery_evidence_read(&operation_id)
+            };
+            if recovery_evidence_read {
+                let (next, _receipt) = {
+                    let mut persistent = self.inner.persistent.lock().await;
+                    let settled = persistent
+                        .execution
+                        .mark_recovery_read_interrupted(&operation_id, unix_time_ms()?)?;
+                    persist_locked(&self.inner, &persistent)?;
+                    settled
+                };
+                crate::v2_observability::operation_completed(
+                    capability,
+                    crate::v2_observability::OperationOutcome::Failed,
+                );
+                tracing::warn!(
+                    event = "v2_recovery_evidence_read_failed",
+                    operation_id = %operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    capability = crate::v2_observability::capability_name(capability),
+                    outcome = "failed_safe",
+                    error_code = "backend_outcome_unproven",
+                    "recovery evidence read failed without changing the existing quarantine"
+                );
+                if let Some(operation) = pending.remove(&operation_id) {
+                    let _ = operation.reply.send(Err(HubCommandError::Remote(
+                        crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate,
+                    )));
+                }
+                return self
+                    .dispatch_next(
+                        next,
+                        outbound,
+                        hello,
+                        challenge,
+                        generation,
+                        capability_revision,
+                        session_clock,
+                        pending,
+                        queue_order,
+                    )
+                    .await;
+            }
             let cancelled_queued = {
                 let mut persistent = self.inner.persistent.lock().await;
                 persistent.execution.mark_indeterminate(
@@ -1287,32 +1554,8 @@ impl SingleDeviceHub {
             return Ok(());
         }
 
-        let (terminal_state, evidence) = match &device_result {
-            DeviceResult::Error { .. } => (
-                HubOperationState::Failed,
-                ExecutionEvidence::VerifiedRemoteError,
-            ),
-            DeviceResult::Process { output } | DeviceResult::Shell { output }
-                if output.cancelled =>
-            {
-                (
-                    HubOperationState::Cancelled,
-                    ExecutionEvidence::ProvenProcessTermination,
-                )
-            }
-            DeviceResult::Process { output } | DeviceResult::Shell { output }
-                if output.timed_out =>
-            {
-                (
-                    HubOperationState::Failed,
-                    ExecutionEvidence::ProvenProcessTermination,
-                )
-            }
-            _ => (
-                HubOperationState::Completed,
-                ExecutionEvidence::VerifiedAgentResult,
-            ),
-        };
+        let (terminal_state, evidence) = terminal_evidence_for_device_result(&device_result)
+            .ok_or(HubServiceError::UnexpectedResultType)?;
         let recoverable_result = recoverable_result_for(capability, &device_result);
         let (next, receipt) = {
             let mut persistent = self.inner.persistent.lock().await;
@@ -1486,19 +1729,36 @@ impl SingleDeviceHub {
                 .ok_or(HubServiceError::PendingOperationMissing)?
                 .owner
                 .clone();
+            let recovery_capability = pending
+                .get(&ack.operation_id)
+                .ok_or(HubServiceError::PendingOperationMissing)?
+                .command
+                .capability();
+            let recovery_evidence_read = {
+                let persistent = self.inner.persistent.lock().await;
+                persistent
+                    .execution
+                    .is_recovery_evidence_read(&ack.operation_id)
+            };
             let cancelled_queued = {
                 let mut persistent = self.inner.persistent.lock().await;
                 if matches!(
                     persistent.execution.state(&ack.operation_id),
                     Some(HubOperationState::Dispatched | HubOperationState::CancelRequested)
                 ) {
-                    persistent.execution.mark_indeterminate(
-                        &ack.operation_id,
-                        &owner,
-                        generation,
-                        IndeterminateReason::CancellationUnproven,
-                        unix_time_ms()?,
-                    )?;
+                    if recovery_evidence_read {
+                        let _ = persistent
+                            .execution
+                            .mark_recovery_read_interrupted(&ack.operation_id, unix_time_ms()?)?;
+                    } else {
+                        persistent.execution.mark_indeterminate(
+                            &ack.operation_id,
+                            &owner,
+                            generation,
+                            IndeterminateReason::CancellationUnproven,
+                            unix_time_ms()?,
+                        )?;
+                    }
                 }
                 let cancelled: Vec<_> = pending
                     .keys()
@@ -1521,36 +1781,57 @@ impl SingleDeviceHub {
                 }
             }
             if let Some(operation) = pending.remove(&ack.operation_id) {
-                let _ = operation
-                    .reply
-                    .send(Err(HubCommandError::DeviceIndeterminate {
+                let response = if recovery_evidence_read {
+                    Err(HubCommandError::Remote(
+                        crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate,
+                    ))
+                } else {
+                    Err(HubCommandError::DeviceIndeterminate {
                         operation_id: ack.operation_id.clone(),
-                    }));
+                    })
+                };
+                let _ = operation.reply.send(response);
             }
-            crate::v2_observability::operation_indeterminate(
-                IndeterminateReason::CancellationUnproven,
-            );
-            emit_quarantine_created_alert(
-                &ack.operation_id,
-                &self.inner.device_id,
-                generation,
-                None,
-                IndeterminateReason::CancellationUnproven,
-            );
-            tracing::warn!(
-                event = "v2_operation_indeterminate",
-                operation_id = %ack.operation_id,
-                device_id = %self.inner.device_id,
-                generation,
-                outcome = "quarantined",
-                indeterminate_reason = crate::v2_observability::indeterminate_reason_name(
-                    IndeterminateReason::CancellationUnproven
-                ),
-                error_code = "cancellation_unproven",
-                "backend cancellation was propagated but side-effect interruption is unproven; device quarantined"
-            );
-            self.maybe_send_recovery_challenge(outbound, generation, session_clock)
-                .await?;
+            if recovery_evidence_read {
+                crate::v2_observability::operation_completed(
+                    recovery_capability,
+                    crate::v2_observability::OperationOutcome::Failed,
+                );
+                tracing::warn!(
+                    event = "v2_recovery_evidence_read_failed",
+                    operation_id = %ack.operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    outcome = "failed_safe",
+                    error_code = "cancellation_unproven",
+                    "recovery evidence read cancellation remained side-effect safe; existing quarantine retained"
+                );
+            } else {
+                crate::v2_observability::operation_indeterminate(
+                    IndeterminateReason::CancellationUnproven,
+                );
+                emit_quarantine_created_alert(
+                    &ack.operation_id,
+                    &self.inner.device_id,
+                    generation,
+                    None,
+                    IndeterminateReason::CancellationUnproven,
+                );
+                tracing::warn!(
+                    event = "v2_operation_indeterminate",
+                    operation_id = %ack.operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    outcome = "quarantined",
+                    indeterminate_reason = crate::v2_observability::indeterminate_reason_name(
+                        IndeterminateReason::CancellationUnproven
+                    ),
+                    error_code = "cancellation_unproven",
+                    "backend cancellation was propagated but side-effect interruption is unproven; device quarantined"
+                );
+                self.maybe_send_recovery_challenge(outbound, generation, session_clock)
+                    .await?;
+            }
         }
         if let Some(waiter) = cancel_waiters.remove(&ack.operation_id) {
             let _ = waiter.send(Ok(ack.disposition));
@@ -1769,6 +2050,7 @@ impl SingleDeviceHub {
             .filter(|operation| operation.operation.device_generation == generation)
             .collect();
         let mut connection_lost_indeterminate = Vec::new();
+        let mut recovery_reads_interrupted = Vec::new();
         for operation in operations {
             let operation_id = operation.operation.operation_id;
             match persistent.execution.state(&operation_id) {
@@ -1776,8 +2058,13 @@ impl SingleDeviceHub {
                     persistent
                         .execution
                         .mark_connection_lost(&operation_id, unix_time_ms()?)?;
-                    connection_lost_indeterminate
-                        .push((operation_id.clone(), operation.capability));
+                    if operation.execution_lane == OperationExecutionLane::RecoveryEvidenceRead {
+                        recovery_reads_interrupted
+                            .push((operation_id.clone(), operation.capability));
+                    } else {
+                        connection_lost_indeterminate
+                            .push((operation_id.clone(), operation.capability));
+                    }
                 }
                 Some(HubOperationState::Queued | HubOperationState::ActiveNotDispatched) => {
                     let _ = persistent.execution.request_cancel(
@@ -1800,6 +2087,22 @@ impl SingleDeviceHub {
             persistent.registry.disconnect(&self.inner.device_id)?;
         }
         persist_locked(&self.inner, &persistent)?;
+        for (operation_id, capability) in recovery_reads_interrupted {
+            crate::v2_observability::operation_completed(
+                capability,
+                crate::v2_observability::OperationOutcome::Failed,
+            );
+            tracing::warn!(
+                event = "v2_recovery_evidence_read_failed",
+                operation_id = %operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                capability = crate::v2_observability::capability_name(capability),
+                outcome = "failed_safe",
+                error_code = "connection_lost",
+                "recovery evidence read lost transport without changing the existing quarantine"
+            );
+        }
         for (operation_id, capability) in connection_lost_indeterminate {
             crate::v2_observability::operation_indeterminate(IndeterminateReason::ConnectionLost);
             emit_quarantine_created_alert(
@@ -1868,6 +2171,19 @@ impl HubHandle {
         }
     }
 
+    /// Close the currently authenticated Agent stream after a planned shutdown
+    /// drain has completed (or its bounded timeout has expired). The session
+    /// cleanup path remains authoritative: if work is still dispatched, closing
+    /// the stream preserves the existing fail-closed Indeterminate + quarantine
+    /// semantics instead of treating transport shutdown as terminal evidence.
+    pub async fn close_live_session_for_shutdown(&self) -> bool {
+        let supersede = {
+            let live = self.inner.live.lock().await;
+            live.as_ref().map(|session| session.supersede.clone())
+        };
+        supersede.is_some_and(|sender| sender.send(true).is_ok())
+    }
+
     pub async fn is_online(&self) -> bool {
         self.inner.live.lock().await.is_some()
     }
@@ -1920,12 +2236,11 @@ impl HubHandle {
         owner: OperationOwner,
         command: DeviceCommand,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        self.start_command_as_with_id(owner, random_operation_id(), command, None)
+        self.start_command_as_with_id(owner, random_operation_id(), command)
             .await
     }
 
-    /// Allocates the CUMG logical operation identity before accounting admission.
-    /// The same value is passed unchanged to MCPUsage as `operationId`.
+    /// Allocates a CUMG logical operation identity before command admission.
     pub fn new_operation_id(&self) -> String {
         random_operation_id()
     }
@@ -1935,30 +2250,147 @@ impl HubHandle {
         owner: OperationOwner,
         operation_id: String,
         command: DeviceCommand,
-        usage: Option<UsageLease>,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        if self.inner.draining.load(Ordering::Acquire) {
-            return Err(HubCommandError::Busy);
-        }
-        if operation_id.is_empty()
-            || usage
-                .as_ref()
-                .is_some_and(|lease| lease.operation_id() != operation_id)
-        {
-            return Err(HubCommandError::Rejected);
+        self.start_command_as_with_id_and_metadata(
+            owner,
+            operation_id,
+            command,
+            OperationAdmissionMetadata::empty(),
+        )
+        .await
+    }
+
+    pub async fn start_command_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as_with_id_and_metadata_inner(
+            owner,
+            operation_id,
+            command,
+            metadata,
+            CommandSessionFence::None,
+        )
+        .await
+    }
+
+    /// Starts only if the live session still matches the generation/revision that an external
+    /// authority gate just observed. CUMG admission and exact-capability grants remain authoritative.
+    pub async fn start_command_as_with_id_and_metadata_for_session(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        metadata: OperationAdmissionMetadata,
+        expected_session: (u64, u64),
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as_with_id_and_metadata_inner(
+            owner,
+            operation_id,
+            command,
+            metadata,
+            CommandSessionFence::Session {
+                generation: expected_session.0,
+                capability_revision: expected_session.1,
+            },
+        )
+        .await
+    }
+
+    pub async fn start_command_as_with_id_and_metadata_for_handoff(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        metadata: OperationAdmissionMetadata,
+        handoff: RemoteHandoffAuthority,
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        self.start_command_as_with_id_and_metadata_inner(
+            owner,
+            operation_id,
+            command,
+            metadata,
+            CommandSessionFence::Handoff(handoff),
+        )
+        .await
+    }
+
+    pub(crate) async fn handoff_request(
+        &self,
+        request: RemoteHandoffRequestKind,
+    ) -> Result<RemoteHandoffResponseKind, HubCommandError> {
+        if request.requires_agent_idle() {
+            let persistent = self.inner.persistent.lock().await;
+            if request.starts_human_control()
+                && let Some(quarantine) = persistent.execution.quarantine(&self.inner.device_id)
+            {
+                return Err(HubCommandError::DeviceIndeterminate {
+                    operation_id: quarantine.operation_id.clone(),
+                });
+            }
+            if persistent
+                .execution
+                .has_unsettled_work(&self.inner.device_id)
+            {
+                return Err(HubCommandError::Busy);
+            }
         }
         let (reply_tx, reply_rx) = oneshot::channel();
+        let request_id = random_handoff_request_id();
         let tx = {
             let live = self.inner.live.lock().await;
             live.as_ref()
                 .map(|session| session.command_tx.clone())
                 .ok_or(HubCommandError::AgentOffline)?
         };
+        tx.send(HubRequest::Handoff {
+            request_id,
+            request,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| HubCommandError::AgentOffline)?;
+        reply_rx.await.map_err(|_| HubCommandError::SessionClosed)?
+    }
+
+    async fn start_command_as_with_id_and_metadata_inner(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        command: DeviceCommand,
+        metadata: OperationAdmissionMetadata,
+        session_fence: CommandSessionFence,
+    ) -> Result<HubPendingCommand, HubCommandError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(HubCommandError::Busy);
+        }
+        if operation_id.is_empty() {
+            return Err(HubCommandError::Rejected);
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let tx = {
+            let live = self.inner.live.lock().await;
+            let session = live.as_ref().ok_or(HubCommandError::AgentOffline)?;
+            if session_fence
+                .expected_session()
+                .is_some_and(|(generation, revision)| {
+                    session.generation != generation || session.capability_revision != revision
+                })
+            {
+                return Err(HubCommandError::SessionSuperseded);
+            }
+            session.command_tx.clone()
+        };
+        let handoff = session_fence.handoff();
         tx.send(HubRequest::Execute {
             operation_id: operation_id.clone(),
             owner,
-            command,
-            usage,
+            command: Box::new(command),
+            metadata: Box::new(metadata),
+            handoff,
             reply: reply_tx,
         })
         .await
@@ -2375,6 +2807,17 @@ fn random_operation_id() -> String {
     output
 }
 
+fn random_handoff_request_id() -> String {
+    let mut random = [0_u8; 16];
+    OsRng.fill_bytes(&mut random);
+    let mut output = String::from("handoff_req_");
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum HubCommandError {
     AgentOffline,
@@ -2386,7 +2829,6 @@ pub enum HubCommandError {
     UnknownOperation,
     DeviceIndeterminate { operation_id: String },
     Rejected,
-    UsageUnavailable,
     GrantSigningUnavailable,
     Remote(DeviceErrorCode),
     UnexpectedResult,
@@ -2405,7 +2847,6 @@ impl SafeErrorCode for HubCommandError {
             Self::UnknownOperation => "unknown_operation",
             Self::DeviceIndeterminate { .. } | Self::Indeterminate => "device_indeterminate",
             Self::Rejected => "rejected",
-            Self::UsageUnavailable => "usage_unavailable",
             Self::GrantSigningUnavailable => "grant_signing_unavailable",
             Self::Remote(_) => "remote_error",
             Self::UnexpectedResult => "unexpected_result",
@@ -2542,6 +2983,7 @@ mod tests {
     use super::*;
     use crate::v2_m0::DeviceIdentity;
     use crate::v2_m0::GrantAuthority;
+    use crate::v2_m0_transport::RemoteHandoffOperatorCommand;
     use crate::v2_m0_trust::build_device_key_rotation;
 
     fn test_state_dir(name: &str) -> std::path::PathBuf {
@@ -2690,6 +3132,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_begin_never_bypasses_desktop_quarantine() {
+        let state_dir = test_state_dir("handoff-operator-quarantine");
+        let device = DeviceIdentity::generate();
+        let (_hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let owner = OperationOwner::local_hub();
+        let operation_id = "op-handoff-quarantine".to_owned();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    crate::v2_m0::DeviceCapability::Shell,
+                    1,
+                )
+                .unwrap();
+            persistent
+                .execution
+                .mark_dispatched(&operation_id, &owner, 1, 2)
+                .unwrap();
+            persistent
+                .execution
+                .mark_connection_lost(&operation_id, 3)
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+
+        assert_eq!(
+            handle
+                .handoff_request(RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Begin,
+                    authority: None,
+                })
+                .await,
+            Err(HubCommandError::DeviceIndeterminate { operation_id })
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn handoff_lifecycle_control_is_rejected_while_device_work_is_active() {
+        let state_dir = test_state_dir("handoff-operator-busy");
+        let device = DeviceIdentity::generate();
+        let (_hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let owner = OperationOwner::local_hub();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: "op-handoff-operator-busy".into(),
+                    },
+                    owner,
+                    crate::v2_m0::DeviceCapability::Shell,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+
+        assert_eq!(
+            handle
+                .handoff_request(RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Begin,
+                    authority: None,
+                })
+                .await,
+            Err(HubCommandError::Busy)
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
     async fn shutdown_drain_closes_new_admission_gate() {
         let state_dir = test_state_dir("shutdown-drain-admission");
         let device = DeviceIdentity::generate();
@@ -2790,6 +3349,21 @@ mod tests {
             .await
             .expect("drain should finish after durable settlement");
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn process_policy_error_code_survives_hub_recovery_boundary() {
+        for capability in [DeviceCapability::ExecuteProcess, DeviceCapability::Shell] {
+            let result = DeviceResult::Error {
+                code: DeviceErrorCode::WorkingDirectoryDenied,
+            };
+            assert_eq!(
+                recoverable_result_for(capability, &result),
+                Some(RecoverableOperationResult::Error {
+                    code: DeviceErrorCode::WorkingDirectoryDenied,
+                })
+            );
+        }
     }
 
     #[derive(Clone)]
@@ -2912,31 +3486,33 @@ mod tests {
     }
 
     #[test]
-    fn usage_liability_boundary_precedes_cumg_dispatched_and_agent_send() {
+    fn reconciliation_commits_candidate_before_live_clear_and_has_no_dispatch_path() {
         let source = include_str!("v2_m1_hub.rs");
-        let start = source.find("async fn dispatch_operation(").unwrap();
+        let start = source
+            .find("async fn handle_reconciliation_report(")
+            .unwrap();
         let end = source[start..]
             .find("async fn handle_result(")
             .map(|offset| start + offset)
             .unwrap();
         let block = &source[start..end];
-        let liable = block.find("usage.mark_liable().await").unwrap();
-        let durable_dispatch = block.find("persistent.execution.mark_dispatched(").unwrap();
-        let agent_send = block
-            .find("send_hub(outbound, HubToAgent::Command(remote)).await?")
-            .unwrap();
-        let effect_possible = block.find("usage.mark_dispatched()").unwrap();
-        assert!(liable < durable_dispatch);
-        assert!(durable_dispatch < agent_send);
-        assert!(agent_send < effect_possible);
-        assert!(block.contains("CancellationDecision::CancelledBeforeDispatch"));
-    }
-
-    #[test]
-    fn usage_accounting_is_not_part_of_execution_safety_state_machine() {
-        let safety = include_str!("v2_execution_safety.rs");
-        assert!(!safety.contains("v2_usage"));
-        assert!(!safety.contains("UsageController"));
-        assert!(!safety.contains("UsageLease"));
+        let durable = block.find("checkpoint.save_with_size(&state)").unwrap();
+        let live_swap = block.find("persistent.execution = candidate").unwrap();
+        assert!(durable < live_swap);
+        for forbidden in [
+            "dispatch_operation(",
+            "HubToAgent::Command",
+            "start_command(",
+            "request_fingerprint",
+            "compare_request_fingerprint",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "reconciliation must not contain {forbidden}"
+            );
+        }
+        assert!(block.contains("ReconciliationStatus::AutoReconciling"));
+        assert!(block.contains("mark_reconciliation_evidence_gap"));
+        assert!(block.contains("mark_reconciliation_operator_required"));
     }
 }

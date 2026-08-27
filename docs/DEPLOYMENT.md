@@ -38,6 +38,32 @@ For a trusted authenticated proxy/tunnel, constrain the Hub listener to loopback
 
 After the local trust gate, trusted-proxy traffic has a separate peer ceiling: `CUMG_V2_TRUSTED_PROXY_MAX_PEER_CONCURRENCY` defaults to `4` and `CUMG_V2_TRUSTED_PROXY_MAX_PEER_REQUESTS_PER_MINUTE` defaults to `60`. Both must remain below the global defaults (`16` and `120`) so global headroom is preserved. Peer concurrency rejection is HTTP 503 and peer rate rejection is HTTP 429. The peer key is the verified loopback source IP; it is overload isolation, not user identity. The fixed CUMG principal still comes only from operator configuration, and caller `clientInfo` remains audit-only. The adapter strips common Authorization/Cloudflare identity headers before MCP dispatch. If the deployment needs per-user CUMG policy, use a signed-token/OIDC-style adapter that conveys a tamper-resistant authenticated identity. Never trust a caller-provided `X-User`/similar header merely because the listener is called a proxy mode.
 
+### First-class Handoff runtime and local operator control
+
+Handoff is a **first-class but optional** CUMG integration. A deployment that does not configure the Agent Handoff runtime continues to support its ordinary authorized process/shell and GUI capabilities without Handoff. The three managed runtime settings below are therefore all-or-none: omitting all of them disables the optional Handoff runtime; configuring only a subset is rejected. When enabled, Handoff becomes authoritative at the Agent/Human control boundary rather than a best-effort external helper: CUMG admission and the Agent-local final gate must honor suspended Human authority, and there is no fallback that bypasses Handoff merely because its runtime or transport is unavailable. This optionality is a deployment/capability choice, not permission to weaken authority fencing after Handoff has been enabled.
+
+The normal OS-Window Handoff runtime is Agent-owned because capture, Human input, TCC/Accessibility, WebRTC, TURN, and the exact controllable surface belong to the controlled device. Configure `CUMG_V2_HANDOFF_RUNTIME_COMMAND`, `CUMG_V2_HANDOFF_RUNTIME_SCRIPT`, and `CUMG_V2_HANDOFF_RUNTIME_ENV_FILE` on `v2_agent` together. The command and script must be absolute regular files. The env file must be an absolute private regular file, must not be a symlink, and is passed only to the Agent-local managed Node Handoff child after the Agent clears the child environment. Handoff-only transport credentials such as TURN configuration therefore do not become Hub process environment variables. `CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS` bounds each Agent-local stdio control exchange. Supplying these managed-runtime variables to `v2_hub` is rejected; the legacy `CUMG_V2_OPERATOR_HANDOFF_SOCKET` remains compatibility/regression-only.
+
+For live operator lifecycle control, configure the Unix-only `CUMG_V2_HANDOFF_CONTROL_SOCKET` on the Hub in a private, non-symlink directory that is not group/world writable. The Hub creates the socket with mode `0600`; the directory/socket filesystem ownership is the authorization boundary. This endpoint is **not MCP** and is never added to normal tool discovery. The Hub is only a signed/session-fenced relay for the Agent-owned Handoff coordinator; it does not run a second Handoff state machine. The closed commands are `status`, `begin`, `recover_reissue`, `recover_rebind`, `rebind_live`, `abandon_expired_recovery`, `request_resume`, and `cancel_before_human`. The local caller cannot supply principal, device, PID, window ID, generation, or capability-revision authority. `begin` uses only the last still-valid exact Window admitted by CUMG. After an authenticated Agent generation rollover, `rebind_live` requires a fresh CUMG observation of the same exact OS Window and the Agent-local runtime itself proves continuity from the prior binding; it never restores Agent authority. Recovery remains explicit and uses fresh CUMG observation plus the prior-owner proof required by the signed Handoff checkpoint.
+
+Invoke `v2_handoff_ctl` directly from the trusted local operator environment. Do not tunnel lifecycle control through CUMG's northbound `shell` or `execute_process`: that caller is itself a tracked Agent operation and must remain subject to the Agent idle fence. If another operation is still active, the local control plane returns `handoff_agent_not_idle`; wait for a durable terminal result before making a new explicit operator request. If that operation instead becomes indeterminate, reconcile the CUMG quarantine first; `begin` returns `handoff_device_quarantined` and never opens Human control across that fence. CUMG never retries or replays the Handoff transition automatically.
+
+The paired local CLI uses the same narrow CUMG operator protocol:
+
+```bash
+export CUMG_V2_HANDOFF_CONTROL_SOCKET=/run/user/$(id -u)/cumg-v2/handoff-control.sock
+v2_handoff_ctl status
+v2_handoff_ctl begin
+# after an authenticated Agent generation rollover, first make a fresh exact-Window observation:
+v2_handoff_ctl rebind-live
+# after Human Done and fresh Agent-local CUMG verification reaches ready_to_resume:
+v2_handoff_ctl request-resume
+```
+
+For restart/context/generation recovery, use `recover-reissue` only for a non-expired checkpoint with the same owner proof. A recovered `human_active` checkpoint uses a deliberately two-phase `recover-rebind`: first make a current exact-Window request so CUMG has a fresh session-bound target selection, then call `recover-rebind --prior-context-id ctx_...` (plus `--prior-generation` / `--prior-capability-revision` when rollover requires them). If the signed prior-owner digest matches, that first call **only** arms a 60-second evidence lease; recovery remains authoritative and all ordinary Agent Window commands remain denied. Within that lease, run an exact `verify_ui_state` for the selected process/window with `include_screenshot=false` and a `window_exists: true` predicate. Only a satisfied verification may mark the lease observed. Repeating the same `recover-rebind` proof can then reissue the Human intervention into `awaiting_human`. Wrong prior proof, wrong principal/device/window, stale lease, unsatisfied verification, or any non-verification Window command stays fail-closed. The evidence lease is ephemeral and never written to the signed checkpoint. Neither recovery command restores Agent authority, resumes, or replays the old Agent operation.
+
+If an **expired** recovery can no longer be rebound because the prior exact surface no longer exists, the local operator may explicitly abandon only that Handoff recovery tombstone with `abandon-expired-recovery --expected-epoch N`. The Agent accepts this only when recovery is expired, no intervention is active, the runtime is not faulted, and the epoch exactly matches. Durable checkpoint deletion must succeed before the recovery lock is released. Abandonment does **not** mark the prior semantic action successful, does not replay or resume it, and does not alter the CUMG operation ledger, quarantine, or recovery evidence. The operator control response may contain the current Human takeover locator; treat it as local capability material and do not place it in logs, issues, shell history, or generic diagnostics.
+
 ### Authenticated Agent session lifetime
 
 `v2_hub` bounds every authenticated Agent transport with `CUMG_V2_MAX_AGENT_SESSION_LIFETIME_SECS` (default `3600`). `CUMG_V2_AGENT_SESSION_REAUTH_DRAIN_SECS` (default `30`) reserves the final part of that lifetime for a controlled reauthentication drain. The drain value must be non-zero and strictly smaller than the hard lifetime.
@@ -50,16 +76,114 @@ The hard lifetime is not advisory. If already-dispatched work is still unsettled
 
 `v2_hub` treats `SIGINT`, `SIGTERM`, and `SIGHUP` as planned shutdown signals. On the first signal it closes the operation-admission gate, keeps the Agent transport alive, and waits up to `CUMG_V2_DRAIN_TIMEOUT_SECS` (default `30`) for work that was already admitted to reach a durable terminal or indeterminate state. Requests that have not crossed the dispatch boundary are rejected/cancelled rather than starting new side effects during the drain.
 
-A successful drain then shuts down the gRPC and northbound HTTP servers. If the bounded drain timeout expires, shutdown continues with the existing fail-closed restart behavior: any work that had crossed the dispatch boundary without terminal proof remains eligible for `Indeterminate` + quarantine on restart. The timeout never authorizes replay or clears ambiguity.
+After the drain, the Hub requests closure of the live Agent session and only then signals the gRPC, northbound HTTP, and private Handoff-control servers to stop. The Agent owns managed Handoff-runtime shutdown: loss or shutdown of that process revokes the live Human transport while preserving its signed checkpoint for explicit recovery; it never auto-restores Agent authority. If the bounded drain timeout expires, the same ordering continues with the existing fail-closed restart behavior: any work that had crossed the dispatch boundary without terminal proof remains eligible for `Indeterminate` + quarantine on restart. The timeout never authorizes replay, clears ambiguity, or automatically restarts Handoff authority.
 
 Configure the service manager's stop/kill timeout to be **longer** than `CUMG_V2_DRAIN_TIMEOUT_SECS`; otherwise the supervisor can kill the Hub before its own bounded drain completes. The packaged systemd unit uses `TimeoutStopSec=45s` for the default 30-second drain. Apply the same ordering to operator-maintained launchd or other service-manager definitions.
 
-### Offline quarantine resolution
+### Read-only quarantine inspection
 
-A durable `Indeterminate` quarantine is never cleared by reconnect or restart. After an operator establishes out-of-band evidence for the exact ambiguous operation, stop `v2_hub` completely and use the offline maintenance CLI instead of editing checkpoint JSON:
+When a caller receives `device_indeterminate`, inspect the durable checkpoint before choosing any recovery action:
 
 ```bash
-cargo run --locked --bin v2_maint -- resolve \
+v2_maint inspect-quarantine \
+  --state-dir /var/lib/cumg-v2/hub
+```
+
+Use `--device-id DEVICE_ID` to restrict output in a multi-device state directory. Inspection reads only the latest atomically committed checkpoint and does **not** take the Hub's exclusive maintenance lock, so it may run while the Hub is serving. It never resolves quarantine, signs recovery, dispatches device work, or rewrites the checkpoint. The output is a point-in-time durable view; a later normal Hub checkpoint may advance after the inspection returns.
+
+Each unresolved entry identifies the exact `blocking_operation_id`, stable device/generation, capability/semantic operation class, conservative `read_only` or `effectful` class, bounded workflow/client correlation labels when supplied, fingerprint presence, bounded text-input evidence shape when present, dispatch-binding presence (never its value), target/effect/verification classes, durable dispatch marker/timestamps, indeterminate timestamp/reason, available evidence class, `evidence_status`, explicit `reconciliation_status` (`auto_reconciling`, `operator_required`, or `unrecoverable_evidence_gap`), `manual_audit_required`, and a bounded recovery disposition. It deliberately omits authenticated owner issuer/subject, the request fingerprint/key value, and every raw command, argv, cwd, environment value, typed text, URL, clipboard value, screenshot, backend identifier, result payload, credential, or secret. Correlation labels are audit-only and do not authenticate the caller or authorize recovery. The state-directory filesystem permissions are the authorization boundary for this local operator surface; no equivalent cross-principal northbound inspection endpoint is exposed.
+
+A northbound tool request rejected by an existing quarantine returns `code=device_indeterminate`, `blocking_operation_id=op_...`, and `retry_safe=false`. `blocking_operation_id` always names the **earlier ambiguous operation that is already quarantining the device**, not a newly generated ID for the rejected request. Do not replay that operation. `confirmed_not_executed` is valid only with independent evidence that no side effect occurred; `confirmed_completed` is valid only with independent evidence that the intended side effect completed; otherwise leave quarantine intact.
+
+For text-input ambiguity, `confirmed_effect_applied_uncommitted` is a third explicit offline decision: use it only when independent evidence proves the input was delivered but a distinct submit/commit action did not occur. It is not equivalent to `confirmed_not_executed`, and it never makes the old operation retry-safe. `v2_maint resolve --decision confirmed_effect_applied_uncommitted` rejects capabilities outside the bounded text-input set. Execution-safety schema v6 persists this distinction and refuses downgrade to v5 when such a record exists.
+
+### Cross-state reconciliation readiness audit
+
+Before manual checkpoint archaeology or an authority-bearing recovery decision, audit the exact quarantine against the latest durable Hub and Agent checkpoints:
+
+```bash
+v2_maint audit-reconciliation \
+  --state-dir /var/lib/cumg-v2/hub \
+  --agent-state-dir /var/lib/cumg-v2/agent \
+  --operation-id op_...
+```
+
+`audit-reconciliation` is strictly read-only. It reads the latest atomically committed Hub and Agent checkpoints without taking the offline recovery lock, never calls `resolve_indeterminate`, never clears quarantine, never signs or publishes recovery authority, and never retries, replays, dispatches, or contacts the backend. It may therefore run while the services are live. Because the two append-only stores are sampled independently, the output is a conservative point-in-time cross-state view; if one store advances during the audit, an observed mismatch fails closed. Re-run the audit rather than editing state or inferring completion from liveness.
+
+The audit correlates only bounded metadata for the exact quarantined operation: Hub execution-safety schema version, stable device, original generation, capability, dispatch-record presence, Hub reconciliation state, the Agent replay generation, legacy terminal-marker presence, and newer payload-free terminal-evidence metadata. The one-shot dispatch fence is compared only in memory and is never printed. Owner principal, raw grant/fingerprint values, command/argv/cwd/env, typed text, URL, clipboard/screenshot data, backend/result payloads, credentials, tokens, secrets, and private paths are not included in the report.
+
+Evidence authority is explicit. Schema-v1/v2/v3 Hub state is reported with its execution-safety schema version and `legacy_hub_execution_schema`; absence of a v4 dispatch binding is therefore not collapsed into generic `operator_required`. A legacy Agent `terminal_operation_id` is `legacy_non_authoritative_marker` even when the operation ID and generation correlate; by itself it always yields `insufficient_evidence_keep_quarantine`. Request fingerprints and evidence envelopes are `observational_correlation_only` and likewise cannot settle an operation. A newer Agent terminal-evidence entry is `authoritative_terminal_evidence` only when its exact device, original generation, capability, capability revision, hidden dispatch fence, terminal state, evidence class, and the Hub's `auto_reconciling` state pass the normal durable reconciliation contract. Device/generation/capability/fence or Hub reconciliation-state mismatches return `state_mismatch_fail_closed`. Missing Agent evidence after the Hub has already classified the gap, or an unavailable Agent checkpoint source, returns `unrecoverable_evidence_gap`.
+
+`confirmed_completed_supported` means an exact authoritative `Completed + VerifiedAgentResult` proof is available and `supported_decisions` contains only `confirmed_completed`; the audit itself still performs no recovery. Other exact authoritative terminal states are reported as `authoritative_terminal_settlement_supported` so the normal self-reconciliation path can consume them without inventing a different manual outcome. In particular, a verified remote error or proven process termination is **not** relabeled as `confirmed_not_executed`; that decision still requires independent evidence that no side effect occurred. Every insufficient or mismatched result keeps `recommended_action=keep_quarantine`, `replay_old_operation=false`, and leaves the existing quarantine untouched.
+
+Operator flow is therefore: `inspect-quarantine` -> `audit-reconciliation` -> either keep quarantine / allow normal authoritative self-reconciliation, or perform an explicitly authorized offline recovery using only a decision named in `supported_decisions`. Never promote a legacy marker, fingerprint match, reconnect, elapsed time, shell parsing, or UI/application heuristic into completion evidence.
+
+For shell/process/text-input deployments that want privacy-preserving candidate matching, provision one private file of at least 32 bytes and configure the Hub with `CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE`. The file must be readable only by the Hub/operator account and must not be committed or copied into logs. The Hub HMACs the canonical shell/process request or typed-text payload before dispatch; no raw request or typed text is persisted for this purpose. `type_text` also persists its bounded shape envelope even when the HMAC key is not configured; in that case candidate equality is unavailable. To compare a locally-held candidate request, place that candidate JSON in a private file and run:
+
+```bash
+v2_maint compare-quarantine-request \
+  --state-dir /var/lib/cumg-v2/hub \
+  --operation-id op_... \
+  --tool shell \
+  --request-file /secure/tmp/candidate.json \
+  --fingerprint-secret-file /secure/path/audit-fingerprint.key
+```
+
+For a quarantined `type_text` operation, use the same command with `--tool type_text`; the private candidate JSON contains only `{"text":"..."}` plus optional audit/operation correlation fields, which are ignored for payload comparison.
+
+Execution-safety schema v7 persists the text-input evidence envelope and rejects downgrade to v6 when an envelope exists. The envelope inspection reports only its versioned shape and whether a fingerprint is present; it never prints typed text or the HMAC value.
+
+Execution-safety schema v8 persists the recovery-evidence lane marker. While `v2_doctor` reports `hub.recovery_mode=restricted_read_only`, only the closed non-mutating recovery allowlist is admissible; generic `shell` / `execute_process` and all mutation/activation/write capabilities remain denied. An interrupted evidence read fails terminally without modifying the pre-existing quarantine. Rollback to a v7 reader is rejected if v8-only lane/evidence state would be lost.
+
+The command prints only `"same_request"`, `"different_request"`, or `"unavailable"`; it does not print the candidate, stored fingerprint, key identifier, or key. A different/rotated key intentionally yields `unavailable`, not `different_request`. Matching proves only request correlation. It never proves completion, clears quarantine, changes retry safety, or authorizes replay. Arbitrary shell text is never parsed to infer idempotency or postconditions. Remove the temporary candidate file according to the deployment's sensitive-file handling policy after use.
+
+### Authoritative self-reconciliation after reconnect/restart
+
+Execution-safety schema v4 can settle a narrow subset of `Indeterminate` operations automatically, but **it never retries or replays them**. The Hub persists an effectful operation's exact dispatch binding before the Agent-visible command is sent: stable device ID, original generation, exact capability, capability revision, and the one-shot grant identifier. The identifier is an opaque one-shot correlation fence, not a bearer grant/token, and normal inspection never prints it.
+
+The Agent keeps a maximum of 64 payload-free terminal-evidence entries. An entry is created only after the normal execution path has reached a definite terminal result already accepted by CUMG's existing evidence contract. Raw command/argv/cwd/env/stdout/stderr/result/credential material is never copied into this journal. On each newly authenticated generation the Agent signs the complete bounded journal against the fresh Hub/Agent nonces and sends it before accepting new work.
+
+For an existing transient quarantine, inspection initially shows `reconciliation_status=auto_reconciling`. The Hub may change it to `auto_resolved` only when the signed report exactly matches the quarantined operation's stable device, original generation, operation ID, capability revision, exact capability, and dispatch fence and uses a supported authoritative terminal evidence/state pair. The Hub first commits a candidate terminal checkpoint and only then swaps the live controller/clears quarantine. A checkpoint failure leaves the live quarantine unchanged. Duplicate evidence for an already-terminal operation is ignored idempotently; it does not create a second settlement.
+
+If the complete Agent journal has no exact proof for an auto-reconciling quarantine, the status becomes `unrecoverable_evidence_gap` and quarantine remains. A signed but stale/wrong/mismatched claim becomes `operator_required` or fails closed. Backend-provided ambiguity, cancellation without terminal proof, correlation/fingerprint equality, shell-text heuristics, and observational postconditions do not qualify as self-reconciliation evidence. In those cases use the offline operator procedure below only after independent evidence is available.
+
+To inspect bounded automatic-resolution history without owner principal, raw payload, fingerprint/key, or dispatch-fence values:
+
+```bash
+v2_maint inspect-reconciliation-history \
+  --state-dir /var/lib/cumg-v2/hub
+```
+
+Add `--device-id DEVICE_ID` to filter by stable device. Auto-resolution history and retired-indeterminate history are each bounded to 64 entries and report only safe fields such as operation/device/generation, capability, terminal/evidence or retirement class, resolution/retirement timestamp, and `replayed=false`.
+
+This feature requires capability schema v5 on both Hub and Agent. Upgrade the pair together. Mixed old/new peers fail the capability-schema handshake closed rather than attempting a partially compatible session. Execution-safety checkpoint restore remains compatible with schemas v1/v2/v3/v4/v5 when those checkpoints stay within their representational limits; downgrading a state that already contains v4 dispatch/reconciliation metadata, v5 retirement state, or v6 partial-input resolution state is intentionally rejected.
+
+### Unknown-outcome retirement for permanently unknowable legacy ambiguity
+
+Execution-safety schema v5 adds a separate retirement path for a narrow class of legacy `Indeterminate` operations whose historical outcome can no longer be established truthfully. This is **not** a resolution and does not mean completed, failed, cancelled, or not-executed. `inspect-quarantine` reports `execution_outcome=indeterminate`, the current durable device generation, `retirement_eligibility`, the reviewed `retirement_policy`, and a bounded `recommended_action`. The initial policy allows only `scroll` and pointer movement; every other capability, including shell/process and other higher-impact effects, remains ineligible by default. Eligibility also requires a recorded dispatch, `operator_required` or `unrecoverable_evidence_gap`, and a durable device generation strictly newer than the original operation generation.
+
+If and only if inspection reports `retirement_eligibility=eligible`, install `v2_hub` and `v2_maint` from the same reviewed schema-v5 build, stop `v2_hub` completely, and use the exclusive offline maintenance path:
+
+```bash
+v2_maint retire-indeterminate \
+  --state-dir /var/lib/cumg-v2/hub \
+  --operation-id op_... \
+  --policy transient_ui_interaction_v1 \
+  --reason "legacy transient UI outcome permanently unknowable; retired without replay"
+```
+
+The policy must be named explicitly so an existing runbook can never opt into a future retirement policy merely because the binary gained one. The reason is bounded audit metadata; never include raw commands, results, desktop content, URLs, credentials, tokens, or secrets. A successful retirement appends a schema-v5 execution checkpoint before the prior checkpoint stops being authoritative. The operation itself remains `Indeterminate` with no terminal receipt, its exact operation ID remains permanently non-replayable, and the retirement record preserves `outcome=unknown`, original/authorizing generations, capability/policy, prior reconciliation state, local-maintenance authority, timestamp, and `replayed=false`. Only the device quarantine is removed. The old command is never reconstructed, re-signed, resumed, retried, or dispatched. Any later requested work uses a fresh operation ID and ordinary authorization/admission.
+
+Retirement intentionally creates state that execution-safety schema v4 cannot represent. After a successful retirement, do not roll back to an older Hub binary while keeping the new checkpoint. A binary rollback requires restoring the pre-retirement checkpoint as well, which also restores the original quarantine. A failed checkpoint publication leaves the previous quarantined checkpoint authoritative. `inspect-reconciliation-history` includes a privacy-bounded `retired_indeterminate` history entry and never prints the operator reason text.
+
+Do not use retirement as a substitute for independent evidence. When authoritative/independent evidence proves a terminal outcome, use self-reconciliation or explicit `confirmed_completed` / `confirmed_not_executed` resolution instead. Retirement exists only for the distinct case where the outcome remains permanently unknown but the reviewed low-impact operation can be abandoned without replay. The `Scroll`/`MovePointer` allowlist is a risk policy, not a claim that every application treats those inputs as side-effect-free or idempotent. An application may attach its own state changes to input events; authorizing retirement explicitly accepts that historical uncertainty. The strictly newer Agent generation invalidates prior interaction contexts/scoped refs, and quarantine has already cancelled queued pre-ambiguity work, so later effectful work must be newly admitted rather than continuing the old operation chain.
+
+### Offline quarantine resolution
+
+Reconnect or restart **alone** never clears a durable `Indeterminate` quarantine. If schema-v4 authoritative self-reconciliation did not produce an exact terminal proof (`operator_required` or `unrecoverable_evidence_gap`), then after an operator establishes independent evidence for the exact ambiguous operation, stop `v2_hub` completely and use the offline maintenance CLI instead of editing checkpoint JSON:
+
+```bash
+v2_maint resolve \
   --state-dir /var/lib/cumg-v2/hub \
   --operation-id op_... \
   --decision confirmed_not_executed \
@@ -68,7 +192,9 @@ cargo run --locked --bin v2_maint -- resolve \
 
 `confirmed_completed` is also available when the side effect is positively confirmed. Evidence is required and remains subject to `MAX_RESOLUTION_EVIDENCE_BYTES`; keep it to bounded audit metadata and never place commands, results, desktop content, credentials, tokens, or secrets in it.
 
-The Hub and maintenance CLI take the same exclusive state-directory lock. `v2_maint` therefore fails closed while any `SingleDeviceHub` instance still owns that state directory. A successful resolution restores the checkpoint through the normal schema-validation path, invokes the existing authoritative `resolve_indeterminate` transition, and appends a new checkpoint through the same private-pending-file/fsync/atomic-publication persistence path. The resulting `ResolutionRecord` remains durable even after terminal operation tombstones are pruned on later generations. Restart the Hub only after the CLI exits successfully.
+The Hub and maintenance CLI take the same exclusive state-directory lock. `v2_maint` therefore fails closed while any `SingleDeviceHub` instance still owns that state directory. Before applying the in-memory resolution transition, maintenance verifies that the restored execution state can still be represented by the execution-safety schema of the authoritative input checkpoint. It validates the post-resolution candidate again before publishing bytes. Maintenance preserves the input checkpoint's outer state schema, registry snapshot, and execution-safety writer contract instead of silently upgrading durable state while the intended Hub is offline. If the source writer contract cannot represent the candidate state, recovery fails before checkpoint publication with a bounded persistence-compatibility error; do not edit the checkpoint or force a downgrade. Use a `v2_maint` paired with the deployed Hub release, or upgrade the Hub through the documented compatibility path before retrying recovery.
+
+A successful resolution invokes the existing authoritative `resolve_indeterminate` transition and appends a new checkpoint through the same private-pending-file/fsync/atomic-publication persistence path. The resulting `ResolutionRecord` remains durable even after terminal operation tombstones are pruned on later generations. Restart the Hub only after the CLI exits successfully. For packaged deployments, install `v2_hub` and `v2_maint` from the same reviewed build/release artifact. Running `cargo run --bin v2_maint` from a newer checkout against state owned by an older deployed Hub is not a supported shortcut unless that checkout is the exact source used for the deployed Hub.
 
 ### Initial Agent enrollment
 
@@ -93,7 +219,7 @@ Transfer `agent/` over an authenticated operator channel and preserve the device
 
 ### Linux Hub
 
-Use `packaging/systemd/cumg-v2-hub.service`, `packaging/systemd/cumg-v2-grant-signer.service`, and `packaging/systemd/hub.env.example` as templates. Production packaging deliberately separates grant-key custody from the Hub process: the Hub unit receives the Hub Ed25519 key and ACME TLS key, while the dedicated signer unit receives the grant Ed25519 key. Provision them independently outside the repository:
+Use `packaging/systemd/cumg-v2-hub.service`, `packaging/systemd/cumg-v2-grant-signer.service`, and `packaging/systemd/hub.env.example` as templates. Install the operator maintenance binary `v2_maint` from the same reviewed build/release artifact as `/usr/local/bin/v2_hub`; offline recovery relies on the durable-state compatibility contract shared by that pair. Production packaging deliberately separates grant-key custody from the Hub process: the Hub unit receives the Hub Ed25519 key and ACME TLS key, while the dedicated signer unit receives the grant Ed25519 key. Provision them independently outside the repository:
 
 ```bash
 sudo systemd-creds encrypt --name=hub-secret \
@@ -108,11 +234,6 @@ The signer is not a raw signing oracle: requests are bounded typed grant fields;
 
 For northbound OAuth introspection, use the optional encrypted-credential drop-in in `packaging/systemd/cumg-v2-hub-oauth-credential.conf.example` rather than putting the client secret in `hub.env`. For trusted-proxy mode, use `packaging/systemd/cumg-v2-hub-trusted-proxy-credential.conf.example`; provision the same random secret separately to the proxy/tunnel and never place the value itself in `hub.env`.
 
-#### Optional MemoryUsageStore sidecar
-
-Usage accounting is disabled by default. To enable it, install `packaging/systemd/cumg-v2-usage-sidecar.service`, copy `usage.env.example` outside the repository, build/install `mcp-usage-control` core from source locally, and install the optional `cumg-v2-hub-usage.conf.example` drop-in. The Hub then uses `CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/`.
-
-The drop-in couples the sidecar lifecycle to Hub restart; therefore an explicit packaged Hub restart recreates the non-durable MemoryUsageStore. If you manually supervise Hub and sidecar separately, a Hub-only restart does not reset a still-running sidecar. In either case, usage reset never clears CUMG operation/quarantine checkpoints. Do not use this Memory store as a financial ledger. See [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md).
 
 ### TLS renewal
 
@@ -151,6 +272,18 @@ Customize `packaging/launchd/com.github.git-ksk.cumg-v2-agent.plist`, replacing 
 
 Install `packaging/launchd/com.github.git-ksk.cumg-v2-tls-expiry.plist` alongside it after replacing `@BINARY@` with `v2_tls_check` and `@HOME@`. It checks the DER trust root at load and every 24 hours, writing the same `CUMG_TLS_EXPIRY_OK` / `CUMG_TLS_EXPIRY_ALERT` markers to the configured log files. Route the alert log/non-zero job status into the operator monitoring used on that Mac.
 
+#### Disk/temp exhaustion and `agent_offline`
+
+Controlled `StorageFull` fault injection at the Agent checkpoint publication boundary confirms that local storage exhaustion **can** make an enrolled Agent appear offline. Agent checkpoint persistence is authority-bearing, so a failed durable write is intentionally non-reconnectable inside the running process: the Agent emits `v2_persistence_failure` with the bounded `persistence_resource_exhausted` / `storage_full` classification and exits fail closed. A service manager such as launchd may then retry the process. Once no authenticated Agent session is live, northbound Hub calls report the existing `agent_offline` symptom; the Hub does not invent a remote filesystem diagnosis after the Agent has disappeared. The August 2026 dogfood incident remains correlated evidence rather than proof that this exact checkpoint boundary was the historical trigger.
+
+A failed pending checkpoint never supersedes the last committed checkpoint. On restart, grant and operation replay barriers therefore restore from the prior durable state; there is no automatic replay or quarantine bypass. After writable capacity returns, normal checkpoint publication succeeds again and the ordinary service-manager restart/authenticated reconnect path is sufficient. Do not delete checkpoints, clear quarantine, or manually replay an operation as a storage-recovery step. If the failure happened after an effect may have begun, the existing indeterminate/quarantine rules still apply unchanged.
+
+`v2_doctor` now performs read-only available-space inspection for both the Agent state filesystem and the host temporary filesystem. It reports only low-cardinality states: `available_ge_64_mib`, `critical_lt_64_mib`, or `capacity_unavailable`; it never creates probe files or prints the inspected path. A critically-low warning is an operability signal, not a guarantee that a large browser transfer will fit. Browser staging initialization has its own bounded startup diagnostics (`remove_existing_root`, `create_root`, `set_permissions`, `metadata`, `canonicalize`) and may independently report `storage_full`. Once the Agent process is offline, Agent-routed read-only, shell/process, filesystem, browser, and GUI tools all remain unavailable until a fresh authenticated Agent session exists.
+
+Browser transfer staging is created before the Agent starts its outbound session. If that fail-closed initialization cannot remove an old private root, create the replacement, set private permissions, read metadata, or canonicalize the root, the Agent emits one local `ERROR` event named `v2_agent_browser_staging_startup_failed` and refuses startup. The event contains only the closed fields `staging_direction`, `stage`, `failure_class`, `io_class`, `error_code`, `agent_startup=refused`, and `service_manager_retry=external`. `stage` is one of `remove_existing_root`, `create_root`, `set_permissions`, `metadata`, or `canonicalize`; `io_class` is a bounded `std::io::ErrorKind` class such as `permission_denied`, `storage_full`, or `other`. No staging path, browser ref, transfer payload, credential, secret, or provider error text is logged.
+
+A launchd `KeepAlive` policy may therefore produce repeated failed starts while the underlying host condition remains. Treat repeated `v2_agent_browser_staging_startup_failed` events as an operator signal that the Agent can remain offline even though Hub-side `agent_offline` is only the remote symptom. Fix the host condition first, then let launchd start the same fail-closed Agent again; do not disable staging validation or redirect transfer bytes to a less-private fallback. The external safe codes remain `browser_upload_staging_io` / `browser_download_staging_io` or the corresponding bounded `*_invalid_root` code.
+
 For an existing V1 production endpoint moving to V2, follow the guarded [`V2 production cutover runbook`](v2/V2_PRODUCTION_CUTOVER.md). Do not treat a successful local V2 start as permission to stop V1.
 
 ### Overload and observability
@@ -159,7 +292,7 @@ The Hub defaults to bounded Agent sessions/session starts and bounded northbound
 
 OTLP is opt-in through standard OpenTelemetry variables. `OTEL_EXPORTER_OTLP_ENDPOINT` enables traces and metrics; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` enable individual signals; `OTEL_SDK_DISABLED=true` disables export. The packaged build uses the standard OTLP `grpc` transport. Default telemetry intentionally excludes command/result bodies, argv, stdout/stderr, file contents, screenshots, clipboard data, bearer tokens, OAuth introspection secrets, grants, signatures and private key material. Protocol failures log only a message kind plus safe error metadata, never the full signed protocol object.
 
-V2 structured events use control-plane correlation fields only when available. The principal incident keys are `operation_id`, `device_id` and `generation`; `capability`, `outcome`, `error_code`, `indeterminate_reason`, `reconnect_attempt` and `backend` add bounded diagnostic context. Authenticated principal issuer/subject is not emitted by default. Northbound audit events additionally record bounded MCP `clientInfo` name/version/description as `client_name`, `client_version`, and `client_description`. These values are caller-supplied **audit metadata only** (`identity_source=mcp_client_info_untrusted`): they never select the authenticated principal, authorize a capability, change operation ownership, or cross the Hub/Agent trust boundary. `v2_northbound_operation_requested` carries the same `operation_id` used by downstream Hub execution events so tooling/human callers can be correlated without treating their claimed client name as identity. The main event families cover Agent session start/accept/supersede/end/reconnect/exhaustion, northbound client initialization/request correlation, operation admission/dispatch/terminal failure or completion, cancellation request/acknowledgement, indeterminate/quarantine/resolution, persistence failure, authorization failure, overload rejection, backend ambiguity/timeout and stale result/session rejection.
+V2 structured events use control-plane correlation fields only when available. The principal incident keys are `operation_id`, `device_id` and `generation`; `capability`, `outcome`, `error_code`, `indeterminate_reason`, `reconnect_attempt` and `backend` add bounded diagnostic context. Authenticated principal issuer/subject is not emitted by default. Northbound audit events additionally record bounded MCP `clientInfo` name/version/description as `client_name`, `client_version`, and `client_description`. These values are caller-supplied **audit metadata only** (`identity_source=mcp_client_info_untrusted`): they never select the authenticated principal, authorize a capability, change operation ownership, or cross the Hub/Agent trust boundary. `v2_northbound_operation_requested` carries the same `operation_id` used by downstream Hub execution events so tooling/human callers can be correlated without treating their claimed client name as identity. The main event families cover Agent session start/accept/supersede/end/reconnect/exhaustion, northbound client initialization/request correlation, operation admission/dispatch/terminal failure or completion, cancellation request/acknowledgement, indeterminate/quarantine/manual resolution/auto reconciliation, persistence failure, authorization failure, overload rejection, backend ambiguity/timeout and stale result/session rejection.
 
 OTel counters intentionally expose only closed, low-cardinality attribute domains:
 
@@ -185,13 +318,13 @@ Every newly-created quarantine emits a dedicated `ERROR`-level `v2_quarantine_cr
 journalctl -u cumg-v2-hub.service --priority=err --grep=v2_quarantine_created --follow
 ```
 
-For OTLP-backed monitoring, alert whenever the **increase/delta of `cumg.v2.quarantine_created` is greater than zero** over the collector's shortest reliable alert window (for example one to five minutes), and page or otherwise notify the operator responsible for the device. Metric exporters may translate the meter name to backend-specific syntax; alert on the exported counter corresponding to this exact OpenTelemetry meter rather than adding `operation_id` or `device_id` labels. Use the paired `v2_quarantine_created` error event to recover those incident identifiers, then follow the offline resolution procedure above. Clear the operational alert only after explicit resolution is evidenced by `v2_quarantine_resolved` / `cumg.v2.quarantine_resolved`; reconnect or process restart is not resolution.
+For OTLP-backed monitoring, alert whenever the **increase/delta of `cumg.v2.quarantine_created` is greater than zero** over the collector's shortest reliable alert window (for example one to five minutes), and page or otherwise notify the operator responsible for the device. Metric exporters may translate the meter name to backend-specific syntax; alert on the exported counter corresponding to this exact OpenTelemetry meter rather than adding `operation_id` or `device_id` labels. Use the paired `v2_quarantine_created` error event to recover those incident identifiers, then follow the offline resolution procedure above. Clear the operational alert only after a durable terminal settlement exists: either explicit operator resolution (`v2_quarantine_resolved` / `cumg.v2.quarantine_resolved`) or an `v2_operation_auto_resolved` event for the exact quarantined operation. Reconnect or process restart alone is not resolution; `operator_required` and `unrecoverable_evidence_gap` remain alerting conditions.
 
 The Hub also bounds same-generation checkpoint growth. After a successful checkpoint reaches `CUMG_V2_CHECKPOINT_GENERATION_ROLLOVER_BYTES` (default `524288`, at most half of the 1 MiB checkpoint ceiling), the Hub pauses new operation admission, lets already-admitted work settle, then closes the authenticated Agent session cleanly. The Agent reconnects with a fresh generation, and the existing generation fence makes prior signed commands stale before the Hub prunes old terminal replay/receipt records. `Indeterminate` operations and quarantine are never pruned by this rollover; a quarantined device therefore remains quarantined across every generation. This is a reliability compaction boundary, not permission to replay or forget ambiguity.
 
 Checkpoint publication is atomic from the loader's point of view. Hub and Agent first write a private same-directory pending file, flush and fsync that complete file, then publish the sequenced final name with a no-clobber atomic link and fsync the state directory. `load_latest()` and retention discovery recognize only the exact sequenced final-name grammar, so an ENOSPC/I/O failure before publication—or a crash-leftover pending file—cannot supersede the last committed checkpoint. Pending leftovers are ignored rather than treated as fallback candidates or deleted opportunistically across processes. A malformed **committed** checkpoint still fails closed; this protocol does not add silent fallback to older committed state.
 
-For an incident, correlate Hub and Agent by `device_id` + `generation`, then follow `operation_id`. A `v2_operation_indeterminate` event must be followed by durable quarantine until a `v2_quarantine_resolved` event exists for that operation. Persistence failures expose a safe `error_code` such as `persistence_checkpoint_too_large` without a path or serialized checkpoint. Reconnect exhaustion and heartbeat timeouts are visible independently from TLS/transport connection failures. OAuth introspection unavailability is distinct from authorization denial, and a quarantine admission rejection remains `device_indeterminate` rather than being retried or auto-replayed.
+For an incident, correlate Hub and Agent by `device_id` + `generation`, then follow `operation_id`. A `v2_operation_indeterminate` event must be followed by durable quarantine until either a persistence-gated manual resolution or an exact authoritative `v2_operation_auto_resolved` settlement exists for that operation. Persistence failures expose a safe `error_code` such as `persistence_checkpoint_too_large` without a path or serialized checkpoint. Reconnect exhaustion and heartbeat timeouts are visible independently from TLS/transport connection failures. OAuth introspection unavailability is distinct from authorization denial, and a quarantine admission rejection remains `device_indeterminate` rather than being retried or auto-replayed.
 
 See [`V2_M1_ACCEPTANCE.md`](v2/acceptance/V2_M1_ACCEPTANCE.md) for the final security gate and [`../packaging/README.md`](../packaging/README.md) for lifecycle details.
 
@@ -480,6 +613,10 @@ V1 has no built-in:
 
 All MCP clients connected to one V1 gateway ultimately share one serialized physical desktop/backend state.
 
+## Reviewed single-Mac macOS deployment
+
+A trusted development Mac that intentionally co-locates Hub, external grant signer, Agent, and Cua should use the reviewed single-Mac profile rather than hand-written LaunchAgents. See [`v2/V2_SINGLE_MAC_PRODUCTION.md`](v2/V2_SINGLE_MAC_PRODUCTION.md). Its upgrade helper preserves Hub drain/quarantine semantics, archives a version-paired rollback asset, writes a payload-free runtime identity manifest, and requires a healthy read-only `v2_doctor` result after restart.
+
 ## Local-user online quarantine recovery
 
 The optional online quarantine-recovery path is documented in [`v2/V2_ONLINE_RECOVERY.md`](v2/V2_ONLINE_RECOVERY.md). It does not expose recovery through northbound MCP and does not make the Agent device key a resolver credential.
@@ -490,4 +627,4 @@ The existing `v2_maint` offline resolver remains required as break-glass for an 
 
 ### Online recovery upgrade compatibility
 
-The online recovery transport advances `HUB_AGENT_SCHEMA_VERSION` from 1 to 2. Hub-Agent schema mismatch is rejected fail-closed, so deploy the corresponding v0.3 Hub and Agent as a coordinated upgrade; do not assume mixed-version rolling operation across this boundary. This requirement is limited to the V2 Hub-Agent application protocol and does not change V1 gateway compatibility.
+Online recovery is part of the versioned Hub-Agent application protocol. The current protocol schema is `HUB_AGENT_SCHEMA_VERSION = 4`; schema mismatch is rejected fail-closed. Deploy the matching Hub and Agent as a coordinated upgrade and do not assume mixed-version rolling operation across this boundary. This does not change V1 gateway compatibility.

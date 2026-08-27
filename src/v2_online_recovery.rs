@@ -214,6 +214,7 @@ pub fn new_authorization(
 ) -> Result<RecoveryAuthorization, RecoveryError> {
     let evidence = evidence.into();
     validate_evidence(&evidence)?;
+    let _ = resolution_name(&decision)?;
     let mut random = [0_u8; 16];
     OsRng.fill_bytes(&mut random);
     let mut request_id = String::from("rec_");
@@ -246,6 +247,7 @@ pub fn validate_authorization_against_challenge(
     validate_schema(challenge.schema_version)?;
     validate_schema(authorization.schema_version)?;
     validate_evidence(&authorization.evidence)?;
+    let _ = resolution_name(&authorization.decision)?;
     if authorization.request_id.len() != 36
         || !authorization.request_id.starts_with("rec_")
         || !authorization.request_id[4..]
@@ -388,7 +390,7 @@ pub fn authorization_signing_bytes(
         &mut bytes,
         audit_assessment_name(authorization.audit_assessment),
     );
-    push_str(&mut bytes, resolution_name(&authorization.decision));
+    push_str(&mut bytes, resolution_name(&authorization.decision)?);
     push_str(&mut bytes, &authorization.evidence);
     Ok(bytes)
 }
@@ -418,7 +420,7 @@ fn resolved_signing_bytes(resolved: &RecoveryResolved) -> Result<Vec<u8>, Recove
     push_str(&mut bytes, &resolved.device_id);
     push_str(&mut bytes, &resolved.operation_id);
     bytes.extend_from_slice(&resolved.current_generation.to_be_bytes());
-    push_str(&mut bytes, resolution_name(&resolved.decision));
+    push_str(&mut bytes, resolution_name(&resolved.decision)?);
     bytes.extend_from_slice(&resolved.resolved_at_ms.to_be_bytes());
     Ok(bytes)
 }
@@ -448,10 +450,15 @@ fn push_str(output: &mut Vec<u8>, value: &str) {
     push_bytes(output, value.as_bytes());
 }
 
-fn resolution_name(value: &IndeterminateResolution) -> &'static str {
+fn resolution_name(value: &IndeterminateResolution) -> Result<&'static str, RecoveryError> {
     match value {
-        IndeterminateResolution::ConfirmedCompleted => "confirmed_completed",
-        IndeterminateResolution::ConfirmedNotExecuted => "confirmed_not_executed",
+        IndeterminateResolution::ConfirmedCompleted => Ok("confirmed_completed"),
+        IndeterminateResolution::ConfirmedNotExecuted => Ok("confirmed_not_executed"),
+        // This bounded text-input state is intentionally offline-only. Online recovery
+        // remains the reviewed two-decision local-user contract from #100.
+        IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+            Err(RecoveryError::InvalidMessage)
+        }
     }
 }
 

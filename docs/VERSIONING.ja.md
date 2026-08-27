@@ -62,6 +62,14 @@ project/crate version、wire protocol schema、capability-advertisement schema�
 
 既に supported な release line の checkpoint を、wire/configuration behavior を変えず backward-compatible に restore する persisted-state migration は PATCH で扱えます。documented persisted-state version の support removal、新しい incompatible persisted-state shape、operator に state transformation を要求する変更は新しい compatibility boundary なので、pre-1.0 では通常 MINOR が必要です。したがって、この backward-compatible checkpoint migration 自体は **MINOR version bump を要求しません**。
 
+## Durable-state writer compatibility と maintenance pairing
+
+execution-safety durable-state schema は crate version とは独立した operational compatibility boundary です。operator がたまたま新しい maintenance binary を実行したという理由だけで、offline recovery が古い authoritative checkpoint を新しい representation に暗黙変換してはいけません。
+
+そのため `v2_maint resolve` は input checkpoint が support する writer contract を維持し、post-resolution state をその contract で表現できるか検証し、表現できない場合は **publication 前に** fail します。packaged deployment では `v2_hub` と `v2_maint` を同じ reviewed build/release artifact から install し、pair として一緒に upgrade します。rollback checkpoint を保持する場合は対応する version-paired binary も rollback asset として保持してください。新しい source checkout の maintenance binary を、古い deployed Hub と pair された binary の代替として任意に使う運用は support しません。
+
+`inspect-quarantine` のような read-only inspection command は recovery authority にはならず、supported checkpoint を mutate せず読むことができます。authority-bearing maintenance で intended Hub が必要な durable representation を読めない場合は、先に documented compatible Hub + maintenance path で upgrade してください。state の手編集、forced schema downgrade、release tag の移動で回避しません。
+
 ## `1.0.0` の条件
 
 `1.0.0` は **CUMG が stable public compatibility contract を維持する意思を持つ**ことを意味します。あらゆる機能が実装済みであることを意味しません。

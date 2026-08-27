@@ -1,4 +1,5 @@
 use super::*;
+use crate::v2_execution_safety::ExecutionEvidence;
 use crate::v2_m0::{DeviceCapability, DeviceIdentity, GrantAuthority};
 use crate::v2_m0_execution::{ExecutionError, HubOperationState, OperationRef};
 use crate::v2_m1_grpc::decode_hub_frame;

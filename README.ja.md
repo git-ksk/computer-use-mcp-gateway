@@ -32,7 +32,7 @@ V2 Agent
 Computer-use backend (Cua Driver today)
 ```
 
-Hub は admission、authorization、operation state、replay barrier、永続的な `indeterminate` quarantine を所有します。Agent は認証済み device session とローカル実行境界を所有します。任意の usage accounting は独立した accounting authority であり、実行を認可したり、quarantine を解除したり、replay を許可したりする権限はありません。
+Hub は admission、authorization、operation state、replay barrier、永続的な `indeterminate` quarantine を所有します。Agent は認証済み device session とローカル実行境界を所有します。quota、billing、usage control は deployment 側で外付けする責務であり、CUMG の execution、replay、quarantine、recovery authority を得ることはありません。
 
 詳しくは [`docs/ARCHITECTURE.ja.md`](docs/ARCHITECTURE.ja.md) と、V2 の canonical boundary を定義する [`docs/v2/V2_POSITIONING.ja.md`](docs/v2/V2_POSITIONING.ja.md) を参照してください。
 
@@ -81,6 +81,8 @@ CUMG は、デスクトップを変更できる capability について fail-clo
 
 これらの制御は OS 権限、endpoint hardening、secret custody、network control、deployment 固有の監視を代替するものではありません。機密性の高い desktop をリモート公開する前に、[`docs/SECURITY.ja.md`](docs/SECURITY.ja.md) と [`docs/v2/V2_THREAT_MODEL.ja.md`](docs/v2/V2_THREAT_MODEL.ja.md) を確認してください。
 
+V2 caller が `device_indeterminate` を受け取った場合は、**old operation を retry しないでください**。response の `blocking_operation_id` は、すでに device を quarantine している以前の ambiguous operation を示します。authority-bearing recovery の前に [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) の read-only inspection / reconciliation flow に従ってください。offline resolution では version-paired な `v2_hub` / `v2_maint` を使い、Hub を停止するのは mutation step だけです。
+
 ## V2 の状況
 
 現在の実装状況は、内部 milestone 名ではなく capability 単位で追跡します:
@@ -90,9 +92,12 @@ CUMG は、デスクトップを変更できる capability について fail-clo
 | Desktop semantic path | Complete / accepted |
 | Browser core | Complete / accepted |
 | Browser transfer (upload/download) | Complete / accepted |
+| Optional Human Handoff coordination | CUMGではfirst-class / accepted。Window + Terminalはupstream Handoff componentを利用 |
 | V1 regression/conformance | Required and preserved |
 
 Browser core は、opaque CUMG reference と exact-or-refuse 実行 semantics を維持したまま、型付きの prepare、bind、inspect、navigate、click、type、dialog、pointer 経路を提供します。Browser transfer は、context-scoped ref、Agent-private filesystem staging、exact capability check、および stale ref、path escape、partial completion、timeout、cancellation に対する fail-closed 処理を備えた bounded staged upload/download を追加します。
+
+optional Human Handoffを有効化した場合、CUMGはupstream Handoff authorityをbest-effort sidecarではなくAgent execution boundaryの一部として扱います。Window integrationは `WindowHandoffAdapter`、Terminal/PTY integrationは `TerminalHandoffAdapter` をconsumeし、Handoffのexperimental Terminal authority / WebRTC moduleを直接importしません。authorization、operation/quarantine semantics、PTY/process containment、fresh semantic verificationは引き続きCUMGが所有します。upstream Window #85にはfirst-class adapterのsame-LAN direct physical rerunが残っていますが、CUMG #152や完了済みTerminal integrationをreopenするものではありません。
 
 現在の全体像は [`docs/v2/STATUS.ja.md`](docs/v2/STATUS.ja.md) を参照してください。Browser core の evidence は [`docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_CORE_ACCEPTANCE.md)、Browser transfer の evidence は [`docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md`](docs/v2/acceptance/V2_BROWSER_TRANSFER_ACCEPTANCE.md) にあります。active spec、acceptance evidence、archive 済み decision record の整理方法は [`docs/README.md`](docs/README.md) を参照してください。
 

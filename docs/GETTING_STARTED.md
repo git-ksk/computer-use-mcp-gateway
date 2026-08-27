@@ -257,20 +257,7 @@ CUMG_V2_CUA_BACKEND_VERSION=0.19.3
 
 Cua stays behind the Agent over MCP stdio. Set `CUMG_V2_CUA_BACKEND_VERSION` to the exact reviewed compatibility target in production. When set to a concrete value, the Agent verifies the Cua MCP handshake `serverInfo.version` on every connection and reconnect and fails closed on drift. The `external` default is an explicit unpinned mode for custom deployments, not the recommended production setting for the reviewed Cua path. On macOS, keep the Agent/Cua in the logged-in user session and do not bypass TCC prompts or move GUI automation into a headless system daemon.
 
-## 9. Optional runtime usage quota
-
-With no `CUMG_V2_USAGE_ENDPOINT`, V2 uses `NoopUsageController` and Node is not required.
-
-To enable the optional local MemoryUsageStore sidecar, follow [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md). The Hub endpoint must be literal loopback, for example:
-
-```text
-CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/
-CUMG_V2_USAGE_TIMEOUT_SECS=2
-```
-
-This is non-durable runtime/session quota, not billing. Restarting the packaged Hub+sidecar lifecycle resets usage state but never clears CUMG's durable `indeterminate` quarantine.
-
-## 10. Verify before remote exposure
+## 9. Verify before remote exposure
 
 Before exposing the northbound MCP resource, verify all of these independently:
 
@@ -280,8 +267,7 @@ Before exposing the northbound MCP resource, verify all of these independently:
 - northbound OAuth produces only the intended issuer+subject principal;
 - `tools/list` contains only capabilities granted by the exact policy;
 - a harmless V2 Cua-backed operation such as `list_apps` or `get_screen_size` succeeds;
-- optional usage accounting increments only when enabled;
-- reconnect does not clear any unresolved CUMG quarantine.
+- reconnect/liveness alone does not clear unresolved CUMG quarantine; only exact signed terminal evidence for the same prior dispatch may self-reconcile without replay.
 
 Then use [`DEPLOYMENT.md`](DEPLOYMENT.md) for the reviewed reverse-proxy/TLS path. Keep the northbound MCP listener loopback-only.
 

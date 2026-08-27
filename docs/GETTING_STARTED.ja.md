@@ -257,20 +257,7 @@ CUMG_V2_CUA_BACKEND_VERSION=0.19.3
 
 Cua は Agent の背後に MCP stdio で配置します。production では `CUMG_V2_CUA_BACKEND_VERSION` を exact reviewed compatibility target に設定してください。concrete value を設定すると、Agent は connection / reconnect ごとに Cua MCP handshake の `serverInfo.version` を verify し、drift した場合は fail closed します。default の `external` は custom deployment 用の explicit unpinned mode であり、reviewed Cua path の recommended production setting ではありません。macOS では Agent/Cua を logged-in user session 内に置き、TCC prompt を bypass したり、GUI automation を headless system daemon に移したりしないでください。
 
-## 9. Optional runtime usage quota
-
-`CUMG_V2_USAGE_ENDPOINT` を設定しない場合、V2 は `NoopUsageController` を使うため Node は不要です。
-
-optional local MemoryUsageStore sidecar を有効化する場合は [`V2_USAGE_ACCOUNTING.md`](v2/V2_USAGE_ACCOUNTING.md) に従います。Hub endpoint は literal loopback でなければなりません。例:
-
-```text
-CUMG_V2_USAGE_ENDPOINT=http://127.0.0.1:8787/
-CUMG_V2_USAGE_TIMEOUT_SECS=2
-```
-
-これは billing ではなく non-durable runtime/session quota です。packaged Hub+sidecar lifecycle を restart すると usage state は reset されますが、CUMG の durable `indeterminate` quarantine は clear されません。
-
-## 10. remote exposure の前に確認する
+## 9. remote exposure の前に確認する
 
 northbound MCP resource を公開する前に、次をそれぞれ独立して確認します。
 
@@ -280,8 +267,7 @@ northbound MCP resource を公開する前に、次をそれぞれ独立して�
 - northbound OAuth が intended issuer+subject principal のみを生成する。
 - `tools/list` に exact policy で grant された capability のみが含まれる。
 - `list_apps` / `get_screen_size` のような harmless V2 Cua-backed operation が成功する。
-- optional usage accounting は enable 時のみ increment する。
-- reconnect が unresolved CUMG quarantine を clear しない。
+- reconnect/liveness だけでは unresolved CUMG quarantine を clear しない。同じ prior dispatch に対する exact signed terminal evidence だけが replay なしで self-reconcile できる。
 
 その後、reviewed reverse-proxy/TLS path について [`DEPLOYMENT.md`](DEPLOYMENT.md) に従ってください。northbound MCP listener は loopback-only のままにします。
 
