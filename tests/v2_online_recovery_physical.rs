@@ -355,12 +355,28 @@ async fn physical_secure_enclave_online_recovery_never_replays_ambiguous_cua_ope
     assert!(matches!(fresh.result, DeviceResult::ScreenGeometry { .. }));
     assert_ne!(fresh.operation_id, operation_id);
 
+    // Match the production Hub shutdown sequence before reopening the same
+    // durable state directory. Tonic may finish serving before detached Agent
+    // session cleanup drops its Hub clone, so close admission/session authority
+    // first and wait until the live session is fully gone.
+    handle.begin_shutdown_drain();
+    tokio::time::timeout(Duration::from_secs(8), handle.wait_for_shutdown_drain())
+        .await
+        .context("physical online-recovery Hub shutdown drain did not complete")?;
+    let _ = handle.close_live_session_for_shutdown().await;
     let _ = second_shutdown_tx.send(true);
     let second_agent_result = tokio::time::timeout(Duration::from_secs(8), second_agent_task)
         .await
         .context("second physical online-recovery Agent did not shut down")?
         .context("second Agent task join failed")?;
     second_agent_result?;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while handle.is_online().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("physical online-recovery Hub session did not close")?;
     let _ = server_shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(8), server)
         .await
