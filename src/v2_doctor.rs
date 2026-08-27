@@ -229,7 +229,7 @@ fn verify_runtime_manifest(
                 return;
             }
         };
-    if manifest.schema_version != 2
+    if manifest.schema_version != 3
         || manifest.hub_agent_schema_version != HUB_AGENT_SCHEMA_VERSION
         || manifest.source_commit.len() != 40
         || !manifest
@@ -255,7 +255,7 @@ fn verify_runtime_manifest(
             "package_version_differs_from_doctor",
         );
     }
-    let mut required = vec!["v2_hub", "v2_agent", "v2_maint", "v2_doctor"];
+    let mut required = vec!["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_recover"];
     if config.grant_signer_launchd_label.is_some() || config.grant_signer_socket.is_some() {
         required.push("v2_grant_signer");
     }
@@ -1362,6 +1362,7 @@ mod tests {
             "v2_agent",
             "v2_maint",
             "v2_doctor",
+            "v2_recover",
             "v2_grant_signer",
         ];
         let mut binaries = Vec::new();
@@ -1374,7 +1375,7 @@ mod tests {
         std::fs::write(
             &manifest,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "hub_agent_schema_version": HUB_AGENT_SCHEMA_VERSION,
                 "source_commit": "0123456789abcdef0123456789abcdef01234567",
                 "package_version": env!("CARGO_PKG_VERSION"),

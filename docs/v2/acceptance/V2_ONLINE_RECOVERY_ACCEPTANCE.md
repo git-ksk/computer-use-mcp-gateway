@@ -1,6 +1,6 @@
 # V2 online recovery acceptance
 
-Status: **automated gate in progress; trusted physical macOS Secure Enclave acceptance required before release.**
+Status: **automated gate complete on the refreshed PR head; trusted physical macOS Secure Enclave acceptance remains required before release.**
 
 Canonical contract: [`../V2_ONLINE_RECOVERY.md`](../V2_ONLINE_RECOVERY.md).
 

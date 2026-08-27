@@ -82,7 +82,7 @@ For an actual single-Mac cutover, invoke that helper through `scripts/v2_launchd
 
 ## macOS local-user online quarantine recovery
 
-The macOS Agent remains a LaunchAgent in the interactive login session; online recovery does not add a daemon or a second service supervisor. Install the `v2_recover` binary alongside `v2_agent`. Its local challenge/authorization handoff uses the same `CUMG_V2_STATE_DIR` configured for the LaunchAgent.
+The macOS Agent remains a LaunchAgent in the interactive login session; online recovery does not add a daemon or a second service supervisor. The reviewed single-Mac upgrade helper builds, stable-signs, installs, rollback-archives, and runtime-manifest-verifies `v2_recover` alongside the paired runtime binaries. Its local challenge/authorization handoff uses the same `CUMG_V2_STATE_DIR` configured for the LaunchAgent.
 
 Initialize the recovery key once as the Agent's logged-in user:
 

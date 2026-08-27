@@ -76,7 +76,7 @@ signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します
 4. old binaries/config、Handoff env、helper copy、runtime dependency を含む self-contained old Handoff generation を private rollback bundle に保存。dependency が欠けた archive は external-runtime reference のまま扱い、その runtime の cleanup を許可しない。authoritative Hub/Agent state は drain 後だけ保存;
 5. Hub を先に signal して admission close/drain、Hub/Agent/signer unload 後、alternate の既知 Hub/Agent label を plist を削除せず bootout + disable し、stopped quarantine を再確認;
 6. stopped 状態で private Handoff env と Agent plist を staged generation へ atomic retarget し、paired CUMG binaries を atomic replace;
-7. merged CUMG source commit、exact Hub/Agent application-schema version、package version、binary SHA-256 を持つ schema 2 `runtime-manifest.json` を作成;
+7. merged CUMG source commit、exact Hub/Agent application-schema version、package version、binary SHA-256 を持つ schema 3 `runtime-manifest.json` を作成;
 8. signer -> Hub -> Agent で起動し、既知 launchd family の競合がないことを再確認してから read-only Handoff status を含む `v2_doctor` を実行;
 9. doctor healthy の後だけ、eligible な未参照 `runtime-*` code directory を prune。active runtime、legacy external rollback reference、bounded recent generations、symlink/unsafe candidate は保護または拒否。checkpoint/key/env/audit/control/rollback data は cleanup candidate 外。
 
@@ -107,7 +107,7 @@ expired-recovery abandonment は signed checkpoint を削除する前に private
 
 standard profile では次を確認します。
 
-- runtime manifest schema 2、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_grant_signer` の exact SHA-256 identity;
+- runtime manifest schema 3、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_recover` / `v2_grant_signer` の exact SHA-256 identity;
 - authoritative Hub checkpoint の readability と current registry/capability schema;
 - enrolled single-Mac device が 1 台だけであることと current generation;
 - Agent checkpoint readability と exact Hub/Agent generation pairing;
@@ -135,7 +135,7 @@ single-Mac upgrade を healthy とする前に最低限次を満たします。
 - `v2_doctor` が `overall=healthy`;
 - restart 後に fresh authenticated Agent generation がある;
 - live quarantine が 0 のまま;
-- schema-2 runtime manifest が installed paired binary と exact Hub/Agent application schema を verify;
+- schema-3 runtime manifest が installed paired binary と exact Hub/Agent application schema を verify;
 - Handoff が recovery/resume/fault なしの idle;
 - harmless northbound semantic smoke が durable terminal `Completed` に到達;
 - operator-selected bake period が終わるまで old binary/state rollback pair を保持。

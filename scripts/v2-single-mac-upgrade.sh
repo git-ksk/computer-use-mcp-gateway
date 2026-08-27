@@ -329,12 +329,15 @@ echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned stable_t
 [[ "$PRELIGHT_ONLY" == "1" ]] && exit 0
 
 cargo build --release --locked \
-  --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_grant_signer
-for name in v2_hub v2_agent v2_maint v2_doctor v2_grant_signer; do
+  --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_recover --bin v2_grant_signer
+for name in v2_hub v2_agent v2_maint v2_doctor v2_recover v2_grant_signer; do
   [[ -x "target/release/$name" ]] || { echo "REFUSED reason=build_output_missing binary=$name" >&2; exit 2; }
 done
 stable_codesign "target/release/v2_agent" "com.github.git-ksk.cumg-v2-agent" || {
   echo "REFUSED reason=agent_stable_codesign_failed" >&2; exit 2;
+}
+stable_codesign "target/release/v2_recover" "com.github.git-ksk.cumg-v2-recover" || {
+  echo "REFUSED reason=recovery_cli_stable_codesign_failed" >&2; exit 2;
 }
 
 HANDOFF_RUNTIME_COMMAND="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_COMMAND' "$AGENT_PLIST" 2>/dev/null || true)"
@@ -515,7 +518,7 @@ ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
 umask 077
 mkdir -p "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
 chmod 700 "$ROLLBACK" "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
-for name in v2_hub v2_agent v2_maint v2_doctor v2_grant_signer; do
+for name in v2_hub v2_agent v2_maint v2_doctor v2_recover v2_grant_signer; do
   [[ -f "$BIN_DIR/$name" ]] && cp -p "$BIN_DIR/$name" "$ROLLBACK/bin/$name"
 done
 cp -p "$HUB_PLIST" "$ROLLBACK/launchd/"
@@ -699,7 +702,7 @@ install_atomic() {
   chmod 700 "$tmp"
   mv -f "$tmp" "$destination"
 }
-for name in v2_hub v2_agent v2_maint v2_doctor v2_grant_signer; do
+for name in v2_hub v2_agent v2_maint v2_doctor v2_recover v2_grant_signer; do
   install_atomic "target/release/$name" "$BIN_DIR/$name"
 done
 
@@ -718,7 +721,7 @@ python3 - "$HEAD" "$PACKAGE_VERSION" "$HUB_AGENT_SCHEMA_VERSION" "$BIN_DIR" > "$
 import hashlib, json, pathlib, sys
 commit, version, hub_agent_schema, bindir = sys.argv[1:]
 bindir = pathlib.Path(bindir)
-names = ["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_grant_signer"]
+names = ["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_recover", "v2_grant_signer"]
 items = []
 for name in names:
     h = hashlib.sha256()
@@ -727,7 +730,7 @@ for name in names:
             h.update(chunk)
     items.append({"name": name, "sha256": h.hexdigest()})
 print(json.dumps({
-    "schema_version": 2,
+    "schema_version": 3,
     "hub_agent_schema_version": int(hub_agent_schema),
     "source_commit": commit,
     "package_version": version,

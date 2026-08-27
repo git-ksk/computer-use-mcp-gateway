@@ -233,7 +233,7 @@ def verify_health_manifest(path: Path, expected_source_commit: str) -> None:
     except Exception as exc:
         raise CleanupRefusal("runtime_manifest_unreadable") from exc
     if (
-        manifest.get("schema_version") != 2
+        manifest.get("schema_version") != 3
         or manifest.get("source_commit") != expected_source_commit
         or not isinstance(manifest.get("hub_agent_schema_version"), int)
         or manifest.get("hub_agent_schema_version", 0) <= 0
