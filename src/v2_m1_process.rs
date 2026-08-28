@@ -49,7 +49,7 @@ pub struct ProcessPolicy {
 
 impl ProcessPolicy {
     pub fn developer_defaults(allowed_cwd_roots: Vec<PathBuf>) -> Result<Self, ProcessError> {
-        let mut inherited_env_keys = [
+        let inherited_env_keys = [
             "PATH",
             "HOME",
             "USER",
@@ -63,15 +63,15 @@ impl ProcessPolicy {
             "TERM",
             "SSH_AUTH_SOCK",
             "DEVELOPER_DIR",
+            // Git for Windows and other per-user tools resolve user-scoped config from
+            // USERPROFILE when HOME is absent. Preserve only that profile locator rather
+            // than widening the cleared child environment to APPDATA/LOCALAPPDATA.
+            #[cfg(windows)]
+            "USERPROFILE",
         ]
         .into_iter()
         .map(str::to_owned)
-        .collect::<HashSet<String>>();
-        // Git for Windows and other per-user tools resolve user-scoped config from
-        // USERPROFILE when HOME is absent. Preserve only that profile locator rather
-        // than widening the cleared child environment to APPDATA/LOCALAPPDATA.
-        #[cfg(windows)]
-        inherited_env_keys.insert("USERPROFILE".to_owned());
+        .collect();
         let explicit_env_keys = [
             "CI",
             "RUST_LOG",
