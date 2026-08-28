@@ -63,6 +63,11 @@ impl ProcessPolicy {
             "TERM",
             "SSH_AUTH_SOCK",
             "DEVELOPER_DIR",
+            // Git for Windows and other per-user tools resolve user-scoped config from
+            // USERPROFILE when HOME is absent. Preserve only that profile locator rather
+            // than widening the cleared child environment to APPDATA/LOCALAPPDATA.
+            #[cfg(windows)]
+            "USERPROFILE",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -762,6 +767,31 @@ mod tests {
         let error = drain_bounded(FailingReader, 16).unwrap_err();
         assert!(matches!(error, ProcessError::Io(_)));
         assert_eq!(error.outcome_unproven_stage(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_inherits_userprofile_without_broad_profile_environment() {
+        let root = temp_root("windows-userprofile");
+        let policy = ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap();
+        assert!(policy.inherited_env_keys.contains("USERPROFILE"));
+        assert!(!policy.inherited_env_keys.contains("APPDATA"));
+        assert!(!policy.inherited_env_keys.contains("LOCALAPPDATA"));
+
+        let executor = ProcessExecutor::new(policy);
+        let shell = ShellRequest {
+            command: "if defined USERPROFILE (echo %USERPROFILE%) else exit /b 7".into(),
+            cwd: root.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        };
+        let output = executor
+            .execute_shell(&shell, &ProcessCancellation::default())
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert!(!output.stdout.trim().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
