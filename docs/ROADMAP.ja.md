@@ -70,7 +70,7 @@ CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 �
 
 現在の作業順:
 
-- **`0.3.x` — Product Readiness & Stabilization:** 新しい public contract を必要としない operator UX、configuration / least-privilege hardening、再現可能な performance evidence、packaging / release hygiene、compatible fix。現在の候補は #109、#115、#104、#111、および #96 の bounded な調査 / documentation 部分。
+- **`0.3.x` — Product Readiness & Stabilization:** 新しい public contract を必要としない operator UX、configuration / least-privilege hardening、再現可能な performance evidence、packaging / release hygiene、compatible fix。現在の候補は #224、#109、#115、#104、#111、および #96 の bounded な調査 / documentation 部分。
 - **`0.4.0` — Recovery & Reconciliation:** durable operation identity/status を effectful operation へ広げる #103、review 済み low-impact GUI ambiguity を local Human が current state として明示 acceptance できる #137、permanent replay tombstone と bounded detailed retirement history を分離する #136 により、曖昧な effectful work から replay せず安全に復帰する contract を強化。
 - **`0.5.0` — Multi-principal Identity:** #139 で provider-neutral OIDC/JWT caller identity を追加し、既存の exact `principal -> device -> capability` authorizer と single-principal / introspection adapter を維持。
 - **`0.6.0` — Least-privilege Workspace:** #83 の bounded retrievable output、#105 の ranged / deterministic filesystem observation、#107 の明示的 writable root 下での atomic workspace mutation により Dangerous shell authority への依存を減らす。
@@ -144,7 +144,7 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 repository の open issue は、work が roadmap の可視性から黙って抜け落ちないよう working milestone ごとに分類します。これらの milestone は ordering / admission guidance であり、evidence により split / defer が必要になった場合まで同時 ship を約束するものではありません。
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate、#215 が desktop execution を Cloud Run へ移さず formally supported hosted Cloud Run Hub を評価し、#109 が online-recovery CLI の durable completion confirmation、#115 が replay しない actionable `Indeterminate` operator UX、#104 が filesystem observation root と process cwd root の分離、#111 が再現可能な latency / concurrency evidence、#96 が Unix descendant containment の正確な boundary 調査を所有します。
+- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate、#224 が version-paired release-candidate artifact / fresh-extraction smoke、#215 が desktop execution を Cloud Run へ移さず formally supported hosted Cloud Run Hub を評価し、#109 が online-recovery CLI の durable completion confirmation、#115 が replay しない actionable `Indeterminate` operator UX、#104 が filesystem observation root と process cwd root の分離、#111 が再現可能な latency / concurrency evidence、#96 が Unix descendant containment の正確な boundary 調査を所有します。
 - **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離、#217 が software-key fallback なしで reviewed Windows/Linux provider へ separate user-presence online recovery authority を拡張します。
 - **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity、#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
 - **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。

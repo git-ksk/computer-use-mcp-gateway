@@ -97,6 +97,28 @@ Starting with 1.0:
 
 Before 1.0, only the **latest released minor line** is actively supported. Older 0.x lines are best-effort and do not receive routine backports. Severe security backports are discretionary exceptions, not an LTS promise.
 
+## Release-candidate artifacts
+
+The currently published `v0.3.0` release remains **source-only** unless a later GitHub Release explicitly contains reviewed binary assets. CI artifacts are not silently promoted into a supported distribution.
+
+The `Release Candidate Artifacts` workflow builds a bounded native candidate on Linux, macOS, and Windows from one exact checkout. `scripts/v2_release_candidate.py` copies only the platform allowlisted V2 binaries, records package version + exact source commit + platform/architecture + per-file size/SHA-256 in `release-artifact-manifest.json`, creates the archive, and emits an archive-level `.sha256` record. The artifact manifest is distribution evidence only; it does not replace the installed single-Mac `runtime-manifest.json` or become execution/recovery authority.
+
+Verification is intentionally a fresh-extraction path:
+
+```bash
+python3 scripts/v2_release_candidate.py verify \
+  --archive dist/cumg-v0.3.0-macos-arm64.tar.gz \
+  --checksum dist/cumg-v0.3.0-macos-arm64.tar.gz.sha256 \
+  --extract-dir /tmp/cumg-candidate
+
+python3 scripts/v2_release_candidate.py smoke \
+  --bundle-dir /tmp/cumg-candidate/cumg-v0.3.0-macos-arm64
+```
+
+`verify` rejects checksum mismatch, unexpected/missing files, unsafe paths, symlinks, malformed identity metadata, and per-file size/digest drift before a candidate is accepted. `smoke` runs the packaged binaries from the extracted bundle, never through `cargo run` or the source checkout.
+
+These candidates are **not official production installers**. Before a future release claims an installable supported distribution, complete the relevant platform signing/notarization decision, SBOM/provenance strategy, clean-machine install acceptance, and explicit supported-platform matrix. The CI workflow uploads candidates for review only and does not create/mutate Git tags or GitHub Releases.
+
 ## Release procedure
 
 A normal release is prepared from `main` through a dedicated release PR.

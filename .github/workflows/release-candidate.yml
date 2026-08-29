@@ -1,0 +1,113 @@
+name: Release Candidate Artifacts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            platform: linux
+            python: python3
+          - name: macOS
+            os: macos-latest
+            platform: macos
+            python: python3
+          - name: Windows
+            os: windows-latest
+            platform: windows
+            python: python
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.88
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Build reviewed V2 candidate binaries
+        shell: bash
+        run: |
+          bins=(
+            --bin v2_hub
+            --bin v2_agent
+            --bin v2_maint
+            --bin v2_grant_signer
+            --bin v2_keyctl
+            --bin v2_tls_check
+          )
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            bins+=(--bin v2_handoff_ctl)
+          fi
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            bins+=(--bin v2_doctor)
+          fi
+          cargo build --release --locked "${bins[@]}"
+
+      - name: Resolve exact candidate identity
+        shell: bash
+        run: |
+          package_version="$(${{ matrix.python }} - <<'PY'
+          import pathlib
+          import tomllib
+          with pathlib.Path("Cargo.toml").open("rb") as handle:
+              print(tomllib.load(handle)["package"]["version"])
+          PY
+          )"
+          source_commit="$(git rev-parse HEAD)"
+          architecture="$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          printf 'PACKAGE_VERSION=%s\n' "$package_version" >> "$GITHUB_ENV"
+          printf 'SOURCE_COMMIT=%s\n' "$source_commit" >> "$GITHUB_ENV"
+          printf 'CANDIDATE_ARCH=%s\n' "$architecture" >> "$GITHUB_ENV"
+
+      - name: Build bounded release candidate
+        shell: bash
+        run: |
+          ${{ matrix.python }} scripts/v2_release_candidate.py build \
+            --binary-dir target/release \
+            --output-dir dist \
+            --package-version "$PACKAGE_VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --platform "${{ matrix.platform }}" \
+            --architecture "$CANDIDATE_ARCH"
+
+      - name: Verify archive and extract fresh bundle
+        shell: bash
+        run: |
+          archive="$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)"
+          [[ -n "$archive" ]] || { echo "release candidate archive missing" >&2; exit 1; }
+          ${{ matrix.python }} scripts/v2_release_candidate.py verify \
+            --archive "$archive" \
+            --checksum "$archive.sha256" \
+            --extract-dir extracted
+
+      - name: Smoke packaged binaries from extracted artifact
+        shell: bash
+        run: |
+          bundle="$(find extracted -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          [[ -n "$bundle" ]] || { echo "verified bundle directory missing" >&2; exit 1; }
+          ${{ matrix.python }} scripts/v2_release_candidate.py smoke --bundle-dir "$bundle"
+
+      - name: Upload verified candidate archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-candidate-${{ matrix.platform }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
