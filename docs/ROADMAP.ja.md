@@ -144,14 +144,16 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 repository の open issue は、work が roadmap の可視性から黙って抜け落ちないよう working milestone ごとに分類します。これらの milestone は ordering / admission guidance であり、evidence により split / defer が必要になった場合まで同時 ship を約束するものではありません。
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate、#109 が online-recovery CLI の durable completion confirmation、#115 が replay しない actionable `Indeterminate` operator UX、#104 が filesystem observation root と process cwd root の分離、#111 が再現可能な latency / concurrency evidence、#96 が Unix descendant containment の正確な boundary 調査を所有します。
-- **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離を扱います。
-- **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity を追加します。
+- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate、#215 が desktop execution を Cloud Run へ移さず formally supported hosted Cloud Run Hub を評価し、#109 が online-recovery CLI の durable completion confirmation、#115 が replay しない actionable `Indeterminate` operator UX、#104 が filesystem observation root と process cwd root の分離、#111 が再現可能な latency / concurrency evidence、#96 が Unix descendant containment の正確な boundary 調査を所有します。
+- **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離、#217 が software-key fallback なしで reviewed Windows/Linux provider へ separate user-presence online recovery authority を拡張します。
+- **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity、#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
 - **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。
 - **`0.7.0 — Managed Developer Execution`:** #106 が explicit managed-job lifecycle、#114 が separately sandboxed Playwright/E2E execution を追加します。
 - **Upstream-blocked V1 compatibility:** #14（`get_screen_size` session/escalation）と #15（`list_apps` live-process discovery mismatch）は upstream Cua 待ちのまま、active post-v0.3 milestone を意図的に付けません。V1 を deliberate に retire する場合は no-longer-applicable になる可能性があります。
 
 open issue がこの inventory または他の明示的 roadmap section に存在しない場合、roadmap は stale とみなし、milestone / release closeout を宣言する前に修正します。
+
+Cua authorization / product-boundary research #219 は [`v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md`](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md) で完了し、admit した follow-up は #221 と #222 です。
 
 ### `0.5.0` candidate: multi-principal northbound identity
 
@@ -191,6 +193,8 @@ gap は、具体的な workflow need があり、generic backend passthrough を
 [`v2/V2_CUA_PARITY_MATRIX.ja.md`](v2/V2_CUA_PARITY_MATRIX.ja.md) を参照してください。
 
 ### Additional backend or native GUI adapter
+
+Issue #222 が current P1 portability-evidence candidate を所有します。materially different な second real computer-use/native-GUI backend で small overlapping semantic slice を実証し、real side effect と ambiguity semantics を exercise します。compile-time compatibility や deterministic reference executor だけを cross-GUI-backend claim の evidence にはしません。
 
 second real Computer Use backend または native GUI adapter は、具体的な operational、portability、support、security benefit がある場合にのみ candidate とします。
 
