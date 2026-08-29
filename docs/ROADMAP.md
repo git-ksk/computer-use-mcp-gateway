@@ -144,14 +144,16 @@ This queue records the practical result of continuing Handoff integration and ph
 
 The repository's open issues are intentionally classified by working milestone so work cannot silently fall out of roadmap visibility. These milestones are ordering/admission guidance, not a promise that every listed item ships together if evidence later requires a split or defer.
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 owns the cross-cutting product-readiness gate; #109 closes the online-recovery CLI confirmation gap; #115 makes `Indeterminate` operator UX actionable without replay; #104 separates filesystem observation roots from process cwd roots; #111 establishes repeatable latency/concurrency evidence; #96 investigates the exact Unix descendant-containment boundary.
-- **`0.4.0 — Recovery & Reconciliation`:** #103 extends durable operation identity/status to effectful Desktop/Browser calls; #137 adds reviewed local-Human acceptance of current state without rewriting historical truth; #136 separates permanent replay tombstones from bounded detailed retirement history.
-- **`0.5.0 — Multi-principal Identity`:** #139 adds generic provider-neutral OIDC/JWT identity while preserving the existing exact authorizer.
+- **`0.3.x — Product Readiness & Stabilization`:** #213 owns the cross-cutting product-readiness gate; #215 evaluates a formally supported hosted Cloud Run Hub without moving desktop execution into Cloud Run; #109 closes the online-recovery CLI confirmation gap; #115 makes `Indeterminate` operator UX actionable without replay; #104 separates filesystem observation roots from process cwd roots; #111 establishes repeatable latency/concurrency evidence; #96 investigates the exact Unix descendant-containment boundary.
+- **`0.4.0 — Recovery & Reconciliation`:** #103 extends durable operation identity/status to effectful Desktop/Browser calls; #137 adds reviewed local-Human acceptance of current state without rewriting historical truth; #136 separates permanent replay tombstones from bounded detailed retirement history; #217 extends separate user-presence online recovery authority to reviewed Windows/Linux providers without a software-key fallback.
+- **`0.5.0 — Multi-principal Identity`:** #139 adds generic provider-neutral OIDC/JWT identity while preserving the existing exact authorizer; #221 adds typed backend-neutral semantic constraints as a narrow-only layer without turning CUMG into a generic policy engine.
 - **`0.6.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
 - **`0.7.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle and #114 adds separately sandboxed Playwright/E2E execution.
 - **Upstream-blocked V1 compatibility:** #14 (`get_screen_size` session/escalation) and #15 (`list_apps` live-process discovery mismatch) remain blocked on upstream Cua and intentionally have no active post-v0.3 milestone. They may become no-longer-applicable if V1 is deliberately retired.
 
 If an open issue is not represented in this inventory or another explicit roadmap section, treat the roadmap as stale and correct it before declaring milestone/release closeout.
+
+The Cua authorization/product-boundary research in #219 is completed by [`v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.md`](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.md); its admitted follow-ups are #221 and #222.
 
 ### `0.5.0` candidate: multi-principal northbound identity
 
@@ -191,6 +193,8 @@ A gap should be implemented only when there is a concrete workflow need and a bo
 See [`v2/V2_CUA_PARITY_MATRIX.md`](v2/V2_CUA_PARITY_MATRIX.md).
 
 ### Additional backend or native GUI adapter
+
+Issue #222 owns the current P1 portability-evidence candidate: prove a small overlapping semantic slice on a second materially different real computer-use/native-GUI backend. This evidence must exercise real side effects and ambiguity semantics; compile-time compatibility or the deterministic reference executor alone is not sufficient for a cross-GUI-backend claim.
 
 A second real Computer Use backend or a native GUI adapter is a candidate only if it provides a concrete operational, portability, support, or security benefit.
 
