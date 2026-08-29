@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "v2_release_candidate.py"
 SPEC = importlib.util.spec_from_file_location("v2_release_candidate", SCRIPT)
@@ -81,11 +82,26 @@ class ReleaseCandidateTests(unittest.TestCase):
         )
         self.assertIn("bin/v2_doctor", mod.expected_binary_paths("macos"))
 
-    def test_windows_zip_candidate_round_trip_has_no_macos_doctor(self):
+    def test_windows_zip_candidate_round_trip_omits_unix_only_binaries(self):
         bundle = self.extract("windows")
         mod.verify_bundle_dir(bundle)
-        self.assertNotIn("bin/v2_doctor.exe", mod.expected_binary_paths("windows"))
+        paths = mod.expected_binary_paths("windows")
+        self.assertNotIn("bin/v2_doctor.exe", paths)
+        self.assertNotIn("bin/v2_grant_signer.exe", paths)
+        self.assertNotIn("bin/v2_handoff_ctl.exe", paths)
         self.assertTrue((bundle / "bin/v2_hub.exe").is_file())
+
+    def test_smoke_resolves_relative_bundle_before_spawning(self):
+        bundle = self.extract("macos")
+        relative = bundle.relative_to(Path.cwd()) if bundle.is_relative_to(Path.cwd()) else bundle
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(mod, "current_platform", return_value="macos"), mock.patch.object(
+            mod.host_platform, "platform", return_value="test-host"
+        ), mock.patch.object(mod.subprocess, "run", return_value=completed) as run:
+            mod.smoke_bundle(relative)
+        for call in run.call_args_list:
+            binary = Path(call.args[0][0])
+            self.assertTrue(binary.is_absolute())
 
     def test_invalid_source_commit_is_refused_before_artifact_creation(self):
         binary_dir = self.make_binary_dir("linux")

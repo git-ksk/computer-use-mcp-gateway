@@ -101,7 +101,7 @@ feature count は 1.0 gate ではありません。product boundary を先に変
 
 現在公開済みの `v0.3.0` release は、将来の GitHub Release が reviewed binary asset を明示的に含めるまでは **source-only** のままです。CI artifact を supported distribution へ暗黙昇格させません。
 
-`Release Candidate Artifacts` workflow は、1つの exact checkout から Linux / macOS / Windows の bounded native candidate を build します。`scripts/v2_release_candidate.py` は platform allowlist に含まれる V2 binary だけを copy し、package version、exact source commit、platform/architecture、各 file の size/SHA-256 を `release-artifact-manifest.json` に記録し、archive と archive-level `.sha256` record を生成します。artifact manifest は distribution evidence に限定し、installed single-Mac `runtime-manifest.json` を置き換えず、execution/recovery authority にもしません。
+`Release Candidate Artifacts` workflow は、1つの exact checkout から Linux / macOS / Windows の bounded native candidate を build します。`scripts/v2_release_candidate.py` は platform allowlist に含まれる V2 binary だけを copy し（Unix-only operator binary は Windows から除外）、package version、exact source commit、platform/architecture、各 file の size/SHA-256 を `release-artifact-manifest.json` に記録し、archive と archive-level `.sha256` record を生成します。artifact manifest は distribution evidence に限定し、installed single-Mac `runtime-manifest.json` を置き換えず、execution/recovery authority にもしません。
 
 verification は意図的に fresh extraction で行います。
 

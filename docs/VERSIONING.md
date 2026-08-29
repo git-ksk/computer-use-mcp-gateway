@@ -101,7 +101,7 @@ Before 1.0, only the **latest released minor line** is actively supported. Older
 
 The currently published `v0.3.0` release remains **source-only** unless a later GitHub Release explicitly contains reviewed binary assets. CI artifacts are not silently promoted into a supported distribution.
 
-The `Release Candidate Artifacts` workflow builds a bounded native candidate on Linux, macOS, and Windows from one exact checkout. `scripts/v2_release_candidate.py` copies only the platform allowlisted V2 binaries, records package version + exact source commit + platform/architecture + per-file size/SHA-256 in `release-artifact-manifest.json`, creates the archive, and emits an archive-level `.sha256` record. The artifact manifest is distribution evidence only; it does not replace the installed single-Mac `runtime-manifest.json` or become execution/recovery authority.
+The `Release Candidate Artifacts` workflow builds a bounded native candidate on Linux, macOS, and Windows from one exact checkout. `scripts/v2_release_candidate.py` copies only the platform allowlisted V2 binaries (Unix-only operator binaries are omitted from Windows), records package version + exact source commit + platform/architecture + per-file size/SHA-256 in `release-artifact-manifest.json`, creates the archive, and emits an archive-level `.sha256` record. The artifact manifest is distribution evidence only; it does not replace the installed single-Mac `runtime-manifest.json` or become execution/recovery authority.
 
 Verification is intentionally a fresh-extraction path:
 

@@ -31,13 +31,13 @@ COMMON_BINARIES = (
     "v2_hub",
     "v2_agent",
     "v2_maint",
-    "v2_grant_signer",
     "v2_keyctl",
     "v2_tls_check",
 )
+UNIX_BINARIES = ("v2_grant_signer", "v2_handoff_ctl")
 PLATFORM_BINARIES = {
-    "linux": COMMON_BINARIES + ("v2_handoff_ctl",),
-    "macos": COMMON_BINARIES + ("v2_doctor", "v2_handoff_ctl"),
+    "linux": COMMON_BINARIES + UNIX_BINARIES,
+    "macos": COMMON_BINARIES + UNIX_BINARIES + ("v2_doctor",),
     "windows": COMMON_BINARIES,
 }
 
@@ -514,6 +514,7 @@ def current_platform() -> str:
 
 
 def smoke_bundle(bundle_root: Path) -> None:
+    bundle_root = bundle_root.resolve(strict=True)
     manifest = verify_bundle_dir(bundle_root)
     platform_name = str(manifest["platform"])
     if platform_name != current_platform():

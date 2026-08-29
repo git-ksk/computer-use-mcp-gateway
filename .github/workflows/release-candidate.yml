@@ -47,12 +47,11 @@ jobs:
             --bin v2_hub
             --bin v2_agent
             --bin v2_maint
-            --bin v2_grant_signer
             --bin v2_keyctl
             --bin v2_tls_check
           )
           if [[ "$RUNNER_OS" != "Windows" ]]; then
-            bins+=(--bin v2_handoff_ctl)
+            bins+=(--bin v2_grant_signer --bin v2_handoff_ctl)
           fi
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             bins+=(--bin v2_doctor)
