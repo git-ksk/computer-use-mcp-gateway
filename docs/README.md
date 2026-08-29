@@ -22,6 +22,8 @@ Current V2 contracts and status live under [`v2/`](v2/). Start with [`v2/STATUS.
 
 The active specification covers the product boundary, execution safety, process/shell operation recovery, interaction context, Desktop and Browser semantic capabilities, backend parity, threat model, standardization seams, and optional usage accounting. See [`v2/V2_OPERATION_RECOVERY.md`](v2/V2_OPERATION_RECOVERY.md) for the durable no-replay recovery contract.
 
+[`v2/V2_EXECUTION_ENVIRONMENT_BOUNDARY.md`](v2/V2_EXECUTION_ENVIRONMENT_BOUNDARY.md) clarifies the provider boundary: CUMG owns uncertainty-aware authority and recovery for a specific stateful desktop, while VM/sandbox/fleet provisioning remains replaceable infrastructure below or outside the core.
+
 ## Acceptance evidence
 
 Closeout evidence that proves a bounded capability or environment lives under [`v2/acceptance/`](v2/acceptance/). Acceptance records are evidence, not the primary product specification.
