@@ -97,6 +97,28 @@ feature count は 1.0 gate ではありません。product boundary を先に変
 
 1.0 より前は **latest released minor line** のみを actively supported line とします。古い 0.x line は best-effort で routine backport は行いません。severe security backport は discretionary exception であり、LTS promise ではありません。
 
+## Release-candidate artifact
+
+現在公開済みの `v0.3.0` release は、将来の GitHub Release が reviewed binary asset を明示的に含めるまでは **source-only** のままです。CI artifact を supported distribution へ暗黙昇格させません。
+
+`Release Candidate Artifacts` workflow は、1つの exact checkout から Linux / macOS / Windows の bounded native candidate を build します。`scripts/v2_release_candidate.py` は platform allowlist に含まれる V2 binary だけを copy し（Unix-only operator binary は Windows から除外）、package version、exact source commit、platform/architecture、各 file の size/SHA-256 を `release-artifact-manifest.json` に記録し、archive と archive-level `.sha256` record を生成します。artifact manifest は distribution evidence に限定し、installed single-Mac `runtime-manifest.json` を置き換えず、execution/recovery authority にもしません。
+
+verification は意図的に fresh extraction で行います。
+
+```bash
+python3 scripts/v2_release_candidate.py verify \
+  --archive dist/cumg-v0.3.0-macos-arm64.tar.gz \
+  --checksum dist/cumg-v0.3.0-macos-arm64.tar.gz.sha256 \
+  --extract-dir /tmp/cumg-candidate
+
+python3 scripts/v2_release_candidate.py smoke \
+  --bundle-dir /tmp/cumg-candidate/cumg-v0.3.0-macos-arm64
+```
+
+`verify` は candidate acceptance 前に checksum mismatch、unexpected/missing file、unsafe path、symlink、malformed identity metadata、per-file size/digest drift を拒否します。`smoke` は source checkout や `cargo run` ではなく extracted bundle 内の packaged binary を実行します。
+
+これらの candidate は **official production installer ではありません**。将来の release で installable supported distribution を claim する前に、対象 platform の signing/notarization 方針、SBOM/provenance strategy、clean-machine install acceptance、explicit supported-platform matrix を完了させます。CI workflow は review 用 candidate を upload するだけで、Git tag や GitHub Release を create/mutate しません。
+
 ## Release procedure
 
 通常 release は `main` から dedicated release PR で準備します。

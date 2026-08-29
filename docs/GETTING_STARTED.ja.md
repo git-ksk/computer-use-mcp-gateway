@@ -213,6 +213,8 @@ cargo build --locked
 
 `Cargo.lock` は commit 済みで、normal build は `--locked` を使って dependency graph の reproducibility を保ちます。
 
+現在公開済みの `v0.3.0` release は source-only です。CI では packaging review 用の verified **release-candidate** archive を公開する場合がありますが、unsigned / unnotarized artifact は official installer や broader platform-support claim ではありません。bounded manifest / checksum / fresh-extraction contract は [`VERSIONING.ja.md`](VERSIONING.ja.md#release-candidate-artifact) を参照してください。
+
 ## 6. V2 identity と TLS boundary を provision する
 
 Hub/Agent trust split 自体が safety model の一部なので、V2 には old V1 の one-line startup は意図的にありません。`v2_keyctl` で Hub、grant、device identity を分離して作成し、secret file は repository 外に置きます。
