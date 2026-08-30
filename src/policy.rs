@@ -165,6 +165,16 @@ impl ToolPolicy {
     pub fn classify(&self, tool_name: &str) -> ToolClass {
         classify_tool(tool_name)
     }
+
+    /// Whether this policy can expose at least one effectful backend capability.
+    /// A wildcard is conservatively effectful because future/unknown tools are
+    /// classified as dangerous. Explicitly denied names never create authority.
+    pub fn may_allow_effectful(&self) -> bool {
+        self.allow_all
+            || self.allowed.iter().any(|tool| {
+                !self.denied.contains(tool) && classify_tool(tool) != ToolClass::Observe
+            })
+    }
 }
 
 #[cfg(test)]
@@ -242,5 +252,15 @@ mod tests {
     #[test]
     fn unknown_tools_are_conservatively_dangerous() {
         assert_eq!(classify_tool("future_backend_tool"), ToolClass::Dangerous);
+    }
+
+    #[test]
+    fn effectful_allowance_is_conservative_and_respects_explicit_deny() {
+        assert!(!ToolPolicy::new(vec![], vec![]).may_allow_effectful());
+        assert!(!ToolPolicy::new(vec!["list_windows".into()], vec![]).may_allow_effectful());
+        assert!(ToolPolicy::new(vec!["click".into()], vec![]).may_allow_effectful());
+        assert!(ToolPolicy::new(vec!["future_backend_tool".into()], vec![]).may_allow_effectful());
+        assert!(ToolPolicy::new(vec!["*".into()], vec![]).may_allow_effectful());
+        assert!(!ToolPolicy::new(vec!["click".into()], vec!["click".into()]).may_allow_effectful());
     }
 }

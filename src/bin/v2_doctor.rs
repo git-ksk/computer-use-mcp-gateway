@@ -35,6 +35,8 @@ struct Args {
     cua_command: Option<PathBuf>,
     #[arg(long)]
     expected_cua_version: Option<String>,
+    #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+    mutation_authority_dir: Option<PathBuf>,
     /// Optional private local Handoff control socket. Status is queried read-only and locator/IDs are omitted.
     #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
     handoff_control_socket: Option<PathBuf>,
@@ -88,6 +90,9 @@ fn main() -> ExitCode {
             .cua_command
             .or_else(|| Some(home.join(".local/bin/cua-driver"))),
         expected_cua_version: args.expected_cua_version,
+        mutation_authority_dir: args
+            .mutation_authority_dir
+            .or_else(|| Some(root.join("mutation-authority"))),
         handoff_control_socket: args.handoff_control_socket,
         maintenance_job_exclude_label: args.maintenance_job_exclude_label,
     };

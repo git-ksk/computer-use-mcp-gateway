@@ -28,6 +28,23 @@ HEALTH_URL = f"{BASE_URL}/healthz"
 PROTOCOL_VERSION = "2025-11-25"
 
 
+def mutation_authority_fixture() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="cumg-v1-mutation-authority-"))
+    if os.name != "nt":
+        root.chmod(0o700)
+    lock = root / "mutation-authority.lock"
+    lock.write_bytes(b"")
+    state = root / "mutation-authority.json"
+    state.write_text('{"schema_version":1,"owner":"v1","epoch":1}\n', encoding="utf-8")
+    if os.name != "nt":
+        lock.chmod(0o600)
+        state.chmod(0o600)
+    return root
+
+
+MUTATION_AUTHORITY_DIR = mutation_authority_fixture()
+
+
 def gateway_binary() -> Path:
     path = Path("target/debug/v1_gateway")
     if not path.exists():
@@ -203,6 +220,7 @@ def start_gateway() -> tuple[subprocess.Popen[str], TextIO]:
             "CUMG_BACKEND_COMMAND": "cua-driver",
             "CUMG_BACKEND_ARGS": "mcp",
             "CUMG_ALLOW_TOOLS": "launch_app,kill_app,list_windows,get_window_state,click,type_text",
+            "CUMG_MUTATION_AUTHORITY_DIR": str(MUTATION_AUTHORITY_DIR),
             "CUMG_CONNECT_TIMEOUT_SECS": "15",
             "CUMG_TOOL_TIMEOUT_SECS": "60",
             "CUMG_RECONNECT_ATTEMPTS": "3",

@@ -279,6 +279,7 @@ async fn multi_device_quarantine_partition_restart_and_no_replay() -> Result<()>
         tool_timeout: Duration::from_secs(30),
         reconnect_attempts: 3,
         reconnect_backoff: Duration::from_millis(20),
+        mutation_authority_dir: None,
     };
     let config_a = agent_config(
         endpoint_a,

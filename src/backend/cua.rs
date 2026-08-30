@@ -10,6 +10,8 @@ use super::{
     BackendCallCancelled, BackendCallResponseLost, BackendCallTimedOut, BackendHealth,
     BackendResourceMetrics, ComputerUseBackend,
 };
+use crate::mutation_authority::{MutationAuthorityGate, MutationAuthorityPermit};
+use crate::policy::{ToolClass, classify_tool};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use rmcp::{
@@ -41,6 +43,7 @@ pub struct CuaBackend {
     backend_pid: Arc<Mutex<Option<u32>>>,
     reconnect_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
+    mutation_authority: Option<MutationAuthorityGate>,
 }
 
 impl std::fmt::Debug for CuaBackend {
@@ -75,6 +78,7 @@ impl CuaBackend {
             backend_pid: Arc::new(Mutex::new(None)),
             reconnect_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
+            mutation_authority: None,
         }
     }
 
@@ -87,6 +91,23 @@ impl CuaBackend {
             self.expected_server_version = Some(version);
         }
         self
+    }
+
+    /// Fence effectful Cua calls through a cross-process single-writer authority.
+    /// Observe-class calls remain available for health/cutover diagnostics.
+    pub fn with_mutation_authority(mut self, gate: MutationAuthorityGate) -> Self {
+        self.mutation_authority = Some(gate);
+        self
+    }
+
+    fn mutation_permit(&self, tool_name: &str) -> Result<Option<MutationAuthorityPermit>> {
+        if classify_tool(tool_name) == ToolClass::Observe {
+            return Ok(None);
+        }
+        let Some(gate) = &self.mutation_authority else {
+            return Ok(None);
+        };
+        gate.try_acquire().map(Some).map_err(anyhow::Error::new)
     }
 
     async fn is_connected(&self) -> bool {
@@ -349,6 +370,7 @@ impl ComputerUseBackend for CuaBackend {
         // backend operations in V1 so independent MCP clients cannot interleave
         // clicks, keystrokes, snapshots, and stateful element-index operations.
         let _operation = self.operation_lock.lock().await;
+        let _mutation_authority = self.mutation_permit(name)?;
         let peer = self.peer().await?;
         let mut params = CallToolRequestParams::new(name.to_owned());
         if let Some(arguments) = arguments {
@@ -470,6 +492,126 @@ mod tests {
             mismatched.connect().await.is_err(),
             "mismatched MCP server version must fail closed"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_mutation_authority_fences_effectful_calls_but_keeps_observation_available() {
+        use crate::mutation_authority::{
+            MutationAuthorityError, MutationAuthorityGate, MutationAuthorityRole,
+            initialize_mutation_authority, switch_mutation_authority,
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("cumg-cua-authority-{}-{nonce}", std::process::id()));
+        let args_marker = root.join("type-text-args.json");
+        let legacy_marker = root.join("legacy-type-text-args.json");
+        initialize_mutation_authority(&root, MutationAuthorityRole::V1).unwrap();
+
+        let legacy_backend = CuaBackend::new(
+            fixture_python(),
+            vec![
+                "scripts/mock_mcp_backend.py".into(),
+                "--args-marker".into(),
+                legacy_marker.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            Duration::from_millis(10),
+        )
+        .with_mutation_authority(MutationAuthorityGate::new(&root, MutationAuthorityRole::V1));
+        legacy_backend.connect().await.unwrap();
+
+        let v2_backend = CuaBackend::new(
+            fixture_python(),
+            vec![
+                "scripts/mock_mcp_backend.py".into(),
+                "--args-marker".into(),
+                args_marker.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            Duration::from_millis(10),
+        )
+        .with_mutation_authority(MutationAuthorityGate::new(&root, MutationAuthorityRole::V2));
+        v2_backend.connect().await.unwrap();
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        v2_backend
+            .call_tool("list_apps", None, cancel_rx.clone())
+            .await
+            .expect("read-only observation stays available to non-owner");
+        let denied = v2_backend
+            .call_tool(
+                "type_text",
+                serde_json::json!({"text":"must-not-dispatch"})
+                    .as_object()
+                    .cloned(),
+                cancel_rx.clone(),
+            )
+            .await
+            .expect_err("non-owner mutation must fail before backend dispatch");
+        assert!(matches!(
+            denied.downcast_ref::<MutationAuthorityError>(),
+            Some(MutationAuthorityError::WrongOwner {
+                expected: MutationAuthorityRole::V2,
+                actual: MutationAuthorityRole::V1,
+            })
+        ));
+        assert!(!args_marker.exists(), "denied mutation reached the backend");
+
+        switch_mutation_authority(&root, MutationAuthorityRole::V1, MutationAuthorityRole::V2)
+            .unwrap();
+        v2_backend
+            .call_tool(
+                "type_text",
+                serde_json::json!({"text":"owner-dispatch"})
+                    .as_object()
+                    .cloned(),
+                cancel_rx,
+            )
+            .await
+            .expect("new owner may mutate after atomic authority switch");
+        assert_eq!(
+            fs::read_to_string(&args_marker).unwrap(),
+            r#"{"text":"owner-dispatch"}"#
+        );
+
+        let (_legacy_cancel_tx, legacy_cancel_rx) = watch::channel(false);
+        legacy_backend
+            .call_tool("list_apps", None, legacy_cancel_rx.clone())
+            .await
+            .expect("legacy non-owner retains read-only diagnostics after cutover");
+        let legacy_denied = legacy_backend
+            .call_tool(
+                "type_text",
+                serde_json::json!({"text":"legacy-must-not-dispatch"})
+                    .as_object()
+                    .cloned(),
+                legacy_cancel_rx,
+            )
+            .await
+            .expect_err("legacy mutation must be fenced after V2 ownership cutover");
+        assert!(matches!(
+            legacy_denied.downcast_ref::<MutationAuthorityError>(),
+            Some(MutationAuthorityError::WrongOwner {
+                expected: MutationAuthorityRole::V1,
+                actual: MutationAuthorityRole::V2,
+            })
+        ));
+        assert!(
+            !legacy_marker.exists(),
+            "legacy mutation reached the backend after V2 took ownership"
+        );
+
+        legacy_backend.shutdown().await.unwrap();
+        v2_backend.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod config;
 pub mod gateway;
+pub mod mutation_authority;
 pub mod policy;
 pub mod v2_agent_handoff;
 pub mod v2_browser;

@@ -54,6 +54,23 @@ Start order is signer -> Hub -> Agent. The Agent stays in the logged-in user ses
 
 The example signer policy is intentionally minimal. Expand it only with exact `DeviceCapability` values that the reviewed northbound policy requires. There is no wildcard capability and no signer fallback.
 
+## Single mutating authority
+
+The physical desktop/Cua backend is one local mutation-authority domain. The standard single-Mac profile stores its owner state under `@ROOT@/mutation-authority` (normally `~/Library/Application Support/computer-use-mcp-gateway/mutation-authority`) and passes the same directory to every supported control plane that can reach that backend. The state contains only a closed owner role (`v1` or `v2`) and a monotonically increasing epoch. A private OS file lock serializes each effectful backend call and authority transition. Process death releases the transient lock, but it never transfers the durable owner role.
+
+V1 direct-Cua startup requires `CUMG_MUTATION_AUTHORITY_DIR` whenever its policy can expose an effectful tool. V2 requires the same directory whenever Cua or Agent-owned Human Handoff input is configured. Observe-class Cua calls may remain available to the non-owner for diagnostics; every effectful call fails before backend dispatch unless that control plane is the durable owner. Human Handoff begin/recovery is also V2-owner gated, so Human input cannot bypass the Cua-side fence.
+
+Authority changes are explicit CAS transitions through `v2_maint mutation-authority-switch`. The switch uses the same exclusive lock as live mutations, refuses a mismatched current owner, refuses while durable V2 quarantine exists, and requires the Agent-owned Handoff runtime to be provably idle while the lock is held. It never resolves quarantine, replays an operation, or infers ownership from process liveness. `v2_doctor` reports the privacy-bounded current owner/epoch.
+
+Supported legacy-to-V2 cutover:
+
+1. If an old unfenced legacy Gateway and V2 Agent are both loaded against the same backend, stop there. The upgrade preflight returns `legacy_gateway_unfenced`; it does not auto-stop either writer or guess that one is safe to retire.
+2. Either retire the old legacy Gateway first, or upgrade it to an authority-aware V1 profile using the same authority directory. When an authority-aware legacy writer must remain active, initialize the domain with `owner=v1`.
+3. Prove V2 quarantine is empty and Handoff is idle, then perform the explicit `v1 -> v2` CAS switch. After that transition, an authority-aware V1 may stay loaded for read-only diagnostics, but its effectful Cua calls are refused before dispatch. It may also be unloaded.
+4. For rollback to an authority-aware V1, perform the inverse explicit `v2 -> v1` switch before enabling V1 mutations. Never restart an old unfenced legacy Gateway concurrently with V2.
+
+A V2-only pre-authority installation has a narrower automatic migration lane: after normal preflight proves no legacy Gateway is loaded, the reviewed upgrade helper stops V2, creates a fresh private authority domain with `owner=v2`, adds the Agent configuration, and then restarts. An existing unreferenced authority directory causes refusal rather than adoption.
+
 ## Safe runtime upgrade
 
 `scripts/v2-single-mac-upgrade.sh` is the reviewed upgrade helper for an already-installed single-Mac profile. It refuses before replacement when the CUMG checkout is not clean `main == origin/main`, the reviewed Handoff checkout is not clean `main == origin/main` at the exact `CUMG_V2_EXPECTED_HANDOFF_COMMIT`, live quarantine exists, Handoff is active/recovering/faulted, required state/services are unavailable, or the Cua/signing inputs are incomplete.

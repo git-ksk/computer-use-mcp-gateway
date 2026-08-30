@@ -94,6 +94,7 @@ fn agent_config(
             tool_timeout: Duration::from_secs(30),
             reconnect_attempts: 3,
             reconnect_backoff: Duration::from_millis(200),
+            mutation_authority_dir: None,
         }),
     }
 }

@@ -5,6 +5,7 @@
 //! reconnect, grant validation, replay barriers, direct process execution, and
 //! cancellation. An optional external Cua MCP adapter adds typed GUI capabilities.
 
+use crate::mutation_authority::{MutationAuthorityGate, MutationAuthorityRole};
 use crate::v2_agent_handoff::{AgentHandoffCoordinator, AgentHandoffSessionFence};
 use crate::v2_browser_execute::BrowserRefusalReason;
 use crate::v2_browser_staging::{
@@ -78,6 +79,7 @@ pub struct CuaAgentConfig {
     pub tool_timeout: Duration,
     pub reconnect_attempts: u32,
     pub reconnect_backoff: Duration,
+    pub mutation_authority_dir: Option<PathBuf>,
 }
 
 impl CuaAgentConfig {
@@ -99,7 +101,7 @@ impl CuaAgentConfig {
     }
 
     fn adapter(&self) -> CuaMcpAdapter {
-        CuaMcpAdapter::new(
+        let adapter = CuaMcpAdapter::new(
             self.command.clone(),
             self.args.clone(),
             self.backend_version.clone(),
@@ -109,7 +111,14 @@ impl CuaAgentConfig {
             self.tool_timeout,
             self.reconnect_attempts,
             self.reconnect_backoff,
-        )
+        );
+        match &self.mutation_authority_dir {
+            Some(directory) => adapter.with_mutation_authority(MutationAuthorityGate::new(
+                directory,
+                MutationAuthorityRole::V2,
+            )),
+            None => adapter,
+        }
     }
 }
 
@@ -1777,6 +1786,9 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         AgentOperationError::BrowserDownloadStaging(_) => DeviceErrorCode::InvalidRequest,
         AgentOperationError::Backend(M1BackendError::BrowserRefused(reason)) => {
             browser_refusal_error_code(*reason)
+        }
+        AgentOperationError::Backend(M1BackendError::MutationAuthority(_)) => {
+            DeviceErrorCode::MutationAuthorityUnavailable
         }
         AgentOperationError::Backend(_) | AgentOperationError::WorkerPanicked => {
             DeviceErrorCode::InternalFailure

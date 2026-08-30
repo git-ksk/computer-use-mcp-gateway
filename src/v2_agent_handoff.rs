@@ -6,6 +6,7 @@
 //! before a protected surface command can reach the local backend.
 
 use crate::{
+    mutation_authority::{MutationAuthorityGate, MutationAuthorityPermit},
     v2_m0::DeviceCommand,
     v2_m0_transport::{
         RemoteHandoffAdmissionDecision, RemoteHandoffAuthority, RemoteHandoffErrorCode,
@@ -42,11 +43,31 @@ impl AgentHandoffSessionFence {
 #[derive(Clone)]
 pub struct AgentHandoffCoordinator {
     runtime: Arc<ManagedOperatorHandoffAuthority>,
+    mutation_authority: Option<MutationAuthorityGate>,
 }
 
 impl AgentHandoffCoordinator {
     pub fn new(runtime: Arc<ManagedOperatorHandoffAuthority>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            mutation_authority: None,
+        }
+    }
+
+    pub fn with_mutation_authority(mut self, gate: MutationAuthorityGate) -> Self {
+        self.mutation_authority = Some(gate);
+        self
+    }
+
+    fn mutation_authority_permit(
+        &self,
+    ) -> Result<Option<MutationAuthorityPermit>, RemoteHandoffErrorCode> {
+        let Some(gate) = &self.mutation_authority else {
+            return Ok(None);
+        };
+        gate.try_acquire()
+            .map(Some)
+            .map_err(|_| RemoteHandoffErrorCode::Rejected)
     }
 
     pub async fn shutdown(&self) {
@@ -104,6 +125,7 @@ impl AgentHandoffCoordinator {
                 })
             }
             RemoteHandoffOperatorCommand::Begin => {
+                let _mutation_authority = self.mutation_authority_permit()?;
                 let authority = self.required_control_authority(authority, &session)?;
                 let status = self
                     .runtime
@@ -113,6 +135,7 @@ impl AgentHandoffCoordinator {
                 Ok(operator_status(status))
             }
             RemoteHandoffOperatorCommand::RecoverReissue => {
+                let _mutation_authority = self.mutation_authority_permit()?;
                 let authority = self.required_control_authority(authority, &session)?;
                 let status = self.runtime.status().await.map_err(map_control_error)?;
                 if !status.recovery_required || status.recovery_expired {
@@ -130,6 +153,7 @@ impl AgentHandoffCoordinator {
                 prior_generation,
                 prior_capability_revision,
             } => {
+                let _mutation_authority = self.mutation_authority_permit()?;
                 let authority = self.required_control_authority(authority, &session)?;
                 if !valid_context_id(&prior_context_id)
                     || prior_generation
@@ -156,6 +180,7 @@ impl AgentHandoffCoordinator {
                 Ok(operator_status(status))
             }
             RemoteHandoffOperatorCommand::RebindLive => {
+                let _mutation_authority = self.mutation_authority_permit()?;
                 let authority = self.required_control_authority(authority, &session)?;
                 let status = self.runtime.status().await.map_err(map_control_error)?;
                 if status.recovery_required || status.active.is_none() || status.faulted {
@@ -559,6 +584,47 @@ done
             }
             other => panic!("expected operator status, got {other:?}"),
         }
+        runtime.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_begin_is_refused_when_v2_does_not_own_mutation_authority() {
+        use crate::mutation_authority::{
+            MutationAuthorityGate, MutationAuthorityRole, initialize_mutation_authority,
+        };
+
+        let (config, root) = managed_runtime_fixture();
+        let authority_root = root.join("mutation-authority");
+        initialize_mutation_authority(&authority_root, MutationAuthorityRole::V1).unwrap();
+        let runtime = Arc::new(
+            ManagedOperatorHandoffAuthority::spawn(config)
+                .await
+                .expect("managed runtime should start"),
+        );
+        let coordinator = AgentHandoffCoordinator::new(runtime.clone()).with_mutation_authority(
+            MutationAuthorityGate::new(&authority_root, MutationAuthorityRole::V2),
+        );
+        let command = inspect_command(34);
+        let authority = authority_for(&command, "device-a", false);
+        let response = coordinator
+            .handle_remote(
+                RemoteHandoffRequestKind::Operator {
+                    command: RemoteHandoffOperatorCommand::Begin,
+                    authority: Some(authority),
+                },
+                AgentHandoffSessionFence::for_device("device-a", 7, 3),
+            )
+            .await;
+        assert!(matches!(
+            response,
+            RemoteHandoffResponseKind::Rejected {
+                code: RemoteHandoffErrorCode::Rejected
+            }
+        ));
+        let status = runtime.status().await.unwrap();
+        assert!(status.active.is_none());
         runtime.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
     }

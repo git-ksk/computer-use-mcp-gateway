@@ -38,6 +38,23 @@ PINNED_CUA_LINUX_EXTRA_FIXTURE = Path("tests/fixtures/cua-0.19.3-tools-linux-ext
 PINNED_CUA_WINDOWS_EXTRA_FIXTURE = Path("tests/fixtures/cua-0.19.3-tools-windows-extra.txt")
 
 
+def mutation_authority_fixture() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="cumg-v1-mutation-authority-"))
+    if os.name != "nt":
+        root.chmod(0o700)
+    lock = root / "mutation-authority.lock"
+    lock.write_bytes(b"")
+    state = root / "mutation-authority.json"
+    state.write_text('{"schema_version":1,"owner":"v1","epoch":1}\n', encoding="utf-8")
+    if os.name != "nt":
+        lock.chmod(0o600)
+        state.chmod(0o600)
+    return root
+
+
+MUTATION_AUTHORITY_DIR = mutation_authority_fixture()
+
+
 def _fixture_names(path: Path) -> set[str]:
     return {
         line.strip()
@@ -265,6 +282,7 @@ def start_gateway(deny_tool: str | None = None) -> tuple[subprocess.Popen[str], 
             # CI explicitly opts in to the entire real Cua tool surface. The
             # product default is deny-all.
             "CUMG_ALLOW_TOOLS": "*",
+            "CUMG_MUTATION_AUTHORITY_DIR": str(MUTATION_AUTHORITY_DIR),
             "CUMG_CONNECT_TIMEOUT_SECS": "15",
             "CUMG_TOOL_TIMEOUT_SECS": "30",
             "CUMG_RECONNECT_ATTEMPTS": "3",

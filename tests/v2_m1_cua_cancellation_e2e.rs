@@ -123,6 +123,7 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
                 tool_timeout: Duration::from_secs(30),
                 reconnect_attempts: 3,
                 reconnect_backoff: Duration::from_millis(200),
+                mutation_authority_dir: None,
             }),
         },
         AgentProvisionedMaterial {
