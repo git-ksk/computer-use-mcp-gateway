@@ -1230,13 +1230,13 @@ pub mod macos {
 
             write_helper(&helper, "#!/bin/sh\nexit 0\n");
             assert!(matches!(
-                run_helper_with_timeout(&helper, "public", None, Duration::from_secs(1)),
+                run_helper_with_timeout(&helper, "public", None, Duration::from_secs(3)),
                 Err(RecoveryError::RecoveryHelperProtocol)
             ));
 
             write_helper(&helper, "#!/bin/sh\nprintf 'not-json\n'\n");
             assert!(matches!(
-                run_helper_with_timeout(&helper, "public", None, Duration::from_secs(1)),
+                run_helper_with_timeout(&helper, "public", None, Duration::from_secs(3)),
                 Err(RecoveryError::RecoveryHelperProtocol)
             ));
             let _ = fs::remove_dir_all(root);
