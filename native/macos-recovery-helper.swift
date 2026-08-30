@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import Security
 
 private let schemaVersion = 1
@@ -12,6 +13,7 @@ enum ExitCode: Int32 {
     case keyUnavailable = 21
     case userPresenceDenied = 22
     case internalFailure = 23
+    case authenticationUnavailable = 24
 }
 
 struct HelperRequest: Decodable {
@@ -30,6 +32,25 @@ struct HelperResponse: Encodable {
 func fail(_ code: ExitCode) -> Never {
     FileHandle.standardError.write(Data("RECOVERY_HELPER_ERROR code=\(code.rawValue)\n".utf8))
     exit(code.rawValue)
+}
+
+func authenticationIsUnavailable(_ error: Error) -> Bool {
+    var current: NSError? = error as NSError
+    var depth = 0
+    while let candidate = current, depth < 4 {
+        if candidate.domain == LAError.errorDomain,
+           let code = LAError.Code(rawValue: candidate.code) {
+            switch code {
+            case .biometryNotAvailable, .biometryNotEnrolled, .passcodeNotSet, .notInteractive:
+                return true
+            default:
+                return false
+            }
+        }
+        current = candidate.userInfo[NSUnderlyingErrorKey] as? NSError
+        depth += 1
+    }
+    return false
 }
 
 func readRequest(allowedKeys: Set<String>) -> HelperRequest {
@@ -132,8 +153,10 @@ func sign() {
         ))
     } catch {
         // Signing is the only operation that may require interactive user
-        // presence. Keep failure output low-cardinality and payload-free.
-        fail(.userPresenceDenied)
+        // presence. Keep failure output low-cardinality and payload-free while
+        // distinguishing an unavailable authentication facility from a local
+        // denial/cancellation.
+        fail(authenticationIsUnavailable(error) ? .authenticationUnavailable : .userPresenceDenied)
     }
 }
 

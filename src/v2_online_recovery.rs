@@ -622,6 +622,9 @@ pub enum RecoveryError {
     UnsafeRecoveryKey,
     RecoveryHelperUnavailable,
     RecoveryHelperProtocol,
+    RecoveryHelperTimeout,
+    RecoveryHelperAuthUnavailable,
+    RecoveryHelperAbnormalExit,
     UnsupportedPlatform,
     KeyUnavailable,
     KeyAlreadyExists,
@@ -646,6 +649,9 @@ impl RecoveryError {
             Self::UnsafeRecoveryKey => "recovery_unsafe_key_material",
             Self::RecoveryHelperUnavailable => "recovery_helper_unavailable",
             Self::RecoveryHelperProtocol => "recovery_helper_protocol",
+            Self::RecoveryHelperTimeout => "recovery_helper_timeout",
+            Self::RecoveryHelperAuthUnavailable => "recovery_helper_auth_unavailable",
+            Self::RecoveryHelperAbnormalExit => "recovery_helper_abnormal_exit",
             Self::UnsupportedPlatform => "recovery_unsupported_platform",
             Self::KeyUnavailable => "recovery_key_unavailable",
             Self::KeyAlreadyExists => "recovery_key_already_exists",
@@ -674,13 +680,18 @@ pub mod macos {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Serialize};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const HELPER_SCHEMA_VERSION: u16 = 1;
     const MAX_SEALED_KEY_BYTES: usize = 4096;
     const MAX_HELPER_MESSAGE_BYTES: usize = 16 * 1024;
     const MAX_HELPER_OUTPUT_BYTES: usize = 16 * 1024;
+    const RECOVERY_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
+    const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
     #[derive(Serialize)]
     struct HelperRequest<'a> {
@@ -898,6 +909,15 @@ pub mod macos {
         command: &str,
         input: Option<&[u8]>,
     ) -> Result<HelperResponse, RecoveryError> {
+        run_helper_with_timeout(helper, command, input, RECOVERY_HELPER_TIMEOUT)
+    }
+
+    fn run_helper_with_timeout(
+        helper: &Path,
+        command: &str,
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<HelperResponse, RecoveryError> {
         validate_helper(helper)?;
         let mut process = Command::new(helper);
         process
@@ -909,44 +929,143 @@ pub mod macos {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(timeout)
+            .ok_or(RecoveryError::RecoveryHelperTimeout)?;
         let mut child = process
             .spawn()
             .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
-        if let Some(input) = input {
-            if input.len() > MAX_HELPER_OUTPUT_BYTES {
-                let _ = child.kill();
-                return Err(RecoveryError::InvalidMessage);
-            }
-            let Some(mut stdin) = child.stdin.take() else {
-                let _ = child.kill();
+
+        if input.is_some_and(|input| input.len() > MAX_HELPER_MESSAGE_BYTES) {
+            kill_and_reap(&mut child);
+            return Err(RecoveryError::InvalidMessage);
+        }
+        let mut stdin = if input.is_some() {
+            let Some(stdin) = child.stdin.take() else {
+                kill_and_reap(&mut child);
                 return Err(RecoveryError::RecoveryHelperProtocol);
             };
-            stdin
-                .write_all(input)
-                .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
-        }
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
+            if let Err(error) = set_nonblocking(stdin.as_raw_fd()) {
+                kill_and_reap(&mut child);
+                return Err(error);
+            }
+            Some(stdin)
+        } else {
+            None
+        };
+        let mut input_offset = 0_usize;
+
+        let Some(mut stdout) = child.stdout.take() else {
+            kill_and_reap(&mut child);
             return Err(RecoveryError::RecoveryHelperProtocol);
         };
-        let mut output = Vec::new();
-        stdout
-            .take(MAX_HELPER_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut output)
-            .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
-        if output.len() > MAX_HELPER_OUTPUT_BYTES {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(RecoveryError::RecoveryHelperProtocol);
+        if let Err(error) = set_nonblocking(stdout.as_raw_fd()) {
+            kill_and_reap(&mut child);
+            return Err(error);
         }
-        let status = child
-            .wait()
-            .map_err(|_| RecoveryError::RecoveryHelperUnavailable)?;
+
+        let mut output = Vec::new();
+        loop {
+            if let (Some(bytes), Some(child_stdin)) = (input, stdin.as_mut()) {
+                match child_stdin.write(&bytes[input_offset..]) {
+                    Ok(0) => {
+                        kill_and_reap(&mut child);
+                        return Err(RecoveryError::RecoveryHelperUnavailable);
+                    }
+                    Ok(written) => {
+                        input_offset += written;
+                        if input_offset == bytes.len() {
+                            stdin.take();
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        kill_and_reap(&mut child);
+                        return Err(RecoveryError::RecoveryHelperUnavailable);
+                    }
+                }
+            }
+
+            if let Err(error) = drain_available_output(&mut stdout, &mut output) {
+                kill_and_reap(&mut child);
+                return Err(error);
+            }
+            if output.len() > MAX_HELPER_OUTPUT_BYTES {
+                kill_and_reap(&mut child);
+                return Err(RecoveryError::RecoveryHelperProtocol);
+            }
+
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    kill_and_reap(&mut child);
+                    return Err(RecoveryError::RecoveryHelperUnavailable);
+                }
+            };
+            if let Some(status) = status {
+                drain_available_output(&mut stdout, &mut output)?;
+                if output.len() > MAX_HELPER_OUTPUT_BYTES {
+                    return Err(RecoveryError::RecoveryHelperProtocol);
+                }
+                return finish_helper(status, output);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                kill_and_reap(&mut child);
+                return Err(RecoveryError::RecoveryHelperTimeout);
+            }
+            thread::sleep(HELPER_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+        }
+    }
+
+    fn set_nonblocking(fd: std::os::fd::RawFd) -> Result<(), RecoveryError> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(RecoveryError::RecoveryHelperUnavailable);
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(RecoveryError::RecoveryHelperUnavailable);
+        }
+        Ok(())
+    }
+
+    fn drain_available_output(
+        stdout: &mut std::process::ChildStdout,
+        output: &mut Vec<u8>,
+    ) -> Result<(), RecoveryError> {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(read) => {
+                    output.extend_from_slice(&buffer[..read]);
+                    if output.len() > MAX_HELPER_OUTPUT_BYTES {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(RecoveryError::RecoveryHelperUnavailable),
+            }
+        }
+    }
+
+    fn kill_and_reap(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn finish_helper(status: ExitStatus, output: Vec<u8>) -> Result<HelperResponse, RecoveryError> {
         if !status.success() {
             return Err(match status.code() {
-                Some(22) => RecoveryError::UserPresenceDenied,
                 Some(20) | Some(23) => RecoveryError::RecoveryHelperProtocol,
-                _ => RecoveryError::KeyUnavailable,
+                Some(21) => RecoveryError::KeyUnavailable,
+                Some(22) => RecoveryError::UserPresenceDenied,
+                Some(24) => RecoveryError::RecoveryHelperAuthUnavailable,
+                _ => RecoveryError::RecoveryHelperAbnormalExit,
             });
         }
         if output.is_empty() || output.len() > MAX_HELPER_OUTPUT_BYTES {
@@ -1057,6 +1176,68 @@ pub mod macos {
             assert!(matches!(
                 run_helper(&helper, "sign", Some(b"{}")),
                 Err(RecoveryError::UserPresenceDenied)
+            ));
+
+            write_helper(&helper, "#!/bin/sh\nexit 24\n");
+            assert!(matches!(
+                run_helper(&helper, "sign", Some(b"{}")),
+                Err(RecoveryError::RecoveryHelperAuthUnavailable)
+            ));
+
+            write_helper(&helper, "#!/bin/sh\nexit 99\n");
+            assert!(matches!(
+                run_helper(&helper, "sign", Some(b"{}")),
+                Err(RecoveryError::RecoveryHelperAbnormalExit)
+            ));
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn hung_helper_times_out_and_is_reaped() {
+            let root = temp_dir("hung-helper");
+            let helper = root.join("helper");
+            let pid_file = root.join("helper.pid");
+            write_helper(
+                &helper,
+                &format!(
+                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nwhile :; do :; done\n",
+                    pid_file.display()
+                ),
+            );
+
+            let started = Instant::now();
+            assert!(matches!(
+                run_helper_with_timeout(&helper, "sign", Some(b"{}"), Duration::from_secs(1)),
+                Err(RecoveryError::RecoveryHelperTimeout)
+            ));
+            assert!(started.elapsed() < Duration::from_secs(3));
+
+            let pid: libc::pid_t = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+            let mut status = 0_i32;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            assert_eq!(waited, -1, "helper child was not reaped");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn silent_success_and_malformed_output_fail_closed() {
+            let root = temp_dir("malformed-helper");
+            let helper = root.join("helper");
+
+            write_helper(&helper, "#!/bin/sh\nexit 0\n");
+            assert!(matches!(
+                run_helper_with_timeout(&helper, "public", None, Duration::from_secs(1)),
+                Err(RecoveryError::RecoveryHelperProtocol)
+            ));
+
+            write_helper(&helper, "#!/bin/sh\nprintf 'not-json\n'\n");
+            assert!(matches!(
+                run_helper_with_timeout(&helper, "public", None, Duration::from_secs(1)),
+                Err(RecoveryError::RecoveryHelperProtocol)
             ));
             let _ = fs::remove_dir_all(root);
         }
