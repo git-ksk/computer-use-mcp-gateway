@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use computer_use_mcp_gateway::{
+    mutation_authority::{MutationAuthorityGate, MutationAuthorityRole},
     v2_agent_handoff::AgentHandoffCoordinator,
     v2_m0_trust::HubKeyRotation,
     v2_m1::ReconnectPolicy,
@@ -72,6 +73,9 @@ struct Config {
     cua_connect_timeout_secs: u64,
     #[arg(long, env = "CUMG_V2_CUA_TOOL_TIMEOUT_SECS", default_value_t = 30)]
     cua_tool_timeout_secs: u64,
+    /// Shared local single-writer authority directory for V1/V2 coexistence.
+    #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+    mutation_authority_dir: Option<PathBuf>,
     /// Absolute Node.js executable for the Agent-local canonical Handoff runtime.
     #[arg(long, env = "CUMG_V2_HANDOFF_RUNTIME_COMMAND")]
     handoff_runtime_command: Option<PathBuf>,
@@ -127,12 +131,21 @@ async fn main() -> Result<()> {
         tool_timeout: Duration::from_secs(args.cua_tool_timeout_secs),
         reconnect_attempts: 3,
         reconnect_backoff: Duration::from_millis(200),
+        mutation_authority_dir: args.mutation_authority_dir.clone(),
     });
     let managed_handoff_fields = [
         args.handoff_runtime_command.is_some(),
         args.handoff_runtime_script.is_some(),
         args.handoff_runtime_env_file.is_some(),
     ];
+    let managed_handoff_configured = managed_handoff_fields
+        .into_iter()
+        .all(|configured| configured);
+    anyhow::ensure!(
+        args.cua_command.is_none() && !managed_handoff_configured
+            || args.mutation_authority_dir.is_some(),
+        "CUMG_MUTATION_AUTHORITY_DIR is required when V2 controls Cua or Human Handoff input"
+    );
     anyhow::ensure!(
         args.handoff_runtime_timeout_secs > 0,
         "CUMG_V2_HANDOFF_RUNTIME_TIMEOUT_SECS must be greater than zero"
@@ -146,10 +159,7 @@ async fn main() -> Result<()> {
                 .all(|configured| configured),
         "CUMG_V2_HANDOFF_RUNTIME_COMMAND, CUMG_V2_HANDOFF_RUNTIME_SCRIPT, and CUMG_V2_HANDOFF_RUNTIME_ENV_FILE must be configured together"
     );
-    let handoff_runtime = if managed_handoff_fields
-        .into_iter()
-        .all(|configured| configured)
-    {
+    let handoff_runtime = if managed_handoff_configured {
         let config = ManagedHandoffRuntimeConfig::new(
             args.handoff_runtime_command
                 .clone()
@@ -174,7 +184,14 @@ async fn main() -> Result<()> {
             outcome = "ready",
             "Agent-local canonical Handoff runtime configured"
         );
-        Some(Arc::new(AgentHandoffCoordinator::new(runtime)))
+        let mut coordinator = AgentHandoffCoordinator::new(runtime);
+        if let Some(directory) = args.mutation_authority_dir.as_ref() {
+            coordinator = coordinator.with_mutation_authority(MutationAuthorityGate::new(
+                directory,
+                MutationAuthorityRole::V2,
+            ));
+        }
+        Some(Arc::new(coordinator))
     } else {
         None
     };

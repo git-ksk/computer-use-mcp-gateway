@@ -8,6 +8,7 @@ use crate::backend::{
     BackendCallCancelled, BackendCallResponseLost, BackendCallTimedOut, ComputerUseBackend,
     cua::CuaBackend,
 };
+use crate::mutation_authority::{MutationAuthorityError, MutationAuthorityGate};
 use crate::v2_browser_execute::{
     BrowserExecutionError, BrowserExecutionOutcome, BrowserRefusalReason, execute_cua_browser,
     execute_cua_browser_download, execute_cua_browser_upload,
@@ -165,6 +166,11 @@ impl CuaMcpAdapter {
         }
     }
 
+    pub fn with_mutation_authority(mut self, gate: MutationAuthorityGate) -> Self {
+        self.backend = self.backend.with_mutation_authority(gate);
+        self
+    }
+
     pub fn advertisement(&self) -> CapabilityAdvertisement {
         CapabilityAdvertisement {
             backend: "cua".into(),
@@ -214,15 +220,12 @@ impl CuaMcpAdapter {
             crate::v2_observability::backend_failure(
                 crate::v2_observability::BackendFailureReason::Connect,
             );
-            M1BackendError::Backend(error)
+            map_backend_error(error)
         })
     }
 
     pub async fn shutdown(&self) -> Result<(), M1BackendError> {
-        self.backend
-            .shutdown()
-            .await
-            .map_err(M1BackendError::Backend)
+        self.backend.shutdown().await.map_err(map_backend_error)
     }
 
     pub async fn end_interaction_session(&self, context_id: &str) -> Result<(), M1BackendError> {
@@ -248,7 +251,7 @@ impl CuaMcpAdapter {
                 crate::v2_observability::backend_failure(
                     crate::v2_observability::BackendFailureReason::Tool,
                 );
-                M1BackendError::Backend(error)
+                map_backend_error(error)
             })?;
         if result.is_error == Some(true) {
             crate::v2_observability::backend_failure(
@@ -288,7 +291,7 @@ impl CuaMcpAdapter {
             Err(BrowserExecutionError::InvalidRequest(message)) => {
                 Err(M1BackendError::InvalidRequest(message))
             }
-            Err(BrowserExecutionError::Backend(error)) => Err(M1BackendError::Backend(error)),
+            Err(BrowserExecutionError::Backend(error)) => Err(map_backend_error(error)),
             Err(BrowserExecutionError::BackendToolError) => Err(M1BackendError::BackendToolError),
             Err(BrowserExecutionError::BackendRefused(reason)) => {
                 Err(M1BackendError::BrowserRefused(reason))
@@ -345,7 +348,7 @@ impl CuaMcpAdapter {
             Err(BrowserExecutionError::InvalidRequest(message)) => {
                 Err(M1BackendError::InvalidRequest(message))
             }
-            Err(BrowserExecutionError::Backend(error)) => Err(M1BackendError::Backend(error)),
+            Err(BrowserExecutionError::Backend(error)) => Err(map_backend_error(error)),
             Err(BrowserExecutionError::BackendToolError) => Err(M1BackendError::BackendToolError),
             Err(BrowserExecutionError::BackendRefused(reason)) => {
                 Err(M1BackendError::BrowserRefused(reason))
@@ -391,7 +394,7 @@ impl CuaMcpAdapter {
                 Err(BrowserExecutionError::InvalidRequest(message)) => {
                     Err(M1BackendError::InvalidRequest(message))
                 }
-                Err(BrowserExecutionError::Backend(error)) => Err(M1BackendError::Backend(error)),
+                Err(BrowserExecutionError::Backend(error)) => Err(map_backend_error(error)),
                 Err(BrowserExecutionError::BackendToolError) => {
                     Err(M1BackendError::BackendToolError)
                 }
@@ -450,7 +453,7 @@ impl CuaMcpAdapter {
                     crate::v2_observability::backend_failure(
                         crate::v2_observability::BackendFailureReason::Tool,
                     );
-                    return Err(M1BackendError::Backend(error));
+                    return Err(map_backend_error(error));
                 }
             };
             if started.is_error == Some(true) {
@@ -477,7 +480,7 @@ impl CuaMcpAdapter {
                     crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
                 );
                 if command.is_read_only() {
-                    return Err(M1BackendError::Backend(error));
+                    return Err(map_backend_error(error));
                 }
                 return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
             }
@@ -485,7 +488,7 @@ impl CuaMcpAdapter {
                 crate::v2_observability::backend_failure(
                     crate::v2_observability::BackendFailureReason::Tool,
                 );
-                return Err(M1BackendError::Backend(error));
+                return Err(map_backend_error(error));
             }
         };
         if raw.is_error == Some(true) {
@@ -2636,8 +2639,16 @@ fn json_u32(value: &Value, key: &'static str) -> Result<u32, M1BackendError> {
     u32::try_from(raw).map_err(|_| M1BackendError::NumericOverflow)
 }
 
+fn map_backend_error(error: AnyError) -> M1BackendError {
+    match error.downcast::<MutationAuthorityError>() {
+        Ok(authority) => M1BackendError::MutationAuthority(authority),
+        Err(error) => M1BackendError::Backend(error),
+    }
+}
+
 pub enum M1BackendError {
     Backend(AnyError),
+    MutationAuthority(MutationAuthorityError),
     BackendToolError,
     MalformedResponse(&'static str),
     NumericOverflow,
@@ -2651,6 +2662,7 @@ impl SafeErrorCode for M1BackendError {
     fn safe_error_code(&self) -> &'static str {
         match self {
             Self::Backend(_) => "backend_failure",
+            Self::MutationAuthority(error) => error.safe_code(),
             Self::BackendToolError => "backend_tool_error",
             Self::MalformedResponse(_) => "backend_malformed_response",
             Self::NumericOverflow => "backend_numeric_overflow",

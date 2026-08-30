@@ -22,6 +22,7 @@ Environment overrides:
   CUMG_V2_MACOS_TEAM_ID       required; exact 10-character Apple Developer Team ID
   CUMG_V2_HANDOFF_SOURCE_ROOT required after first pinned cutover; reviewed Handoff checkout
   CUMG_V2_EXPECTED_HANDOFF_COMMIT required; exact reviewed mcp-execution-handoff commit
+  CUMG_V1_GATEWAY_LABEL      default: com.sawadakousuke.computer-use-mcp-gateway
 USAGE
 }
 
@@ -60,9 +61,11 @@ RUN_ROOT="${CUMG_V2_RUN_ROOT:-$HOME/Library/Caches/cumg-v2}"
 BIN_DIR="$ROOT/bin"
 HUB_STATE="$ROOT/v2/state/hub"
 AGENT_STATE="$ROOT/v2/state/agent"
+MUTATION_AUTHORITY_DIR="$ROOT/mutation-authority"
 HUB_LABEL="${CUMG_V2_HUB_LABEL:-com.github.git-ksk.cumg-v2-hub}"
 AGENT_LABEL="${CUMG_V2_AGENT_LABEL:-com.github.git-ksk.cumg-v2-agent}"
 SIGNER_LABEL="${CUMG_V2_SIGNER_LABEL:-com.github.git-ksk.cumg-v2-grant-signer}"
+LEGACY_GATEWAY_LABEL="${CUMG_V1_GATEWAY_LABEL:-com.sawadakousuke.computer-use-mcp-gateway}"
 EXTERNAL_SIGNER="${CUMG_V2_EXTERNAL_SIGNER:-1}"
 EXPECTED_CUA_VERSION="${CUMG_V2_EXPECTED_CUA_VERSION:-}"
 MACOS_CODESIGN_FINGERPRINT="${CUMG_V2_MACOS_CODESIGN_FINGERPRINT:-}"
@@ -171,6 +174,37 @@ python3 "$MAINTENANCE_JOB_GUARD" "${MAINTENANCE_GUARD_ARGS[@]}" || exit 2
 [[ -x "$BIN_DIR/v2_maint" ]] || { echo "REFUSED reason=installed_maint_missing" >&2; exit 2; }
 [[ -d "$HUB_STATE" && -d "$AGENT_STATE" ]] || { echo "REFUSED reason=state_directory_missing" >&2; exit 2; }
 [[ -f "$HUB_PLIST" && -f "$AGENT_PLIST" ]] || { echo "REFUSED reason=launchd_profile_missing" >&2; exit 2; }
+LEGACY_GATEWAY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_GATEWAY_LABEL.plist"
+MUTATION_AUTHORITY_PREFLIGHT="$REPO_ROOT/scripts/v2_mutation_authority_preflight.py"
+[[ -f "$MUTATION_AUTHORITY_PREFLIGHT" && ! -L "$MUTATION_AUTHORITY_PREFLIGHT" ]] || {
+  echo "REFUSED reason=mutation_authority_preflight_missing_or_unsafe" >&2; exit 2;
+}
+CURRENT_MUTATION_AUTHORITY_DIR="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_MUTATION_AUTHORITY_DIR' "$AGENT_PLIST" 2>/dev/null || true)"
+if [[ -n "$CURRENT_MUTATION_AUTHORITY_DIR" && "$CURRENT_MUTATION_AUTHORITY_DIR" != "$MUTATION_AUTHORITY_DIR" ]]; then
+  echo "REFUSED reason=mutation_authority_path_mismatch" >&2
+  exit 2
+fi
+MUTATION_AUTHORITY_PREFLIGHT_ARGS=(
+  --domain "$DOMAIN"
+  --launchctl "$LAUNCHCTL_BIN"
+  --legacy-label "$LEGACY_GATEWAY_LABEL"
+  --agent-label "$AGENT_LABEL"
+  --legacy-plist "$LEGACY_GATEWAY_PLIST"
+  --agent-plist "$AGENT_PLIST"
+)
+if [[ -z "$CURRENT_MUTATION_AUTHORITY_DIR" ]]; then
+  MUTATION_AUTHORITY_PREFLIGHT_ARGS+=(--allow-v2-uninitialized)
+fi
+MUTATION_AUTHORITY_PREFLIGHT_OUTPUT="$(python3 "$MUTATION_AUTHORITY_PREFLIGHT" "${MUTATION_AUTHORITY_PREFLIGHT_ARGS[@]}")" || exit 2
+MUTATION_AUTHORITY_MIGRATION=0
+if [[ "$MUTATION_AUTHORITY_PREFLIGHT_OUTPUT" == *"migration=required"* ]]; then
+  MUTATION_AUTHORITY_MIGRATION=1
+  [[ ! -e "$MUTATION_AUTHORITY_DIR" ]] || {
+    echo "REFUSED reason=mutation_authority_unreferenced_state_present" >&2
+    exit 2
+  }
+fi
+printf '%s\n' "$MUTATION_AUTHORITY_PREFLIGHT_OUTPUT"
 HANDOFF_ENV_FILE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_ENV_FILE' "$AGENT_PLIST" 2>/dev/null || true)"
 [[ "$HANDOFF_ENV_FILE" == /* && -f "$HANDOFF_ENV_FILE" && ! -L "$HANDOFF_ENV_FILE" ]] || {
   echo "REFUSED reason=agent_handoff_runtime_env_missing_or_unsafe" >&2; exit 2;
@@ -325,7 +359,7 @@ stable_codesign() {
   verify_stable_codesign "$pathname" "$identifier"
 }
 
-echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned stable_tcc_signing=required"
+echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required"
 [[ "$PRELIGHT_ONLY" == "1" ]] && exit 0
 
 cargo build --release --locked \
@@ -517,6 +551,7 @@ PYRUNTIMEGEN
   NEW_HANDOFF_HELPERS="${NEW_HANDOFF_HELPERS//$STAGE_RUNTIME/$NEW_HANDOFF_RUNTIME}"
 fi
 
+MUTATION_AUTHORITY_CREATED=0
 STAMP="$(date '+%Y%m%dT%H%M%S%z')"
 ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
 umask 077
@@ -625,8 +660,21 @@ if [[ "$STOPPED_QUARANTINE_COUNT" != "0" ]]; then
   exit 2
 fi
 
+if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
+  if ! target/release/v2_maint mutation-authority-init \
+    --authority-dir "$MUTATION_AUTHORITY_DIR" --owner v2 >/dev/null; then
+    echo "REFUSED reason=mutation_authority_initialization_failed rollback=$ROLLBACK services_stopped=1" >&2
+    exit 2
+  fi
+  MUTATION_AUTHORITY_CREATED=1
+fi
+
 restore_preinstall_profile() {
   cp -p "$ROLLBACK/launchd/$(basename "$AGENT_PLIST")" "$AGENT_PLIST" 2>/dev/null || true
+  if [[ "$MUTATION_AUTHORITY_CREATED" == "1" && "$MUTATION_AUTHORITY_DIR" == "$ROOT/mutation-authority" ]]; then
+    rm -rf "$MUTATION_AUTHORITY_DIR" 2>/dev/null || true
+    MUTATION_AUTHORITY_CREATED=0
+  fi
   cp -p "$ROLLBACK/handoff/managed-runtime.env" "$HANDOFF_ENV_FILE" 2>/dev/null || true
   chmod 600 "$HANDOFF_ENV_FILE" 2>/dev/null || true
   while IFS=$'\t' read -r _key _identifier helper archived; do
@@ -696,6 +744,13 @@ if ! plutil -replace EnvironmentVariables.CUMG_V2_HANDOFF_RUNTIME_SCRIPT -string
   restore_preinstall_profile
   echo "REFUSED reason=agent_handoff_runtime_script_update_failed rollback=$ROLLBACK" >&2
   exit 2
+fi
+if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
+  if ! plutil -insert EnvironmentVariables.CUMG_MUTATION_AUTHORITY_DIR -string "$MUTATION_AUTHORITY_DIR" "$AGENT_PLIST"; then
+    restore_preinstall_profile
+    echo "REFUSED reason=agent_mutation_authority_update_failed rollback=$ROLLBACK" >&2
+    exit 2
+  fi
 fi
 
 install_atomic() {
@@ -773,6 +828,12 @@ if ! python3 "$LAUNCHD_TOPOLOGY_GUARD" check \
   --launchctl "$LAUNCHCTL_BIN"; then
   fail_poststart "conflicting_launchd_topology"
 fi
+if ! python3 "$MUTATION_AUTHORITY_PREFLIGHT" \
+  --domain "$DOMAIN" --launchctl "$LAUNCHCTL_BIN" \
+  --legacy-label "$LEGACY_GATEWAY_LABEL" --agent-label "$AGENT_LABEL" \
+  --legacy-plist "$LEGACY_GATEWAY_PLIST" --agent-plist "$AGENT_PLIST"; then
+  fail_poststart "mutation_authority_preflight"
+fi
 
 DOCTOR_ARGS=(
   --hub-state-dir "$HUB_STATE"
@@ -781,6 +842,7 @@ DOCTOR_ARGS=(
   --binary-dir "$BIN_DIR"
   --hub-launchd-label "$HUB_LABEL"
   --agent-launchd-label "$AGENT_LABEL"
+  --mutation-authority-dir "$MUTATION_AUTHORITY_DIR"
   --handoff-control-socket "$HANDOFF_CONTROL_SOCKET"
   --json
 )

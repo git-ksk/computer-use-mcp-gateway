@@ -1,3 +1,4 @@
+use crate::mutation_authority::inspect_mutation_authority;
 use crate::v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control};
 use crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, HubPersistentState};
@@ -40,6 +41,7 @@ pub struct DoctorConfig {
     pub tls_root_certificate: Option<PathBuf>,
     pub cua_command: Option<PathBuf>,
     pub expected_cua_version: Option<String>,
+    pub mutation_authority_dir: Option<PathBuf>,
     pub handoff_control_socket: Option<PathBuf>,
     pub maintenance_job_exclude_label: Option<String>,
 }
@@ -85,12 +87,20 @@ pub struct AgentSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MutationAuthoritySummary {
+    pub owner: String,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
     pub schema_version: u16,
     pub overall: String,
     pub runtime: RuntimeSummary,
     pub hub: HubSummary,
     pub agent: AgentSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_authority: Option<MutationAuthoritySummary>,
     pub checks: Vec<DoctorCheck>,
 }
 
@@ -182,6 +192,11 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     if let Some(command) = &config.cua_command {
         inspect_cua(command, config.expected_cua_version.as_deref(), &mut checks);
     }
+    let mutation_authority = inspect_mutation_authority_for_doctor(
+        config.mutation_authority_dir.as_deref(),
+        config.cua_command.is_some(),
+        &mut checks,
+    );
     if let Some(socket) = &config.handoff_control_socket {
         inspect_handoff_recovery(socket, &mut checks);
     }
@@ -207,7 +222,53 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         runtime,
         hub,
         agent,
+        mutation_authority,
         checks,
+    }
+}
+
+fn inspect_mutation_authority_for_doctor(
+    directory: Option<&Path>,
+    cua_enabled: bool,
+    checks: &mut Vec<DoctorCheck>,
+) -> Option<MutationAuthoritySummary> {
+    let Some(directory) = directory else {
+        if cua_enabled {
+            push(
+                checks,
+                "mutation_authority",
+                CheckStatus::Error,
+                "not_configured",
+            );
+        }
+        return None;
+    };
+    match inspect_mutation_authority(directory) {
+        Ok(status) => {
+            push(
+                checks,
+                "mutation_authority",
+                CheckStatus::Ok,
+                match status.owner.as_str() {
+                    "v1" => "owner_v1",
+                    "v2" => "owner_v2",
+                    _ => "owner_invalid",
+                },
+            );
+            Some(MutationAuthoritySummary {
+                owner: status.owner.as_str().to_owned(),
+                epoch: status.epoch,
+            })
+        }
+        Err(error) => {
+            push(
+                checks,
+                "mutation_authority",
+                CheckStatus::Error,
+                error.safe_code(),
+            );
+            None
+        }
     }
 }
 
@@ -1400,6 +1461,7 @@ mod tests {
             tls_root_certificate: None,
             cua_command: None,
             expected_cua_version: None,
+            mutation_authority_dir: None,
             handoff_control_socket: None,
             maintenance_job_exclude_label: None,
         };

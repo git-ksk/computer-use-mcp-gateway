@@ -13,12 +13,13 @@ use computer_use_mcp_gateway::backend::{
 };
 use computer_use_mcp_gateway::config::Config;
 use computer_use_mcp_gateway::gateway::Gateway;
+use computer_use_mcp_gateway::mutation_authority::{MutationAuthorityGate, MutationAuthorityRole};
 use computer_use_mcp_gateway::policy::ToolPolicy;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -60,17 +61,32 @@ async fn main() -> Result<()> {
         );
     }
 
+    let policy = ToolPolicy::new(config.allow_tools(), config.deny_tools());
+    if is_direct_cua_backend(&config.backend_command) && policy.may_allow_effectful() {
+        anyhow::ensure!(
+            config.mutation_authority_dir.is_some(),
+            "CUMG_MUTATION_AUTHORITY_DIR is required when direct Cua V1 policy can expose effectful backend tools"
+        );
+    }
+
     let backend_command = config.backend_command.clone();
     let backend_args = config.backend_args();
     let backend_arg_count = backend_args.len();
-    let backend: Arc<dyn ComputerUseBackend> = Arc::new(CuaBackend::new(
+    let mut cua_backend = CuaBackend::new(
         backend_command.clone(),
         backend_args,
         Duration::from_secs(config.connect_timeout_secs),
         Duration::from_secs(config.tool_timeout_secs),
         config.reconnect_attempts,
         Duration::from_millis(config.reconnect_backoff_ms),
-    ));
+    );
+    if let Some(directory) = config.mutation_authority_dir.clone() {
+        cua_backend = cua_backend.with_mutation_authority(MutationAuthorityGate::new(
+            directory,
+            MutationAuthorityRole::V1,
+        ));
+    }
+    let backend: Arc<dyn ComputerUseBackend> = Arc::new(cua_backend);
 
     info!(
         event = "backend_connect",
@@ -83,7 +99,6 @@ async fn main() -> Result<()> {
         .await
         .context("computer-use backend startup failed")?;
 
-    let policy = ToolPolicy::new(config.allow_tools(), config.deny_tools());
     let gateway = Gateway::discover(backend.clone(), policy)
         .await
         .context("gateway tool discovery failed")?;
@@ -151,6 +166,15 @@ async fn main() -> Result<()> {
     serve_result.context("gateway HTTP server failed")?;
     shutdown_result.context("computer-use backend shutdown failed")?;
     Ok(())
+}
+
+fn is_direct_cua_backend(command: &str) -> bool {
+    matches!(
+        Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("cua-driver" | "cua-driver.exe")
+    )
 }
 
 async fn mcp_concurrency_guard(
@@ -229,6 +253,15 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_cua_backend_identity_is_narrow() {
+        assert!(is_direct_cua_backend("cua-driver"));
+        assert!(is_direct_cua_backend("/usr/local/bin/cua-driver"));
+        assert!(is_direct_cua_backend("cua-driver.exe"));
+        assert!(!is_direct_cua_backend("python3"));
+        assert!(!is_direct_cua_backend("cua-wrapper"));
+    }
 
     #[test]
     fn concurrency_gate_sheds_excess_requests_without_waiting() {

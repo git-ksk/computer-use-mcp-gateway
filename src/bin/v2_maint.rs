@@ -1,7 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use computer_use_mcp_gateway::{
+    mutation_authority::{
+        MutationAuthorityRole, initialize_mutation_authority, inspect_mutation_authority,
+        switch_mutation_authority_guarded,
+    },
     v2_execution_safety::RetirementPolicy,
+    v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control},
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_secret_text,
     v2_maintenance::{
@@ -15,6 +20,18 @@ use std::path::PathBuf;
 const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_REQUEST_BYTES: u64 = 256 * 1024;
 const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
+
+fn handoff_is_idle(socket: &std::path::Path) -> bool {
+    match exchange_unix_handoff_control(socket, &LocalHandoffControlRequest::Status) {
+        Ok(response) if response.ok => response.status.is_some_and(|status| {
+            status.active.is_none()
+                && !status.recovery_required
+                && !status.resume_requested
+                && !status.faulted
+        }),
+        _ => false,
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "v2_maint")]
@@ -94,6 +111,48 @@ enum Command {
         #[arg(long, env = "CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE")]
         fingerprint_secret_file: PathBuf,
     },
+    /// Initialize the private shared V1/V2 mutation-authority state.
+    MutationAuthorityInit {
+        #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+        authority_dir: PathBuf,
+        #[arg(long, value_enum)]
+        owner: MutationAuthorityRoleArg,
+    },
+    /// Inspect the shared mutation owner without changing authority.
+    MutationAuthorityStatus {
+        #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+        authority_dir: PathBuf,
+    },
+    /// CAS-switch the shared mutation owner after proving V2 has no quarantine and Handoff is idle.
+    MutationAuthoritySwitch {
+        #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+        authority_dir: PathBuf,
+        #[arg(long, value_enum)]
+        from: MutationAuthorityRoleArg,
+        #[arg(long, value_enum)]
+        to: MutationAuthorityRoleArg,
+        #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
+        hub_state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
+        handoff_control_socket: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MutationAuthorityRoleArg {
+    #[value(name = "v1")]
+    V1,
+    #[value(name = "v2")]
+    V2,
+}
+
+impl From<MutationAuthorityRoleArg> for MutationAuthorityRole {
+    fn from(value: MutationAuthorityRoleArg) -> Self {
+        match value {
+            MutationAuthorityRoleArg::V1 => Self::V1,
+            MutationAuthorityRoleArg::V2 => Self::V2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -237,6 +296,41 @@ fn main() -> Result<()> {
                 audit_reconciliation_read_only(&state_dir, &agent_state_dir, &operation_id)
                     .context("read-only reconciliation readiness audit failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::MutationAuthorityInit {
+            authority_dir,
+            owner,
+        } => {
+            let status = initialize_mutation_authority(&authority_dir, owner.into())
+                .context("shared mutation authority initialization failed")?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Command::MutationAuthorityStatus { authority_dir } => {
+            let status = inspect_mutation_authority(&authority_dir)
+                .context("shared mutation authority inspection failed")?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Command::MutationAuthoritySwitch {
+            authority_dir,
+            from,
+            to,
+            hub_state_dir,
+            handoff_control_socket,
+        } => {
+            let quarantine = inspect_quarantines_read_only(&hub_state_dir, None)
+                .context("V2 quarantine preflight for mutation authority switch failed")?;
+            ensure!(
+                quarantine.quarantines.is_empty(),
+                "mutation authority switch refused while V2 quarantine is non-empty"
+            );
+            let status =
+                switch_mutation_authority_guarded(&authority_dir, from.into(), to.into(), || {
+                    handoff_is_idle(&handoff_control_socket)
+                })
+                .context(
+                    "shared mutation authority switch failed or Handoff was not provably idle",
+                )?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Command::CompareQuarantineRequest {
             state_dir,

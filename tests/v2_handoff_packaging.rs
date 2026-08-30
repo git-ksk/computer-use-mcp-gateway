@@ -15,6 +15,8 @@ fn single_mac_handoff_is_agent_owned_and_stably_codesigned_for_tcc() {
     assert!(agent.contains("CUMG_V2_HANDOFF_RUNTIME_COMMAND"));
     assert!(agent.contains("CUMG_V2_HANDOFF_RUNTIME_SCRIPT"));
     assert!(agent.contains("CUMG_V2_HANDOFF_RUNTIME_ENV_FILE"));
+    assert!(agent.contains("CUMG_MUTATION_AUTHORITY_DIR"));
+    assert!(agent.contains("@ROOT@/mutation-authority"));
 
     // Ad-hoc signing has a cdhash-based designated requirement and therefore
     // cannot provide a durable TCC identity across rebuilt binaries. The reviewed
@@ -120,6 +122,25 @@ fn single_mac_upgrade_rejects_conflicting_launchd_families_and_retires_alternate
     assert!(guard.contains("alternate_launchd_disable_failed"));
     assert!(!guard.contains("unlink("));
     assert!(!guard.contains("remove("));
+}
+
+#[test]
+fn single_mac_upgrade_enforces_cross_control_plane_mutation_authority() {
+    let upgrade = include_str!("../scripts/v2-single-mac-upgrade.sh");
+    let preflight = include_str!("../scripts/v2_mutation_authority_preflight.py");
+
+    assert!(upgrade.contains(r#"MUTATION_AUTHORITY_DIR="$ROOT/mutation-authority""#));
+    assert!(upgrade.contains("v2_mutation_authority_preflight.py"));
+    assert!(upgrade.contains("--allow-v2-uninitialized"));
+    assert!(preflight.contains("legacy_gateway_unfenced"));
+    assert!(upgrade.contains("mutation-authority-init"));
+    assert!(upgrade.contains("--owner v2"));
+    assert!(upgrade.contains("CUMG_MUTATION_AUTHORITY_DIR"));
+    assert!(upgrade.contains(r#"--mutation-authority-dir "$MUTATION_AUTHORITY_DIR""#));
+    assert!(upgrade.contains(r#"fail_poststart "mutation_authority_preflight""#));
+    assert!(preflight.contains("shared_mutation_authority_missing"));
+    assert!(preflight.contains("shared_mutation_authority_mismatch"));
+    assert!(preflight.contains("migration=required"));
 }
 
 #[test]

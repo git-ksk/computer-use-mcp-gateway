@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "computer-use-mcp-gateway")]
@@ -20,6 +21,10 @@ pub struct Config {
     /// Backend arguments, split on ASCII whitespace in V1.
     #[arg(long, env = "CUMG_BACKEND_ARGS", default_value = "mcp")]
     pub backend_args: String,
+
+    /// Shared local single-writer authority directory for coexistence with V2.
+    #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+    pub mutation_authority_dir: Option<PathBuf>,
 
     /// Comma-separated tool allowlist. Empty is deny-all; `*` explicitly allows every discovered tool.
     #[arg(long, env = "CUMG_ALLOW_TOOLS", default_value = "")]

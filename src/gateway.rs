@@ -1,5 +1,6 @@
 use crate::{
     backend::ComputerUseBackend,
+    mutation_authority::MutationAuthorityError,
     policy::{PolicyDecision, ToolClass, ToolPolicy},
 };
 use anyhow::{Context, Result};
@@ -220,6 +221,25 @@ impl ServerHandler for Gateway {
                     "tool call completed"
                 );
                 Ok(result.into())
+            }
+            Err(error) if error.downcast_ref::<MutationAuthorityError>().is_some() => {
+                let authority = error
+                    .downcast_ref::<MutationAuthorityError>()
+                    .expect("guarded mutation authority error");
+                warn!(
+                    event = "mcp_tool_call",
+                    tool = %tool_name,
+                    tool_class,
+                    policy = "allow",
+                    outcome = "mutation_authority_refused",
+                    error_code = authority.safe_code(),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "effectful tool call refused before backend dispatch by shared mutation authority"
+                );
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "This effectful tool call was refused before backend dispatch because this gateway does not currently hold the shared desktop mutation authority."
+                )])
+                .into())
             }
             Err(_) if context.ct.is_cancelled() => {
                 warn!(

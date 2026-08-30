@@ -141,6 +141,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
                 tool_timeout: Duration::from_secs(30),
                 reconnect_attempts: 3,
                 reconnect_backoff: Duration::from_millis(20),
+                mutation_authority_dir: None,
             }),
         },
         AgentProvisionedMaterial {

@@ -54,6 +54,23 @@ install -d -m 700 "$RUN_ROOT"
 
 signer policy example は意図的に最小です。review 済み northbound policy が必要とする exact `DeviceCapability` だけを追加してください。wildcard capability も signer fallback もありません。
 
+## Single mutating authority
+
+物理 desktop / Cua backend 1つを local mutation-authority domain 1つとして扱います。standard single-Mac profile は owner state を `@ROOT@/mutation-authority`（通常 `~/Library/Application Support/computer-use-mcp-gateway/mutation-authority`）に置き、その backend に到達できる supported control plane すべてへ同じ directory を渡します。state が保持するのは closed owner role (`v1` / `v2`) と単調増加 epoch だけです。effectful backend call と authority transition は private OS file lock で直列化します。process が死ねば一時 lock は kernel により解放されますが、durable owner role は自動移譲されません。
+
+V1 の direct-Cua startup は、policy が effectful tool を1つでも公開し得る場合 `CUMG_MUTATION_AUTHORITY_DIR` を必須とします。V2 も Cua または Agent-owned Human Handoff input を構成する場合に同じ directory を必須とします。non-owner でも observe-class Cua call は diagnostics 用に利用できますが、effectful call は durable owner でない限り backend dispatch 前に拒否されます。Human Handoff の begin/recovery も V2 owner gate を通るため、Human input が Cua-side fence を迂回することもありません。
+
+authority change は `v2_maint mutation-authority-switch` による明示的 CAS transition だけです。live mutation と同じ exclusive lock を使い、current owner 不一致、durable V2 quarantine 存在、lock 保持中に Agent-owned Handoff が idle と証明できない場合は拒否します。quarantine resolve、operation replay、process liveness からの owner 推測は行いません。`v2_doctor` は privacy-bounded な current owner / epoch を表示します。
+
+legacy -> V2 の supported cutover は次です。
+
+1. 同じ backend に対して旧 unfenced Legacy Gateway と V2 Agent が同時に loaded ならそこで停止します。upgrade preflight は `legacy_gateway_unfenced` を返し、writer の自動停止や安全な retire の推測は行いません。
+2. 旧 Legacy Gateway を先に retire するか、同じ authority directory を使う authority-aware V1 へ更新します。legacy writer を残す必要がある場合は domain を `owner=v1` で初期化します。
+3. V2 quarantine が空で Handoff が idle であることを証明してから、明示的な `v1 -> v2` CAS switch を実行します。以後 authority-aware V1 を read-only diagnostics 用に loaded のまま残しても、effectful Cua call は dispatch 前に拒否されます。不要なら unload して構いません。
+4. authority-aware V1 へ rollback する場合は、V1 mutation を有効にする前に逆向きの `v2 -> v1` switch を明示的に行います。旧 unfenced Legacy Gateway を V2 と同時に再起動してはいけません。
+
+pre-authority の V2-only installation だけは狭い automatic migration lane を持ちます。通常 preflight で Legacy Gateway が loaded でないことを証明した後、reviewed upgrade helper が V2 を停止し、新しい private authority domain を `owner=v2` で作成して Agent configuration を追加し、その後 restart します。参照されていない既存 authority directory がある場合は採用せず拒否します。
+
 ## Safe runtime upgrade
 
 `scripts/v2-single-mac-upgrade.sh` は導入済み single-Mac profile 用の reviewed upgrade helper です。CUMG checkout が clean な `main == origin/main` でない、review 済み Handoff checkout が clean な `main == origin/main` かつ exact `CUMG_V2_EXPECTED_HANDOFF_COMMIT` でない、live quarantine がある、Handoff が active/recovery/faulted、必須 state/service がない、Cua/signing input が不足している場合は replacement 前に拒否します。
