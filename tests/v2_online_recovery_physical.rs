@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use computer_use_mcp_gateway::{
     v2_execution_safety::{ExecutionEvidence, OperationOwner},
     v2_m0::{DeviceCommand, DeviceIdentity, DeviceResult, GrantAuthority},
-    v2_m0_execution::HubOperationState,
+    v2_m0_execution::{HubOperationState, IndeterminateResolution},
     v2_m0_transport::{CancellationDisposition, HubIdentity},
     v2_m1::ReconnectPolicy,
     v2_m1_agent::{AgentService, AgentServiceConfig, CuaAgentConfig},
@@ -340,13 +340,21 @@ async fn physical_secure_enclave_online_recovery_never_replays_ambiguous_cua_ope
     let recovery = handle
         .operation_recovery_as(owner.clone(), &operation_id)
         .await?;
-    assert_eq!(recovery.state, HubOperationState::Completed);
+    let resolutions = handle.resolution_records().await;
+    assert_eq!(resolutions.len(), 1);
+    let expected_state = match resolutions[0].decision {
+        IndeterminateResolution::ConfirmedCompleted
+        | IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+            HubOperationState::Completed
+        }
+        IndeterminateResolution::ConfirmedNotExecuted => HubOperationState::Cancelled,
+    };
+    assert_eq!(recovery.state, expected_state);
     let receipt = handle
         .operation_receipt(&operation_id)
         .await
         .ok_or_else(|| anyhow!("resolved physical operation receipt missing"))?;
     assert_eq!(receipt.evidence, ExecutionEvidence::OperatorResolution);
-    assert_eq!(handle.resolution_records().await.len(), 1);
 
     let fresh = handle
         .start_command_as(owner.clone(), DeviceCommand::ScreenGeometry)
@@ -395,8 +403,10 @@ async fn physical_secure_enclave_online_recovery_never_replays_ambiguous_cua_ope
     let restarted_recovery = restarted_handle
         .operation_recovery_as(owner, &operation_id)
         .await?;
-    assert_eq!(restarted_recovery.state, HubOperationState::Completed);
-    assert_eq!(restarted_handle.resolution_records().await.len(), 1);
+    assert_eq!(restarted_recovery.state, expected_state);
+    let restarted_resolutions = restarted_handle.resolution_records().await;
+    assert_eq!(restarted_resolutions.len(), 1);
+    assert_eq!(restarted_resolutions[0].decision, resolutions[0].decision);
 
     println!("ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false");
     Ok(())
