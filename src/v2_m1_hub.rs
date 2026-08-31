@@ -1939,6 +1939,7 @@ impl SingleDeviceHub {
         }
 
         let resolved_at_ms = session_clock.now_ms();
+        let mut retirement_capacity = None;
         {
             let mut persistent = self.inner.persistent.lock().await;
             let quarantine = persistent
@@ -1991,13 +1992,31 @@ impl SingleDeviceHub {
                     let policy = authorization.current_state_policy.ok_or(
                         HubServiceError::OnlineRecovery(RecoveryError::ChallengeMismatch),
                     )?;
-                    persistent.execution.accept_current_state(
+                    match persistent.execution.accept_current_state(
                         &authorization.operation_id,
                         policy,
                         authorization.evidence.clone(),
                         authorization.current_generation,
                         resolved_at_ms,
-                    )?;
+                    ) {
+                        Ok(_) => {
+                            retirement_capacity = Some(persistent.execution.retirement_capacity());
+                        }
+                        Err(
+                            crate::v2_m0_execution::ExecutionError::RetirementCapacityExhausted,
+                        ) => {
+                            crate::v2_observability::retirement_capacity_exhausted();
+                            tracing::warn!(
+                                event = "v2_retirement_capacity_exhausted",
+                                outcome = "rejected",
+                                "current-state acceptance refused because permanent replay tombstone capacity is exhausted"
+                            );
+                            return Err(HubServiceError::Execution(
+                                crate::v2_m0_execution::ExecutionError::RetirementCapacityExhausted,
+                            ));
+                        }
+                        Err(error) => return Err(HubServiceError::Execution(error)),
+                    }
                 }
             }
             if let Err(error) = persist_locked(&self.inner, &persistent) {
@@ -2019,6 +2038,9 @@ impl SingleDeviceHub {
             let mut runtime = self.inner.recovery_runtime.lock().await;
             runtime.pending = None;
             runtime.last_resolved = Some((authorization.clone(), ack.clone()));
+        }
+        if let Some(capacity) = retirement_capacity {
+            crate::v2_observability::retirement_capacity_observed(capacity);
         }
         crate::v2_observability::quarantine_resolved();
         tracing::info!(

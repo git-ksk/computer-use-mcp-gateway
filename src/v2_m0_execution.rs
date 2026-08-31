@@ -4,9 +4,13 @@
 //! operation and remembers terminal operation IDs so a reconnect or retry cannot
 //! silently replay an action whose outcome may already be externally visible.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+
+pub const MAX_RETIRED_OPERATION_TOMBSTONES: usize = 4096;
+const MAX_RETIRED_OPERATION_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionLimits {
@@ -85,10 +89,94 @@ pub struct HubOperationSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayDenyTombstone {
+    /// Lossless compact encoding of the retired operation ID. Canonical CUMG
+    /// `op_<128-bit hex>` IDs use a 16-byte base64url payload; historical
+    /// non-canonical IDs use an exact UTF-8 fallback. Neither form is a hash.
+    pub encoded_id: String,
+}
+
+impl ReplayDenyTombstone {
+    const CANONICAL_PREFIX: &'static str = "c:";
+    const RAW_PREFIX: &'static str = "r:";
+
+    pub fn from_operation_id(operation_id: &str) -> Result<Self, ExecutionError> {
+        if operation_id.trim().is_empty() || operation_id.len() > MAX_RETIRED_OPERATION_ID_BYTES {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        if let Some(suffix) = operation_id.strip_prefix("op_")
+            && suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            let mut bytes = [0_u8; 16];
+            for (index, pair) in suffix.as_bytes().chunks_exact(2).enumerate() {
+                let text =
+                    std::str::from_utf8(pair).map_err(|_| ExecutionError::InvalidOperation)?;
+                bytes[index] =
+                    u8::from_str_radix(text, 16).map_err(|_| ExecutionError::InvalidOperation)?;
+            }
+            return Ok(Self {
+                encoded_id: format!(
+                    "{}{}",
+                    Self::CANONICAL_PREFIX,
+                    URL_SAFE_NO_PAD.encode(bytes)
+                ),
+            });
+        }
+        Ok(Self {
+            encoded_id: format!(
+                "{}{}",
+                Self::RAW_PREFIX,
+                URL_SAFE_NO_PAD.encode(operation_id.as_bytes())
+            ),
+        })
+    }
+
+    pub fn operation_id(&self) -> Result<String, ExecutionError> {
+        if let Some(payload) = self.encoded_id.strip_prefix(Self::CANONICAL_PREFIX) {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| ExecutionError::InvalidSnapshot)?;
+            if bytes.len() != 16 {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            let mut operation_id = String::from("op_");
+            for byte in bytes {
+                use std::fmt::Write as _;
+                write!(&mut operation_id, "{byte:02x}")
+                    .map_err(|_| ExecutionError::InvalidSnapshot)?;
+            }
+            return Ok(operation_id);
+        }
+        if let Some(payload) = self.encoded_id.strip_prefix(Self::RAW_PREFIX) {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| ExecutionError::InvalidSnapshot)?;
+            let operation_id =
+                String::from_utf8(bytes).map_err(|_| ExecutionError::InvalidSnapshot)?;
+            if operation_id.trim().is_empty() || operation_id.len() > MAX_RETIRED_OPERATION_ID_BYTES
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            return Ok(operation_id);
+        }
+        Err(ExecutionError::InvalidSnapshot)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubAdmissionSnapshot {
     pub operations: Vec<HubOperationSnapshot>,
-    #[serde(default)]
+    /// Legacy schema-v5..v10 representation. Current snapshots leave this empty
+    /// and use the compact exact tombstone index below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_indeterminate_operation_ids: Vec<String>,
+    /// Current exact replay-deny index. This is independent from detailed
+    /// retirement audit history and remains bounded by a separate safety cap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_indeterminate_tombstones: Vec<ReplayDenyTombstone>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,31 +235,77 @@ impl HubAdmissionController {
                 .operation_id
                 .cmp(&right.operation.operation_id)
         });
+        let mut retired_indeterminate_tombstones: Vec<_> = self
+            .retired_indeterminate
+            .iter()
+            .map(|operation_id| ReplayDenyTombstone::from_operation_id(operation_id))
+            .collect::<Result<_, _>>()
+            .expect("validated operation IDs must encode as replay tombstones");
+        retired_indeterminate_tombstones
+            .sort_by(|left, right| left.encoded_id.cmp(&right.encoded_id));
+        HubAdmissionSnapshot {
+            operations,
+            retired_indeterminate_operation_ids: Vec::new(),
+            retired_indeterminate_tombstones,
+        }
+    }
+
+    pub fn snapshot_for_restart_legacy_retired_ids(&self) -> HubAdmissionSnapshot {
+        let mut snapshot = self.snapshot_for_restart();
         let mut retired_indeterminate_operation_ids: Vec<_> =
             self.retired_indeterminate.iter().cloned().collect();
         retired_indeterminate_operation_ids.sort();
-        HubAdmissionSnapshot {
-            operations,
-            retired_indeterminate_operation_ids,
-        }
+        snapshot.retired_indeterminate_operation_ids = retired_indeterminate_operation_ids;
+        snapshot.retired_indeterminate_tombstones.clear();
+        snapshot
     }
 
     pub fn restore_after_restart(
         limits: AdmissionLimits,
         snapshot: HubAdmissionSnapshot,
     ) -> Result<Self, ExecutionError> {
-        let retired_indeterminate: HashSet<_> = snapshot
-            .retired_indeterminate_operation_ids
-            .iter()
-            .cloned()
-            .collect();
-        if retired_indeterminate.len() != snapshot.retired_indeterminate_operation_ids.len()
-            || retired_indeterminate
-                .iter()
-                .any(|operation_id| operation_id.trim().is_empty())
+        if !snapshot.retired_indeterminate_operation_ids.is_empty()
+            && !snapshot.retired_indeterminate_tombstones.is_empty()
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
+        let retired_indeterminate: HashSet<_> = if !snapshot
+            .retired_indeterminate_tombstones
+            .is_empty()
+        {
+            if snapshot.retired_indeterminate_tombstones.len() > MAX_RETIRED_OPERATION_TOMBSTONES {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            let decoded: Vec<_> = snapshot
+                .retired_indeterminate_tombstones
+                .iter()
+                .map(ReplayDenyTombstone::operation_id)
+                .collect::<Result<_, _>>()?;
+            let set: HashSet<_> = decoded.iter().cloned().collect();
+            if set.len() != decoded.len() {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            set
+        } else {
+            if snapshot.retired_indeterminate_operation_ids.len() > MAX_RETIRED_OPERATION_TOMBSTONES
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            let set: HashSet<_> = snapshot
+                .retired_indeterminate_operation_ids
+                .iter()
+                .cloned()
+                .collect();
+            if set.len() != snapshot.retired_indeterminate_operation_ids.len()
+                || set.iter().any(|operation_id| {
+                    operation_id.trim().is_empty()
+                        || operation_id.len() > MAX_RETIRED_OPERATION_ID_BYTES
+                })
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+            set
+        };
         let mut controller = Self::new(limits)?;
         for persisted in snapshot.operations {
             if !matches!(
@@ -213,7 +347,7 @@ impl HubAdmissionController {
             controller
                 .operations
                 .get(operation_id)
-                .is_none_or(|operation| operation.state != HubOperationState::Indeterminate)
+                .is_some_and(|operation| operation.state != HubOperationState::Indeterminate)
         }) {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -225,7 +359,9 @@ impl HubAdmissionController {
         if operation.operation_id.trim().is_empty() || operation.device_id.trim().is_empty() {
             return Err(ExecutionError::InvalidOperation);
         }
-        if self.operations.contains_key(&operation.operation_id) {
+        if self.operations.contains_key(&operation.operation_id)
+            || self.retired_indeterminate.contains(&operation.operation_id)
+        {
             return Err(ExecutionError::OperationReplay);
         }
         if let Some(operation_id) = self.blocked_by_indeterminate.get(&operation.device_id) {
@@ -519,6 +655,9 @@ impl HubAdmissionController {
         {
             return Err(ExecutionError::InvalidTransition);
         }
+        if self.retired_indeterminate.len() >= MAX_RETIRED_OPERATION_TOMBSTONES {
+            return Err(ExecutionError::RetirementCapacityExhausted);
+        }
         let device_id = operation.operation.device_id.clone();
         if self
             .blocked_by_indeterminate
@@ -532,6 +671,40 @@ impl HubAdmissionController {
         Ok(self
             .start_next_for_available_capacity(Some(&device_id))
             .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
+    }
+
+    /// Drop the full retired operation record after its detailed audit record has
+    /// rotated out. The exact replay-deny tombstone remains authoritative.
+    pub fn compact_retired_indeterminate_detail(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<(), ExecutionError> {
+        if !self.retired_indeterminate.contains(operation_id) {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let operation = self
+            .operations
+            .get(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if operation.state != HubOperationState::Indeterminate
+            || self
+                .blocked_by_indeterminate
+                .values()
+                .any(|blocked| blocked == operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        self.operations.remove(operation_id);
+        self.recovery_read_only_operations.remove(operation_id);
+        Ok(())
+    }
+
+    pub fn retired_indeterminate_count(&self) -> usize {
+        self.retired_indeterminate.len()
+    }
+
+    pub fn retired_indeterminate_ids(&self) -> impl Iterator<Item = &String> {
+        self.retired_indeterminate.iter()
     }
 
     /// Settle an indeterminate operation from already-authoritative terminal
@@ -809,6 +982,7 @@ pub enum ExecutionError {
     BackpressureRejected,
     UnknownOperation,
     InvalidTransition,
+    RetirementCapacityExhausted,
     AgentBusy,
     GenerationChangeWhileActive,
     OwnershipFenceMismatch,
@@ -1072,6 +1246,20 @@ mod tests {
     }
 
     #[test]
+    fn replay_deny_tombstone_is_lossless_for_canonical_and_legacy_ids() {
+        let canonical = "op_00112233445566778899aabbccddeeff";
+        let encoded = ReplayDenyTombstone::from_operation_id(canonical).unwrap();
+        assert!(encoded.encoded_id.starts_with("c:"));
+        assert!(encoded.encoded_id.len() < canonical.len());
+        assert_eq!(encoded.operation_id().unwrap(), canonical);
+
+        let legacy = "legacy-scroll-operation";
+        let encoded = ReplayDenyTombstone::from_operation_id(legacy).unwrap();
+        assert!(encoded.encoded_id.starts_with("r:"));
+        assert_eq!(encoded.operation_id().unwrap(), legacy);
+    }
+
+    #[test]
     fn retired_indeterminate_remains_unknown_tombstoned_and_unblocked_across_restart() {
         let limits = AdmissionLimits {
             max_global_active: 1,
@@ -1102,9 +1290,13 @@ mod tests {
         hub.mark_dispatched("fresh-after-retirement").unwrap();
         hub.complete("fresh-after-retirement", false).unwrap();
         let snapshot = hub.snapshot_for_restart();
+        assert!(snapshot.retired_indeterminate_operation_ids.is_empty());
+        assert_eq!(snapshot.retired_indeterminate_tombstones.len(), 1);
         assert_eq!(
-            snapshot.retired_indeterminate_operation_ids,
-            vec!["legacy-scroll".to_owned()]
+            snapshot.retired_indeterminate_tombstones[0]
+                .operation_id()
+                .unwrap(),
+            "legacy-scroll"
         );
         let mut restored = HubAdmissionController::restore_after_restart(limits, snapshot).unwrap();
         assert_eq!(

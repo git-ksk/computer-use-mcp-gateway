@@ -10,8 +10,10 @@
 //! as metric attributes.
 
 use crate::{
-    v2_execution_safety::IndeterminateReason, v2_m0::DeviceCapability,
-    v2_m0_execution::IndeterminateResolution, v2_m0_transport::CancellationDisposition,
+    v2_execution_safety::{IndeterminateReason, RetirementCapacity, RetirementCapacityStatus},
+    v2_m0::DeviceCapability,
+    v2_m0_execution::IndeterminateResolution,
+    v2_m0_transport::CancellationDisposition,
 };
 use anyhow::{Context, Result};
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
@@ -215,6 +217,24 @@ pub fn quarantine_resolved() {
     increment_counter("cumg.v2.quarantine_resolved", &[]);
 }
 
+pub fn retirement_capacity_observed(capacity: RetirementCapacity) {
+    record_gauge("cumg.v2.retirement_capacity_used", capacity.used as u64);
+    record_gauge("cumg.v2.retirement_capacity_limit", capacity.limit as u64);
+    if !matches!(capacity.status, RetirementCapacityStatus::Normal) {
+        increment_counter(
+            "cumg.v2.retirement_capacity_warning",
+            &[KeyValue::new(
+                "reason",
+                retirement_capacity_status_name(capacity.status),
+            )],
+        );
+    }
+}
+
+pub fn retirement_capacity_exhausted() {
+    increment_counter("cumg.v2.retirement_capacity_exhausted", &[]);
+}
+
 pub fn persistence_failure(component: PersistenceComponent) {
     increment_counter(
         "cumg.v2.persistence_failure",
@@ -241,6 +261,13 @@ pub fn backend_failure(reason: BackendFailureReason) {
 
 pub fn stale_result_rejected() {
     increment_counter("cumg.v2.stale_result_rejected", &[]);
+}
+
+fn record_gauge(name: &'static str, value: u64) {
+    global::meter("computer-use-mcp-gateway")
+        .u64_gauge(name)
+        .build()
+        .record(value, &[]);
 }
 
 fn increment_counter(name: &'static str, attributes: &[KeyValue]) {
@@ -364,6 +391,15 @@ const fn auth_failure_reason_name(reason: AuthFailureReason) -> &'static str {
     }
 }
 
+pub const fn retirement_capacity_status_name(status: RetirementCapacityStatus) -> &'static str {
+    match status {
+        RetirementCapacityStatus::Normal => "normal",
+        RetirementCapacityStatus::Warning => "warning",
+        RetirementCapacityStatus::Critical => "critical",
+        RetirementCapacityStatus::Exhausted => "exhausted",
+    }
+}
+
 const fn backend_failure_reason_name(reason: BackendFailureReason) -> &'static str {
     match reason {
         BackendFailureReason::Connect => "connect",
@@ -484,6 +520,10 @@ mod tests {
         assert_eq!(
             backend_failure_reason_name(BackendFailureReason::AmbiguousOutcome),
             "ambiguous_outcome"
+        );
+        assert_eq!(
+            retirement_capacity_status_name(RetirementCapacityStatus::Critical),
+            "critical"
         );
     }
 }
