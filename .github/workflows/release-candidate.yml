@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  HANDOFF_SOURCE_COMMIT: 9a621d12524632fd717e5f8d84a42c29946ab662
+
 jobs:
   bundle:
     name: bundle (${{ matrix.name }})
@@ -34,6 +37,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Checkout pinned Handoff runtime
+        if: runner.os == 'macOS'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: git-ksk/mcp-execution-handoff
+          ref: ${{ env.HANDOFF_SOURCE_COMMIT }}
+          path: handoff-src
+
       - name: Install Rust 1.88
         shell: bash
         run: |
@@ -54,9 +65,12 @@ jobs:
             bins+=(--bin v2_grant_signer --bin v2_handoff_ctl)
           fi
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            bins+=(--bin v2_doctor --bin v2_status)
+            bins+=(--bin v2_doctor --bin v2_status --bin v2_recover)
           fi
           cargo build --release --locked "${bins[@]}"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            scripts/build-macos-recovery-helper.sh target/release/v2_recovery_enclave_helper
+          fi
 
       - name: Resolve exact candidate identity
         shell: bash
@@ -70,20 +84,76 @@ jobs:
           )"
           source_commit="$(git rev-parse HEAD)"
           architecture="$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          hub_agent_schema="$(python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("src/v2_m0_transport.rs").read_text(encoding="utf-8")
+          match = re.search(r"pub const HUB_AGENT_SCHEMA_VERSION: u16 = ([0-9]+);", text)
+          if not match:
+              raise SystemExit(2)
+          print(match.group(1))
+          PY
+          )"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            pinned="$(python3 -c 'import json; print(json.load(open("packaging/release/single-mac-handoff.json"))["source_commit"])')"
+            [[ "$pinned" == "$HANDOFF_SOURCE_COMMIT" ]] || { echo "Handoff workflow pin differs from reviewed package pin" >&2; exit 1; }
+            [[ "$(git -C handoff-src rev-parse HEAD)" == "$HANDOFF_SOURCE_COMMIT" ]] || { echo "Handoff checkout identity mismatch" >&2; exit 1; }
+          fi
           printf 'PACKAGE_VERSION=%s\n' "$package_version" >> "$GITHUB_ENV"
           printf 'SOURCE_COMMIT=%s\n' "$source_commit" >> "$GITHUB_ENV"
           printf 'CANDIDATE_ARCH=%s\n' "$architecture" >> "$GITHUB_ENV"
+          printf 'HUB_AGENT_SCHEMA_VERSION=%s\n' "$hub_agent_schema" >> "$GITHUB_ENV"
+
+      - name: Build self-contained single-Mac payload
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          npm ci --prefix handoff-src --no-audit --no-fund
+          npm run build --prefix handoff-src
+          npm ci --prefix handoff-src --omit=dev --ignore-scripts --no-audit --no-fund
+          swift build -c release \
+            --package-path handoff-src/experiments/thin-takeover-runtime \
+            --product takeover-webrtc-host
+          mkdir -p artifact-payload/install artifact-payload/launchd artifact-payload/components
+          python3 scripts/v2_artifact_payload.py build \
+            --handoff-source handoff-src \
+            --webrtc-host handoff-src/experiments/thin-takeover-runtime/.build/release/takeover-webrtc-host \
+            --runtime-script scripts/v2_handoff_runtime.mjs \
+            --output-dir artifact-payload/components \
+            --cumg-commit "$SOURCE_COMMIT" \
+            --handoff-commit "$HANDOFF_SOURCE_COMMIT"
+          cp \
+            scripts/v2_artifact_install.py \
+            scripts/v2_artifact_payload.py \
+            scripts/v2_release_candidate.py \
+            scripts/v2-single-mac-upgrade.sh \
+            scripts/v2_launchd_maintenance_job.py \
+            scripts/v2_upgrade_transaction.py \
+            scripts/v2_launchd_topology_guard.py \
+            scripts/v2_mutation_authority_preflight.py \
+            scripts/v2_handoff_runtime_preflight.py \
+            scripts/v2_handoff_runtime_cleanup.py \
+            artifact-payload/install/
+          cp packaging/launchd/single-mac/*.plist artifact-payload/launchd/
+          cp packaging/release/SINGLE_MAC_ARTIFACT_INSTALL.md artifact-payload/install/README.md
+          cp packaging/release/single-mac-profile.example.json artifact-payload/install/single-mac-profile.example.json
 
       - name: Build bounded release candidate
         shell: bash
         run: |
-          ${{ matrix.python }} scripts/v2_release_candidate.py build \
-            --binary-dir target/release \
-            --output-dir dist \
-            --package-version "$PACKAGE_VERSION" \
-            --source-commit "$SOURCE_COMMIT" \
-            --platform "${{ matrix.platform }}" \
+          args=(
+            build
+            --binary-dir target/release
+            --output-dir dist
+            --package-version "$PACKAGE_VERSION"
+            --source-commit "$SOURCE_COMMIT"
+            --platform "${{ matrix.platform }}"
             --architecture "$CANDIDATE_ARCH"
+            --hub-agent-schema-version "$HUB_AGENT_SCHEMA_VERSION"
+          )
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            args+=(--paired-handoff-commit "$HANDOFF_SOURCE_COMMIT" --payload-dir artifact-payload)
+          fi
+          ${{ matrix.python }} scripts/v2_release_candidate.py "${args[@]}"
 
       - name: Verify archive and extract fresh bundle
         shell: bash
@@ -101,6 +171,16 @@ jobs:
           bundle="$(find extracted -mindepth 1 -maxdepth 1 -type d -print -quit)"
           [[ -n "$bundle" ]] || { echo "verified bundle directory missing" >&2; exit 1; }
           ${{ matrix.python }} scripts/v2_release_candidate.py smoke --bundle-dir "$bundle"
+
+      - name: Verify packaged single-Mac installer is source-free
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bundle="$(find extracted -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          python3 "$bundle/install/v2_artifact_install.py" inspect --bundle-dir "$bundle"
+          [[ ! -d "$bundle/.git" ]]
+          [[ ! -e "$bundle/Cargo.toml" ]]
+          [[ ! -e "$bundle/handoff-src" ]]
 
       - name: Upload verified candidate archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

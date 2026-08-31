@@ -99,25 +99,17 @@ Before 1.0, only the **latest released minor line** is actively supported. Older
 
 ## Release-candidate artifacts
 
-The currently published `v0.3.0` release remains **source-only** unless a later GitHub Release explicitly contains reviewed binary assets. CI artifacts are not silently promoted into a supported distribution.
+The currently published `v0.3.0` release remains **source-only** unless a later GitHub Release explicitly contains reviewed binary assets. CI artifacts are never silently promoted into a supported distribution.
 
-The `Release Candidate Artifacts` workflow builds a bounded native candidate on Linux, macOS, and Windows from one exact checkout. `scripts/v2_release_candidate.py` copies only the platform allowlisted V2 binaries (Unix-only operator binaries are omitted from Windows), records package version + exact source commit + platform/architecture + per-file size/SHA-256 in `release-artifact-manifest.json`, creates the archive, and emits an archive-level `.sha256` record. The artifact manifest is distribution evidence only; it does not replace the installed single-Mac `runtime-manifest.json` or become execution/recovery authority.
+The `Release Candidate Artifacts` workflow still builds bounded native candidates on Linux, macOS, and Windows. Manifest schema v2 records the package version, exact CUMG source commit, Hub/Agent application-schema version, platform/architecture, exact allowlisted files, sizes, and SHA-256 identities. Linux and Windows candidates remain distribution evidence only.
 
-Verification is intentionally a fresh-extraction path:
+The macOS single-Mac candidate additionally implements the #237 install-capable profile. It binds an exact reviewed `mcp-execution-handoff` commit, includes `v2_recover` plus the Secure Enclave helper, ships bounded install/upgrade support files and LaunchAgent templates, and embeds a separately manifested self-contained Handoff runtime payload. Fresh verification fails closed on checksum drift, unexpected/missing files, unsafe paths, symlinks, inner/outer commit mismatch, or incomplete production dependencies. The artifact manifest remains distribution evidence; the installed schema-3 `runtime-manifest.json` remains the runtime identity checked by `v2_doctor`.
 
-```bash
-python3 scripts/v2_release_candidate.py verify \
-  --archive dist/cumg-v0.3.0-macos-arm64.tar.gz \
-  --checksum dist/cumg-v0.3.0-macos-arm64.tar.gz.sha256 \
-  --extract-dir /tmp/cumg-candidate
+A supported clean single-Mac installation means no CUMG/Handoff source checkout is required. Deployment trust/secrets, stable device/resource/proxy identity, Cua, Node.js, and the operator-selected Apple code-signing identity remain separately provisioned inputs. Before activation the installer copies verified artifact bytes into private staging and applies the existing stable Team-ID code-signing boundary to TCC-sensitive local executables/helpers; CI candidates are not claimed to be Apple-notarized public installers.
 
-python3 scripts/v2_release_candidate.py smoke \
-  --bundle-dir /tmp/cumg-candidate/cumg-v0.3.0-macos-arm64
-```
+The same verified macOS artifact is the normal upgrade input. The bundled one-shot maintenance wrapper preserves the existing no-auto-retry durable upgrade transaction, fail-closed quarantine/Handoff/mutation-authority checks, paired rollback asset, restart ordering, and post-upgrade `v2_doctor` verification. The historical source-build path remains maintainer-only.
 
-`verify` rejects checksum mismatch, unexpected/missing files, unsafe paths, symlinks, malformed identity metadata, and per-file size/digest drift before a candidate is accepted. `smoke` runs the packaged binaries from the extracted bundle, never through `cargo run` or the source checkout.
-
-These candidates are **not official production installers**. Before a future release claims an installable supported distribution, complete the relevant platform signing/notarization decision, SBOM/provenance strategy, clean-machine install acceptance, and explicit supported-platform matrix. The CI workflow uploads candidates for review only and does not create/mutate Git tags or GitHub Releases.
+See [`v2/V2_RELEASE_ARTIFACTS.md`](v2/V2_RELEASE_ARTIFACTS.md) for the normative install/upgrade/distribution contract. An **official** binary GitHub Release must additionally attach reviewed SBOM/license inventory plus provenance/attestation binding the published archive checksum to the protected source/workflow identity. Publication metadata, signatures, SBOMs, and attestations never become execution/recovery authority.
 
 ## Release procedure
 

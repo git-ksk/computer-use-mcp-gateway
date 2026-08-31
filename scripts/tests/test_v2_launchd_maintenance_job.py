@@ -233,6 +233,43 @@ class LaunchdMaintenanceTests(unittest.TestCase):
         )
         self.assertEqual(exit_code, 0)
 
+    def test_artifact_upgrade_uses_shipped_helper_and_preserves_one_shot_contract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            bundle = root / "cumg-v0.3.0-macos-arm64"
+            install = bundle / "install"
+            install.mkdir(parents=True)
+            upgrade = install / "v2-single-mac-upgrade.sh"
+            upgrade.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+            jobs = root / "jobs"
+            fake = FakeLaunchctl(job_exit=0)
+            exit_code = mod.run_upgrade_one_shot(
+                repo_root=None,
+                artifact_bundle=bundle,
+                domain=DOMAIN,
+                launchctl="/bin/launchctl",
+                job_dir=jobs,
+                environment={"PATH": "/usr/bin", "HOME": str(root)},
+                timeout_secs=5,
+                runner=fake,
+                sleep=lambda _seconds: None,
+                now=lambda: 1234.0,
+                token_hex=lambda _count: "deadbeef",
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(fake.plists), 1)
+            plist = fake.plists[0]
+            resolved_bundle = bundle.resolve()
+            resolved_upgrade = resolved_bundle / "install/v2-single-mac-upgrade.sh"
+            self.assertEqual(
+                plist["ProgramArguments"],
+                ["/bin/bash", str(resolved_upgrade), "--artifact-bundle", str(resolved_bundle)],
+            )
+            self.assertEqual(plist["WorkingDirectory"], str(resolved_bundle))
+            self.assertIs(plist["RunAtLoad"], True)
+            self.assertIs(plist["KeepAlive"], False)
+            self.assertFalse(any(call[1] == "kickstart" for call in fake.calls))
+
     def test_nonzero_upgrade_exit_runs_once_and_cleanup_always_boots_out_and_unlinks_plist(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

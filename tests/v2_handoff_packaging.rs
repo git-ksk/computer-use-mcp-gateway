@@ -104,7 +104,7 @@ fn single_mac_upgrade_rejects_conflicting_launchd_families_and_retires_alternate
 
     assert!(upgrade.contains("v2_launchd_topology_guard.py"));
     let preflight_exit = upgrade
-        .find("[[ \"$PRELIGHT_ONLY\" == \"1\" ]] && exit 0")
+        .find("if [[ \"$PRELIGHT_ONLY\" == \"1\" ]]; then")
         .unwrap();
     let topology_check = upgrade.find("\"$LAUNCHD_TOPOLOGY_GUARD\" check").unwrap();
     let retire_alternates = upgrade.find("retire-alternates").unwrap();

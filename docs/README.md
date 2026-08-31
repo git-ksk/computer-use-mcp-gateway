@@ -12,6 +12,7 @@ The documentation is grouped by purpose so current contracts are easy to disting
 - [`CLIENTS.md`](CLIENTS.md) and [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — client setup and diagnostics.
 - [`PROJECT_GOVERNANCE.md`](PROJECT_GOVERNANCE.md) — maintainer model, change classes, merge rules, localization, and feature admission.
 - [`VERSIONING.md`](VERSIONING.md) — SemVer, pre-1.0 compatibility, support/deprecation, and release procedure.
+- [`v2/V2_RELEASE_ARTIFACTS.md`](v2/V2_RELEASE_ARTIFACTS.md) — release-artifact integrity plus the source-free single-Mac install/upgrade boundary.
 - [`ROADMAP.md`](ROADMAP.md) — current maintenance priorities, future-minor admission, and the path to 1.0.
 
 Repository-level community health files live at the repository root: [`../SECURITY.md`](../SECURITY.md) for private vulnerability reporting, [`../SUPPORT.md`](../SUPPORT.md) for support routing, [`../CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) for participation expectations, and [`../GOVERNANCE.md`](../GOVERNANCE.md) as the standard governance entry point.

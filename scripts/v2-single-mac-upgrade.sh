@@ -7,56 +7,129 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: scripts/v2-single-mac-upgrade.sh [--preflight-only]
+usage: scripts/v2-single-mac-upgrade.sh [--preflight-only] [--artifact-bundle PATH]
 
+Normal artifact-backed upgrade:
+  bash <bundle>/install/v2-single-mac-upgrade.sh --artifact-bundle <bundle> [--preflight-only]
+
+Without --artifact-bundle the historical source-build path remains maintainer-only.
 Environment overrides:
   CUMG_V2_INSTALL_ROOT       default: ~/Library/Application Support/computer-use-mcp-gateway
   CUMG_V2_RUN_ROOT           default: ~/Library/Caches/cumg-v2
   CUMG_V2_HUB_LABEL          default: com.github.git-ksk.cumg-v2-hub
   CUMG_V2_AGENT_LABEL        default: com.github.git-ksk.cumg-v2-agent
   CUMG_V2_SIGNER_LABEL       default: com.github.git-ksk.cumg-v2-grant-signer
-  CUMG_V2_EXTERNAL_SIGNER    default: 1 (set 0 only for an explicitly reviewed legacy profile)
-  CUMG_V2_EXPECTED_CUA_VERSION required; exact reviewed Cua version for post-upgrade v2_doctor
+  CUMG_V2_EXTERNAL_SIGNER    default: 1
+  CUMG_V2_EXPECTED_CUA_VERSION required
   CUMG_V2_MACOS_CODESIGN_FINGERPRINT preferred; exact 40-hex certificate fingerprint
-  CUMG_V2_MACOS_CODESIGN_IDENTITY fallback; exact Apple code-signing identity name, must resolve uniquely
-  CUMG_V2_MACOS_TEAM_ID       required; exact 10-character Apple Developer Team ID
-  CUMG_V2_HANDOFF_SOURCE_ROOT required after first pinned cutover; reviewed Handoff checkout
-  CUMG_V2_EXPECTED_HANDOFF_COMMIT required; exact reviewed mcp-execution-handoff commit
-  CUMG_V2_CARGO_BUILD_JOBS   default: 2; bounded source-build parallelism (1..8)
-  CUMG_V2_MIN_BUILD_FREE_MIB default: 6144; pre-build free-space floor
+  CUMG_V2_MACOS_CODESIGN_IDENTITY fallback; exact identity name, must resolve uniquely
+  CUMG_V2_MACOS_TEAM_ID       required; exact 10-character Team ID
+  CUMG_V2_HANDOFF_SOURCE_ROOT source mode only
+  CUMG_V2_EXPECTED_HANDOFF_COMMIT source mode only
+  CUMG_V2_CARGO_BUILD_JOBS   source mode only; default 2
+  CUMG_V2_MIN_BUILD_FREE_MIB source mode only; default 6144
   CUMG_V1_GATEWAY_LABEL      default: com.sawadakousuke.computer-use-mcp-gateway
 USAGE
 }
 
 PRELIGHT_ONLY=0
-case "${1:-}" in
-  "") ;;
-  --preflight-only) PRELIGHT_ONLY=1 ;;
-  -h|--help) usage; exit 0 ;;
-  *) usage >&2; exit 64 ;;
-esac
+ARTIFACT_BUNDLE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --preflight-only) PRELIGHT_ONLY=1; shift ;;
+    --artifact-bundle)
+      [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 64; }
+      ARTIFACT_BUNDLE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 64 ;;
+  esac
+done
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "REFUSED reason=macos_required" >&2; exit 2; }
-command -v git >/dev/null || { echo "REFUSED reason=git_missing" >&2; exit 2; }
-command -v cargo >/dev/null || { echo "REFUSED reason=cargo_missing" >&2; exit 2; }
-command -v python3 >/dev/null || { echo "REFUSED reason=python3_missing" >&2; exit 2; }
-command -v shasum >/dev/null || { echo "REFUSED reason=shasum_missing" >&2; exit 2; }
-command -v launchctl >/dev/null || { echo "REFUSED reason=launchctl_missing" >&2; exit 2; }
-command -v codesign >/dev/null || { echo "REFUSED reason=codesign_missing" >&2; exit 2; }
-command -v security >/dev/null || { echo "REFUSED reason=security_missing" >&2; exit 2; }
-command -v openssl >/dev/null || { echo "REFUSED reason=openssl_missing" >&2; exit 2; }
-command -v plutil >/dev/null || { echo "REFUSED reason=plutil_missing" >&2; exit 2; }
-command -v npm >/dev/null || { echo "REFUSED reason=npm_missing" >&2; exit 2; }
+for cmd in python3 shasum launchctl codesign security openssl plutil; do
+  command -v "$cmd" >/dev/null || { echo "REFUSED reason=${cmd}_missing" >&2; exit 2; }
+done
 [[ -x /usr/libexec/PlistBuddy ]] || { echo "REFUSED reason=plistbuddy_missing" >&2; exit 2; }
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "REFUSED reason=not_git_checkout" >&2; exit 2; }
-cd "$REPO_ROOT"
-[[ "$(git branch --show-current)" == "main" ]] || { echo "REFUSED reason=branch_not_main" >&2; exit 2; }
-[[ -z "$(git status --porcelain=v1)" ]] || { echo "REFUSED reason=dirty_checkout" >&2; exit 2; }
-git fetch --quiet origin main
-HEAD="$(git rev-parse HEAD)"
-ORIGIN_MAIN="$(git rev-parse origin/main)"
-[[ "$HEAD" == "$ORIGIN_MAIN" ]] || { echo "REFUSED reason=main_diverged" >&2; exit 2; }
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+ARTIFACT_MODE=0
+ARTIFACT_TMP=""
+ARTIFACT_PACKAGE_VERSION=""
+ARTIFACT_HUB_AGENT_SCHEMA_VERSION=""
+if [[ -n "$ARTIFACT_BUNDLE" ]]; then
+  ARTIFACT_MODE=1
+  ARTIFACT_BUNDLE="$(python3 - "$ARTIFACT_BUNDLE" <<'PYRESOLVE'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1]).expanduser().resolve(strict=True)
+if not p.is_dir() or p.is_symlink(): raise SystemExit(2)
+print(p)
+PYRESOLVE
+)" || { echo "REFUSED reason=artifact_bundle_unsafe" >&2; exit 2; }
+  [[ "$SCRIPT_DIR" == "$ARTIFACT_BUNDLE/install" ]] || { echo "REFUSED reason=artifact_upgrade_must_run_shipped_script" >&2; exit 2; }
+  SUPPORT_ROOT="$SCRIPT_DIR"
+  python3 "$SUPPORT_ROOT/v2_release_candidate.py" verify-dir --bundle-dir "$ARTIFACT_BUNDLE" >/dev/null || { echo "REFUSED reason=artifact_verification_failed" >&2; exit 2; }
+  eval "$(python3 - "$ARTIFACT_BUNDLE/release-artifact-manifest.json" <<'PYART'
+import json,pathlib,shlex,sys
+m=json.loads(pathlib.Path(sys.argv[1]).read_text())
+if m.get('platform')!='macos' or m.get('install_profile')!='single-mac-artifact-v1': raise SystemExit(2)
+for k,v in {
+ 'HEAD':m.get('source_commit'),
+ 'HANDOFF_HEAD':m.get('paired_handoff_commit'),
+ 'ARTIFACT_PACKAGE_VERSION':str(m.get('package_version','')),
+ 'ARTIFACT_HUB_AGENT_SCHEMA_VERSION':str(m.get('hub_agent_schema_version','')),
+ 'ARTIFACT_ARCHITECTURE':str(m.get('architecture','')),
+}.items():
+    if not isinstance(v,str) or not v: raise SystemExit(3)
+    print(f'{k}={shlex.quote(v)}')
+PYART
+)" || { echo "REFUSED reason=artifact_identity_invalid" >&2; exit 2; }
+  [[ "$HEAD" =~ ^[0-9a-f]{40}$ && "$HANDOFF_HEAD" =~ ^[0-9a-f]{40}$ ]] || { echo "REFUSED reason=artifact_commit_identity_invalid" >&2; exit 2; }
+  case "$(uname -m)" in
+    arm64|aarch64) HOST_ARTIFACT_ARCH="arm64" ;;
+    x86_64|amd64) HOST_ARTIFACT_ARCH="x64" ;;
+    *) echo "REFUSED reason=unsupported_host_architecture" >&2; exit 2 ;;
+  esac
+  [[ "$ARTIFACT_ARCHITECTURE" == "$HOST_ARTIFACT_ARCH" ]] || { echo "REFUSED reason=artifact_architecture_mismatch" >&2; exit 2; }
+  ARTIFACT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/cumg-v2-artifact-upgrade.XXXXXX")"
+  chmod 700 "$ARTIFACT_TMP"
+  python3 "$SUPPORT_ROOT/v2_artifact_payload.py" extract \
+    --archive "$ARTIFACT_BUNDLE/components/handoff-runtime.tar.gz" \
+    --output-dir "$ARTIFACT_TMP/handoff" --cumg-commit "$HEAD" --handoff-commit "$HANDOFF_HEAD" >/dev/null || {
+      rm -rf "$ARTIFACT_TMP"; echo "REFUSED reason=artifact_handoff_payload_invalid" >&2; exit 2;
+    }
+  HANDOFF_PAYLOAD_ROOT="$ARTIFACT_TMP/handoff/handoff-runtime"
+  HANDOFF_SOURCE_ROOT="$HANDOFF_PAYLOAD_ROOT/handoff-root"
+  ARTIFACT_BINARY_STAGE="$ARTIFACT_TMP/bin"
+  mkdir -m 700 "$ARTIFACT_BINARY_STAGE"
+  for source in "$ARTIFACT_BUNDLE"/bin/*; do
+    [[ -f "$source" && ! -L "$source" ]] || { rm -rf "$ARTIFACT_TMP"; echo "REFUSED reason=artifact_binary_unsafe" >&2; exit 2; }
+    cp "$source" "$ARTIFACT_BINARY_STAGE/$(basename "$source")"
+    chmod 700 "$ARTIFACT_BINARY_STAGE/$(basename "$source")"
+  done
+  BUILD_BIN_DIR="$ARTIFACT_BINARY_STAGE"
+  RUNTIME_SCRIPT_SOURCE="$HANDOFF_PAYLOAD_ROOT/v2_handoff_runtime.mjs"
+  REPO_ROOT=""
+else
+  command -v git >/dev/null || { echo "REFUSED reason=git_missing" >&2; exit 2; }
+  command -v cargo >/dev/null || { echo "REFUSED reason=cargo_missing" >&2; exit 2; }
+  command -v npm >/dev/null || { echo "REFUSED reason=npm_missing" >&2; exit 2; }
+  REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "REFUSED reason=not_git_checkout" >&2; exit 2; }
+  cd "$REPO_ROOT"
+  [[ "$(git branch --show-current)" == "main" ]] || { echo "REFUSED reason=branch_not_main" >&2; exit 2; }
+  [[ -z "$(git status --porcelain=v1)" ]] || { echo "REFUSED reason=dirty_checkout" >&2; exit 2; }
+  git fetch --quiet origin main
+  HEAD="$(git rev-parse HEAD)"
+  ORIGIN_MAIN="$(git rev-parse origin/main)"
+  [[ "$HEAD" == "$ORIGIN_MAIN" ]] || { echo "REFUSED reason=main_diverged" >&2; exit 2; }
+  SUPPORT_ROOT="$REPO_ROOT/scripts"
+  BUILD_BIN_DIR="$REPO_ROOT/target/release"
+  RUNTIME_SCRIPT_SOURCE="$SUPPORT_ROOT/v2_handoff_runtime.mjs"
+fi
+
+cleanup_artifact_tmp() {
+  [[ -n "$ARTIFACT_TMP" ]] && rm -rf "$ARTIFACT_TMP" || true
+}
+trap cleanup_artifact_tmp EXIT
 
 ROOT="${CUMG_V2_INSTALL_ROOT:-$HOME/Library/Application Support/computer-use-mcp-gateway}"
 RUN_ROOT="${CUMG_V2_RUN_ROOT:-$HOME/Library/Caches/cumg-v2}"
@@ -76,7 +149,7 @@ MACOS_TEAM_ID="${CUMG_V2_MACOS_TEAM_ID:-}"
 EXPECTED_HANDOFF_COMMIT="${CUMG_V2_EXPECTED_HANDOFF_COMMIT:-}"
 CARGO_BUILD_JOBS="${CUMG_V2_CARGO_BUILD_JOBS:-2}"
 MIN_BUILD_FREE_MIB="${CUMG_V2_MIN_BUILD_FREE_MIB:-6144}"
-UPGRADE_TRANSACTION_HELPER="$REPO_ROOT/scripts/v2_upgrade_transaction.py"
+UPGRADE_TRANSACTION_HELPER="$SUPPORT_ROOT/v2_upgrade_transaction.py"
 UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/upgrade-transaction.json"
 [[ "$CARGO_BUILD_JOBS" =~ ^[1-8]$ ]] || { echo "REFUSED reason=invalid_cargo_build_jobs" >&2; exit 2; }
 [[ "$MIN_BUILD_FREE_MIB" =~ ^[0-9]+$ && "$MIN_BUILD_FREE_MIB" -ge 1024 && "$MIN_BUILD_FREE_MIB" -le 65536 ]] || {
@@ -93,7 +166,9 @@ UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/upgrade-transaction.json"
   echo "REFUSED reason=invalid_macos_codesign_fingerprint" >&2; exit 2;
 }
 [[ "$MACOS_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "REFUSED reason=invalid_macos_team_id" >&2; exit 2; }
-[[ "$EXPECTED_HANDOFF_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "REFUSED reason=invalid_expected_handoff_commit" >&2; exit 2; }
+if [[ "$ARTIFACT_MODE" == "0" ]]; then
+  [[ "$EXPECTED_HANDOFF_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "REFUSED reason=invalid_expected_handoff_commit" >&2; exit 2; }
+fi
 MACOS_CODESIGN_SELECTOR="$(python3 - "$MACOS_CODESIGN_IDENTITY" "$MACOS_CODESIGN_FINGERPRINT" "$MACOS_TEAM_ID" <<'PYIDENTITY'
 import re, subprocess, sys
 name, requested, expected_team = sys.argv[1:]
@@ -152,7 +227,7 @@ HUB_PLIST="$HOME/Library/LaunchAgents/$HUB_LABEL.plist"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 SIGNER_PLIST="$HOME/Library/LaunchAgents/$SIGNER_LABEL.plist"
 LAUNCHCTL_BIN="$(command -v launchctl)"
-LAUNCHD_TOPOLOGY_GUARD="$REPO_ROOT/scripts/v2_launchd_topology_guard.py"
+LAUNCHD_TOPOLOGY_GUARD="$SUPPORT_ROOT/v2_launchd_topology_guard.py"
 [[ -f "$LAUNCHD_TOPOLOGY_GUARD" && ! -L "$LAUNCHD_TOPOLOGY_GUARD" ]] || {
   echo "REFUSED reason=launchd_topology_guard_missing_or_unsafe" >&2; exit 2;
 }
@@ -160,7 +235,7 @@ python3 "$LAUNCHD_TOPOLOGY_GUARD" check \
   --domain "$DOMAIN" --hub-label "$HUB_LABEL" --agent-label "$AGENT_LABEL" \
   --launchctl "$LAUNCHCTL_BIN" || exit 2
 
-MAINTENANCE_JOB_GUARD="$REPO_ROOT/scripts/v2_launchd_maintenance_job.py"
+MAINTENANCE_JOB_GUARD="$SUPPORT_ROOT/v2_launchd_maintenance_job.py"
 [[ -f "$MAINTENANCE_JOB_GUARD" && ! -L "$MAINTENANCE_JOB_GUARD" ]] || {
   echo "REFUSED reason=maintenance_job_guard_missing_or_unsafe" >&2; exit 2;
 }
@@ -188,7 +263,7 @@ python3 "$MAINTENANCE_JOB_GUARD" "${MAINTENANCE_GUARD_ARGS[@]}" || exit 2
 [[ -d "$HUB_STATE" && -d "$AGENT_STATE" ]] || { echo "REFUSED reason=state_directory_missing" >&2; exit 2; }
 [[ -f "$HUB_PLIST" && -f "$AGENT_PLIST" ]] || { echo "REFUSED reason=launchd_profile_missing" >&2; exit 2; }
 LEGACY_GATEWAY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_GATEWAY_LABEL.plist"
-MUTATION_AUTHORITY_PREFLIGHT="$REPO_ROOT/scripts/v2_mutation_authority_preflight.py"
+MUTATION_AUTHORITY_PREFLIGHT="$SUPPORT_ROOT/v2_mutation_authority_preflight.py"
 [[ -f "$MUTATION_AUTHORITY_PREFLIGHT" && ! -L "$MUTATION_AUTHORITY_PREFLIGHT" ]] || {
   echo "REFUSED reason=mutation_authority_preflight_missing_or_unsafe" >&2; exit 2;
 }
@@ -250,11 +325,30 @@ for key, identifier, value in found:
     print(f"{key}\t{identifier}\t{value}")
 PYHELPERS
 )" || { echo "REFUSED reason=handoff_host_executable_missing" >&2; exit 2; }
+CURRENT_HANDOFF_HELPERS="$HANDOFF_HELPERS"
+if [[ "$ARTIFACT_MODE" == "1" ]]; then
+  ARTIFACT_HANDOFF_HELPERS=""
+  while IFS=$'\t' read -r key identifier _helper; do
+    [[ -n "$key" ]] || continue
+    case "$key" in
+      CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE) helper="$HANDOFF_PAYLOAD_ROOT/takeover-webrtc-host" ;;
+      *) echo "REFUSED reason=artifact_handoff_helper_surface_unsupported" >&2; exit 2 ;;
+    esac
+    ARTIFACT_HANDOFF_HELPERS+="${key}"$'\t'"${identifier}"$'\t'"${helper}"$'\n'
+  done <<< "$HANDOFF_HELPERS"
+  HANDOFF_HELPERS="$ARTIFACT_HANDOFF_HELPERS"
+fi
 while IFS=$'\t' read -r _key _identifier helper; do
   [[ -n "$helper" ]] || continue
-  [[ "$helper" == "$ROOT"/v2/handoff/* && -f "$helper" && -x "$helper" && ! -L "$helper" ]] || {
-    echo "REFUSED reason=handoff_host_executable_unsafe" >&2; exit 2;
-  }
+  if [[ "$ARTIFACT_MODE" == "1" ]]; then
+    [[ "$helper" == "$HANDOFF_PAYLOAD_ROOT"/* && -f "$helper" && -x "$helper" && ! -L "$helper" ]] || {
+      echo "REFUSED reason=artifact_handoff_host_executable_unsafe" >&2; exit 2;
+    }
+  else
+    [[ "$helper" == "$ROOT"/v2/handoff/* && -f "$helper" && -x "$helper" && ! -L "$helper" ]] || {
+      echo "REFUSED reason=handoff_host_executable_unsafe" >&2; exit 2;
+    }
+  fi
 done <<< "$HANDOFF_HELPERS"
 CONFIGURED_HANDOFF_ROOT="$(python3 - "$HANDOFF_ENV_FILE" <<'PYHANDOFFROOT'
 import pathlib, sys
@@ -278,7 +372,9 @@ if value is None:
 print(value)
 PYHANDOFFROOT
 )" || { echo "REFUSED reason=handoff_source_root_missing" >&2; exit 2; }
-HANDOFF_SOURCE_ROOT="${CUMG_V2_HANDOFF_SOURCE_ROOT:-$CONFIGURED_HANDOFF_ROOT}"
+if [[ "$ARTIFACT_MODE" == "0" ]]; then
+  HANDOFF_SOURCE_ROOT="${CUMG_V2_HANDOFF_SOURCE_ROOT:-$CONFIGURED_HANDOFF_ROOT}"
+fi
 [[ "$HANDOFF_SOURCE_ROOT" == /* && -d "$HANDOFF_SOURCE_ROOT" && ! -L "$HANDOFF_SOURCE_ROOT" ]] || {
   echo "REFUSED reason=handoff_source_root_unsafe" >&2; exit 2;
 }
@@ -289,18 +385,16 @@ HANDOFF_SOURCE_ROOT="${CUMG_V2_HANDOFF_SOURCE_ROOT:-$CONFIGURED_HANDOFF_ROOT}"
     && -f "$HANDOFF_SOURCE_ROOT/package-lock.json" && ! -L "$HANDOFF_SOURCE_ROOT/package-lock.json" ]] || {
   echo "REFUSED reason=handoff_package_lock_missing_or_unsafe" >&2; exit 2;
 }
-[[ "$(git -C "$HANDOFF_SOURCE_ROOT" branch --show-current)" == "main" ]] || {
-  echo "REFUSED reason=handoff_branch_not_main" >&2; exit 2;
-}
-[[ -z "$(git -C "$HANDOFF_SOURCE_ROOT" status --porcelain=v1)" ]] || {
-  echo "REFUSED reason=handoff_dirty_checkout" >&2; exit 2;
-}
-git -C "$HANDOFF_SOURCE_ROOT" fetch --quiet origin main
-HANDOFF_HEAD="$(git -C "$HANDOFF_SOURCE_ROOT" rev-parse HEAD)"
-HANDOFF_ORIGIN_MAIN="$(git -C "$HANDOFF_SOURCE_ROOT" rev-parse origin/main)"
-[[ "$HANDOFF_HEAD" == "$HANDOFF_ORIGIN_MAIN" && "$HANDOFF_HEAD" == "$EXPECTED_HANDOFF_COMMIT" ]] || {
-  echo "REFUSED reason=handoff_source_commit_mismatch" >&2; exit 2;
-}
+if [[ "$ARTIFACT_MODE" == "0" ]]; then
+  [[ "$(git -C "$HANDOFF_SOURCE_ROOT" branch --show-current)" == "main" ]] || { echo "REFUSED reason=handoff_branch_not_main" >&2; exit 2; }
+  [[ -z "$(git -C "$HANDOFF_SOURCE_ROOT" status --porcelain=v1)" ]] || { echo "REFUSED reason=handoff_dirty_checkout" >&2; exit 2; }
+  git -C "$HANDOFF_SOURCE_ROOT" fetch --quiet origin main
+  HANDOFF_HEAD="$(git -C "$HANDOFF_SOURCE_ROOT" rev-parse HEAD)"
+  HANDOFF_ORIGIN_MAIN="$(git -C "$HANDOFF_SOURCE_ROOT" rev-parse origin/main)"
+  [[ "$HANDOFF_HEAD" == "$HANDOFF_ORIGIN_MAIN" && "$HANDOFF_HEAD" == "$EXPECTED_HANDOFF_COMMIT" ]] || { echo "REFUSED reason=handoff_source_commit_mismatch" >&2; exit 2; }
+else
+  [[ -f "$HANDOFF_SOURCE_ROOT/node_modules/werift/package.json" && ! -L "$HANDOFF_SOURCE_ROOT/node_modules" ]] || { echo "REFUSED reason=artifact_handoff_dependencies_missing" >&2; exit 2; }
+fi
 HANDOFF_CONTROL_SOCKET="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_CONTROL_SOCKET' "$HUB_PLIST" 2>/dev/null || true)"
 [[ "$HANDOFF_CONTROL_SOCKET" == /* ]] || { echo "REFUSED reason=handoff_control_socket_missing" >&2; exit 2; }
 python3 - "$HANDOFF_CONTROL_SOCKET" <<'PYHANDOFFSTATUS' || {
@@ -372,15 +466,22 @@ stable_codesign() {
   verify_stable_codesign "$pathname" "$identifier"
 }
 
-BUILD_FREE_KIB="$(df -Pk "$REPO_ROOT" | awk 'NR==2 {print $4}')"
-[[ "$BUILD_FREE_KIB" =~ ^[0-9]+$ ]] || { echo "REFUSED reason=build_capacity_unavailable" >&2; exit 2; }
-if (( BUILD_FREE_KIB < MIN_BUILD_FREE_MIB * 1024 )); then
-  echo "REFUSED reason=insufficient_build_capacity required_mib=$MIN_BUILD_FREE_MIB" >&2
-  exit 2
+if [[ "$ARTIFACT_MODE" == "0" ]]; then
+  BUILD_FREE_KIB="$(df -Pk "$REPO_ROOT" | awk 'NR==2 {print $4}')"
+  [[ "$BUILD_FREE_KIB" =~ ^[0-9]+$ ]] || { echo "REFUSED reason=build_capacity_unavailable" >&2; exit 2; }
+  if (( BUILD_FREE_KIB < MIN_BUILD_FREE_MIB * 1024 )); then
+    echo "REFUSED reason=insufficient_build_capacity required_mib=$MIN_BUILD_FREE_MIB" >&2
+    exit 2
+  fi
+  BUILD_FREE_MIB=$((BUILD_FREE_KIB / 1024))
+  echo "PREFLIGHT_OK source=checkout source_commit=$HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required build_jobs=$CARGO_BUILD_JOBS build_free_mib=$BUILD_FREE_MIB"
+else
+  echo "PREFLIGHT_OK source=verified_artifact source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required"
 fi
-BUILD_FREE_MIB=$((BUILD_FREE_KIB / 1024))
-echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required build_jobs=$CARGO_BUILD_JOBS build_free_mib=$BUILD_FREE_MIB"
-[[ "$PRELIGHT_ONLY" == "1" ]] && exit 0
+if [[ "$PRELIGHT_ONLY" == "1" ]]; then
+  [[ -n "$ARTIFACT_TMP" ]] && rm -rf "$ARTIFACT_TMP"
+  exit 0
+fi
 
 UPGRADE_FAILURE_STATUS="failed_before_install"
 UPGRADE_FAILURE_REASON="phase_failed"
@@ -399,6 +500,7 @@ upgrade_transaction_exit() {
       --status "$UPGRADE_FAILURE_STATUS" --reason "$UPGRADE_FAILURE_REASON" \
       --operator-action "$UPGRADE_OPERATOR_ACTION" >/dev/null 2>&1 || true
   fi
+  [[ -n "$ARTIFACT_TMP" ]] && rm -rf "$ARTIFACT_TMP" || true
   exit "$code"
 }
 trap upgrade_transaction_exit EXIT
@@ -412,32 +514,36 @@ tx_advance() {
   }
 }
 
-BUILD_ERR="$(mktemp "${TMPDIR:-/tmp}/cumg-v2-build.XXXXXX")"
-if ! cargo build -j "$CARGO_BUILD_JOBS" --release --locked \
-  --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_status --bin v2_recover --bin v2_grant_signer 2>"$BUILD_ERR"; then
-  cat "$BUILD_ERR" >&2
-  if grep -Eqi 'No space left on device|ENOSPC|os error 28' "$BUILD_ERR"; then
-    UPGRADE_FAILURE_REASON="build_storage_exhausted"
-    UPGRADE_OPERATOR_ACTION="restore_capacity_and_retry"
-  else
-    UPGRADE_FAILURE_REASON="build_failed"
+if [[ "$ARTIFACT_MODE" == "0" ]]; then
+  BUILD_ERR="$(mktemp "${TMPDIR:-/tmp}/cumg-v2-build.XXXXXX")"
+  if ! cargo build -j "$CARGO_BUILD_JOBS" --release --locked \
+    --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_status --bin v2_recover --bin v2_grant_signer 2>"$BUILD_ERR"; then
+    cat "$BUILD_ERR" >&2
+    if grep -Eqi 'No space left on device|ENOSPC|os error 28' "$BUILD_ERR"; then
+      UPGRADE_FAILURE_REASON="build_storage_exhausted"
+      UPGRADE_OPERATOR_ACTION="restore_capacity_and_retry"
+    else
+      UPGRADE_FAILURE_REASON="build_failed"
+    fi
+    rm -f "$BUILD_ERR"
+    exit 2
   fi
+  cat "$BUILD_ERR" >&2
   rm -f "$BUILD_ERR"
-  exit 2
+  "$SUPPORT_ROOT/build-macos-recovery-helper.sh" "$BUILD_BIN_DIR/v2_recovery_enclave_helper" >/dev/null
 fi
-cat "$BUILD_ERR" >&2
-rm -f "$BUILD_ERR"
-"$REPO_ROOT/scripts/build-macos-recovery-helper.sh" "$REPO_ROOT/target/release/v2_recovery_enclave_helper" >/dev/null
 for name in v2_hub v2_agent v2_maint v2_doctor v2_status v2_recover v2_recovery_enclave_helper v2_grant_signer; do
-  [[ -x "target/release/$name" ]] || { echo "REFUSED reason=build_output_missing binary=$name" >&2; exit 2; }
+  [[ -x "$BUILD_BIN_DIR/$name" && -f "$BUILD_BIN_DIR/$name" && ! -L "$BUILD_BIN_DIR/$name" ]] || {
+    echo "REFUSED reason=build_output_missing binary=$name" >&2; exit 2
+  }
 done
-stable_codesign "target/release/v2_agent" "com.github.git-ksk.cumg-v2-agent" || {
+stable_codesign "$BUILD_BIN_DIR/v2_agent" "com.github.git-ksk.cumg-v2-agent" || {
   echo "REFUSED reason=agent_stable_codesign_failed" >&2; exit 2;
 }
-stable_codesign "target/release/v2_recover" "com.github.git-ksk.cumg-v2-recover" || {
+stable_codesign "$BUILD_BIN_DIR/v2_recover" "com.github.git-ksk.cumg-v2-recover" || {
   echo "REFUSED reason=recovery_cli_stable_codesign_failed" >&2; exit 2;
 }
-stable_codesign "target/release/v2_recovery_enclave_helper" "com.github.git-ksk.cumg-v2-recovery-helper" || {
+stable_codesign "$BUILD_BIN_DIR/v2_recovery_enclave_helper" "com.github.git-ksk.cumg-v2-recovery-helper" || {
   echo "REFUSED reason=recovery_helper_stable_codesign_failed" >&2; exit 2;
 }
 
@@ -446,7 +552,7 @@ HANDOFF_RUNTIME_COMMAND="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariabl
 [[ "$HANDOFF_RUNTIME_COMMAND" == /* && -x "$HANDOFF_RUNTIME_COMMAND" ]] || {
   echo "REFUSED reason=handoff_runtime_command_missing_or_unsafe" >&2; exit 2;
 }
-HANDOFF_RUNTIME_PREFLIGHT="$REPO_ROOT/scripts/v2_handoff_runtime_preflight.py"
+HANDOFF_RUNTIME_PREFLIGHT="$SUPPORT_ROOT/v2_handoff_runtime_preflight.py"
 [[ -f "$HANDOFF_RUNTIME_PREFLIGHT" && ! -L "$HANDOFF_RUNTIME_PREFLIGHT" ]] || {
   echo "REFUSED reason=handoff_runtime_preflight_missing_or_unsafe" >&2; exit 2
 }
@@ -482,6 +588,20 @@ for base, directories, files in os.walk(root, topdown=True, followlinks=False):
         if (base / name).is_symlink():
             raise SystemExit(3)
 PYRUNTIMEDEPS
+}
+
+validate_artifact_handoff_dependencies() {
+  local runtime_root="$1"
+  [[ -f "$runtime_root/node_modules/werift/package.json" && ! -L "$runtime_root/node_modules" ]] || return 2
+  python3 - "$runtime_root/node_modules" <<'PYRUNTIMEDEPSVERIFY'
+import os,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+if root.is_symlink() or not root.is_dir(): raise SystemExit(2)
+for base, dirs, files in os.walk(root, topdown=True, followlinks=False):
+    base=pathlib.Path(base)
+    for name in [*dirs,*files]:
+        if (base/name).is_symlink(): raise SystemExit(3)
+PYRUNTIMEDEPSVERIFY
 }
 
 HANDOFF_DIR="$ROOT/v2/handoff"
@@ -550,15 +670,24 @@ else
   umask 077
   mkdir -p "$STAGE_RUNTIME/handoff-root"
   chmod 700 "$STAGE_RUNTIME" "$STAGE_RUNTIME/handoff-root"
-  cp "$REPO_ROOT/scripts/v2_handoff_runtime.mjs" "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
+  cp "$RUNTIME_SCRIPT_SOURCE" "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
   chmod 700 "$STAGE_RUNTIME/v2_handoff_runtime.mjs"
   cp -R "$HANDOFF_SOURCE_ROOT/dist" "$STAGE_RUNTIME/handoff-root/dist"
   cp "$HANDOFF_SOURCE_ROOT/package.json" "$HANDOFF_SOURCE_ROOT/package-lock.json" "$STAGE_RUNTIME/handoff-root/"
-  install_handoff_runtime_dependencies "$STAGE_RUNTIME/handoff-root" || {
-    rm -rf "$STAGE_RUNTIME"
-    echo "REFUSED reason=handoff_runtime_dependencies_install_or_symlink_validation_failed" >&2
-    exit 2
-  }
+  if [[ "$ARTIFACT_MODE" == "1" ]]; then
+    cp -R "$HANDOFF_SOURCE_ROOT/node_modules" "$STAGE_RUNTIME/handoff-root/node_modules"
+    validate_artifact_handoff_dependencies "$STAGE_RUNTIME/handoff-root" || {
+      rm -rf "$STAGE_RUNTIME"
+      echo "REFUSED reason=artifact_handoff_runtime_dependencies_invalid" >&2
+      exit 2
+    }
+  else
+    install_handoff_runtime_dependencies "$STAGE_RUNTIME/handoff-root" || {
+      rm -rf "$STAGE_RUNTIME"
+      echo "REFUSED reason=handoff_runtime_dependencies_install_or_symlink_validation_failed" >&2
+      exit 2
+    }
+  fi
   python3 "$HANDOFF_RUNTIME_PREFLIGHT" verify-import \
     --runtime-command "$HANDOFF_RUNTIME_COMMAND_RESOLVED" \
     --entrypoint "$STAGE_RUNTIME/handoff-root/dist/index.js" \
@@ -639,12 +768,16 @@ while IFS=$'\t' read -r key identifier helper; do
   archived="$ROLLBACK/handoff/helper-$HELPER_INDEX"
   cp -p "$helper" "$archived"
   printf '%s\t%s\t%s\t%s\n' "$key" "$identifier" "$helper" "$archived" >> "$ROLLBACK/handoff/paths.tsv"
-done <<< "$HANDOFF_HELPERS"
+done <<< "$CURRENT_HANDOFF_HELPERS"
 cp -p "$HANDOFF_ENV_FILE" "$ROLLBACK/handoff/managed-runtime.env"
 chmod 600 "$ROLLBACK/handoff/managed-runtime.env"
 cp -R "$CURRENT_HANDOFF_RUNTIME" "$ROLLBACK/handoff/runtime-generation"
 if [[ ! -f "$ROLLBACK/handoff/runtime-generation/handoff-root/dist/index.js" \
       || ! -f "$ROLLBACK/handoff/runtime-generation/handoff-root/node_modules/werift/package.json" ]]; then
+  if [[ "$ARTIFACT_MODE" == "1" ]]; then
+    echo "REFUSED reason=rollback_handoff_runtime_not_self_contained rollback=$ROLLBACK" >&2
+    exit 2
+  fi
   mkdir -p "$ROLLBACK/handoff/runtime-generation/handoff-root"
   rm -rf "$ROLLBACK/handoff/runtime-generation/handoff-root/dist" "$ROLLBACK/handoff/runtime-generation/handoff-root/node_modules"
   cp -R "$HANDOFF_SOURCE_ROOT/dist" "$ROLLBACK/handoff/runtime-generation/handoff-root/dist"
@@ -737,14 +870,14 @@ fi
 tx_advance --flag quarantine_clear
 tx_advance --phase authority_migration
 if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
-  if ! target/release/v2_maint mutation-authority-init \
+  if ! "$BUILD_BIN_DIR/v2_maint" mutation-authority-init \
     --authority-dir "$MUTATION_AUTHORITY_DIR" --owner v2 >/dev/null; then
     echo "REFUSED reason=mutation_authority_initialization_failed rollback=$ROLLBACK services_stopped=1" >&2
     exit 2
   fi
   MUTATION_AUTHORITY_CREATED=1
 fi
-AUTHORITY_JSON="$(target/release/v2_maint mutation-authority-status --authority-dir "$MUTATION_AUTHORITY_DIR")" || {
+AUTHORITY_JSON="$("$BUILD_BIN_DIR/v2_maint" mutation-authority-status --authority-dir "$MUTATION_AUTHORITY_DIR")" || {
   UPGRADE_FAILURE_REASON="mutation_authority_status_failed"
   echo "REFUSED reason=mutation_authority_status_failed rollback=$ROLLBACK services_stopped=1" >&2
   exit 2
@@ -855,11 +988,15 @@ install_atomic() {
   mv -f "$tmp" "$destination"
 }
 for name in v2_hub v2_agent v2_maint v2_doctor v2_status v2_recover v2_recovery_enclave_helper v2_grant_signer; do
-  install_atomic "target/release/$name" "$BIN_DIR/$name"
+  install_atomic "$BUILD_BIN_DIR/$name" "$BIN_DIR/$name"
 done
 
-PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"]=="computer-use-mcp-gateway"))')"
-HUB_AGENT_SCHEMA_VERSION="$(python3 - "$REPO_ROOT/src/v2_m0_transport.rs" <<'PYSCHEMA'
+if [[ "$ARTIFACT_MODE" == "1" ]]; then
+  PACKAGE_VERSION="$ARTIFACT_PACKAGE_VERSION"
+  HUB_AGENT_SCHEMA_VERSION="$ARTIFACT_HUB_AGENT_SCHEMA_VERSION"
+else
+  PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"]=="computer-use-mcp-gateway"))')"
+  HUB_AGENT_SCHEMA_VERSION="$(python3 - "$REPO_ROOT/src/v2_m0_transport.rs" <<'PYSCHEMA'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 match = re.search(r'pub const HUB_AGENT_SCHEMA_VERSION: u16 = ([0-9]+);', text)
@@ -867,7 +1004,8 @@ if not match:
     raise SystemExit(2)
 print(match.group(1))
 PYSCHEMA
-)" || { echo "REFUSED reason=hub_agent_schema_unavailable" >&2; exit 2; }
+  )" || { echo "REFUSED reason=hub_agent_schema_unavailable" >&2; exit 2; }
+fi
 MANIFEST_TMP="$ROOT/runtime-manifest.json.new.$$"
 python3 - "$HEAD" "$PACKAGE_VERSION" "$HUB_AGENT_SCHEMA_VERSION" "$BIN_DIR" > "$MANIFEST_TMP" <<'PY'
 import hashlib, json, pathlib, sys
@@ -976,7 +1114,7 @@ tx_advance --phase cleanup
 UPGRADE_FAILURE_STATUS="operator_action_required"
 UPGRADE_FAILURE_REASON="cleanup_safety_refusal"
 UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
-if ! python3 "$REPO_ROOT/scripts/v2_handoff_runtime_cleanup.py" \
+if ! python3 "$SUPPORT_ROOT/v2_handoff_runtime_cleanup.py" \
   --install-root "$ROOT" \
   --agent-plist "$AGENT_PLIST" \
   --rollback-root "$ROOT/rollback" \
@@ -997,4 +1135,9 @@ python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" c
   exit 4
 }
 UPGRADE_TRANSACTION_ACTIVE=0
-echo "UPGRADE_OK source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD runtime_generation=$NEW_RUNTIME_NAME rollback=$ROLLBACK"
+[[ -n "$ARTIFACT_TMP" ]] && rm -rf "$ARTIFACT_TMP" && ARTIFACT_TMP=""
+if [[ "$ARTIFACT_MODE" == "1" ]]; then
+  echo "UPGRADE_OK source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD runtime_generation=$NEW_RUNTIME_NAME rollback=$ROLLBACK source=verified_artifact"
+else
+  echo "UPGRADE_OK source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD runtime_generation=$NEW_RUNTIME_NAME rollback=$ROLLBACK source=checkout"
+fi

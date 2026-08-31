@@ -20,12 +20,12 @@ import tempfile
 import zipfile
 
 MANIFEST_NAME = "release-artifact-manifest.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
-MAX_ARCHIVE_MEMBERS = 32
+MAX_ARCHIVE_MEMBERS = 64
 
 COMMON_BINARIES = (
     "v2_hub",
@@ -37,9 +37,29 @@ COMMON_BINARIES = (
 UNIX_BINARIES = ("v2_grant_signer", "v2_handoff_ctl")
 PLATFORM_BINARIES = {
     "linux": COMMON_BINARIES + UNIX_BINARIES,
-    "macos": COMMON_BINARIES + UNIX_BINARIES + ("v2_doctor", "v2_status"),
+    "macos": COMMON_BINARIES + UNIX_BINARIES + ("v2_doctor", "v2_status", "v2_recover", "v2_recovery_enclave_helper"),
     "windows": COMMON_BINARIES,
 }
+
+MACOS_INSTALL_ASSETS = (
+    "install/v2_artifact_install.py",
+    "install/v2_artifact_payload.py",
+    "install/v2_release_candidate.py",
+    "install/v2-single-mac-upgrade.sh",
+    "install/v2_launchd_maintenance_job.py",
+    "install/v2_upgrade_transaction.py",
+    "install/v2_launchd_topology_guard.py",
+    "install/v2_mutation_authority_preflight.py",
+    "install/v2_handoff_runtime_preflight.py",
+    "install/v2_handoff_runtime_cleanup.py",
+    "install/README.md",
+    "install/single-mac-profile.example.json",
+    "launchd/com.github.git-ksk.cumg-v2-agent.plist",
+    "launchd/com.github.git-ksk.cumg-v2-grant-signer.plist",
+    "launchd/com.github.git-ksk.cumg-v2-hub.plist",
+    "components/handoff-runtime.tar.gz",
+)
+INSTALL_PROFILE = "single-mac-artifact-v1"
 
 SEMVER_RE = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+"
@@ -102,6 +122,13 @@ def expected_binary_paths(platform_name: str) -> tuple[str, ...]:
     return tuple(f"bin/{name}{suffix}" for name in PLATFORM_BINARIES[platform_name])
 
 
+def expected_artifact_paths(platform_name: str) -> tuple[str, ...]:
+    binaries = expected_binary_paths(platform_name)
+    if platform_name == "macos":
+        return binaries + MACOS_INSTALL_ASSETS
+    return binaries
+
+
 def bundle_name(package_version: str, platform_name: str, architecture: str) -> str:
     return f"cumg-v{package_version}-{platform_name}-{architecture}"
 
@@ -144,6 +171,8 @@ def write_manifest(
     source_commit: str,
     platform_name: str,
     architecture: str,
+    hub_agent_schema_version: int,
+    paired_handoff_commit: str | None,
     records: list[dict[str, object]],
 ) -> None:
     manifest = {
@@ -152,6 +181,9 @@ def write_manifest(
         "source_commit": source_commit,
         "platform": platform_name,
         "architecture": architecture,
+        "hub_agent_schema_version": hub_agent_schema_version,
+        "paired_handoff_commit": paired_handoff_commit,
+        "install_profile": INSTALL_PROFILE if platform_name == "macos" else None,
         "files": records,
     }
     encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -223,6 +255,16 @@ def build_candidate(args: argparse.Namespace) -> Path:
     architecture = normalized_architecture(args.architecture)
     package_version = validate_package_version(args.package_version)
     source_commit = validate_source_commit(args.source_commit)
+    hub_agent_schema_version = int(args.hub_agent_schema_version)
+    if not 1 <= hub_agent_schema_version <= 65535:
+        raise CandidateError("Hub/Agent schema version is invalid")
+    paired_handoff_commit = None
+    payload_dir = None
+    if platform_name == "macos":
+        paired_handoff_commit = validate_source_commit(args.paired_handoff_commit)
+        payload_dir = Path(args.payload_dir)
+        if not payload_dir.is_dir() or payload_dir.is_symlink():
+            raise CandidateError("macOS install payload directory must be a real directory")
 
     if not binary_dir.is_dir() or binary_dir.is_symlink():
         raise CandidateError("binary directory must be a real directory")
@@ -257,12 +299,34 @@ def build_candidate(args: argparse.Namespace) -> Path:
                 }
             )
 
+        if platform_name == "macos":
+            assert payload_dir is not None
+            for relative in MACOS_INSTALL_ASSETS:
+                relative_path = validate_relative_path(relative)
+                source = payload_dir.joinpath(*relative_path.parts)
+                try:
+                    info = source.lstat()
+                except FileNotFoundError as exc:
+                    raise CandidateError(f"required install asset is missing: {relative}") from exc
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    raise CandidateError(f"required install asset is not regular: {relative}")
+                if info.st_size <= 0 or info.st_size > MAX_FILE_BYTES:
+                    raise CandidateError(f"required install asset has invalid size: {relative}")
+                destination = bundle_root.joinpath(*relative_path.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                if relative.startswith("install/"):
+                    destination.chmod(0o755)
+                records.append({"path": relative, "size": destination.stat().st_size, "sha256": sha256_file(destination)})
+
         write_manifest(
             bundle_root,
             package_version,
             source_commit,
             platform_name,
             architecture,
+            hub_agent_schema_version,
+            paired_handoff_commit,
             records,
         )
         verify_bundle_dir(bundle_root)
@@ -299,6 +363,9 @@ def load_manifest(bundle_root: Path) -> dict[str, object]:
         "source_commit",
         "platform",
         "architecture",
+        "hub_agent_schema_version",
+        "paired_handoff_commit",
+        "install_profile",
         "files",
     }
     if set(manifest) != expected_keys:
@@ -317,13 +384,24 @@ def verify_bundle_dir(bundle_root: Path) -> dict[str, object]:
     source_commit = validate_source_commit(str(manifest["source_commit"]))
     platform_name = normalized_platform(str(manifest["platform"]))
     architecture = normalized_architecture(str(manifest["architecture"]))
+    schema_value = manifest["hub_agent_schema_version"]
+    if not isinstance(schema_value, int) or isinstance(schema_value, bool) or not 1 <= schema_value <= 65535:
+        raise CandidateError("manifest Hub/Agent schema version is invalid")
+    paired = manifest["paired_handoff_commit"]
+    profile = manifest["install_profile"]
+    if platform_name == "macos":
+        validate_source_commit(str(paired))
+        if profile != INSTALL_PROFILE:
+            raise CandidateError("macOS install profile is invalid")
+    elif paired is not None or profile is not None:
+        raise CandidateError("non-macOS candidate must not declare single-Mac pairing")
     if bundle_root.name != bundle_name(package_version, platform_name, architecture):
         raise CandidateError("bundle directory name does not match manifest identity")
 
     records = manifest["files"]
     if not isinstance(records, list):
         raise CandidateError("manifest files must be an array")
-    expected = set(expected_binary_paths(platform_name))
+    expected = set(expected_artifact_paths(platform_name))
     if len(records) != len(expected):
         raise CandidateError("manifest file count does not match the platform allowlist")
 
@@ -357,7 +435,7 @@ def verify_bundle_dir(bundle_root: Path) -> dict[str, object]:
             raise CandidateError(f"manifested file size differs: {relative}")
         if sha256_file(path) != digest:
             raise CandidateError(f"manifested file SHA-256 differs: {relative}")
-        if platform_name != "windows" and os.name != "nt" and info.st_mode & 0o111 == 0:
+        if relative.startswith("bin/") and platform_name != "windows" and os.name != "nt" and info.st_mode & 0o111 == 0:
             raise CandidateError(f"manifested Unix binary is not executable: {relative}")
 
     if seen != expected:
@@ -519,13 +597,21 @@ def smoke_bundle(bundle_root: Path) -> None:
     platform_name = str(manifest["platform"])
     if platform_name != current_platform():
         raise CandidateError("release-candidate smoke must run on its native platform")
-    records = manifest["files"]
-    assert isinstance(records, list)
-    for record in records:
-        assert isinstance(record, dict)
-        binary = bundle_root.joinpath(*PurePosixPath(str(record["path"])).parts)
+    record_by_path = {
+        str(record["path"]): record
+        for record in manifest["files"]
+        if isinstance(record, dict) and "path" in record
+    }
+    for relative in expected_binary_paths(platform_name):
+        if relative not in record_by_path:
+            raise CandidateError(f"packaged binary is missing from manifest: {relative}")
+        binary = bundle_root.joinpath(*PurePosixPath(relative).parts)
+        # The Secure Enclave helper is an internal bounded IPC executable, not a Clap CLI.
+        # Its reviewed non-interactive smoke contract is --version; generate/sign/public would
+        # access key material or LocalAuthentication and must never be triggered by packaging CI.
+        smoke_arg = "--version" if binary.name == "v2_recovery_enclave_helper" else "--help"
         result = subprocess.run(
-            [str(binary), "--help"],
+            [str(binary), smoke_arg],
             cwd=bundle_root,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -549,6 +635,9 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--source-commit", required=True)
     build.add_argument("--platform", required=True)
     build.add_argument("--architecture", required=True)
+    build.add_argument("--hub-agent-schema-version", required=True, type=int)
+    build.add_argument("--paired-handoff-commit")
+    build.add_argument("--payload-dir")
 
     verify = commands.add_parser("verify", help="verify checksum, safely extract, and verify bundle")
     verify.add_argument("--archive", required=True)
@@ -558,7 +647,7 @@ def parser() -> argparse.ArgumentParser:
     verify_dir = commands.add_parser("verify-dir", help="verify an already-extracted bundle")
     verify_dir.add_argument("--bundle-dir", required=True)
 
-    smoke = commands.add_parser("smoke", help="run safe --help smoke from an extracted native bundle")
+    smoke = commands.add_parser("smoke", help="run safe non-effectful smoke from an extracted native bundle")
     smoke.add_argument("--bundle-dir", required=True)
     return root
 
