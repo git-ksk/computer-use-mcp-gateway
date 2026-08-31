@@ -196,6 +196,18 @@ Do not run a newer arbitrary `v2_maint` checkout against an older deployed Hub's
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full inspection, reconciliation, retirement, and offline-recovery contracts.
 
+## Single-Mac upgrade caller disconnected or timed out
+
+Do not infer success or start a second upgrade from the client timeout. The reviewed upgrade persists its last durable maintenance phase independently of the invoking MCP/client. Inspect it with:
+
+```bash
+v2_maint upgrade-status
+```
+
+The record is read-only operational evidence and never authorizes replay, quarantine resolution, rollback, or mutation-authority transfer. `in_progress` means the last phase was durably recorded but no terminal result was established. Check `python3 scripts/v2_launchd_maintenance_job.py inspect`: if the same one-shot job is still active, do not launch another job; if no job is active and the transaction remains `in_progress`, treat it as incomplete and inspect the recorded phase before any recovery. `failed_before_install` means the install boundary was not crossed. `failed_closed_after_stop` means services may intentionally remain stopped; inspect the recorded rollback asset before explicit recovery. `operator_action_required` means restore/cleanup/status handling did not prove a clean terminal state.
+
+For build failures, the source path defaults to `CUMG_V2_CARGO_BUILD_JOBS=2` and refuses preflight below `CUMG_V2_MIN_BUILD_FREE_MIB=6144`. A Cargo `ENOSPC`/`No space left on device` after preflight is recorded as `build_storage_exhausted` and exits before service drain, mutation-authority migration, or install. Restore capacity and make a fresh explicit upgrade attempt only after `upgrade-status` shows `failed_before_install`; do not delete Git WIP/untracked files as automatic cleanup.
+
 ## MCP connects but shows no tools
 
 The gateway is **deny-by-default**. An empty allowlist is intentionally a valid zero-tool configuration.

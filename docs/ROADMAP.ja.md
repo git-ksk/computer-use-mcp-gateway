@@ -56,7 +56,7 @@ completion provable?
 
 released safety regression を示す新しい evidence がない限り、次の順序を使います。
 
-1. **独立して進められる foundation:** #226 lane-scoped readiness、#233 operator-ready incident brief、#234 durable / inspectable single-Mac upgrade transaction。
+1. **完了済み operator foundation:** #226 lane-scoped readiness、#233 operator-ready incident brief、#234 durable / inspectable single-Mac upgrade transaction は完了し、#235 が統合する入力を提供します。
 2. **統合 operator surface:** #235 がそれらの signal を、authority/state machine を複製せず1つの privacy-safe status view にまとめる。
 3. **guided product workflow:** #236 が explicit Human choice と durable completion verification を通る quarantine recovery を案内し、#237 が reviewed single-Mac install/upgrade を source-tree compilation から verified artifact へ移す。prerequisite が揃えば両者は並行可能。
 4. **その後 Recovery & Reconciliation を拡張:** #217 と split provider の #227（Windows Hello/WebAuthn）、#228（Linux FIDO2 UV）は `0.4.0` work とする。
@@ -157,7 +157,7 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 repository の open issue は、work が roadmap の可視性から黙って抜け落ちないよう working milestone ごとに分類します。これらの milestone は ordering / admission guidance であり、evidence により split / defer が必要になった場合まで同時 ship を約束するものではありません。
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate を所有します。active な operator/product sequence は #226/#233/#234 -> #235 -> #236/#237 です。#224 は完了済みで、#237 が利用する release-candidate artifact boundary を提供します。その他の compatible work は #215 hosted-Hub design、#109 durable online-recovery completion confirmation、#115 actionable `Indeterminate` UX、#104 filesystem/process-root separation、#111 latency/concurrency evidence、bounded な #96 Unix containment investigation です。
+- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate を所有します。#226/#233/#234 の foundation set は完了し、active な operator/product sequence は #235 -> #236/#237 です。#224 は完了済みで、#237 が利用する release-candidate artifact boundary を提供します。その他の compatible work は #215 hosted-Hub design、#109 durable online-recovery completion confirmation、#115 actionable `Indeterminate` UX、#104 filesystem/process-root separation、#111 latency/concurrency evidence、bounded な #96 Unix containment investigation です。
 - **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離、#217 が cross-platform user-presence recovery parity を所有し、#227 Windows Hello/WebAuthn と #228 Linux FIDO2 UV に split しています。production evidence が priority を変えない限り、これら provider 実装は直近 `0.3.x` Product Readiness sequence の後に進めます。
 - **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity、#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
 - **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。

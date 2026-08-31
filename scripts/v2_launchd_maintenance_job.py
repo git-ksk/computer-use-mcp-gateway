@@ -60,6 +60,8 @@ SAFE_UPGRADE_ENV_KEYS = (
     "CUMG_V2_MACOS_TEAM_ID",
     "CUMG_V2_HANDOFF_SOURCE_ROOT",
     "CUMG_V2_EXPECTED_HANDOFF_COMMIT",
+    "CUMG_V2_CARGO_BUILD_JOBS",
+    "CUMG_V2_MIN_BUILD_FREE_MIB",
 )
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
