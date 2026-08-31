@@ -64,6 +64,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
     std::fs::set_permissions(&agent_state, std::fs::Permissions::from_mode(0o700))?;
     let app_marker = state_root.join("app-launched");
     let ambiguous_click_marker = state_root.join("ambiguous-click");
+    let successful_click_marker = state_root.join("successful-click");
     let drag_marker = state_root.join("drag-calls");
     let cancel_marker = state_root.join("drag-cancels");
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/mock_cua_mcp_backend.py");
@@ -129,6 +130,8 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
                     fixture.to_string_lossy().into_owned(),
                     "--ambiguous-click-marker".into(),
                     ambiguous_click_marker.to_string_lossy().into_owned(),
+                    "--successful-click-marker".into(),
+                    successful_click_marker.to_string_lossy().into_owned(),
                     "--drag-marker".into(),
                     drag_marker.to_string_lossy().into_owned(),
                     "--cancel-marker".into(),
@@ -269,6 +272,76 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
         )
         .await?;
     assert!(handle.desktop_quarantine().await.is_none());
+
+    // Model a caller losing the response after a successful GUI dispatch. The
+    // caller retained the stable operation id before dispatch, so recovery is a
+    // read-only ledger lookup and never replays the click.
+    let lost_response_operation = "op_22222222222222222222222222222222".to_owned();
+    let lost_response = handle
+        .start_command_as_with_id(
+            alice.clone(),
+            lost_response_operation.clone(),
+            DeviceCommand::PointerClick {
+                x: 31,
+                y: 41,
+                button: computer_use_mcp_gateway::v2_m0::PointerButton::Left,
+            },
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !successful_click_marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("successful GUI click never crossed the fixture dispatch boundary")?;
+    drop(lost_response);
+
+    let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match handle
+                .operation_recovery_as(alice.clone(), &lost_response_operation)
+                .await
+            {
+                Ok(recovery) if recovery.state == HubOperationState::Completed => break recovery,
+                Ok(_) | Err(HubCommandError::UnknownOperation) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("unexpected GUI recovery lookup error: {error:?}"),
+            }
+        }
+    })
+    .await
+    .context("lost GUI response did not become durably recoverable")?;
+    assert_eq!(
+        recovered.result,
+        Some(computer_use_mcp_gateway::v2_execution_safety::RecoverableOperationResult::EffectfulStatus)
+    );
+    assert_eq!(
+        recovered.receipt.unwrap().evidence,
+        ExecutionEvidence::VerifiedAgentResult
+    );
+    assert!(handle.desktop_quarantine().await.is_none());
+    assert_eq!(
+        handle
+            .operation_recovery_as(bob.clone(), &lost_response_operation)
+            .await,
+        Err(HubCommandError::UnknownOperation)
+    );
+    let replay = handle
+        .start_command_as_with_id(
+            alice.clone(),
+            lost_response_operation.clone(),
+            DeviceCommand::PointerClick {
+                x: 31,
+                y: 41,
+                button: computer_use_mcp_gateway::v2_m0::PointerButton::Left,
+            },
+        )
+        .await?;
+    assert_eq!(replay.wait().await, Err(HubCommandError::OperationReplay));
+    let click_calls = std::fs::read_to_string(&successful_click_marker)?;
+    assert_eq!(click_calls.lines().count(), 1);
 
     let pending = handle
         .start_command_as(

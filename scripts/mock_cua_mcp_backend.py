@@ -19,6 +19,7 @@ DRAG_MARKER: Path | None = None
 CANCEL_MARKER: Path | None = None
 TRANSFER_MARKER: Path | None = None
 AMBIGUOUS_CLICK_MARKER: Path | None = None
+SUCCESSFUL_CLICK_MARKER: Path | None = None
 AMBIGUOUS_BROWSER_CLICK_MARKER: Path | None = None
 DROP_AFTER_CLICK_MARKER: Path | None = None
 FAIL_LIST_APPS = False
@@ -35,6 +36,7 @@ def args() -> argparse.Namespace:
     parser.add_argument("--cancel-marker")
     parser.add_argument("--transfer-marker")
     parser.add_argument("--ambiguous-click-marker")
+    parser.add_argument("--successful-click-marker")
     parser.add_argument("--ambiguous-browser-click-marker")
     parser.add_argument("--drop-after-click-marker")
     parser.add_argument("--fail-list-apps", action="store_true")
@@ -120,10 +122,18 @@ def handle_request(message: dict) -> None:
     elif name == "get_screen_size":
         success(request_id, {"width": 1440, "height": 900, "scale_factor": 2.0})
     elif name == "click":
+        arguments = params.get("arguments") or {}
         if DROP_AFTER_CLICK_MARKER is not None:
             append(DROP_AFTER_CLICK_MARKER, {"tool": name, "dispatched": True})
             raise SystemExit(0)
-        if AMBIGUOUS_CLICK_MARKER is not None:
+        if (
+            SUCCESSFUL_CLICK_MARKER is not None
+            and arguments.get("x") == 31
+            and arguments.get("y") == 41
+        ):
+            append(SUCCESSFUL_CLICK_MARKER, {"tool": name, "dispatched": True})
+            success(request_id)
+        elif AMBIGUOUS_CLICK_MARKER is not None:
             append(AMBIGUOUS_CLICK_MARKER, {"tool": name, "dispatched": True})
             result(
                 request_id,
@@ -235,7 +245,8 @@ def handle_notification(message: dict) -> None:
 
 def main() -> None:
     global DRAG_MARKER, CANCEL_MARKER, TRANSFER_MARKER
-    global AMBIGUOUS_CLICK_MARKER, AMBIGUOUS_BROWSER_CLICK_MARKER, DROP_AFTER_CLICK_MARKER
+    global AMBIGUOUS_CLICK_MARKER, SUCCESSFUL_CLICK_MARKER
+    global AMBIGUOUS_BROWSER_CLICK_MARKER, DROP_AFTER_CLICK_MARKER
     global FAIL_LIST_APPS
     global SLOW_BROWSER_UPLOAD, SLOW_BROWSER_DOWNLOAD
     global FAIL_BROWSER_UPLOAD, FAIL_BROWSER_DOWNLOAD, DOWNLOAD_PAYLOAD
@@ -245,6 +256,9 @@ def main() -> None:
     TRANSFER_MARKER = Path(parsed.transfer_marker) if parsed.transfer_marker else None
     AMBIGUOUS_CLICK_MARKER = (
         Path(parsed.ambiguous_click_marker) if parsed.ambiguous_click_marker else None
+    )
+    SUCCESSFUL_CLICK_MARKER = (
+        Path(parsed.successful_click_marker) if parsed.successful_click_marker else None
     )
     AMBIGUOUS_BROWSER_CLICK_MARKER = (
         Path(parsed.ambiguous_browser_click_marker)
