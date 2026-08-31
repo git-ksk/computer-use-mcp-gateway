@@ -30,7 +30,7 @@ Secrets and durable state live outside the repository under:
 ~/Library/Application Support/computer-use-mcp-gateway/
 ```
 
-Directories containing state, secrets, trust material, or rollback assets must be owner-private (`0700`). The signer runtime directory is kept separately under the shorter `~/Library/Caches/cumg-v2/` path to stay well below macOS Unix-domain socket path limits and must also be `0700`. Secret files must be owner-private (`0600`). Do not place secret values in plist files, runtime manifests, command output, or issue logs.
+Directories containing state, secrets, trust material, or rollback assets must be owner-private (`0700`). The signer runtime directory is kept separately under the shorter `~/Library/Caches/cumg-v2/` path to stay well below macOS Unix-domain socket path limits and must also be `0700`. Secret files must be owner-private (`0600`). Do not place secret values in plist files, runtime manifests, command output, or issue logs. For coherent backup/restore of this state and the exact paired runtime, follow [`V2_BACKUP_RESTORE.md`](V2_BACKUP_RESTORE.md); a live directory copy is not an application-consistent backup.
 
 ## Reviewed LaunchAgents
 

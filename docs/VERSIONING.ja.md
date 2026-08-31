@@ -120,10 +120,11 @@ normative install/upgrade/distribution contract は [`v2/V2_RELEASE_ARTIFACTS.ja
 3. `Cargo.toml` と対応する `Cargo.lock` package version を更新。
 4. `CHANGELOG.md` に release section を追加し、compatibility/breaking note と meaningful acceptance evidence を記載。
 5. 新しい released state を表す必要がある status/version reference のみ更新。
-6. required CI と change class が要求する release-specific acceptance を実行。
-7. protected `main` process で release PR を merge。
-8. merge 後の `main` commit に annotated `vMAJOR.MINOR.PATCH` tag を作成。
-9. matching GitHub Release を作成。0.x は pre-release、`1.0.0` 以降は alpha/beta/RC を明示する場合を除き stable とする。
+6. admitted release scope について恒久 checklist [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) を完了し、各項目に evidence または scope に基づく明示的 N/A rationale を記録。
+7. required CI と change class が要求する release-specific acceptance を実行。
+8. protected `main` process で release PR を merge。
+9. merge 後の `main` commit に annotated `vMAJOR.MINOR.PATCH` tag を作成。
+10. matching GitHub Release を作成。0.x は pre-release、`1.0.0` 以降は alpha/beta/RC を明示する場合を除き stable とする。
 
 published tag は immutable です。release tag を移動・再利用しません。問題があれば新しい patch/minor release で fix forward します。
 

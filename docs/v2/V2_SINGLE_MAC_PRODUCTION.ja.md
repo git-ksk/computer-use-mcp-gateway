@@ -30,7 +30,7 @@ secret と durable state は repository 外の以下に置きます。
 ~/Library/Application Support/computer-use-mcp-gateway/
 ```
 
-state、secret、trust material、rollback asset を含む directory は owner-private (`0700`) とします。signer runtime directory は macOS の Unix-domain socket path 長制限に十分余裕を持たせるため、短い `~/Library/Caches/cumg-v2/` に分離し、ここも `0700` とします。secret file は `0600` とします。secret value を plist、runtime manifest、command output、Issue log に入れてはいけません。
+state、secret、trust material、rollback asset を含む directory は owner-private (`0700`) とします。signer runtime directory は macOS の Unix-domain socket path 長制限に十分余裕を持たせるため、短い `~/Library/Caches/cumg-v2/` に分離し、ここも `0700` とします。secret file は `0600` とします。secret value を plist、runtime manifest、command output、Issue log に入れてはいけません。この state と exact paired runtime の coherent backup/restore は [`V2_BACKUP_RESTORE.ja.md`](V2_BACKUP_RESTORE.ja.md) に従い、live directory の単純copyを application-consistent backup とみなしません。
 
 ## Reviewed LaunchAgents
 
