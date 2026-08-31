@@ -167,7 +167,18 @@ v2_maint audit-reconciliation \
   --operation-id op_...
 ```
 
-Both commands are read-only and may run while the services are live. They do not clear quarantine, sign recovery authority, contact the backend, or replay work. Treat legacy terminal markers, request/fingerprint matches, reconnect, elapsed time, and heuristic UI/application state as non-authoritative unless the audit explicitly reports an accepted authoritative proof. If evidence remains insufficient, keep quarantine intact.
+For the normal operator view, generate the incident brief instead of manually combining those outputs:
+
+```bash
+v2_maint incident-brief \
+  --state-dir /var/lib/cumg-v2/hub \
+  --agent-state-dir /var/lib/cumg-v2/agent \
+  --operation-id op_... \
+  --mutation-authority-dir /var/lib/cumg-v2/mutation-authority \
+  --format text
+```
+
+These inspection commands are read-only and may run while the services are live. They do not clear quarantine, sign recovery authority, contact the backend, or replay work. `incident-brief` embeds the exact reconciliation audit and can optionally add only allowlisted observational findings from an owner-private diagnostics JSON file; those observations cannot widen `supported_decisions`. Treat legacy terminal markers, request/fingerprint matches, reconnect, elapsed time, and heuristic UI/application state as non-authoritative unless the audit explicitly reports an accepted authoritative proof. If evidence remains insufficient, keep quarantine intact.
 
 Choose a manual decision only from independent evidence for the exact operation: `confirmed_completed` requires proof that the intended effect completed; `confirmed_not_executed` requires proof that no effect occurred; `confirmed_effect_applied_uncommitted` is reserved for the bounded text-input case where input delivery occurred but a distinct submit/commit did not. None makes the old operation retry-safe.
 
