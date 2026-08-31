@@ -1,5 +1,6 @@
 use crate::mutation_authority::inspect_mutation_authority;
 use crate::v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control};
+use crate::v2_m0::{CapabilityClass, DeviceCapability};
 use crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, HubPersistentState};
 use crate::v2_maintenance::inspect_quarantines_read_only;
@@ -92,10 +93,54 @@ pub struct MutationAuthoritySummary {
     pub epoch: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneReadiness {
+    Ready,
+    IndeterminateFenced,
+    Unavailable,
+    Unsupported,
+    Unknown,
+}
+
+impl LaneReadiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::IndeterminateFenced => "indeterminate_fenced",
+            Self::Unavailable => "unavailable",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadinessLanes {
+    pub control_plane: LaneReadiness,
+    pub computer_use_observation: LaneReadiness,
+    pub filesystem_observation: LaneReadiness,
+    pub effectful_execution: LaneReadiness,
+    pub browser_effectful_execution: LaneReadiness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadinessSummary {
+    pub device: String,
+    pub lanes: ReadinessLanes,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocking_operation_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocking_operation_retry_safe: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_action: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
     pub schema_version: u16,
     pub overall: String,
+    pub readiness: ReadinessSummary,
     pub runtime: RuntimeSummary,
     pub hub: HubSummary,
     pub agent: AgentSummary,
@@ -157,7 +202,8 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     // configured Agent. A caller-provided operation ID or environment marker is never trusted.
     let in_band_live_agent_path =
         transport_established && agent_pid.is_some_and(current_process_descends_from);
-    let (hub, hub_device_id) = inspect_hub(config, in_band_live_agent_path, &mut checks);
+    let (hub, hub_device_id, supported_capabilities) =
+        inspect_hub(config, in_band_live_agent_path, &mut checks);
     let agent = inspect_agent(
         config,
         hub_device_id.as_deref(),
@@ -201,6 +247,14 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         inspect_handoff_recovery(socket, &mut checks);
     }
 
+    let readiness = summarize_readiness(
+        &checks,
+        hub.live_quarantine_count,
+        supported_capabilities.as_deref(),
+        config.cua_command.is_some(),
+        mutation_authority.as_ref(),
+    );
+
     let overall = if checks
         .iter()
         .any(|check| check.status == CheckStatus::Error)
@@ -219,6 +273,7 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     DoctorReport {
         schema_version: 1,
         overall,
+        readiness,
         runtime,
         hub,
         agent,
@@ -372,7 +427,7 @@ fn inspect_hub(
     config: &DoctorConfig,
     in_band_agent_descendant: bool,
     checks: &mut Vec<DoctorCheck>,
-) -> (HubSummary, Option<String>) {
+) -> (HubSummary, Option<String>, Option<Vec<DeviceCapability>>) {
     let mut summary = HubSummary {
         state_schema: None,
         registry_schema: None,
@@ -392,7 +447,7 @@ fn inspect_hub(
                 CheckStatus::Error,
                 "invalid_state_directory",
             );
-            return (summary, None);
+            return (summary, None, None);
         }
     };
     let state = match store.load_latest::<HubPersistentState>() {
@@ -404,7 +459,7 @@ fn inspect_hub(
                 CheckStatus::Error,
                 "checkpoint_unreadable_or_unsafe",
             );
-            return (summary, None);
+            return (summary, None, None);
         }
     };
     summary.state_schema = Some(state.schema_version);
@@ -416,6 +471,9 @@ fn inspect_hub(
         None
     };
     let device_id = device.map(|device| device.device_id.clone());
+    let supported_capabilities = device
+        .and_then(|device| device.capabilities.as_ref())
+        .map(|capabilities| capabilities.supported.clone());
     if let Some(device) = device {
         summary.generation = Some(device.generation);
         if let Some(capabilities) = &device.capabilities {
@@ -472,7 +530,178 @@ fn inspect_hub(
             "inspection_failed",
         ),
     }
-    (summary, device_id)
+    (summary, device_id, supported_capabilities)
+}
+
+fn check_status(checks: &[DoctorCheck], name: &str) -> Option<CheckStatus> {
+    checks
+        .iter()
+        .rev()
+        .find(|check| check.name == name)
+        .map(|check| check.status)
+}
+
+fn checks_ready(checks: &[DoctorCheck], names: &[&str]) -> Option<bool> {
+    let mut saw_unknown = false;
+    for name in names {
+        match check_status(checks, name) {
+            Some(CheckStatus::Ok) => {}
+            Some(CheckStatus::Error) => return Some(false),
+            Some(CheckStatus::Warning) | None => saw_unknown = true,
+        }
+    }
+    if saw_unknown { None } else { Some(true) }
+}
+
+fn capability_group_supported(
+    capabilities: Option<&[DeviceCapability]>,
+    predicate: impl Fn(DeviceCapability) -> bool,
+) -> Option<bool> {
+    capabilities.map(|capabilities| capabilities.iter().copied().any(predicate))
+}
+
+fn summarize_readiness(
+    checks: &[DoctorCheck],
+    live_quarantine_count: Option<usize>,
+    capabilities: Option<&[DeviceCapability]>,
+    cua_configured: bool,
+    mutation_authority: Option<&MutationAuthoritySummary>,
+) -> ReadinessSummary {
+    let control_plane = match checks_ready(
+        checks,
+        &[
+            "hub_state",
+            "agent_state",
+            "hub_service",
+            "agent_service",
+            "agent_hub_transport",
+        ],
+    ) {
+        Some(true) => LaneReadiness::Ready,
+        Some(false) => LaneReadiness::Unavailable,
+        None => LaneReadiness::Unknown,
+    };
+    let control_ready = control_plane == LaneReadiness::Ready;
+    let cua_ready = !cua_configured
+        || !matches!(
+            check_status(checks, "cua_version"),
+            Some(CheckStatus::Error) | None
+        );
+    let mutation_ready =
+        !cua_configured || mutation_authority.is_some_and(|authority| authority.owner == "v2");
+
+    let computer_observation_supported = capability_group_supported(capabilities, |capability| {
+        capability.class() == CapabilityClass::Observe
+            && !matches!(
+                capability,
+                DeviceCapability::ReadFile | DeviceCapability::ListDirectory
+            )
+    });
+    let filesystem_observation_supported = capability_group_supported(capabilities, |capability| {
+        matches!(
+            capability,
+            DeviceCapability::ReadFile | DeviceCapability::ListDirectory
+        )
+    });
+    let effectful_supported = capability_group_supported(capabilities, |capability| {
+        capability.class() != CapabilityClass::Observe
+    });
+    let computer_use_effectful_supported = capability_group_supported(capabilities, |capability| {
+        capability.class() != CapabilityClass::Observe
+            && !matches!(
+                capability,
+                DeviceCapability::ExecuteProcess | DeviceCapability::Shell
+            )
+    });
+    let browser_effectful_supported = capability_group_supported(capabilities, |capability| {
+        matches!(
+            capability,
+            DeviceCapability::BrowserPrepare
+                | DeviceCapability::BrowserNavigate
+                | DeviceCapability::BrowserClick
+                | DeviceCapability::BrowserType
+                | DeviceCapability::BrowserDialog
+                | DeviceCapability::BrowserPointer
+                | DeviceCapability::BrowserUploadFile
+                | DeviceCapability::BrowserDownload
+        )
+    });
+
+    let observation_lane = |supported: Option<bool>, backend_required: bool| match supported {
+        Some(false) => LaneReadiness::Unsupported,
+        Some(true) if !control_ready => LaneReadiness::Unavailable,
+        Some(true) if backend_required && !cua_ready => LaneReadiness::Unavailable,
+        Some(true) => LaneReadiness::Ready,
+        None => LaneReadiness::Unknown,
+    };
+    let blocking_operation_present = live_quarantine_count.map(|count| count > 0);
+    let effectful_lane = |supported: Option<bool>, backend_required: bool| match supported {
+        Some(false) => LaneReadiness::Unsupported,
+        Some(true) if blocking_operation_present == Some(true) => {
+            LaneReadiness::IndeterminateFenced
+        }
+        Some(true) if blocking_operation_present.is_none() => LaneReadiness::Unknown,
+        Some(true) if !control_ready => LaneReadiness::Unavailable,
+        Some(true) if backend_required && (!cua_ready || !mutation_ready) => {
+            LaneReadiness::Unavailable
+        }
+        Some(true) => LaneReadiness::Ready,
+        None => LaneReadiness::Unknown,
+    };
+
+    let lanes = ReadinessLanes {
+        control_plane,
+        computer_use_observation: observation_lane(computer_observation_supported, cua_configured),
+        filesystem_observation: observation_lane(filesystem_observation_supported, false),
+        effectful_execution: effectful_lane(
+            effectful_supported,
+            cua_configured && computer_use_effectful_supported == Some(true),
+        ),
+        browser_effectful_execution: effectful_lane(browser_effectful_supported, cua_configured),
+    };
+    let device = if blocking_operation_present == Some(true) {
+        "degraded_operator_action_required"
+    } else if lanes.control_plane == LaneReadiness::Unavailable {
+        "unavailable"
+    } else if [
+        lanes.control_plane,
+        lanes.computer_use_observation,
+        lanes.filesystem_observation,
+        lanes.effectful_execution,
+        lanes.browser_effectful_execution,
+    ]
+    .iter()
+    .any(|lane| matches!(lane, LaneReadiness::Unavailable | LaneReadiness::Unknown))
+    {
+        "degraded"
+    } else {
+        "healthy"
+    }
+    .to_owned();
+
+    let diagnostic_attention = [
+        lanes.control_plane,
+        lanes.computer_use_observation,
+        lanes.filesystem_observation,
+        lanes.effectful_execution,
+        lanes.browser_effectful_execution,
+    ]
+    .iter()
+    .any(|lane| matches!(lane, LaneReadiness::Unavailable | LaneReadiness::Unknown));
+
+    ReadinessSummary {
+        device,
+        lanes,
+        blocking_operation_present,
+        blocking_operation_retry_safe: (blocking_operation_present == Some(true)).then_some(false),
+        operator_action: if blocking_operation_present == Some(true) {
+            Some("inspect_reconciliation_status".to_owned())
+        } else if blocking_operation_present.is_none() || diagnostic_attention {
+            Some("inspect_doctor_failures".to_owned())
+        } else {
+            None
+        },
+    }
 }
 
 fn recovery_mode_for_quarantine_count(persistent_count: usize) -> (&'static str, CheckStatus) {
@@ -1202,6 +1431,180 @@ mod tests {
                 replay_old_operation: false,
             },
         }
+    }
+
+    fn readiness_checks(cua_status: CheckStatus) -> Vec<DoctorCheck> {
+        vec![
+            DoctorCheck {
+                name: "hub_state".into(),
+                status: CheckStatus::Ok,
+                detail: "ok".into(),
+            },
+            DoctorCheck {
+                name: "agent_state".into(),
+                status: CheckStatus::Ok,
+                detail: "ok".into(),
+            },
+            DoctorCheck {
+                name: "hub_service".into(),
+                status: CheckStatus::Ok,
+                detail: "ok".into(),
+            },
+            DoctorCheck {
+                name: "agent_service".into(),
+                status: CheckStatus::Ok,
+                detail: "ok".into(),
+            },
+            DoctorCheck {
+                name: "agent_hub_transport".into(),
+                status: CheckStatus::Ok,
+                detail: "ok".into(),
+            },
+            DoctorCheck {
+                name: "cua_version".into(),
+                status: cua_status,
+                detail: "bounded".into(),
+            },
+        ]
+    }
+
+    fn readiness_capabilities() -> Vec<DeviceCapability> {
+        vec![
+            DeviceCapability::ListApplications,
+            DeviceCapability::ListWindows,
+            DeviceCapability::ReadFile,
+            DeviceCapability::ListDirectory,
+            DeviceCapability::ExecuteProcess,
+            DeviceCapability::Shell,
+            DeviceCapability::BrowserInspect,
+            DeviceCapability::BrowserPrepare,
+            DeviceCapability::BrowserNavigate,
+        ]
+    }
+
+    fn v2_mutation_authority() -> MutationAuthoritySummary {
+        MutationAuthoritySummary {
+            owner: "v2".into(),
+            epoch: 7,
+        }
+    }
+
+    #[test]
+    fn readiness_preserves_observation_while_quarantine_fences_effectful_lanes() {
+        let checks = readiness_checks(CheckStatus::Ok);
+        let capabilities = readiness_capabilities();
+        let authority = v2_mutation_authority();
+        let readiness = summarize_readiness(
+            &checks,
+            Some(1),
+            Some(&capabilities),
+            true,
+            Some(&authority),
+        );
+
+        assert_eq!(readiness.device, "degraded_operator_action_required");
+        assert_eq!(readiness.lanes.control_plane, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.computer_use_observation,
+            LaneReadiness::Ready
+        );
+        assert_eq!(readiness.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.effectful_execution,
+            LaneReadiness::IndeterminateFenced
+        );
+        assert_eq!(
+            readiness.lanes.browser_effectful_execution,
+            LaneReadiness::IndeterminateFenced
+        );
+        assert_eq!(readiness.blocking_operation_present, Some(true));
+        assert_eq!(readiness.blocking_operation_retry_safe, Some(false));
+        assert_eq!(
+            readiness.operator_action.as_deref(),
+            Some("inspect_reconciliation_status")
+        );
+    }
+
+    #[test]
+    fn readiness_reports_supported_lanes_ready_without_quarantine() {
+        let checks = readiness_checks(CheckStatus::Ok);
+        let capabilities = readiness_capabilities();
+        let authority = v2_mutation_authority();
+        let readiness = summarize_readiness(
+            &checks,
+            Some(0),
+            Some(&capabilities),
+            true,
+            Some(&authority),
+        );
+
+        assert_eq!(readiness.device, "healthy");
+        assert_eq!(
+            readiness.lanes.computer_use_observation,
+            LaneReadiness::Ready
+        );
+        assert_eq!(readiness.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(readiness.lanes.effectful_execution, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.browser_effectful_execution,
+            LaneReadiness::Ready
+        );
+        assert_eq!(readiness.blocking_operation_present, Some(false));
+        assert_eq!(readiness.blocking_operation_retry_safe, None);
+        assert_eq!(readiness.operator_action, None);
+    }
+
+    #[test]
+    fn readiness_distinguishes_backend_unavailable_from_quarantine_fencing() {
+        let checks = readiness_checks(CheckStatus::Error);
+        let capabilities = readiness_capabilities();
+        let authority = v2_mutation_authority();
+        let readiness = summarize_readiness(
+            &checks,
+            Some(0),
+            Some(&capabilities),
+            true,
+            Some(&authority),
+        );
+
+        assert_eq!(
+            readiness.lanes.computer_use_observation,
+            LaneReadiness::Unavailable
+        );
+        assert_eq!(
+            readiness.lanes.browser_effectful_execution,
+            LaneReadiness::Unavailable
+        );
+        assert_eq!(
+            readiness.lanes.effectful_execution,
+            LaneReadiness::Unavailable
+        );
+        assert_eq!(readiness.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_ne!(
+            readiness.lanes.browser_effectful_execution,
+            LaneReadiness::IndeterminateFenced
+        );
+    }
+
+    #[test]
+    fn readiness_fails_closed_when_quarantine_state_is_unknown() {
+        let checks = readiness_checks(CheckStatus::Ok);
+        let capabilities = readiness_capabilities();
+        let authority = v2_mutation_authority();
+        let readiness =
+            summarize_readiness(&checks, None, Some(&capabilities), true, Some(&authority));
+
+        assert_eq!(readiness.device, "degraded");
+        assert_eq!(readiness.lanes.effectful_execution, LaneReadiness::Unknown);
+        assert_eq!(
+            readiness.lanes.browser_effectful_execution,
+            LaneReadiness::Unknown
+        );
+        assert_eq!(readiness.blocking_operation_present, None);
+        assert_eq!(
+            readiness.operator_action.as_deref(),
+            Some("inspect_doctor_failures")
+        );
     }
 
     #[test]

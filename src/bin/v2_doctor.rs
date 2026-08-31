@@ -104,6 +104,18 @@ fn main() -> ExitCode {
         );
     } else {
         println!("CUMG_V2_DOCTOR overall={}", report.overall);
+        println!(
+            "READINESS device={} control_plane={} computer_use_observation={} filesystem_observation={} effectful_execution={} browser_effectful_execution={}",
+            report.readiness.device,
+            report.readiness.lanes.control_plane.as_str(),
+            report.readiness.lanes.computer_use_observation.as_str(),
+            report.readiness.lanes.filesystem_observation.as_str(),
+            report.readiness.lanes.effectful_execution.as_str(),
+            report.readiness.lanes.browser_effectful_execution.as_str()
+        );
+        if let Some(action) = &report.readiness.operator_action {
+            println!("OPERATOR_ACTION {action}");
+        }
         for check in &report.checks {
             println!("{:?} {} {}", check.status, check.name, check.detail);
         }
