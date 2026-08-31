@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import stat
 import sys
@@ -84,6 +85,23 @@ class ArtifactPayloadTests(unittest.TestCase):
         target.write_text("tampered\n", encoding="utf-8")
         with self.assertRaises(mod.PayloadError):
             mod.verify_tree(root, self.CUMG, self.HANDOFF)
+
+    def test_zero_length_regular_dependency_is_manifested_and_allowed(self):
+        source, runtime, host = self.make_inputs()
+        empty = source / "node_modules/werift/factory-function.js"
+        empty.write_bytes(b"")
+        archive = mod.build(argparse.Namespace(
+            handoff_source=str(source), webrtc_host=str(host), runtime_script=str(runtime),
+            output_dir=str(self.root / "out-empty"), cumg_commit=self.CUMG, handoff_commit=self.HANDOFF,
+        ))
+        extracted = mod.extract(argparse.Namespace(
+            archive=str(archive), output_dir=str(self.root / "extract-empty"),
+            cumg_commit=self.CUMG, handoff_commit=self.HANDOFF,
+        ))
+        manifest = json.loads((extracted / mod.MANIFEST).read_text(encoding="utf-8"))
+        record = next(x for x in manifest["files"] if x["path"] == "handoff-root/node_modules/werift/factory-function.js")
+        self.assertEqual(record["size"], 0)
+        self.assertEqual(record["sha256"], hashlib.sha256(b"").hexdigest())
 
     def test_remaining_dependency_symlink_is_refused(self):
         handoff, runtime, host = self.make_inputs()

@@ -53,7 +53,7 @@ def iter_regular(root: Path):
             raise PayloadError(f"payload contains symlink: {p.name}")
         if p.is_dir():
             continue
-        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > MAX_FILE:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
             raise PayloadError(f"unsafe payload file: {p.name}")
         count += 1
         total += info.st_size
@@ -132,11 +132,11 @@ def build(args) -> Path:
         raise PayloadError("refusing to overwrite payload")
     for rel in ("dist/index.js", "package.json", "package-lock.json", "node_modules/werift/package.json"):
         p = source / rel
-        if not p.is_file() or p.is_symlink():
+        if not p.is_file() or p.is_symlink() or p.stat().st_size <= 0:
             raise PayloadError(f"Handoff input missing or unsafe: {rel}")
-    if not host.is_file() or host.is_symlink() or host.stat().st_mode & 0o111 == 0:
+    if not host.is_file() or host.is_symlink() or host.stat().st_size <= 0 or host.stat().st_mode & 0o111 == 0:
         raise PayloadError("WebRTC host missing or not executable")
-    if not runtime.is_file() or runtime.is_symlink():
+    if not runtime.is_file() or runtime.is_symlink() or runtime.stat().st_size <= 0:
         raise PayloadError("runtime script missing")
     with tempfile.TemporaryDirectory(prefix="cumg-handoff-payload-") as td:
         root = Path(td) / "handoff-runtime"
