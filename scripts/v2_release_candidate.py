@@ -37,7 +37,7 @@ COMMON_BINARIES = (
 UNIX_BINARIES = ("v2_grant_signer", "v2_handoff_ctl")
 PLATFORM_BINARIES = {
     "linux": COMMON_BINARIES + UNIX_BINARIES,
-    "macos": COMMON_BINARIES + UNIX_BINARIES + ("v2_doctor",),
+    "macos": COMMON_BINARIES + UNIX_BINARIES + ("v2_doctor", "v2_status"),
     "windows": COMMON_BINARIES,
 }
 

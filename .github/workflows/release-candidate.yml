@@ -54,7 +54,7 @@ jobs:
             bins+=(--bin v2_grant_signer --bin v2_handoff_ctl)
           fi
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            bins+=(--bin v2_doctor)
+            bins+=(--bin v2_doctor --bin v2_status)
           fi
           cargo build --release --locked "${bins[@]}"
 

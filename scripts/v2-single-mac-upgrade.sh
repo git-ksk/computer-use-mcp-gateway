@@ -414,7 +414,7 @@ tx_advance() {
 
 BUILD_ERR="$(mktemp "${TMPDIR:-/tmp}/cumg-v2-build.XXXXXX")"
 if ! cargo build -j "$CARGO_BUILD_JOBS" --release --locked \
-  --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_recover --bin v2_grant_signer 2>"$BUILD_ERR"; then
+  --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_status --bin v2_recover --bin v2_grant_signer 2>"$BUILD_ERR"; then
   cat "$BUILD_ERR" >&2
   if grep -Eqi 'No space left on device|ENOSPC|os error 28' "$BUILD_ERR"; then
     UPGRADE_FAILURE_REASON="build_storage_exhausted"
@@ -428,7 +428,7 @@ fi
 cat "$BUILD_ERR" >&2
 rm -f "$BUILD_ERR"
 "$REPO_ROOT/scripts/build-macos-recovery-helper.sh" "$REPO_ROOT/target/release/v2_recovery_enclave_helper" >/dev/null
-for name in v2_hub v2_agent v2_maint v2_doctor v2_recover v2_recovery_enclave_helper v2_grant_signer; do
+for name in v2_hub v2_agent v2_maint v2_doctor v2_status v2_recover v2_recovery_enclave_helper v2_grant_signer; do
   [[ -x "target/release/$name" ]] || { echo "REFUSED reason=build_output_missing binary=$name" >&2; exit 2; }
 done
 stable_codesign "target/release/v2_agent" "com.github.git-ksk.cumg-v2-agent" || {
@@ -624,7 +624,7 @@ tx_advance --phase backup --rollback-asset "$(basename "$ROLLBACK")"
 umask 077
 mkdir -p "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
 chmod 700 "$ROLLBACK" "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
-for name in v2_hub v2_agent v2_maint v2_doctor v2_recover v2_recovery_enclave_helper v2_grant_signer; do
+for name in v2_hub v2_agent v2_maint v2_doctor v2_status v2_recover v2_recovery_enclave_helper v2_grant_signer; do
   [[ -f "$BIN_DIR/$name" ]] && cp -p "$BIN_DIR/$name" "$ROLLBACK/bin/$name"
 done
 cp -p "$HUB_PLIST" "$ROLLBACK/launchd/"
@@ -854,7 +854,7 @@ install_atomic() {
   chmod 700 "$tmp"
   mv -f "$tmp" "$destination"
 }
-for name in v2_hub v2_agent v2_maint v2_doctor v2_recover v2_recovery_enclave_helper v2_grant_signer; do
+for name in v2_hub v2_agent v2_maint v2_doctor v2_status v2_recover v2_recovery_enclave_helper v2_grant_signer; do
   install_atomic "target/release/$name" "$BIN_DIR/$name"
 done
 
@@ -873,7 +873,7 @@ python3 - "$HEAD" "$PACKAGE_VERSION" "$HUB_AGENT_SCHEMA_VERSION" "$BIN_DIR" > "$
 import hashlib, json, pathlib, sys
 commit, version, hub_agent_schema, bindir = sys.argv[1:]
 bindir = pathlib.Path(bindir)
-names = ["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_recover", "v2_recovery_enclave_helper", "v2_grant_signer"]
+names = ["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_status", "v2_recover", "v2_recovery_enclave_helper", "v2_grant_signer"]
 items = []
 for name in names:
     h = hashlib.sha256()

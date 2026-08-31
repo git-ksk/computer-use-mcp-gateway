@@ -132,6 +132,19 @@ The rollback bundle is evidence and an explicit old-binary/old-state/Handoff-cod
 
 Expired-recovery abandonment also writes a private append-only JSONL audit record before deleting the signed checkpoint. The record contains only timestamp, recovery epoch, prior closed recovery status, and a bounded result code. It intentionally excludes locator, process/window/context/intervention IDs, principals, action digests, TURN credentials, Human input, and payloads. If the audit append fails, abandonment is refused and recovery remains authoritative.
 
+## Unified operator status
+
+Use `v2_status` as the normal first diagnostic for this profile. With the reviewed LaunchAgents installed, it discovers only the exact non-secret configuration fields it needs from the Hub/Agent plists (Handoff control socket, Cua command/version, mutation-authority path) and otherwise uses the same bounded single-Mac defaults as `v2_doctor`:
+
+```bash
+"$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_status"
+"$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_status" --json
+```
+
+JSON schema v1 is the stable machine-readable contract. It reports overall operator status, Agent/control-plane connectivity, backend status, the five #226 readiness lanes, quarantine/replay-safety state and #233 incident-review availability, privacy-bounded Handoff lifecycle, mutation-authority owner/epoch, verified runtime identity, #234 maintenance status/phase, one stable `primary_reason`, and one supported `next_action`. It intentionally omits takeover locators, intervention/recovery IDs or epochs, device/principal identity, commands/argv/cwd/env, typed text, URLs, screenshots, clipboard data, credentials, grants, and fingerprints.
+
+`v2_status` is composition only. A `ready` lane does not authorize another lane; the command cannot resolve quarantine, switch mutation authority, resume/cancel Handoff, retry/resume an upgrade, or replay an operation. `review_incident` means use the #233 incident-brief flow, `complete_recovery` means the existing explicit Handoff/recovery flow, `inspect_upgrade` means `v2_maint upgrade-status`, and configuration/backend codes lead to `v2_doctor` or the backend diagnostics. Unknown or mismatched evidence fails closed as `unknown`, `unavailable`, or `action_required`, never healthy-by-default.
+
 ## `v2_doctor`
 
 `v2_doctor` is read-only. It never resolves quarantine, dispatches work, reads secret contents, or prints raw command/result/desktop data.
@@ -146,7 +159,7 @@ When the doctor itself is launched through the live single-Mac Agent using `exec
 
 For the standard profile it checks:
 
-- runtime manifest schema 3, exact Hub/Agent application-schema version, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, `v2_recover`, `v2_recovery_enclave_helper`, and `v2_grant_signer`;
+- runtime manifest schema 3, exact Hub/Agent application-schema version, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, `v2_status`, `v2_recover`, `v2_recovery_enclave_helper`, and `v2_grant_signer`;
 - authoritative Hub checkpoint readability and current registry/capability schema;
 - exactly one enrolled single-Mac device and current generation;
 - Agent checkpoint readability and exact Hub/Agent generation pairing;
@@ -171,6 +184,7 @@ Exit status is `0` for healthy, `1` for degraded/warning, and `2` for unsafe/err
 
 Before declaring a single-Mac upgrade healthy, require all of the following:
 
+- `v2_status` reports `overall=healthy` and `next_action=none`;
 - `v2_doctor` reports `overall=healthy`;
 - a fresh authenticated Agent generation is present after restart;
 - live quarantine remains zero;
