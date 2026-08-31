@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(target_os = "macos")]
 use computer_use_mcp_gateway::v2_online_recovery::{
     RecoveryAuditAssessment, new_authorization, new_current_state_acceptance_authorization,
-    store_authorization,
+    recovery_decision_name, store_authorization,
 };
 use computer_use_mcp_gateway::{
     v2_execution_safety::RetirementPolicy,
@@ -20,8 +20,7 @@ use computer_use_mcp_gateway::{
     v2_maintenance::{ReconciliationSupportedDecision, inspect_quarantines_read_only},
     v2_online_recovery::{
         RecoveryChallenge, RecoveryDecision, RecoveryResolved, load_challenge,
-        load_recovery_resolved, recovery_decision_name, verify_recovery_challenge,
-        verify_recovery_resolved,
+        load_recovery_resolved, verify_recovery_challenge, verify_recovery_resolved,
     },
     v2_operator_status::OperatorOverallStatus,
 };
