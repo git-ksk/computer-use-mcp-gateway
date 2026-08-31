@@ -9,7 +9,9 @@ use computer_use_mcp_gateway::v2_online_recovery::{
 use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_verifying_key,
-    v2_online_recovery::{load_challenge, verify_recovery_challenge},
+    v2_online_recovery::{
+        load_challenge, load_recovery_resolved, verify_recovery_challenge, verify_recovery_resolved,
+    },
 };
 #[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
@@ -68,6 +70,28 @@ enum Command {
         /// Short metadata describing what the local user inspected. Do not include secrets or screenshots.
         #[arg(long)]
         evidence: String,
+        /// Wait up to this many seconds for the exact signed Hub durable-completion acknowledgement.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
+    },
+    /// Verify the exact signed Hub durable-completion acknowledgement for a published request.
+    Confirm {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        device_id: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        current_generation: u64,
+        #[arg(long, value_enum)]
+        decision: DecisionArg,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
     },
 }
 
@@ -84,6 +108,15 @@ impl From<DecisionArg> for IndeterminateResolution {
             DecisionArg::ConfirmedNotExecuted => Self::ConfirmedNotExecuted,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedRecoveryCompletion {
+    request_id: String,
+    device_id: String,
+    operation_id: String,
+    current_generation: u64,
+    decision: IndeterminateResolution,
 }
 
 fn now_ms() -> Result<u64> {
@@ -149,6 +182,7 @@ fn main() -> Result<()> {
             secure_enclave_helper,
             decision,
             evidence,
+            wait_secs,
         } => resolve(
             state_dir,
             hub_public_key_file,
@@ -156,6 +190,28 @@ fn main() -> Result<()> {
             secure_enclave_helper,
             decision.into(),
             evidence,
+            wait_secs,
+        ),
+        Command::Confirm {
+            state_dir,
+            hub_public_key_file,
+            request_id,
+            device_id,
+            operation_id,
+            current_generation,
+            decision,
+            wait_secs,
+        } => wait_for_completion(
+            &state_dir,
+            &hub_public_key_file,
+            &ExpectedRecoveryCompletion {
+                request_id,
+                device_id,
+                operation_id,
+                current_generation,
+                decision: decision.into(),
+            },
+            wait_secs,
         ),
     }
 }
@@ -239,6 +295,7 @@ fn resolve(
     secure_enclave_helper: PathBuf,
     decision: IndeterminateResolution,
     evidence: String,
+    wait_secs: u64,
 ) -> Result<()> {
     use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
     let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
@@ -280,6 +337,22 @@ fn resolve(
     println!("request_id={}", authorization.request_id);
     println!("operation_id={}", authorization.operation_id);
     println!("authorization=published");
+    if wait_secs > 0 {
+        wait_for_completion(
+            &state_dir,
+            &hub_public_key_file,
+            &ExpectedRecoveryCompletion {
+                request_id: authorization.request_id.clone(),
+                device_id: authorization.device_id.clone(),
+                operation_id: authorization.operation_id.clone(),
+                current_generation: authorization.current_generation,
+                decision: authorization.decision.clone(),
+            },
+            wait_secs,
+        )?;
+    } else {
+        println!("durable_completion=not_checked");
+    }
     Ok(())
 }
 
@@ -291,6 +364,48 @@ fn resolve(
     _secure_enclave_helper: PathBuf,
     _decision: IndeterminateResolution,
     _evidence: String,
+    _wait_secs: u64,
 ) -> Result<()> {
     bail!("local user-presence recovery approval is supported only on macOS")
+}
+
+fn wait_for_completion(
+    state_dir: &Path,
+    hub_public_key_file: &Path,
+    expected: &ExpectedRecoveryCompletion,
+    wait_secs: u64,
+) -> Result<()> {
+    let trusted_hub =
+        load_verifying_key(hub_public_key_file).context("failed to load pinned Hub public key")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    loop {
+        if let Some(resolved) = load_recovery_resolved(state_dir)
+            .context("failed to read durable recovery acknowledgement")?
+        {
+            verify_recovery_resolved(
+                &resolved,
+                &trusted_hub,
+                &expected.request_id,
+                &expected.device_id,
+                expected.current_generation,
+            )
+            .context("durable recovery acknowledgement is stale, mismatched, or invalid")?;
+            if resolved.operation_id != expected.operation_id
+                || resolved.decision != expected.decision
+            {
+                anyhow::bail!(
+                    "durable recovery acknowledgement does not match the exact operation/decision"
+                );
+            }
+            println!("request_id={}", expected.request_id);
+            println!("operation_id={}", expected.operation_id);
+            println!("durable_completion=verified");
+            println!("old_operation_replayed=false");
+            return Ok(());
+        }
+        if wait_secs == 0 || std::time::Instant::now() >= deadline {
+            anyhow::bail!("durable Hub recovery completion is not yet verified");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }

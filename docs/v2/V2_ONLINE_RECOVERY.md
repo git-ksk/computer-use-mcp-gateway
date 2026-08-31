@@ -140,10 +140,13 @@ v2_recover resolve \
   --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --decision confirmed-completed \
-  --evidence "local user inspected the current desktop"
+  --evidence "local user inspected the current desktop" \
+  --wait-secs 30
 ```
 
-The signing operation requires macOS user presence. Cancellation/denial leaves quarantine in place.
+The signing operation requires macOS user presence. Cancellation/denial leaves quarantine in place. `authorization=published` means only that the signed local handoff file became visible to the Agent; it is **not** durable recovery success. With `--wait-secs`, the CLI waits for the exact Hub-signed `RecoveryResolved` acknowledgement, verifies request/device/current-generation/operation/decision binding, and reports `durable_completion=verified` only after the Agent has durably stored that verified acknowledgement. The Hub creates the acknowledgement only after its authoritative resolution checkpoint was committed. The local receipt is owner-private and survives challenge/authorization cleanup; a fresh challenge clears any prior receipt before accepting another decision.
+
+If the original CLI exits after publication or confirmation must be repeated, use `v2_recover confirm` with the exact safe metadata printed by the resolve attempt. A missing acknowledgement, timeout, stale receipt, or mismatch is not success and does not authorize retry/replay.
 
 ## Key lifecycle and failure cases
 
@@ -165,7 +168,8 @@ Automated coverage must include:
 - authorization create/no-clobber behavior;
 - bounded/non-empty evidence;
 - durable Hub resolution and no old-operation replay;
-- duplicate accepted-request acknowledgement and conflicting/stale authorization rejection.
+- duplicate accepted-request acknowledgement and conflicting/stale authorization rejection;
+- owner-private durable acknowledgement receipt, exact CLI confirmation binding, and publication-vs-completion distinction.
 
 Before enabling the macOS online path in a release, a trusted physical Mac must additionally prove:
 
