@@ -54,14 +54,14 @@ A compatible fix merged after `v0.3.0` may contribute to a future `0.3.1`; the r
 
 The current priority is to finish the **single-Mac operator/product path before expanding recovery parity to additional desktop platforms**. Cross-platform recovery remains important, but adding another platform-backed recovery provider does not remove the largest current usability gaps for an already supported deployment.
 
-Practically, the current `0.3.x` closeout has **one remaining implementation track plus one final cross-cutting gate**:
+The `0.3.x` Product Readiness closeout is now complete; the table below records the completed gate and the explicitly non-blocking stabilization/future work:
 
 | Closeout track | Issues | Status | Blocks current `0.3.x` closeout? |
 | --- | --- | --- | --- |
 | Operator/recovery foundation | #226, #233, #234, #235, #109 | Complete | No |
 | Guided quarantine recovery | #236 | Complete | No |
 | Artifact-backed install/upgrade | #237 | Complete | No — implemented closeout evidence |
-| Cross-cutting Product Readiness closeout | #213 | Final review | Yes |
+| Cross-cutting Product Readiness closeout | #213 | Complete | No — standing gate is now [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) |
 | Compatible stabilization backlog | #215, #115, #104, #111, bounded #96 work | Parallel/deferred | No, unless new evidence exposes a released regression |
 | Cross-platform recovery parity | #217, #227, #228 | Planned for `0.4.0` | No |
 
@@ -69,7 +69,7 @@ Use this ordering unless new evidence exposes a released safety regression:
 
 1. **Completed operator/recovery workflow:** #226 lane-scoped readiness, #233 operator-ready incident brief, #234 durable/inspectable single-Mac upgrade transactions, #235 unified operator status, #109 exact durable online-recovery completion confirmation, and #236 guided quarantine recovery are complete.
 2. **Complete the product workflow:** #237 provides the reviewed single-Mac source-free artifact install/upgrade path with exact CUMG/Handoff pairing, fail-closed verification, one-shot upgrade, paired rollback, and installed doctor/status verification.
-3. **Close the cross-cutting gate:** use #213 to review the resulting single-Mac product path end to end. The compatible stabilization backlog does not need to be emptied merely to close this gate unless its evidence invalidates a release invariant.
+3. **Completed cross-cutting gate:** #213 reviewed the resulting single-Mac product path end to end and established [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) as the standing per-release gate. The compatible stabilization backlog remains non-blocking unless its evidence invalidates a release invariant.
 4. **Then broaden Recovery & Reconciliation:** #217 and its split providers #227 (Windows Hello/WebAuthn) and #228 (Linux FIDO2 UV) remain `0.4.0` work.
 
 This is a sequencing decision, not a de-scope of Windows/Linux recovery. The partially implemented #227 work should be preserved, but further provider implementation is deferred while the `0.3.x` product-readiness path is incomplete. Resume it when the operator path above is coherent and Windows is being admitted as a supported recovery target, or earlier only if concrete production evidence makes Windows online recovery a higher-priority safety/operability requirement.
@@ -94,7 +94,7 @@ CUMG is now past the initial V2 production-hardening release. Post-v0.3 work sho
 
 The working sequence is:
 
-- **`0.3.x` — Product Readiness & Stabilization:** #237 is complete; current closeout is the #213 cross-cutting gate. The #226/#233/#234/#235/#109/#236 operator/recovery foundation and #224 release-candidate artifact boundary are complete. Compatible non-blocking stabilization may continue through #215, #115, #104, #111, and the bounded investigation/documentation part of #96 without making the milestone an unbounded backlog-clearing exercise.
+- **`0.3.x` — Product Readiness & Stabilization:** #237 and the #213 cross-cutting closeout are complete; future releases reuse the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate. The #226/#233/#234/#235/#109/#236 operator/recovery foundation and #224 release-candidate artifact boundary are complete. Compatible non-blocking stabilization may continue through #215, #115, #104, #111, and the bounded investigation/documentation part of #96 without making the milestone an unbounded backlog-clearing exercise.
 - **`0.4.0` — Recovery & Reconciliation:** make ambiguous effectful work easier to reconcile without replay by extending durable operation identity/status (#103), adding explicit local-Human current-state acceptance for reviewed low-impact GUI ambiguity (#137), and separating permanent replay tombstones from bounded detailed retirement history (#136).
 - **`0.5.0` — Multi-principal Identity:** add provider-neutral OIDC/JWT caller identity (#139) while preserving the existing exact `principal -> device -> capability` authorizer and existing single-principal/introspection adapters.
 - **`0.6.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through bounded retrievable output (#83), ranged/deterministic filesystem observation (#105), and atomic workspace mutation under explicitly separate writable roots (#107).
@@ -104,7 +104,7 @@ The exact release number may still move if implementation evidence shows that tw
 
 ### Cross-cutting Product Readiness track
 
-Umbrella tracking: [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213). Split concrete implementation work into narrower issues as each sub-area becomes actionable.
+The initial umbrella [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213) is complete. Future release preparation uses the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) checklist; split concrete implementation work into narrower issues when a gate exposes an actionable gap.
 
 Productization is not complete merely because a capability works in source-tree dogfood. Every post-v0.3 milestone should improve or preserve the following product-level foundations:
 
@@ -168,7 +168,7 @@ This queue records the practical result of continuing Handoff integration and ph
 
 The repository's open issues are intentionally classified by working milestone so work cannot silently fall out of roadmap visibility. These milestones are ordering/admission guidance, not a promise that every listed item ships together if evidence later requires a split or defer.
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 owns the final cross-cutting product-readiness gate. The #226/#233/#234/#235/#109/#236 operator/recovery foundation is complete and #224 provides the completed release-candidate artifact boundary. Artifact-backed install/upgrade #237 is complete, so no separate blocking implementation track remains before #213 final cross-cutting closeout. Other compatible work (#215, #115, #104, #111, bounded #96) is explicitly non-blocking for closeout unless its evidence exposes a released safety/reliability invariant failure.
+- **`0.3.x — Product Readiness & Stabilization`:** the #213 final cross-cutting product-readiness gate is complete and is carried forward by [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md). The #226/#233/#234/#235/#109/#236 operator/recovery foundation is complete and #224 provides the completed release-candidate artifact boundary. Artifact-backed install/upgrade #237 and the #213 cross-cutting closeout are complete, so no blocking `0.3.x` implementation/gate remains. Other compatible work (#215, #115, #104, #111, bounded #96) is explicitly non-blocking for closeout unless its evidence exposes a released safety/reliability invariant failure.
 - **`0.4.0 — Recovery & Reconciliation`:** #103 extends durable operation identity/status to effectful Desktop/Browser calls; #137 adds reviewed local-Human acceptance of current state without rewriting historical truth; #136 separates permanent replay tombstones from bounded detailed retirement history; #217 owns cross-platform user-presence recovery parity, split into #227 Windows Hello/WebAuthn and #228 Linux FIDO2 UV. These provider implementations intentionally follow the immediate `0.3.x` product-readiness sequence unless production evidence changes the priority.
 - **`0.5.0 — Multi-principal Identity`:** #139 adds generic provider-neutral OIDC/JWT identity while preserving the existing exact authorizer; #221 adds typed backend-neutral semantic constraints as a narrow-only layer without turning CUMG into a generic policy engine.
 - **`0.6.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.

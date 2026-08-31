@@ -120,10 +120,11 @@ A normal release is prepared from `main` through a dedicated release PR.
 3. Update `Cargo.toml` and the corresponding package version in `Cargo.lock`.
 4. Add the release section to `CHANGELOG.md`, including compatibility/breaking notes and meaningful acceptance evidence.
 5. Update only status/version references intended to describe the newly released state.
-6. Run required CI and any release-specific acceptance required by the change class.
-7. Merge the release PR through the protected-`main` process.
-8. Create an annotated `vMAJOR.MINOR.PATCH` tag on the resulting `main` commit.
-9. Create the matching GitHub Release. Mark 0.x releases as pre-release; `1.0.0` and later are stable unless explicitly published as alpha/beta/RC.
+6. Complete the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) checklist for the admitted release scope, recording evidence or an explicit scope-based N/A rationale for each item.
+7. Run required CI and any release-specific acceptance required by the change class.
+8. Merge the release PR through the protected-`main` process.
+9. Create an annotated `vMAJOR.MINOR.PATCH` tag on the resulting `main` commit.
+10. Create the matching GitHub Release. Mark 0.x releases as pre-release; `1.0.0` and later are stable unless explicitly published as alpha/beta/RC.
 
 Published tags are immutable. Do not move or reuse a release tag. Fix forward with a new patch/minor release.
 

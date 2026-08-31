@@ -54,14 +54,14 @@ completion provable?
 
 現在は、**追加 desktop platform の recovery parity より先に single-Mac の operator/product path を完成させる**ことを優先します。cross-platform recovery は重要ですが、新しい platform-backed recovery provider を追加しても、すでに supported な deployment に残る最大の usability gap は解消しません。
 
-実質的に現在の `0.3.x` closeout は、**残る実装 1 track + 最終横断 gate 1つ**です。
+`0.3.x` Product Readiness closeout は完了済みです。以下の表は completed gate と、明示的に non-blocking な stabilization / future work を記録します。
 
 | Closeout track | Issues | Status | 現在の `0.3.x` closeout を block? |
 | --- | --- | --- | --- |
 | Operator/recovery foundation | #226, #233, #234, #235, #109 | Complete | No |
 | Guided quarantine recovery | #236 | Complete | No |
 | Artifact-backed install/upgrade | #237 | Complete | No — closeout evidence 実装済み |
-| Cross-cutting Product Readiness closeout | #213 | Final review | Yes |
+| Cross-cutting Product Readiness closeout | #213 | Complete | No — standing gate は [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) |
 | Compatible stabilization backlog | #215, #115, #104, #111, bounded #96 work | Parallel/deferred | released regression evidence が出ない限り No |
 | Cross-platform recovery parity | #217, #227, #228 | `0.4.0` planned | No |
 
@@ -69,7 +69,7 @@ released safety regression を示す新しい evidence がない限り、次の�
 
 1. **operator/recovery workflow 完了:** #226 lane-scoped readiness、#233 operator-ready incident brief、#234 durable / inspectable single-Mac upgrade transaction、#235 unified operator status、#109 exact durable online-recovery completion confirmation、#236 guided quarantine recovery は完了済みです。
 2. **product workflow を完了:** #237 は exact CUMG/Handoff pairing、fail-closed verification、one-shot upgrade、paired rollback、installed doctor/status verification を備えた reviewed single-Mac source-free artifact install/upgrade path を提供します。
-3. **横断 gate をclose:** #213 で完成した single-Mac product path を end-to-end review します。compatible stabilization backlog は、その evidence が release invariant を壊さない限り、#213 close のために全件消化する必要はありません。
+3. **横断 gate 完了:** #213 で single-Mac product path を end-to-end review し、恒久 per-release gate として [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) を確立しました。compatible stabilization backlog は、その evidence が release invariant を壊さない限り non-blocking のままです。
 4. **その後 Recovery & Reconciliation を拡張:** #217 と split provider の #227（Windows Hello/WebAuthn）、#228（Linux FIDO2 UV）は `0.4.0` work とします。
 
 これは Windows/Linux recovery の de-scope ではなく、実行順の決定です。途中まで実装済みの #227 work は保持しますが、`0.3.x` Product Readiness path が未完の間は provider 実装の続行を defer します。上記 operator path が一貫したものになり、Windows を supported recovery target として admit するときに再開します。ただし concrete production evidence により Windows online recovery がより高い safety/operability priority になった場合は前倒しできます。
@@ -94,7 +94,7 @@ CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 �
 
 現在の作業順:
 
-- **`0.3.x` — Product Readiness & Stabilization:** #237 は完了済みで、current closeout は #213 cross-cutting gate です。#226/#233/#234/#235/#109/#236 の operator/recovery foundation と #224 release-candidate artifact boundary は完了済みです。#215、#115、#104、#111、#96 の bounded な調査/documentation は compatible non-blocking stabilization として並行可能で、milestone を無制限な backlog-clearing exercise にはしません。
+- **`0.3.x` — Product Readiness & Stabilization:** #237 と #213 cross-cutting closeout は完了済みです。future release は恒久 [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gate を再利用します。#226/#233/#234/#235/#109/#236 の operator/recovery foundation と #224 release-candidate artifact boundary は完了済みです。#215、#115、#104、#111、#96 の bounded な調査/documentation は compatible non-blocking stabilization として並行可能で、milestone を無制限な backlog-clearing exercise にはしません。
 - **`0.4.0` — Recovery & Reconciliation:** durable operation identity/status を effectful operation へ広げる #103、review 済み low-impact GUI ambiguity を local Human が current state として明示 acceptance できる #137、permanent replay tombstone と bounded detailed retirement history を分離する #136 により、曖昧な effectful work から replay せず安全に復帰する contract を強化。
 - **`0.5.0` — Multi-principal Identity:** #139 で provider-neutral OIDC/JWT caller identity を追加し、既存の exact `principal -> device -> capability` authorizer と single-principal / introspection adapter を維持。
 - **`0.6.0` — Least-privilege Workspace:** #83 の bounded retrievable output、#105 の ranged / deterministic filesystem observation、#107 の明示的 writable root 下での atomic workspace mutation により Dangerous shell authority への依存を減らす。
@@ -104,7 +104,7 @@ implementation evidence により area の combine / split / defer、または c
 
 ### 横断 Product Readiness track
 
-umbrella tracking は [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213) です。各 sub-area が具体化した時点で、実装責務を narrower issue へ分割します。
+初回 umbrella [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213) は完了済みです。future release preparation は恒久 [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) checklist を使い、gate が actionable gap を見つけた場合は narrower issue に分割します。
 
 source-tree dogfood で capability が動くだけでは製品化完了とはしません。Post-v0.3 の各 milestone は次の product-level foundation を改善または維持します。
 
@@ -168,7 +168,7 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 repository の open issue は、work が roadmap の可視性から黙って抜け落ちないよう working milestone ごとに分類します。これらの milestone は ordering / admission guidance であり、evidence により split / defer が必要になった場合まで同時 ship を約束するものではありません。
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 が final cross-cutting Product Readiness gate を所有します。#226/#233/#234/#235/#109/#236 の operator/recovery foundation は完了済みで、#224 も completed release-candidate artifact boundary を提供します。artifact-backed install/upgrade #237 は完了済みで、#213 final cross-cutting closeout 前に別の blocking implementation track は残っていません。その他の compatible work（#215、#115、#104、#111、bounded #96）は、released safety/reliability invariant を壊す evidence が出ない限り closeout non-blocking です。
+- **`0.3.x — Product Readiness & Stabilization`:** #213 final cross-cutting Product Readiness gate は完了済みで、今後は [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) が standing gate を引き継ぎます。#226/#233/#234/#235/#109/#236 の operator/recovery foundation は完了済みで、#224 も completed release-candidate artifact boundary を提供します。artifact-backed install/upgrade #237 と #213 cross-cutting closeout は完了済みで、blocking `0.3.x` implementation/gate は残っていません。その他の compatible work（#215、#115、#104、#111、bounded #96）は、released safety/reliability invariant を壊す evidence が出ない限り closeout non-blocking です。
 - **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離、#217 が cross-platform user-presence recovery parity を所有し、#227 Windows Hello/WebAuthn と #228 Linux FIDO2 UV に split しています。production evidence が priority を変えない限り、これら provider 実装は直近 `0.3.x` Product Readiness sequence の後に進めます。
 - **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity、#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
 - **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。
