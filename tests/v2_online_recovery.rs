@@ -268,6 +268,20 @@ fn recovery_cli_requires_explicit_secure_enclave_artifacts() {
     assert!(init_help.contains("--secure-enclave-helper"));
     assert!(!init_help.contains("--key-label"));
 
+    let guide = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .args(["guide", "--help"])
+        .output()
+        .unwrap();
+    assert!(guide.status.success());
+    let guide_help = String::from_utf8(guide.stdout).unwrap();
+    assert!(guide_help.contains("--hub-state-dir"));
+    assert!(guide_help.contains("--agent-state-dir"));
+    assert!(guide_help.contains("--hub-public-key-file"));
+    assert!(guide_help.contains("--key-file"));
+    assert!(guide_help.contains("--secure-enclave-helper"));
+    assert!(guide_help.contains("--json"));
+    assert!(!guide_help.contains("--decision"));
+
     let resolve = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
         .args(["resolve", "--help"])
         .output()

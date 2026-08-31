@@ -159,25 +159,45 @@ This is separate from backend desktop serialization and separate from reverse-pr
 
 `device_indeterminate` means an **earlier state-changing operation has an unproven outcome and is already quarantining the device**. The returned `blocking_operation_id` names that earlier ambiguous operation; it is not a new retry ID for the request that was just refused. Do not replay the old operation or clear state merely because the Agent reconnects.
 
-First inspect the latest durable Hub state while the Hub is still serving:
+For the normal single-Mac operator path, use the guided recovery workflow instead of memorizing the individual inspection/resolution commands:
 
 ```bash
-v2_maint inspect-quarantine \
-  --state-dir /var/lib/cumg-v2/hub
+v2_recover guide \
+  --hub-state-dir /var/lib/cumg-v2/hub \
+  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
+  --mutation-authority-dir /var/lib/cumg-v2/mutation-authority \
+  --wait-secs 60
 ```
 
-Then correlate the exact blocking operation with the Agent checkpoint before doing manual checkpoint/log archaeology:
+`guide` identifies the exact Hub-signed blocking challenge, composes the existing #233 incident brief, and displays only the closed `IncidentBrief.cumg.supported_decisions` set produced by the authoritative reconciliation audit. Optional diagnostics remain observational only and cannot add a decision. If that authoritative set is empty, the workflow stops at `keep_quarantine` without signing or publishing anything.
+
+An authority-bearing guided recovery requires an interactive Human terminal. The Human explicitly selects one displayed CUMG-supported decision (or cancels and keeps quarantine). Immediately before Secure Enclave signing, `guide` re-reads both the exact challenge and incident brief; any changed operation, device, historical/current generation, fingerprint/nonce challenge binding, incident state, or supported-decision set forces re-review. User denial/cancellation/authentication failure leaves quarantine intact. The Agent/LLM cannot pipe a decision into this path.
+
+`authorization=published` is intentionally intermediate. Guided recovery waits for the exact Hub-signed durable `RecoveryResolved` acknowledgement and does not report recovery success until request/device/current-generation/operation/decision binding is verified. It then checks that the exact old quarantine is gone, reports `old_operation_replayed=false`, and invokes the existing `v2_status` JSON contract for post-recovery Handoff, mutation-authority, runtime, recovery-mode, and overall health verification. An unrelated degraded/action-required status is reported separately from a durably verified recovery instead of being mislabeled as a recovery failure.
+
+Agent-assisted UI may inspect the privacy-bounded plan without gaining mutation authority:
 
 ```bash
+v2_recover guide \
+  --hub-state-dir /var/lib/cumg-v2/hub \
+  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --json
+```
+
+`--json` is always read-only: it never prompts, signs, publishes authorization, clears quarantine, or replays work. Its schema excludes the private challenge fingerprint/nonce and credential/key/raw-command/argv/clipboard/screenshot/principal material.
+
+The lower-level inspection commands remain useful for advanced diagnostics and break-glass review:
+
+```bash
+v2_maint inspect-quarantine --state-dir /var/lib/cumg-v2/hub
 v2_maint audit-reconciliation \
   --state-dir /var/lib/cumg-v2/hub \
   --agent-state-dir /var/lib/cumg-v2/agent \
   --operation-id op_...
-```
-
-For the normal operator view, generate the incident brief instead of manually combining those outputs:
-
-```bash
 v2_maint incident-brief \
   --state-dir /var/lib/cumg-v2/hub \
   --agent-state-dir /var/lib/cumg-v2/agent \
@@ -186,23 +206,9 @@ v2_maint incident-brief \
   --format text
 ```
 
-These inspection commands are read-only and may run while the services are live. They do not clear quarantine, sign recovery authority, contact the backend, or replay work. `incident-brief` embeds the exact reconciliation audit and can optionally add only allowlisted observational findings from an owner-private diagnostics JSON file; those observations cannot widen `supported_decisions`. Treat legacy terminal markers, request/fingerprint matches, reconnect, elapsed time, and heuristic UI/application state as non-authoritative unless the audit explicitly reports an accepted authoritative proof. If evidence remains insufficient, keep quarantine intact.
+Those commands are read-only. The low-level `v2_recover status`, `resolve`, and `confirm` commands remain advanced online-recovery primitives for explicit troubleshooting, and `v2_maint resolve` remains the offline authority-bearing break-glass path that requires the Hub to be stopped. None authorizes replay of the quarantined operation; every future effectful action must be admitted with a fresh operation identity.
 
-Choose a manual decision only from independent evidence for the exact operation: `confirmed_completed` requires proof that the intended effect completed; `confirmed_not_executed` requires proof that no effect occurred; `confirmed_effect_applied_uncommitted` is reserved for the bounded text-input case where input delivery occurred but a distinct submit/commit did not. None makes the old operation retry-safe.
-
-Only the authority-bearing offline mutation requires stopping the Hub. Install `v2_hub` and `v2_maint` from the same reviewed build/release, stop `v2_hub` completely, and then run the exact resolution. For example:
-
-```bash
-v2_maint resolve \
-  --state-dir /var/lib/cumg-v2/hub \
-  --operation-id op_... \
-  --decision confirmed_not_executed \
-  --evidence "ticket-1234: operator verified no side effect"
-```
-
-Do not run a newer arbitrary `v2_maint` checkout against an older deployed Hub's state. The maintenance path preserves the checkpoint's existing durable writer contract and fails before publication if the candidate cannot be represented. If pairing is uncertain, deploy/use the matching Hub + maintenance artifacts first rather than editing checkpoint JSON. Restart the Hub only after maintenance exits successfully.
-
-See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full inspection, reconciliation, retirement, and offline-recovery contracts.
+See [`v2/V2_ONLINE_RECOVERY.md`](v2/V2_ONLINE_RECOVERY.md) for the guided online-recovery contract and [`DEPLOYMENT.md`](DEPLOYMENT.md) for the lower-level inspection, reconciliation, retirement, and offline-recovery contracts.
 
 ## Single-Mac upgrade caller disconnected or timed out
 
