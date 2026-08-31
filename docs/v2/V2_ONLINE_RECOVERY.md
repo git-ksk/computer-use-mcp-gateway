@@ -123,17 +123,46 @@ v2_recover init-key \
 
 The Hub state directory and public-key file must satisfy the existing trust-anchor parent/symlink/permission checks. Restarting the Hub after first provisioning is required because the verifier is loaded at Hub startup. Removing the verifier disables online recovery; it does not weaken quarantine semantics.
 
-When quarantine occurs, the connected Agent receives a fresh challenge. On the Mac:
+When quarantine occurs, the connected Agent receives a fresh challenge. The canonical operator workflow is `v2_recover guide`:
+
+```bash
+v2_recover guide \
+  --hub-state-dir "<HUB_STATE_DIR>" \
+  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
+  --mutation-authority-dir "<MUTATION_AUTHORITY_DIR>" \
+  --wait-secs 60
+```
+
+The guided path is orchestration only. It first verifies the Hub-signed challenge, builds the existing #233 incident brief, and copies `IncidentBrief.cumg.supported_decisions` unchanged into a pure recovery plan. Observational diagnostics can be displayed as explanation but cannot create or widen a supported decision. An empty authoritative decision set terminates as `keep_quarantine`; no user-presence signing or authorization publication occurs.
+
+When an authoritative decision is available, `guide` requires an interactive Human terminal and accepts only an explicit selection from that closed set (or cancellation). Agent/LLM input cannot be piped into the authority-bearing path. After the Human has reviewed the incident, the CLI immediately re-reads the exact signed challenge and incident brief. Any operation/device/original-generation/current-generation/fingerprint/nonce binding change, incident-state change, or supported-decision change fails closed and requires a new review before signing.
+
+Only after that fresh validation does the existing Secure Enclave helper request macOS user presence. Denial, cancellation, timeout, or an unavailable authentication facility does not publish authorization and leaves quarantine intact. The guided authorization remains the same reviewed online-recovery protocol; no new recovery authority or replay path is introduced.
+
+`authorization=published` is not completion. Guided recovery always waits for the exact Hub-signed `RecoveryResolved` acknowledgement using #109 semantics. The request/device/current-generation/operation/decision binding must verify, after which the workflow reports `durable_completion=verified` and `old_operation_replayed=false`. It then performs a read-only exact quarantine check and invokes the existing `v2_status` JSON surface. A healthy status yields `recovery_outcome=verified_healthy`; if recovery completed durably but an unrelated Handoff/runtime/mutation-authority/backend/recovery-mode problem remains, the workflow reports `recovery_outcome=verified_with_unrelated_status_problem` and exposes the bounded `v2_status` reason rather than erasing the durable recovery result.
+
+For Agent-assisted explanation or UI composition, the same command has a strictly read-only JSON planning mode:
+
+```bash
+v2_recover guide \
+  --hub-state-dir "<HUB_STATE_DIR>" \
+  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --json
+```
+
+JSON mode never prompts, signs, publishes, clears quarantine, or replays work. It excludes the private challenge fingerprint/nonce and credential/key/raw-command/argv/clipboard/screenshot/principal material. It is therefore suitable for an Agent/UI to explain what CUMG currently supports without allowing that Agent/UI to make the recovery decision.
+
+The lower-level commands remain available for advanced diagnostics and break-glass operation:
 
 ```bash
 v2_recover status \
   --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
   --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub"
-```
 
-Inspect the actual desktop, then approve exactly one decision:
-
-```bash
 v2_recover resolve \
   --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
   --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
@@ -144,9 +173,7 @@ v2_recover resolve \
   --wait-secs 30
 ```
 
-The signing operation requires macOS user presence. Cancellation/denial leaves quarantine in place. `authorization=published` means only that the signed local handoff file became visible to the Agent; it is **not** durable recovery success. With `--wait-secs`, the CLI waits for the exact Hub-signed `RecoveryResolved` acknowledgement, verifies request/device/current-generation/operation/decision binding, and reports `durable_completion=verified` only after the Agent has durably stored that verified acknowledgement. The Hub creates the acknowledgement only after its authoritative resolution checkpoint was committed. The local receipt is owner-private and survives challenge/authorization cleanup; a fresh challenge clears any prior receipt before accepting another decision.
-
-If the original CLI exits after publication or confirmation must be repeated, use `v2_recover confirm` with the exact safe metadata printed by the resolve attempt. A missing acknowledgement, timeout, stale receipt, or mismatch is not success and does not authorize retry/replay.
+`resolve` still requires macOS user presence, and `confirm` can re-check an already-published request using its exact safe metadata. A missing acknowledgement, timeout, stale receipt, or mismatch is not success and does not authorize retry/replay. These low-level commands do not supersede the normal `guide` flow.
 
 ## Key lifecycle and failure cases
 

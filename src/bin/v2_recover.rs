@@ -7,16 +7,24 @@ use computer_use_mcp_gateway::v2_online_recovery::{
     RecoveryAuditAssessment, new_authorization, store_authorization,
 };
 use computer_use_mcp_gateway::{
-    v2_m0_execution::IndeterminateResolution,
-    v2_m1_keys::load_verifying_key,
-    v2_online_recovery::{
-        load_challenge, load_recovery_resolved, verify_recovery_challenge, verify_recovery_resolved,
+    v2_guided_recovery::{
+        GuidedRecoveryDisposition, GuidedRecoveryPlan, GuidedRecoveryPostDisposition,
+        classify_guided_recovery_post_status, compose_guided_recovery_plan,
+        decision_name as guided_decision_name, revalidate_guided_recovery_selection,
     },
+    v2_incident_brief::{build_incident_brief_read_only, render_incident_brief_text},
+    v2_m0_execution::IndeterminateResolution,
+    v2_m1_keys::{load_secret_text, load_verifying_key},
+    v2_maintenance::{ReconciliationSupportedDecision, inspect_quarantines_read_only},
+    v2_online_recovery::{
+        RecoveryChallenge, RecoveryResolved, load_challenge, load_recovery_resolved,
+        verify_recovery_challenge, verify_recovery_resolved,
+    },
+    v2_operator_status::OperatorOverallStatus,
 };
 #[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
-#[cfg(target_os = "macos")]
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,6 +55,36 @@ enum Command {
         secure_enclave_helper: PathBuf,
         #[arg(long)]
         public_key_out: PathBuf,
+    },
+    /// Guide a Human through authoritative quarantine review and durable recovery verification.
+    Guide {
+        #[arg(long)]
+        hub_state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        agent_state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+        key_file: Option<PathBuf>,
+        #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+        secure_enclave_helper: Option<PathBuf>,
+        #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+        mutation_authority_dir: Option<PathBuf>,
+        /// Optional bounded #233 diagnostics JSON. Observations never widen supported decisions.
+        #[arg(long)]
+        diagnostics_file: Option<PathBuf>,
+        /// Root forwarded only to the existing v2_status post-recovery verification.
+        #[arg(long, env = "CUMG_V2_INSTALL_ROOT")]
+        install_root: Option<PathBuf>,
+        /// Runtime root forwarded only to the existing v2_status post-recovery verification.
+        #[arg(long, env = "CUMG_V2_RUN_ROOT")]
+        run_root: Option<PathBuf>,
+        /// Wait for the exact Hub-signed durable acknowledgement; guided recovery never uses zero.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=120))]
+        wait_secs: u64,
+        /// Emit a privacy-bounded read-only plan. JSON mode never prompts, signs, or publishes.
+        #[arg(long)]
+        json: bool,
     },
     /// Show the current Hub-signed recovery challenge without resolving it.
     Status {
@@ -110,6 +148,43 @@ impl From<DecisionArg> for IndeterminateResolution {
     }
 }
 
+const MAX_GUIDED_DIAGNOSTICS_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const GUIDED_RECOVERY_EVIDENCE: &str = "guided_recovery_authoritative_incident_review_v1";
+
+#[derive(Debug)]
+struct GuidedRecoveryArgs {
+    hub_state_dir: PathBuf,
+    agent_state_dir: PathBuf,
+    hub_public_key_file: PathBuf,
+    key_file: Option<PathBuf>,
+    secure_enclave_helper: Option<PathBuf>,
+    mutation_authority_dir: Option<PathBuf>,
+    diagnostics_file: Option<PathBuf>,
+    install_root: Option<PathBuf>,
+    run_root: Option<PathBuf>,
+    wait_secs: u64,
+    json: bool,
+}
+
+#[derive(Debug)]
+struct GuidedRecoveryReview {
+    brief: computer_use_mcp_gateway::v2_incident_brief::IncidentBrief,
+    challenge: RecoveryChallenge,
+    plan: GuidedRecoveryPlan,
+}
+
+#[derive(Debug)]
+struct PostRecoveryStatus {
+    overall: OperatorOverallStatus,
+    primary_reason: String,
+    quarantine: String,
+    recovery_mode: String,
+    handoff: String,
+    mutation_authority: String,
+    runtime: String,
+}
+
 #[derive(Debug, Clone)]
 struct ExpectedRecoveryCompletion {
     request_id: String,
@@ -162,6 +237,31 @@ fn main() -> Result<()> {
             secure_enclave_helper,
             public_key_out,
         } => export_public(key_file, secure_enclave_helper, public_key_out),
+        Command::Guide {
+            hub_state_dir,
+            agent_state_dir,
+            hub_public_key_file,
+            key_file,
+            secure_enclave_helper,
+            mutation_authority_dir,
+            diagnostics_file,
+            install_root,
+            run_root,
+            wait_secs,
+            json,
+        } => guide(GuidedRecoveryArgs {
+            hub_state_dir,
+            agent_state_dir,
+            hub_public_key_file,
+            key_file,
+            secure_enclave_helper,
+            mutation_authority_dir,
+            diagnostics_file,
+            install_root,
+            run_root,
+            wait_secs,
+            json,
+        }),
         Command::Status {
             state_dir,
             hub_public_key_file,
@@ -213,6 +313,370 @@ fn main() -> Result<()> {
             },
             wait_secs,
         ),
+    }
+}
+
+fn load_guided_review(args: &GuidedRecoveryArgs) -> Result<GuidedRecoveryReview> {
+    let before = verified_challenge(&args.agent_state_dir, &args.hub_public_key_file)?;
+    let diagnostics = args
+        .diagnostics_file
+        .as_deref()
+        .map(|path| {
+            load_secret_text(path, MAX_GUIDED_DIAGNOSTICS_BYTES)
+                .context("failed to load private bounded incident diagnostics")
+        })
+        .transpose()?;
+    let brief = build_incident_brief_read_only(
+        &args.hub_state_dir,
+        &args.agent_state_dir,
+        &before.operation_id,
+        args.mutation_authority_dir.as_deref(),
+        diagnostics.as_deref(),
+    )
+    .context("guided recovery incident inspection failed")?;
+    let after = verified_challenge(&args.agent_state_dir, &args.hub_public_key_file)?;
+    if before != after {
+        anyhow::bail!("recovery state changed during inspection; re-run guided review");
+    }
+    let plan = compose_guided_recovery_plan(&brief, &after);
+    Ok(GuidedRecoveryReview {
+        brief,
+        challenge: after,
+        plan,
+    })
+}
+
+fn prompt_guided_decision(
+    plan: &GuidedRecoveryPlan,
+) -> Result<Option<ReconciliationSupportedDecision>> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        anyhow::bail!(
+            "authority-bearing guided recovery requires an interactive Human terminal; use --json for read-only planning"
+        );
+    }
+    println!("\nHuman decision required");
+    println!("  0) Keep quarantine / cancel");
+    for (index, decision) in plan.supported_decisions.iter().enumerate() {
+        println!("  {}) {}", index + 1, guided_decision_name(*decision));
+    }
+    loop {
+        print!("Select a CUMG-supported decision: ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        if stdin.read_line(&mut input)? == 0 {
+            return Ok(None);
+        }
+        let input = input.trim();
+        if matches!(input, "0" | "q" | "quit" | "cancel") {
+            return Ok(None);
+        }
+        let Ok(index) = input.parse::<usize>() else {
+            println!("Invalid selection; choose one listed number or 0 to keep quarantine.");
+            continue;
+        };
+        if let Some(decision) = index
+            .checked_sub(1)
+            .and_then(|offset| plan.supported_decisions.get(offset))
+        {
+            return Ok(Some(*decision));
+        }
+        println!("Unsupported selection; the authoritative decision set was not widened.");
+    }
+}
+
+fn guide(args: GuidedRecoveryArgs) -> Result<()> {
+    let reviewed = load_guided_review(&args)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&reviewed.plan)?);
+        return Ok(());
+    }
+
+    println!("{}", render_incident_brief_text(&reviewed.brief));
+    println!("\nGuided recovery");
+    println!("  operation_id={}", reviewed.plan.operation.operation_id);
+    println!("  device_id={}", reviewed.plan.operation.device_id);
+    println!(
+        "  original_generation={}",
+        reviewed.plan.operation.original_generation
+    );
+    println!(
+        "  current_generation={}",
+        reviewed
+            .plan
+            .operation
+            .current_generation
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+    );
+    println!(
+        "  old_operation_replayed={}",
+        reviewed.plan.old_operation_replayed
+    );
+
+    match reviewed.plan.disposition {
+        GuidedRecoveryDisposition::KeepQuarantine => {
+            println!("guided_outcome=keep_quarantine");
+            println!("authorization=not_published");
+            println!("durable_completion=not_verified");
+            return Ok(());
+        }
+        GuidedRecoveryDisposition::Reinspect => {
+            println!("guided_outcome=re_review_required");
+            println!("authorization=not_published");
+            println!("durable_completion=not_verified");
+            anyhow::bail!("exact recovery binding does not match the reviewed quarantine");
+        }
+        GuidedRecoveryDisposition::HumanSelectionRequired => {}
+    }
+
+    let Some(selected) = prompt_guided_decision(&reviewed.plan)? else {
+        println!("guided_outcome=keep_quarantine");
+        println!("human_selection=cancelled");
+        println!("authorization=not_published");
+        println!("durable_completion=not_verified");
+        return Ok(());
+    };
+
+    // Re-inspect the exact challenge and #233 brief after Human review. The
+    // helper below samples the signed challenge both before and after the brief
+    // read, so generation/fingerprint/nonce changes fail before signing.
+    let fresh = load_guided_review(&args)?;
+    if let Err(error) = revalidate_guided_recovery_selection(&reviewed.plan, &fresh.plan, selected)
+    {
+        println!("guided_outcome=re_review_required");
+        println!("authorization=not_published");
+        println!("durable_completion=not_verified");
+        anyhow::bail!("reviewed recovery state became stale before signing: {error:?}");
+    }
+
+    let key_file = args
+        .key_file
+        .as_deref()
+        .context("--key-file is required for interactive guided recovery")?;
+    let secure_enclave_helper = args
+        .secure_enclave_helper
+        .as_deref()
+        .context("--secure-enclave-helper is required for interactive guided recovery")?;
+
+    let expected = match publish_guided_authorization(
+        &args.agent_state_dir,
+        key_file,
+        secure_enclave_helper,
+        &fresh.challenge,
+        selected,
+    ) {
+        Ok(expected) => expected,
+        Err(error) => {
+            println!("guided_outcome=authorization_not_completed");
+            println!("authorization=not_published");
+            println!("durable_completion=not_verified");
+            println!("quarantine=retained");
+            return Err(error);
+        }
+    };
+
+    println!("request_id={}", expected.request_id);
+    println!("operation_id={}", expected.operation_id);
+    println!("authorization=published");
+    let _resolved = match wait_for_completion_verified(
+        &args.agent_state_dir,
+        &args.hub_public_key_file,
+        &expected,
+        args.wait_secs,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            println!("durable_completion=not_verified");
+            println!("guided_outcome=durable_completion_incomplete");
+            return Err(error);
+        }
+    };
+    println!("durable_completion=verified");
+    println!("old_operation_replayed=false");
+
+    let exact_quarantine_cleared = exact_quarantine_cleared(&args.hub_state_dir, &expected)?;
+    println!("exact_quarantine_cleared={exact_quarantine_cleared}");
+
+    let post_status = match run_post_recovery_status(&args) {
+        Ok(status) => status,
+        Err(error) => {
+            println!("post_recovery_status=unavailable");
+            println!("recovery_outcome=durably_verified_post_verification_unavailable");
+            return Err(error);
+        }
+    };
+    println!(
+        "post_recovery_status={}",
+        operator_overall_name(post_status.overall)
+    );
+    println!("post_recovery_reason={}", post_status.primary_reason);
+    println!("post_recovery_quarantine={}", post_status.quarantine);
+    println!("post_recovery_recovery_mode={}", post_status.recovery_mode);
+    println!("post_recovery_handoff={}", post_status.handoff);
+    println!(
+        "post_recovery_mutation_authority={}",
+        post_status.mutation_authority
+    );
+    println!("post_recovery_runtime={}", post_status.runtime);
+
+    let disposition = classify_guided_recovery_post_status(
+        true,
+        exact_quarantine_cleared,
+        post_status.recovery_mode == "normal",
+        post_status.overall,
+    );
+    match disposition {
+        GuidedRecoveryPostDisposition::VerifiedHealthy => {
+            println!("recovery_outcome=verified_healthy");
+            Ok(())
+        }
+        GuidedRecoveryPostDisposition::VerifiedWithUnrelatedStatusProblem => {
+            println!("recovery_outcome=verified_with_unrelated_status_problem");
+            Ok(())
+        }
+        GuidedRecoveryPostDisposition::VerificationIncomplete => {
+            println!("recovery_outcome=post_recovery_verification_incomplete");
+            anyhow::bail!(
+                "durable acknowledgement was verified but the exact quarantine did not clear as expected"
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn publish_guided_authorization(
+    state_dir: &Path,
+    key_file: &Path,
+    secure_enclave_helper: &Path,
+    challenge: &RecoveryChallenge,
+    selected: ReconciliationSupportedDecision,
+) -> Result<ExpectedRecoveryCompletion> {
+    use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
+    let (assessment, decision) = match selected {
+        ReconciliationSupportedDecision::ConfirmedCompleted => (
+            RecoveryAuditAssessment::Completed,
+            IndeterminateResolution::ConfirmedCompleted,
+        ),
+        ReconciliationSupportedDecision::ConfirmedNotExecuted => (
+            RecoveryAuditAssessment::NotExecuted,
+            IndeterminateResolution::ConfirmedNotExecuted,
+        ),
+    };
+    let authorization =
+        new_authorization(challenge, assessment, decision, GUIDED_RECOVERY_EVIDENCE)
+            .context("failed to construct exact guided recovery authorization")?;
+    println!("human_selection={}", guided_decision_name(selected));
+    println!("user_presence=required");
+    let key = MacRecoveryKey::load(secure_enclave_helper, key_file)
+        .context("recovery key is not provisioned")?;
+    let authorization = key
+        .sign_authorization(authorization)
+        .context("OS user-presence approval was not completed")?;
+    store_authorization(state_dir, &authorization)
+        .context("failed to publish recovery authorization to Agent")?;
+    Ok(ExpectedRecoveryCompletion {
+        request_id: authorization.request_id,
+        device_id: authorization.device_id,
+        operation_id: authorization.operation_id,
+        current_generation: authorization.current_generation,
+        decision: authorization.decision,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn publish_guided_authorization(
+    _state_dir: &Path,
+    _key_file: &Path,
+    _secure_enclave_helper: &Path,
+    _challenge: &RecoveryChallenge,
+    _selected: ReconciliationSupportedDecision,
+) -> Result<ExpectedRecoveryCompletion> {
+    bail!("local user-presence recovery approval is supported only on macOS")
+}
+
+fn exact_quarantine_cleared(
+    hub_state_dir: &Path,
+    expected: &ExpectedRecoveryCompletion,
+) -> Result<bool> {
+    let report = inspect_quarantines_read_only(hub_state_dir, Some(&expected.device_id))
+        .context("post-recovery exact quarantine inspection failed")?;
+    Ok(!report
+        .quarantines
+        .iter()
+        .any(|item| item.blocking_operation_id == expected.operation_id))
+}
+
+fn run_post_recovery_status(args: &GuidedRecoveryArgs) -> Result<PostRecoveryStatus> {
+    let current = std::env::current_exe().context("failed to resolve v2_recover executable")?;
+    let status_exe = current.with_file_name("v2_status");
+    let mut command = std::process::Command::new(status_exe);
+    command
+        .arg("--hub-state-dir")
+        .arg(&args.hub_state_dir)
+        .arg("--agent-state-dir")
+        .arg(&args.agent_state_dir)
+        .arg("--json");
+    if let Some(path) = args.install_root.as_deref() {
+        command.arg("--install-root").arg(path);
+    }
+    if let Some(path) = args.run_root.as_deref() {
+        command.arg("--run-root").arg(path);
+    }
+    if let Some(path) = args.mutation_authority_dir.as_deref() {
+        command.arg("--mutation-authority-dir").arg(path);
+    }
+    let output = command
+        .output()
+        .context("failed to run existing v2_status post-recovery verification")?;
+    if output.stdout.len() > 256 * 1024 {
+        anyhow::bail!("v2_status output exceeded the bounded guided-recovery limit");
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("v2_status did not return its privacy-bounded JSON contract")?;
+    let string_at = |path: &[&str]| -> Result<String> {
+        let mut current = &value;
+        for key in path {
+            current = current
+                .get(*key)
+                .with_context(|| format!("v2_status JSON missing {}", path.join(".")))?;
+        }
+        current
+            .as_str()
+            .map(ToOwned::to_owned)
+            .with_context(|| format!("v2_status JSON field {} is not text", path.join(".")))
+    };
+    let overall_text = string_at(&["overall"])?;
+    let overall = parse_operator_overall(&overall_text)
+        .with_context(|| format!("unsupported v2_status overall value {overall_text}"))?;
+    Ok(PostRecoveryStatus {
+        overall,
+        primary_reason: string_at(&["primary_reason"])?,
+        quarantine: string_at(&["recovery", "quarantine"])?,
+        recovery_mode: string_at(&["recovery", "recovery_mode"])?,
+        handoff: string_at(&["handoff", "status"])?,
+        mutation_authority: string_at(&["mutation_authority", "status"])?,
+        runtime: string_at(&["runtime", "verification"])?,
+    })
+}
+
+fn parse_operator_overall(value: &str) -> Option<OperatorOverallStatus> {
+    match value {
+        "healthy" => Some(OperatorOverallStatus::Healthy),
+        "degraded" => Some(OperatorOverallStatus::Degraded),
+        "action_required" => Some(OperatorOverallStatus::ActionRequired),
+        "unavailable" => Some(OperatorOverallStatus::Unavailable),
+        "unknown" => Some(OperatorOverallStatus::Unknown),
+        _ => None,
+    }
+}
+
+const fn operator_overall_name(value: OperatorOverallStatus) -> &'static str {
+    match value {
+        OperatorOverallStatus::Healthy => "healthy",
+        OperatorOverallStatus::Degraded => "degraded",
+        OperatorOverallStatus::ActionRequired => "action_required",
+        OperatorOverallStatus::Unavailable => "unavailable",
+        OperatorOverallStatus::Unknown => "unknown",
     }
 }
 
@@ -375,6 +839,21 @@ fn wait_for_completion(
     expected: &ExpectedRecoveryCompletion,
     wait_secs: u64,
 ) -> Result<()> {
+    let _resolved =
+        wait_for_completion_verified(state_dir, hub_public_key_file, expected, wait_secs)?;
+    println!("request_id={}", expected.request_id);
+    println!("operation_id={}", expected.operation_id);
+    println!("durable_completion=verified");
+    println!("old_operation_replayed=false");
+    Ok(())
+}
+
+fn wait_for_completion_verified(
+    state_dir: &Path,
+    hub_public_key_file: &Path,
+    expected: &ExpectedRecoveryCompletion,
+    wait_secs: u64,
+) -> Result<RecoveryResolved> {
     let trusted_hub =
         load_verifying_key(hub_public_key_file).context("failed to load pinned Hub public key")?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
@@ -397,11 +876,7 @@ fn wait_for_completion(
                     "durable recovery acknowledgement does not match the exact operation/decision"
                 );
             }
-            println!("request_id={}", expected.request_id);
-            println!("operation_id={}", expected.operation_id);
-            println!("durable_completion=verified");
-            println!("old_operation_replayed=false");
-            return Ok(());
+            return Ok(resolved);
         }
         if wait_secs == 0 || std::time::Instant::now() >= deadline {
             anyhow::bail!("durable Hub recovery completion is not yet verified");

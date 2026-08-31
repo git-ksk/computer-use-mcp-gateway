@@ -92,30 +92,40 @@ exportされるのは公開鍵だけです。operator-authenticated provisioning
 
 Hubは起動時にverifierを読むため、初回provisioning後はHub再起動が必要です。verifier未設定ならonline recoveryが無効になるだけで、quarantine自体が弱くなることはありません。
 
-quarantine発生後、Mac上で状態を確認します。
+quarantine発生後の canonical operator workflow は `v2_recover guide` です。
 
 ```bash
-v2_recover status \
-  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub"
-```
-
-実desktopを確認した後、どちらか一方を明示的に承認します。
-
-```bash
-v2_recover resolve \
-  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+v2_recover guide \
+  --hub-state-dir "<HUB_STATE_DIR>" \
+  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
   --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
   --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
-  --decision confirmed-completed \
-  --evidence "local user inspected the current desktop" \
-  --wait-secs 30
+  --mutation-authority-dir "<MUTATION_AUTHORITY_DIR>" \
+  --wait-secs 60
 ```
 
-署名時にmacOS user presenceが必要です。拒否/キャンセル時はquarantineを維持します。`authorization=published` は署名済みlocal handoff fileがAgentから見える状態になったことだけを意味し、durable recovery成功ではありません。`--wait-secs` を使うと、CLIはexactなHub署名 `RecoveryResolved` ACKを待ち、request/device/current-generation/operation/decision bindingを検証し、Agentがその検証済みACKをdurable receiptとして保存した後だけ `durable_completion=verified` を返します。Hubはauthoritative resolution checkpointのcommit成功後にだけACKを生成します。local receiptはowner-privateでchallenge/authorization cleanup後も残り、fresh challenge受信時に旧receiptをclearします。
+`guide` は orchestration / UX だけを追加し、新しい recovery authority は作りません。最初に Hub 署名 challenge を検証し、既存 #233 incident brief を生成して、`IncidentBrief.cumg.supported_decisions` を変更せず pure recovery plan にコピーします。observational diagnostics は説明材料として表示できますが、supported decision を作成・追加できません。authoritative decision set が空なら `keep_quarantine` で終了し、user-presence signing / authorization publication は実行しません。
 
-resolve CLIがpublication後に終了した場合や再確認が必要な場合は、resolve時に表示されたexact safe metadataを使って `v2_recover confirm` を実行できます。ACK欠落、timeout、stale receipt、mismatchは成功ではなく、retry/replay authorityにもなりません。
+CUMG が support する decision がある場合、authority-bearing guided path は interactive Human terminal を必須にし、その closed set からの明示選択か cancel だけを受け付けます。Agent/LLM から pipe した入力では recovery decision を実行できません。Human review 後、CLI は署名前に signed challenge と incident brief を直ちに再読します。operation/device/original-generation/current-generation/fingerprint/nonce binding、incident state、supported-decision set のどれかが変わっていれば fail closed で再reviewを要求します。
+
+fresh validation 後だけ、既存 Secure Enclave helper が macOS user presence を要求します。deny/cancel/timeout/authentication unavailable では authorization を publish せず、quarantine は維持されます。guided path でも既存 online-recovery protocol をそのまま使用し、old operation の retry/replay authority は追加しません。
+
+`authorization=published` は completion ではありません。guided recovery は必ず #109 semantics で exact Hub-signed `RecoveryResolved` ACK を待ち、request/device/current-generation/operation/decision binding を検証した後だけ `durable_completion=verified` と `old_operation_replayed=false` を表示します。その後、exact quarantine の read-only check と既存 `v2_status` JSON を実行します。すべて healthy なら `recovery_outcome=verified_healthy`、recovery 自体は durable に完了しているが無関係な Handoff/runtime/mutation-authority/backend/recovery-mode 問題が残る場合は `recovery_outcome=verified_with_unrelated_status_problem` と bounded `v2_status` reason を別に表示し、durable recovery 成功を消しません。
+
+Agent-assisted explanation / UI composition には read-only JSON planning mode を使えます。
+
+```bash
+v2_recover guide \
+  --hub-state-dir "<HUB_STATE_DIR>" \
+  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --json
+```
+
+JSON mode は prompt/sign/publish/quarantine clear/replay を一切行いません。private challenge fingerprint/nonce、credential/key/raw command/argv/clipboard/screenshot/principal material も出力しません。そのため Agent/UI は「今 CUMG が何を support しているか」を説明できますが、recovery decision の authority は持ちません。
+
+低レベルの `v2_recover status` / `resolve` / `confirm` は advanced diagnostics / break-glass 用 primitive として残します。`resolve` は従来どおり macOS user presence を要求し、`confirm` は publish 済み request を exact safe metadata で再確認できます。ACK 欠落、timeout、stale receipt、mismatch は成功ではなく、retry/replay authority にもなりません。通常 operator flow では `guide` を優先します。
 
 ## 障害時
 
