@@ -25,7 +25,7 @@ class ReleaseCandidateTests(unittest.TestCase):
     COMMIT = "a" * 40
     VERSION = "0.3.0"
     HANDOFF_COMMIT = "b" * 40
-    HUB_AGENT_SCHEMA = 4
+    HUB_AGENT_SCHEMA = 5
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cumg-release-candidate-")

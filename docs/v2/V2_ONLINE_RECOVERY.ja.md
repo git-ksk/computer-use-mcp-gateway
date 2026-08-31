@@ -2,7 +2,7 @@
 
 > 英語版 [`V2_ONLINE_RECOVERY.md`](V2_ONLINE_RECOVERY.md) が正本です。
 
-状態: **明示的な recovery key provisioning を前提に実装済み。Secure Enclave の user-presence 実機acceptanceはリリース前ゲートとして残る。**
+状態: **明示的な recovery key provisioning を前提に実装済み。trusted physical macOS Secure Enclave user-presence acceptance は完了済みで、current-state acceptance も同じ authority を再利用する。**
 
 この機能は、desktop が durable `Indeterminate` quarantine に入った際、通常運用でHubを停止してoffline maintenanceを行わなくても、端末ユーザーの明示承認により安全に復帰できるようにするものです。既存の no-auto-replay と persistence-gated recovery は維持します。
 
@@ -27,7 +27,8 @@ AgentがHub署名/current generationを検証
         v
 cumg-v2-recover status / ユーザーがdesktopを確認
         |
-        | exact decision
+        | exact Human choice:
+        | historical resolution OR current-state acceptance
         | Secure Enclave user-presence署名
         v
 Agentは署名済みRecoveryAuthorizationを中継するだけ
@@ -35,7 +36,8 @@ Agentは署名済みRecoveryAuthorizationを中継するだけ
         v
 Hubがrecovery key/challenge/current quarantineを検証
         |
-        | resolve_indeterminate + durable checkpoint
+        | resolve_indeterminate OR reviewed tombstone retirement
+        | + durable checkpoint
         v
 Hub署名 RecoveryResolved ACK
         |
@@ -47,11 +49,13 @@ challengeは stable device ID、曖昧operation ID、実行時のhistorical gene
 
 historical generationとcurrent generationは別物です。generationはstale-session fenceであり、recovery ownershipではありません。
 
+online-recovery schema v2 の signed authorization は `confirmed_completed` / `confirmed_not_executed` に加えて `current_state_accepted` を持ちます。後者では `transient_ui_interaction_v1` policy 自体も署名対象です。decision / policy / operation / device / generation / fingerprint / nonce / expiry / assessment / evidence の変更は signature または exact challenge match を壊します。legacy schema v1 は従来 historical resolution shape のみ受理し、current-state acceptance authority は持てません。
+
 ## 監査とプライバシー
 
 通常のV2 checkpointはraw GUI command、screenshot、backend response、clipboard、credential等を保存しません。そのため、任意のGUI side effectを事後にAgentが一般的な方法で自動証明することはできません。
 
-初期CLIは正直に `audit_assessment=inconclusive` とし、ローカルユーザーが実desktopを確認して `confirmed_completed` または `confirmed_not_executed` を選択します。将来、特定capabilityで安全に証明可能な場合のみ `completed` / `not_executed` の自動auditを追加できます。
+generic post-hoc evidence で history を証明できない場合、CLI は正直に `audit_assessment=inconclusive` とします。その後の Human choice は意図的に2種類へ分離します。`resolve` は `confirmed_completed` / `confirmed_not_executed` という historical claim 専用です。`accept-current-state` は historical claim を一切行わず、「現在のscreenを確認し、このstateを continuation point として受け入れる」ことだけを意味します。このpathでは historical operation は `Indeterminate` のままです。将来、特定capabilityで安全に証明可能な場合のみ `completed` / `not_executed` の自動auditを追加できます。
 
 Hubへ送るevidenceは最大1KiBのmetadataのみです。screenshot、raw command/result、credential、typed secret、無関係なdesktop contentを含めません。
 
@@ -68,9 +72,11 @@ Hubは次の条件をすべて満たす場合だけonline resolutionを受理し
 7. durable quarantine fingerprintが変化していない
 8. evidenceとrequest shapeがbound内
 
-解除は既存 `resolve_indeterminate` を利用し、checkpoint永続化に失敗した場合はin-memory stateもquarantine snapshotへrollbackします。durable成功前にACKは返しません。
+historical `confirmed_completed` / `confirmed_not_executed` は既存 `resolve_indeterminate` を利用します。`current_state_accepted` は別物で、online-recovery schema v2、`audit_assessment=inconclusive`、exact `transient_ui_interaction_v1` policy、authorization と exact match する current authenticated registry generation、original ambiguous dispatch より strictly newer generation を追加で要求します。既存 retirement policy が capability を独立に `Scroll` / `MovePointer` のみに限定し、`Shell`、process、filesystem、text/input、browser mutation、その他すべては valid local-user signature があっても fail closed します。
 
-`confirmed_not_executed` でも旧operationは再実行しません。再試行は必ず新しいoperation IDです。同じaccepted request IDの再送は同一live recovery exchange内でidempotentにACKできますが、異なるdecisionへの変更はできません。
+current-state acceptance は terminal resolution ではなく permanent retired-indeterminate replay tombstone を再利用します。durable operation は `Indeterminate`、terminal receipt/result は無し、audit は `outcome=unknown`、`disposition=current_state_accepted`、`authority=local_user_presence`、reviewed policy/generation、bounded Human evidence metadata、`replayed=false` を記録します。解除するのは device quarantine だけです。
+
+どちらの transition も persistence-gated で、checkpoint 永続化に失敗した場合は in-memory execution state を quarantine snapshot へ rollback し、success ACK は返しません。旧operationのresume/replayは一切行わず、後続workは必ず新しいoperation IDです。同一 accepted request ID の exact retransmission は同じ live recovery exchange 内で idempotent に ACK できますが、decision/policy/evidence の conflict は置換できません。
 
 ## macOS provisioning
 
@@ -125,7 +131,19 @@ v2_recover guide \
 
 JSON mode は prompt/sign/publish/quarantine clear/replay を一切行いません。private challenge fingerprint/nonce、credential/key/raw command/argv/clipboard/screenshot/principal material も出力しません。そのため Agent/UI は「今 CUMG が何を support しているか」を説明できますが、recovery decision の authority は持ちません。
 
-低レベルの `v2_recover status` / `resolve` / `confirm` は advanced diagnostics / break-glass 用 primitive として残します。`resolve` は従来どおり macOS user presence を要求し、`confirm` は publish 済み request を exact safe metadata で再確認できます。ACK 欠落、timeout、stale receipt、mismatch は成功ではなく、retry/replay authority にもなりません。通常 operator flow では `guide` を優先します。
+低レベルの `v2_recover status` / `resolve` / `confirm` は advanced diagnostics / break-glass 用 primitive として残します。historical outcome を証明できない reviewed low-impact `Scroll` / `MovePointer` ambiguity で、local Human が現在のscreenを continuation point として明示的に受け入れる場合だけ、別コマンドを使用します。
+
+```bash
+v2_recover accept-current-state \
+  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
+  --evidence "local human inspected and accepted the current screen as the continuation point" \
+  --wait-secs 30
+```
+
+user-presence prompt 前に `historical_execution_outcome=indeterminate`、`operator_observation=current_state_accepted`、`operational_disposition=current_state_accepted`、reviewed retirement policy、`old_operation_replayed=false` を明示します。screen observation 自体は authority ではなく、separately provisioned recovery-key signature と Hub 側の全 policy/generation/quarantine check が必要です。`resolve` / `accept-current-state` はどちらも macOS user presence を要求し、`confirm` は decision/policy を含む exact safe metadata で publish 済み request を再確認します。`guide` の authoritative historical decision closed set は暗黙に current-state acceptance で拡張しません。ACK 欠落、timeout、stale receipt、mismatch は成功ではなく retry/replay authority にもなりません。
 
 ## 障害時
 
@@ -145,8 +163,10 @@ sealed Secure Enclave recovery-key representation紛失、Agent接続不能、Se
 8. 新しいoperationが成功する
 9. 旧operationは一度もreplayされない
 
+#137 は新しい cryptographic/user-presence provider を追加せず、`accept-current-state` も既にaccept済みの Secure Enclave helper/key/challenge/signature/relay path をそのまま再利用します。新しい safety claim は decision/policy semantics、generation/capability gate、persistence rollback、durable unknown-outcome tombstone、wording distinction であり、deterministic regression で固定します。user-presence provider または authority boundary 自体を変更する場合は新しい physical acceptance が必要です。
+
 ## Protocol互換性とchallenge更新
 
-Online recoveryは現在の `HUB_AGENT_SCHEMA_VERSION = 4` application protocolの一部です。schema validationはfail-closedのままなので、このreleaseを有効にする際はHubとAgentを協調して更新し、mixed-version rolling compatibilityには依存しません。V1 gatewayの動作は変わりません。
+Online recoveryは現在の `HUB_AGENT_SCHEMA_VERSION = 5` application protocolの一部です。schema validationはfail-closedのままなので、このreleaseを有効にする際はHubとAgentを協調して更新し、mixed-version rolling compatibilityには依存しません。V1 gatewayの動作は変わりません。
 
 Recovery challengeは300秒（5分）で期限切れになります。desktopがquarantineのままなら、通常のauthenticated Agent heartbeatを契機にHubがpending challengeを再確認し、期限切れ後はfresh nonceを持つchallengeを再発行します。承認時間切れだけを理由にHub/Agentを再起動する必要はありません。fresh challenge受信時は以前のlocal authorization handoffを無効化します。

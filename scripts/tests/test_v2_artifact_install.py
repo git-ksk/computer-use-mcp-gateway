@@ -105,7 +105,7 @@ class ArtifactInstallTests(unittest.TestCase):
             "source_commit": ArtifactInstallTests.CUMG,
             "platform": "macos",
             "architecture": "arm64",
-            "hub_agent_schema_version": 4,
+            "hub_agent_schema_version": 5,
             "paired_handoff_commit": ArtifactInstallTests.HANDOFF,
             "install_profile": "single-mac-artifact-v1",
             "files": [],
@@ -192,7 +192,7 @@ class ArtifactInstallTests(unittest.TestCase):
         self.assertTrue((installed / "runtime-manifest.json").is_file())
         runtime_manifest = json.loads((installed / "runtime-manifest.json").read_text())
         self.assertEqual(runtime_manifest["source_commit"], self.CUMG)
-        self.assertEqual(runtime_manifest["hub_agent_schema_version"], 4)
+        self.assertEqual(runtime_manifest["hub_agent_schema_version"], 5)
         self.assertEqual({x["name"] for x in runtime_manifest["binaries"]}, set(mod.RUNTIME_BINARIES))
         self.assertTrue((installed / "mutation-authority").is_dir())
         for filename in mod.PLISTS.values():

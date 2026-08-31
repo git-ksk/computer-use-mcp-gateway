@@ -4,9 +4,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(target_os = "macos")]
 use computer_use_mcp_gateway::v2_online_recovery::{
-    RecoveryAuditAssessment, new_authorization, store_authorization,
+    RecoveryAuditAssessment, new_authorization, new_current_state_acceptance_authorization,
+    recovery_decision_name, store_authorization,
 };
 use computer_use_mcp_gateway::{
+    v2_execution_safety::RetirementPolicy,
     v2_guided_recovery::{
         GuidedRecoveryDisposition, GuidedRecoveryPlan, GuidedRecoveryPostDisposition,
         classify_guided_recovery_post_status, compose_guided_recovery_plan,
@@ -17,8 +19,8 @@ use computer_use_mcp_gateway::{
     v2_m1_keys::{load_secret_text, load_verifying_key},
     v2_maintenance::{ReconciliationSupportedDecision, inspect_quarantines_read_only},
     v2_online_recovery::{
-        RecoveryChallenge, RecoveryResolved, load_challenge, load_recovery_resolved,
-        verify_recovery_challenge, verify_recovery_resolved,
+        RecoveryChallenge, RecoveryDecision, RecoveryResolved, load_challenge,
+        load_recovery_resolved, verify_recovery_challenge, verify_recovery_resolved,
     },
     v2_operator_status::OperatorOverallStatus,
 };
@@ -104,8 +106,25 @@ enum Command {
         #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
         secure_enclave_helper: PathBuf,
         #[arg(long, value_enum)]
-        decision: DecisionArg,
+        decision: ResolutionDecisionArg,
         /// Short metadata describing what the local user inspected. Do not include secrets or screenshots.
+        #[arg(long)]
+        evidence: String,
+        /// Wait up to this many seconds for the exact signed Hub durable-completion acknowledgement.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
+    },
+    /// Accept the current desktop state as the continuation point without claiming a historical outcome.
+    AcceptCurrentState {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+        key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+        secure_enclave_helper: PathBuf,
+        /// Short metadata stating what the local user inspected. Never include a screenshot or secret.
         #[arg(long)]
         evidence: String,
         /// Wait up to this many seconds for the exact signed Hub durable-completion acknowledgement.
@@ -127,23 +146,47 @@ enum Command {
         #[arg(long)]
         current_generation: u64,
         #[arg(long, value_enum)]
-        decision: DecisionArg,
+        decision: RecoveryDecisionArg,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
         wait_secs: u64,
     },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum DecisionArg {
+enum ResolutionDecisionArg {
     ConfirmedCompleted,
     ConfirmedNotExecuted,
 }
 
-impl From<DecisionArg> for IndeterminateResolution {
-    fn from(value: DecisionArg) -> Self {
+impl From<ResolutionDecisionArg> for IndeterminateResolution {
+    fn from(value: ResolutionDecisionArg) -> Self {
         match value {
-            DecisionArg::ConfirmedCompleted => Self::ConfirmedCompleted,
-            DecisionArg::ConfirmedNotExecuted => Self::ConfirmedNotExecuted,
+            ResolutionDecisionArg::ConfirmedCompleted => Self::ConfirmedCompleted,
+            ResolutionDecisionArg::ConfirmedNotExecuted => Self::ConfirmedNotExecuted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RecoveryDecisionArg {
+    ConfirmedCompleted,
+    ConfirmedNotExecuted,
+    CurrentStateAccepted,
+}
+
+impl RecoveryDecisionArg {
+    fn decision(self) -> RecoveryDecision {
+        match self {
+            Self::ConfirmedCompleted => RecoveryDecision::ConfirmedCompleted,
+            Self::ConfirmedNotExecuted => RecoveryDecision::ConfirmedNotExecuted,
+            Self::CurrentStateAccepted => RecoveryDecision::CurrentStateAccepted,
+        }
+    }
+
+    fn current_state_policy(self) -> Option<RetirementPolicy> {
+        match self {
+            Self::CurrentStateAccepted => Some(RetirementPolicy::TransientUiInteractionV1),
+            Self::ConfirmedCompleted | Self::ConfirmedNotExecuted => None,
         }
     }
 }
@@ -191,7 +234,8 @@ struct ExpectedRecoveryCompletion {
     device_id: String,
     operation_id: String,
     current_generation: u64,
-    decision: IndeterminateResolution,
+    decision: RecoveryDecision,
+    current_state_policy: Option<RetirementPolicy>,
 }
 
 fn now_ms() -> Result<u64> {
@@ -292,6 +336,21 @@ fn main() -> Result<()> {
             evidence,
             wait_secs,
         ),
+        Command::AcceptCurrentState {
+            state_dir,
+            hub_public_key_file,
+            key_file,
+            secure_enclave_helper,
+            evidence,
+            wait_secs,
+        } => accept_current_state(
+            state_dir,
+            hub_public_key_file,
+            key_file,
+            secure_enclave_helper,
+            evidence,
+            wait_secs,
+        ),
         Command::Confirm {
             state_dir,
             hub_public_key_file,
@@ -309,7 +368,8 @@ fn main() -> Result<()> {
                 device_id,
                 operation_id,
                 current_generation,
-                decision: decision.into(),
+                decision: decision.decision(),
+                current_state_policy: decision.current_state_policy(),
             },
             wait_secs,
         ),
@@ -580,6 +640,7 @@ fn publish_guided_authorization(
         operation_id: authorization.operation_id,
         current_generation: authorization.current_generation,
         decision: authorization.decision,
+        current_state_policy: authorization.current_state_policy,
     })
 }
 
@@ -783,14 +844,10 @@ fn resolve(
     );
     println!("current_generation={}", authorization.current_generation);
     println!("audit_assessment=inconclusive");
-    let decision_name = match authorization.decision {
-        IndeterminateResolution::ConfirmedCompleted => "confirmed_completed",
-        IndeterminateResolution::ConfirmedNotExecuted => "confirmed_not_executed",
-        IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
-            return Err(anyhow::anyhow!("unsupported online recovery decision"));
-        }
-    };
-    println!("decision={decision_name}");
+    println!(
+        "decision={}",
+        recovery_decision_name(authorization.decision)
+    );
     let key = MacRecoveryKey::load(&secure_enclave_helper, &key_file)
         .context("recovery key is not provisioned")?;
     let authorization = key
@@ -810,7 +867,8 @@ fn resolve(
                 device_id: authorization.device_id.clone(),
                 operation_id: authorization.operation_id.clone(),
                 current_generation: authorization.current_generation,
-                decision: authorization.decision.clone(),
+                decision: authorization.decision,
+                current_state_policy: authorization.current_state_policy,
             },
             wait_secs,
         )?;
@@ -818,6 +876,81 @@ fn resolve(
         println!("durable_completion=not_checked");
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn accept_current_state(
+    state_dir: PathBuf,
+    hub_public_key_file: PathBuf,
+    key_file: PathBuf,
+    secure_enclave_helper: PathBuf,
+    evidence: String,
+    wait_secs: u64,
+) -> Result<()> {
+    use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
+    let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
+    let authorization = new_current_state_acceptance_authorization(
+        &challenge,
+        RetirementPolicy::TransientUiInteractionV1,
+        evidence,
+    )
+    .context("current-state acceptance is not valid for this recovery schema")?;
+    println!("accepting_current_state");
+    println!("device_id={}", authorization.device_id);
+    println!("operation_id={}", authorization.operation_id);
+    println!(
+        "quarantine_generation={}",
+        authorization.quarantine_generation
+    );
+    println!("current_generation={}", authorization.current_generation);
+    println!("historical_execution_outcome=indeterminate");
+    println!("operator_observation=current_state_accepted");
+    println!("operational_disposition=current_state_accepted");
+    println!("retirement_policy=transient_ui_interaction_v1");
+    println!("old_operation_replayed=false");
+    println!(
+        "statement=I inspected the current screen. This state is acceptable to continue from."
+    );
+    println!("user_presence=required");
+    let key = MacRecoveryKey::load(&secure_enclave_helper, &key_file)
+        .context("recovery key is not provisioned")?;
+    let authorization = key
+        .sign_authorization(authorization)
+        .context("OS user-presence approval was not completed")?;
+    store_authorization(&state_dir, &authorization)
+        .context("failed to publish current-state acceptance authorization to Agent")?;
+    println!("request_id={}", authorization.request_id);
+    println!("authorization=published");
+    if wait_secs > 0 {
+        wait_for_completion(
+            &state_dir,
+            &hub_public_key_file,
+            &ExpectedRecoveryCompletion {
+                request_id: authorization.request_id.clone(),
+                device_id: authorization.device_id.clone(),
+                operation_id: authorization.operation_id.clone(),
+                current_generation: authorization.current_generation,
+                decision: authorization.decision,
+                current_state_policy: authorization.current_state_policy,
+            },
+            wait_secs,
+        )?;
+    } else {
+        println!("durable_completion=not_checked");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn accept_current_state(
+    _state_dir: PathBuf,
+    _hub_public_key_file: PathBuf,
+    _key_file: PathBuf,
+    _secure_enclave_helper: PathBuf,
+    _evidence: String,
+    _wait_secs: u64,
+) -> Result<()> {
+    bail!("local user-presence current-state acceptance is supported only on macOS")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -871,6 +1004,7 @@ fn wait_for_completion_verified(
             .context("durable recovery acknowledgement is stale, mismatched, or invalid")?;
             if resolved.operation_id != expected.operation_id
                 || resolved.decision != expected.decision
+                || resolved.current_state_policy != expected.current_state_policy
             {
                 anyhow::bail!(
                     "durable recovery acknowledgement does not match the exact operation/decision"

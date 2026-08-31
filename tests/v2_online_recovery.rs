@@ -83,7 +83,8 @@ fn recovery_authority_is_bound_to_exact_challenge_and_decision() {
         .unwrap();
 
     let mut changed_decision = authorization.clone();
-    changed_decision.decision = IndeterminateResolution::ConfirmedNotExecuted;
+    changed_decision.decision =
+        computer_use_mcp_gateway::v2_online_recovery::RecoveryDecision::ConfirmedNotExecuted;
     assert_eq!(
         verifier.verify_authorization(&challenge, &changed_decision, 101),
         Err(RecoveryError::InvalidRecoverySignature)
