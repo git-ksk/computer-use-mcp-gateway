@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 8;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 9;
+const RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 8;
 const EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 7;
 const PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 6;
 const RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 5;
@@ -771,9 +772,18 @@ pub struct ResolutionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RecoverableOperationResult {
-    Process { output: ProcessOutput },
-    Shell { output: ProcessOutput },
-    Error { code: DeviceErrorCode },
+    Process {
+        output: ProcessOutput,
+    },
+    Shell {
+        output: ProcessOutput,
+    },
+    Error {
+        code: DeviceErrorCode,
+    },
+    /// Payload-free durable marker for a terminal effectful desktop/browser operation.
+    /// The authoritative state/receipt carries the outcome; raw GUI/browser results are not stored.
+    EffectfulStatus,
 }
 
 impl RecoverableOperationResult {
@@ -792,6 +802,19 @@ impl RecoverableOperationResult {
                 ) =>
             {
                 state == HubOperationState::Failed
+            }
+            Self::EffectfulStatus
+                if !matches!(
+                    capability,
+                    DeviceCapability::ExecuteProcess | DeviceCapability::Shell
+                ) && !matches!(capability.class(), crate::v2_m0::CapabilityClass::Observe) =>
+            {
+                matches!(
+                    state,
+                    HubOperationState::Completed
+                        | HubOperationState::Failed
+                        | HubOperationState::Cancelled
+                )
             }
             _ => false,
         }
@@ -1639,8 +1662,9 @@ impl AuthoritativeOperationController {
             .and_then(|record| record.receipt.as_ref())
     }
 
-    /// Attach bounded caller-visible output to an already finalized process/shell operation.
-    /// Raw request material is never accepted here.
+    /// Attach bounded caller-recovery material to an already finalized operation.
+    /// Process/shell may retain bounded output; other effectful capabilities retain only
+    /// a payload-free terminal marker. Raw request/GUI/browser material is never accepted here.
     pub fn attach_recoverable_result(
         &mut self,
         operation_id: &str,
@@ -1991,10 +2015,36 @@ impl AuthoritativeOperationController {
                     receipt.evidence == ExecutionEvidence::RecoveryReadInterrupted
                 })
         });
+        let has_v9_state = snapshot.operations.iter().any(|record| {
+            matches!(
+                record.recoverable_result,
+                Some(RecoverableOperationResult::EffectfulStatus)
+            )
+        }) || snapshot
+            .recoveries
+            .iter()
+            .any(|record| matches!(record.result, RecoverableOperationResult::EffectfulStatus));
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v9_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version =
+                            RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version =
+                        RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v8_state {
+                if has_v8_state || has_v9_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2010,7 +2060,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v7_state || has_v8_state {
+                if has_v7_state || has_v8_state || has_v9_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2025,7 +2075,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v6_state || has_v7_state || has_v8_state {
+                if has_v6_state || has_v7_state || has_v8_state || has_v9_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2040,7 +2090,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v5_state || has_v6_state || has_v7_state || has_v8_state {
+                if has_v5_state || has_v6_state || has_v7_state || has_v8_state || has_v9_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.retirements.clear();
@@ -2061,7 +2111,13 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v4_state || has_v5_state || has_v6_state || has_v7_state || has_v8_state {
+                if has_v4_state
+                    || has_v5_state
+                    || has_v6_state
+                    || has_v7_state
+                    || has_v8_state
+                    || has_v9_state
+                {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.auto_resolutions.clear();
@@ -2089,6 +2145,7 @@ impl AuthoritativeOperationController {
                     || has_v6_state
                     || has_v7_state
                     || has_v8_state
+                    || has_v9_state
                     || snapshot.operations.iter().any(|record| {
                         !record.audit.is_empty() || record.request_fingerprint.is_some()
                     })
@@ -2120,6 +2177,7 @@ impl AuthoritativeOperationController {
                     || has_v6_state
                     || has_v7_state
                     || has_v8_state
+                    || has_v9_state
                     || !snapshot.recoveries.is_empty()
                     || snapshot.operations.iter().any(|record| {
                         record.recoverable_result.is_some()
@@ -2162,6 +2220,7 @@ impl AuthoritativeOperationController {
                 | RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION
+                | RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -2205,13 +2264,26 @@ impl AuthoritativeOperationController {
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION
             && snapshot.operations.iter().any(|record| {
                 record.execution_lane == OperationExecutionLane::RecoveryEvidenceRead
                     || record.receipt.as_ref().is_some_and(|receipt| {
                         receipt.evidence == ExecutionEvidence::RecoveryReadInterrupted
                     })
             })
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && (snapshot.operations.iter().any(|record| {
+                matches!(
+                    record.recoverable_result,
+                    Some(RecoverableOperationResult::EffectfulStatus)
+                )
+            }) || snapshot
+                .recoveries
+                .iter()
+                .any(|record| matches!(record.result, RecoverableOperationResult::EffectfulStatus)))
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -2647,6 +2719,101 @@ mod tests {
                 .unwrap()
                 .result,
             Some(RecoverableOperationResult::Process { output })
+        );
+    }
+
+    #[test]
+    fn effectful_status_is_owner_scoped_payload_free_and_survives_pruning() {
+        let mut ledger = controller();
+        ledger
+            .prepare(
+                op("op-effectful", 1),
+                alice(),
+                DeviceCapability::PointerClick,
+                10,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-effectful", &alice(), 1, 11)
+            .unwrap();
+        ledger
+            .finalize(
+                "op-effectful",
+                &alice(),
+                1,
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+                12,
+            )
+            .unwrap();
+        ledger
+            .attach_recoverable_result(
+                "op-effectful",
+                &alice(),
+                1,
+                RecoverableOperationResult::EffectfulStatus,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.recovery_for_owner("op-effectful", &bob()),
+            Err(ExecutionError::UnknownOperation)
+        );
+        let recovered = ledger.recovery_for_owner("op-effectful", &alice()).unwrap();
+        assert_eq!(recovered.state, HubOperationState::Completed);
+        assert_eq!(
+            recovered.result,
+            Some(RecoverableOperationResult::EffectfulStatus)
+        );
+        assert!(matches!(
+            ledger.snapshot_for_restart_compatible_with(
+                RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+
+        assert_eq!(
+            ledger
+                .prune_terminal_before_generation("desktop-a", 2)
+                .unwrap(),
+            1
+        );
+        assert_eq!(ledger.state("op-effectful"), None);
+        assert_eq!(
+            ledger
+                .recovery_for_owner("op-effectful", &alice())
+                .unwrap()
+                .result,
+            Some(RecoverableOperationResult::EffectfulStatus)
+        );
+        assert_eq!(
+            ledger.prepare(
+                op("op-effectful", 2),
+                alice(),
+                DeviceCapability::PointerClick,
+                20,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.schema_version, EXECUTION_SAFETY_SCHEMA_VERSION);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(serialized.contains("effectful_status"));
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .recovery_for_owner("op-effectful", &alice())
+                .unwrap()
+                .result,
+            Some(RecoverableOperationResult::EffectfulStatus)
         );
     }
 

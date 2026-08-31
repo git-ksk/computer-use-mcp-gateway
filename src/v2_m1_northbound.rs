@@ -2002,6 +2002,7 @@ impl V2NorthboundMcp {
             Ok(binding) => binding,
             Err(error) => return Err(error),
         };
+        let public_operation_id = operation.operation_id.clone();
         let execution = self
             .execute_command(
                 principal,
@@ -2020,7 +2021,12 @@ impl V2NorthboundMcp {
             .await;
         let result = match execution {
             Ok(result) => result,
-            Err(error) => return Ok(execution_error_response(error)),
+            Err(error) => {
+                return Ok(execution_error_response(mcp_error_with_operation_id(
+                    error,
+                    &public_operation_id,
+                )));
+            }
         };
         let DeviceResult::BrowserUploadStaged {
             backend_file_handle,
@@ -2070,6 +2076,7 @@ impl V2NorthboundMcp {
         let command = DeviceCommand::Browser {
             command: prepared.command.clone(),
         };
+        let public_operation_id = operation.operation_id.clone();
         let result = match self
             .execute_command(
                 principal,
@@ -2081,7 +2088,12 @@ impl V2NorthboundMcp {
             .await
         {
             Ok(result) => result,
-            Err(error) => return Ok(execution_error_response(error)),
+            Err(error) => {
+                return Ok(execution_error_response(mcp_error_with_operation_id(
+                    error,
+                    &public_operation_id,
+                )));
+            }
         };
         self.publicize_browser_result(prepared, result).await
     }
@@ -2514,8 +2526,10 @@ impl V2NorthboundMcp {
     }
 
     fn recovery_access_allowed(&self, principal: &AuthenticatedClientPrincipal) -> bool {
-        [DeviceCapability::ExecuteProcess, DeviceCapability::Shell]
+        all_tools()
             .into_iter()
+            .filter_map(|tool| tool_capability(tool.name.as_ref()))
+            .filter(|capability| capability_supports_operation_recovery(*capability))
             .any(|capability| {
                 self.authorizer
                     .authorize_device_capability(principal, self.hub.device_id(), capability)
@@ -2534,10 +2548,7 @@ impl V2NorthboundMcp {
             .operation_recovery_as(OperationOwner::from_principal(principal), operation_id)
             .await
             .map_err(operation_lookup_error_to_mcp)?;
-        if !matches!(
-            recovery.capability,
-            DeviceCapability::ExecuteProcess | DeviceCapability::Shell
-        ) {
+        if !capability_supports_operation_recovery(recovery.capability) {
             return Err(operation_not_found_error());
         }
         self.authorize(principal, recovery.capability)?;
@@ -2820,9 +2831,8 @@ impl ServerHandler for V2NorthboundMcp {
         } else {
             OperationAuditMetadata::empty()
         };
-        let recoverable_process_call =
-            matches!(request.name.as_ref(), TOOL_EXECUTE_PROCESS | TOOL_SHELL);
-        let operation_id = requested_operation_id(request.name.as_ref(), arguments.as_ref())?
+        let recoverable_effectful_call = capability_supports_operation_recovery(capability);
+        let operation_id = requested_operation_id(request.name.as_ref(), &mut arguments)?
             .unwrap_or_else(|| self.hub.new_operation_id());
         self.authorize(&auth.principal, capability)?;
         log_northbound_operation_requested(
@@ -3328,7 +3338,7 @@ impl ServerHandler for V2NorthboundMcp {
             _ => None,
         };
 
-        let public_operation_id = recoverable_process_call.then(|| operation_id.clone());
+        let public_operation_id = recoverable_effectful_call.then(|| operation_id.clone());
         let mut result = match self
             .execute_command(
                 &auth.principal,
@@ -3693,12 +3703,18 @@ fn publicize_browser_semantic_ref(
 
 fn requested_operation_id(
     tool_name: &str,
-    arguments: Option<&JsonObject>,
+    arguments: &mut Option<JsonObject>,
 ) -> Result<Option<String>, McpError> {
-    if !matches!(tool_name, TOOL_EXECUTE_PROCESS | TOOL_SHELL) {
+    let Some(capability) = tool_capability(tool_name) else {
+        return Ok(None);
+    };
+    if !capability_supports_operation_recovery(capability) {
         return Ok(None);
     }
-    let Some(value) = arguments.and_then(|arguments| arguments.get("operation_id")) else {
+    let Some(value) = arguments
+        .as_mut()
+        .and_then(|arguments| arguments.remove("operation_id"))
+    else {
         return Ok(None);
     };
     let operation_id = value
@@ -3773,6 +3789,9 @@ fn recoverable_result_json(result: RecoverableOperationResult) -> Value {
         }
         RecoverableOperationResult::Error { code } => {
             json!({"type": "error", "code": code.safe_code()})
+        }
+        RecoverableOperationResult::EffectfulStatus => {
+            json!({"type": "effectful_status", "payload_retained": false})
         }
     }
 }
@@ -4225,7 +4244,7 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_GET_OPERATION,
-            "Read the durable status/result of a prior process or shell operation without replaying it.",
+            "Read durable owner-scoped status for a prior effectful operation without replaying it. Process/shell may include bounded output; desktop/browser recovery is status-only and retains no raw GUI/browser payload.",
             object_schema(vec![("operation_id", operation_id_schema())], &["operation_id"]),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
@@ -4513,7 +4532,14 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(true)),
     ];
     for tool in &mut tools {
-        if tool_capability(tool.name.as_ref()).is_some_and(capability_accepts_audit) {
+        let capability = tool_capability(tool.name.as_ref());
+        if capability.is_some_and(capability_supports_operation_recovery) {
+            let schema = Arc::make_mut(&mut tool.input_schema);
+            if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+                properties.insert("operation_id".into(), operation_id_schema());
+            }
+        }
+        if capability.is_some_and(capability_accepts_audit) {
             let schema = Arc::make_mut(&mut tool.input_schema);
             if let Some(Value::Object(properties)) = schema.get_mut("properties") {
                 properties.insert("workflow_id".into(), audit_correlation_id_schema());
@@ -5707,8 +5733,12 @@ fn take_audit_string(arguments: &mut JsonObject, key: &str) -> Result<Option<Str
         .ok_or_else(|| McpError::invalid_params("Audit correlation labels must be strings", None))
 }
 
-fn capability_accepts_audit(capability: DeviceCapability) -> bool {
+fn capability_supports_operation_recovery(capability: DeviceCapability) -> bool {
     !matches!(capability.class(), crate::v2_m0::CapabilityClass::Observe)
+}
+
+fn capability_accepts_audit(capability: DeviceCapability) -> bool {
+    capability_supports_operation_recovery(capability)
 }
 
 fn env_map(env: BTreeMap<String, String>) -> Vec<ProcessEnvVar> {
@@ -7101,16 +7131,40 @@ mod tests {
     }
 
     #[test]
-    fn process_and_shell_tool_schemas_expose_optional_recovery_ref() {
+    fn effectful_tool_schemas_expose_optional_recovery_ref() {
         let tools = all_tools();
-        for name in [TOOL_EXECUTE_PROCESS, TOOL_SHELL, TOOL_GET_OPERATION] {
+        for name in [
+            TOOL_EXECUTE_PROCESS,
+            TOOL_SHELL,
+            TOOL_CLICK,
+            TOOL_TYPE_TEXT,
+            TOOL_LAUNCH_APPLICATION,
+            TOOL_BROWSER_NAVIGATE,
+            TOOL_BROWSER_TYPE,
+            TOOL_BROWSER_DOWNLOAD,
+            TOOL_GET_OPERATION,
+        ] {
             let tool = tools
                 .iter()
                 .find(|tool| tool.name.as_ref() == name)
                 .unwrap();
             let schema = serde_json::to_string(&tool.input_schema).unwrap();
-            assert!(schema.contains("operation_id"));
+            assert!(
+                schema.contains("operation_id"),
+                "missing operation_id on {name}"
+            );
             assert!(schema.contains("^op_[0-9a-f]{32}$"));
+        }
+        for name in [TOOL_SCREENSHOT, TOOL_READ_FILE, TOOL_BROWSER_INSPECT] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            let schema = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(
+                !schema.contains("operation_id"),
+                "recovery ref leaked onto {name}"
+            );
         }
         let recovery = tools
             .iter()
@@ -7119,6 +7173,42 @@ mod tests {
         assert_eq!(
             recovery.annotations.as_ref().and_then(|a| a.read_only_hint),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn effectful_operation_id_is_removed_before_strict_argument_parsing() {
+        let operation_id = "op_0123456789abcdef0123456789abcdef";
+        let mut arguments = Some(
+            json!({"operation_id": operation_id, "x": 10, "y": 20})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert_eq!(
+            requested_operation_id(TOOL_CLICK, &mut arguments)
+                .unwrap()
+                .as_deref(),
+            Some(operation_id)
+        );
+        let parsed: ClickArgs = parse_arguments(arguments).unwrap();
+        assert_eq!((parsed.x, parsed.y), (Some(10), Some(20)));
+
+        let mut observe = Some(
+            json!({"operation_id": operation_id, "path": "bounded.txt"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert_eq!(
+            requested_operation_id(TOOL_READ_FILE, &mut observe).unwrap(),
+            None
+        );
+        assert!(parse_arguments::<PathArgs>(observe).is_err());
+
+        assert_eq!(
+            recoverable_result_json(RecoverableOperationResult::EffectfulStatus),
+            json!({"type": "effectful_status", "payload_retained": false})
         );
     }
 

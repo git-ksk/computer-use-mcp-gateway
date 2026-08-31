@@ -2769,6 +2769,11 @@ fn recoverable_result_for(
             DeviceCapability::ExecuteProcess | DeviceCapability::Shell,
             DeviceResult::Error { code },
         ) => Some(RecoverableOperationResult::Error { code: *code }),
+        (capability, _)
+            if !matches!(capability.class(), crate::v2_m0::CapabilityClass::Observe) =>
+        {
+            Some(RecoverableOperationResult::EffectfulStatus)
+        }
         _ => None,
     }
 }
@@ -3364,6 +3369,34 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn effectful_recovery_marker_never_copies_gui_or_browser_payloads() {
+        assert_eq!(
+            recoverable_result_for(DeviceCapability::TypeText, &DeviceResult::TypeTextCompleted,),
+            Some(RecoverableOperationResult::EffectfulStatus)
+        );
+        assert_eq!(
+            recoverable_result_for(
+                DeviceCapability::PointerClick,
+                &DeviceResult::PointerClickCompleted,
+            ),
+            Some(RecoverableOperationResult::EffectfulStatus)
+        );
+        assert_eq!(
+            recoverable_result_for(
+                DeviceCapability::ScreenGeometry,
+                &DeviceResult::ScreenGeometry {
+                    width_points: 100,
+                    height_points: 100,
+                    scale_factor_milli: 1000,
+                },
+            ),
+            None
+        );
+        let encoded = serde_json::to_string(&RecoverableOperationResult::EffectfulStatus).unwrap();
+        assert_eq!(encoded, r#"{"type":"effectful_status"}"#);
     }
 
     #[derive(Clone)]
