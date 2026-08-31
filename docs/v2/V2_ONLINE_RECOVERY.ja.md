@@ -109,10 +109,13 @@ v2_recover resolve \
   --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --decision confirmed-completed \
-  --evidence "local user inspected the current desktop"
+  --evidence "local user inspected the current desktop" \
+  --wait-secs 30
 ```
 
-署名時にmacOS user presenceが必要です。拒否/キャンセル時はquarantineを維持します。
+署名時にmacOS user presenceが必要です。拒否/キャンセル時はquarantineを維持します。`authorization=published` は署名済みlocal handoff fileがAgentから見える状態になったことだけを意味し、durable recovery成功ではありません。`--wait-secs` を使うと、CLIはexactなHub署名 `RecoveryResolved` ACKを待ち、request/device/current-generation/operation/decision bindingを検証し、Agentがその検証済みACKをdurable receiptとして保存した後だけ `durable_completion=verified` を返します。Hubはauthoritative resolution checkpointのcommit成功後にだけACKを生成します。local receiptはowner-privateでchallenge/authorization cleanup後も残り、fresh challenge受信時に旧receiptをclearします。
+
+resolve CLIがpublication後に終了した場合や再確認が必要な場合は、resolve時に表示されたexact safe metadataを使って `v2_recover confirm` を実行できます。ACK欠落、timeout、stale receipt、mismatchは成功ではなく、retry/replay authorityにもなりません。
 
 ## 障害時
 

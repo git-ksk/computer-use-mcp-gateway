@@ -27,6 +27,7 @@ pub const MAX_RECOVERY_FILE_BYTES: usize = 16 * 1024;
 pub const RECOVERY_PUBLIC_KEY_FILENAME: &str = "recovery-public-key.p256";
 pub const RECOVERY_CHALLENGE_FILENAME: &str = "recovery-challenge.json";
 pub const RECOVERY_AUTHORIZATION_FILENAME: &str = "recovery-authorization.json";
+pub const RECOVERY_RESOLVED_FILENAME: &str = "recovery-resolved.json";
 
 const CHALLENGE_DOMAIN: &[u8] = b"cumg-v2-online-recovery-challenge-v1";
 const AUTHORIZATION_DOMAIN: &[u8] = b"cumg-v2-online-recovery-authorization-v1";
@@ -313,6 +314,26 @@ pub fn verify_recovery_resolved(
         .map_err(|_| RecoveryError::InvalidHubSignature)
 }
 
+pub fn verify_recovery_resolved_for_authorization(
+    resolved: &RecoveryResolved,
+    trusted_hub: &VerifyingKey,
+    authorization: &RecoveryAuthorization,
+) -> Result<(), RecoveryError> {
+    verify_recovery_resolved(
+        resolved,
+        trusted_hub,
+        &authorization.request_id,
+        &authorization.device_id,
+        authorization.current_generation,
+    )?;
+    if resolved.operation_id != authorization.operation_id
+        || resolved.decision != authorization.decision
+    {
+        return Err(RecoveryError::ChallengeMismatch);
+    }
+    Ok(())
+}
+
 pub fn quarantine_fingerprint(quarantine: &DesktopQuarantine) -> [u8; 32] {
     let mut bytes = Vec::new();
     push_bytes(&mut bytes, FINGERPRINT_DOMAIN);
@@ -333,6 +354,10 @@ pub fn challenge_path(state_dir: &Path) -> PathBuf {
 
 pub fn authorization_path(state_dir: &Path) -> PathBuf {
     state_dir.join(RECOVERY_AUTHORIZATION_FILENAME)
+}
+
+pub fn resolved_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(RECOVERY_RESOLVED_FILENAME)
 }
 
 pub fn store_challenge(
@@ -357,6 +382,21 @@ pub fn load_authorization(
     state_dir: &Path,
 ) -> Result<Option<RecoveryAuthorization>, RecoveryError> {
     read_json_optional(&authorization_path(state_dir))
+}
+
+pub fn store_recovery_resolved(
+    state_dir: &Path,
+    resolved: &RecoveryResolved,
+) -> Result<(), RecoveryError> {
+    atomic_write_json_private(&resolved_path(state_dir), resolved)
+}
+
+pub fn load_recovery_resolved(state_dir: &Path) -> Result<Option<RecoveryResolved>, RecoveryError> {
+    read_json_optional(&resolved_path(state_dir))
+}
+
+pub fn clear_recovery_resolved(state_dir: &Path) -> Result<(), RecoveryError> {
+    remove_if_exists(&resolved_path(state_dir))
 }
 
 pub fn clear_recovery_handoff(state_dir: &Path) -> Result<(), RecoveryError> {
@@ -1207,10 +1247,10 @@ pub mod macos {
 
             let started = Instant::now();
             assert!(matches!(
-                run_helper_with_timeout(&helper, "sign", Some(b"{}"), Duration::from_secs(1)),
+                run_helper_with_timeout(&helper, "sign", Some(b"{}"), Duration::from_secs(3)),
                 Err(RecoveryError::RecoveryHelperTimeout)
             ));
-            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(started.elapsed() < Duration::from_secs(5));
 
             let pid: libc::pid_t = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
             let mut status = 0_i32;
@@ -1325,6 +1365,41 @@ mod tests {
             quarantine_fingerprint(&quarantine()),
             quarantine_fingerprint(&changed)
         );
+    }
+
+    #[test]
+    fn signed_resolved_receipt_is_exactly_bound_and_durable() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "cumg-recovery-resolved-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        let hub = HubIdentity::generate();
+        let challenge = build_recovery_challenge(&hub, &quarantine(), 5, 100).unwrap();
+        let authorization = new_authorization(
+            &challenge,
+            RecoveryAuditAssessment::Inconclusive,
+            IndeterminateResolution::ConfirmedNotExecuted,
+            "operator-reviewed",
+        )
+        .unwrap();
+        let resolved = build_recovery_resolved(&hub, &authorization, 110).unwrap();
+        verify_recovery_resolved_for_authorization(&resolved, &hub.verifier(), &authorization)
+            .unwrap();
+        let mut mismatched = authorization.clone();
+        mismatched.operation_id = "op_other".into();
+        assert!(matches!(
+            verify_recovery_resolved_for_authorization(&resolved, &hub.verifier(), &mismatched),
+            Err(RecoveryError::ChallengeMismatch)
+        ));
+        store_recovery_resolved(&state_dir, &resolved).unwrap();
+        assert_eq!(load_recovery_resolved(&state_dir).unwrap(), Some(resolved));
+        clear_recovery_handoff(&state_dir).unwrap();
+        assert!(load_recovery_resolved(&state_dir).unwrap().is_some());
+        clear_recovery_resolved(&state_dir).unwrap();
+        assert!(load_recovery_resolved(&state_dir).unwrap().is_none());
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

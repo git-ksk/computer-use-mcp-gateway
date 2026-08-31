@@ -48,9 +48,10 @@ use crate::v2_m1_process::{
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
-    RecoveryError, clear_authorization, clear_recovery_handoff, load_authorization, load_challenge,
-    store_challenge, validate_authorization_against_challenge, verify_recovery_challenge,
-    verify_recovery_resolved,
+    RecoveryAuthorization, RecoveryError, RecoveryResolved, clear_authorization,
+    clear_recovery_handoff, clear_recovery_resolved, load_authorization, load_challenge,
+    store_challenge, store_recovery_resolved, validate_authorization_against_challenge,
+    verify_recovery_challenge, verify_recovery_resolved_for_authorization,
 };
 use crate::v2_operator_handoff::{
     VerificationToken, is_exact_verification_candidate, is_phase1_protected_command,
@@ -58,7 +59,7 @@ use crate::v2_operator_handoff::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::VecDeque;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -67,6 +68,18 @@ use tonic::Code;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 const GRPC_QUEUE_DEPTH: usize = 8;
+
+fn persist_verified_recovery_completion(
+    state_dir: &Path,
+    trusted_hub: &ed25519_dalek::VerifyingKey,
+    expected_authorization: &RecoveryAuthorization,
+    resolved: &RecoveryResolved,
+) -> Result<(), AgentServiceError> {
+    verify_recovery_resolved_for_authorization(resolved, trusted_hub, expected_authorization)
+        .map_err(AgentServiceError::OnlineRecovery)?;
+    store_recovery_resolved(state_dir, resolved).map_err(AgentServiceError::OnlineRecovery)?;
+    clear_recovery_handoff(state_dir).map_err(AgentServiceError::OnlineRecovery)
+}
 
 #[derive(Debug, Clone)]
 pub struct CuaAgentConfig {
@@ -656,7 +669,7 @@ impl AgentService {
         let mut pending_backend_session_ends = VecDeque::<RemoteBackendSessionEnd>::new();
         let mut recovery_poll = tokio::time::interval(Duration::from_millis(250));
         recovery_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut pending_recovery_request: Option<String> = None;
+        let mut pending_recovery_request: Option<RecoveryAuthorization> = None;
 
         let session_result = async {
             loop {
@@ -917,13 +930,12 @@ impl AgentService {
                                 );
                                 continue;
                             }
-                            let request_id = authorization.request_id.clone();
                             send_agent(
                                 &outbound_tx,
-                                AgentToHub::RecoveryAuthorization(authorization),
+                                AgentToHub::RecoveryAuthorization(authorization.clone()),
                             )
                             .await?;
-                            pending_recovery_request = Some(request_id);
+                            pending_recovery_request = Some(authorization);
                         }
                     }
                 }
@@ -1015,6 +1027,8 @@ impl AgentService {
                             .map_err(AgentServiceError::OnlineRecovery)?;
                             clear_authorization(&self.config.state_dir)
                                 .map_err(AgentServiceError::OnlineRecovery)?;
+                            clear_recovery_resolved(&self.config.state_dir)
+                                .map_err(AgentServiceError::OnlineRecovery)?;
                             store_challenge(&self.config.state_dir, &recovery)
                                 .map_err(AgentServiceError::OnlineRecovery)?;
                             pending_recovery_request = None;
@@ -1029,19 +1043,15 @@ impl AgentService {
                             );
                         }
                         HubToAgent::RecoveryResolved(resolved) => {
-                            let expected_request_id = pending_recovery_request
-                                .as_deref()
+                            let expected_authorization = pending_recovery_request
+                                .as_ref()
                                 .ok_or(AgentServiceError::RecoveryResultMismatch)?;
-                            verify_recovery_resolved(
-                                &resolved,
+                            persist_verified_recovery_completion(
+                                &self.config.state_dir,
                                 &self.trusted_hub.verifier(),
-                                expected_request_id,
-                                &session.device_id,
-                                session.generation,
-                            )
-                            .map_err(AgentServiceError::OnlineRecovery)?;
-                            clear_recovery_handoff(&self.config.state_dir)
-                                .map_err(AgentServiceError::OnlineRecovery)?;
+                                expected_authorization,
+                                &resolved,
+                            )?;
                             pending_recovery_request = None;
                             tracing::info!(
                                 event = "v2_recovery_resolved",
@@ -2313,6 +2323,57 @@ impl std::error::Error for AgentServiceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_completion_receipt_is_persisted_before_handoff_cleanup() {
+        use crate::v2_execution_safety::{DesktopQuarantine, IndeterminateReason, OperationOwner};
+        use crate::v2_m0_execution::IndeterminateResolution;
+        use crate::v2_m0_transport::HubIdentity;
+        use crate::v2_online_recovery::{
+            RecoveryAuditAssessment, build_recovery_challenge, build_recovery_resolved,
+            load_authorization, load_challenge, load_recovery_resolved, new_authorization,
+            store_authorization, store_challenge,
+        };
+        let state_dir = std::env::temp_dir().join(format!(
+            "cumg-agent-recovery-receipt-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let quarantine = DesktopQuarantine {
+            operation_id: "op_recovery_receipt".into(),
+            device_id: "dev_recovery_receipt".into(),
+            device_generation: 4,
+            owner: OperationOwner::new("issuer", "subject").unwrap(),
+            reason: IndeterminateReason::ConnectionLost,
+            since_ms: 100,
+        };
+        let hub = HubIdentity::generate();
+        let challenge = build_recovery_challenge(&hub, &quarantine, 5, 110).unwrap();
+        let authorization = new_authorization(
+            &challenge,
+            RecoveryAuditAssessment::Inconclusive,
+            IndeterminateResolution::ConfirmedNotExecuted,
+            "operator-reviewed",
+        )
+        .unwrap();
+        let resolved = build_recovery_resolved(&hub, &authorization, 120).unwrap();
+        store_challenge(&state_dir, &challenge).unwrap();
+        store_authorization(&state_dir, &authorization).unwrap();
+
+        persist_verified_recovery_completion(
+            &state_dir,
+            &hub.verifier(),
+            &authorization,
+            &resolved,
+        )
+        .unwrap();
+
+        assert_eq!(load_recovery_resolved(&state_dir).unwrap(), Some(resolved));
+        assert!(load_challenge(&state_dir).unwrap().is_none());
+        assert!(load_authorization(&state_dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
 
     #[test]
     fn storage_full_persistence_failure_is_bounded_and_forces_fail_closed_exit() {
