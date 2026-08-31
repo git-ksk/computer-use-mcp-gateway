@@ -118,6 +118,52 @@ Evidence authority is explicit. Schema-v1/v2/v3 Hub state is reported with its e
 
 Operator flow is therefore: `inspect-quarantine` -> `audit-reconciliation` -> either keep quarantine / allow normal authoritative self-reconciliation, or perform an explicitly authorized offline recovery using only a decision named in `supported_decisions`. Never promote a legacy marker, fingerprint match, reconnect, elapsed time, shell parsing, or UI/application heuristic into completion evidence.
 
+### Operator incident brief
+
+`v2_maint incident-brief` composes the exact `audit-reconciliation` result with the bounded quarantine metadata needed by a Human, without reimplementing checkpoint reconciliation. Its `cumg` object is the unchanged authoritative #133 audit, so optional diagnostics cannot create or widen `supported_decisions`, change `recommended_action`, clear quarantine, sign recovery authority, or replay/probe the old operation. JSON is the machine contract; `--format text` is a compact Human/Agent rendering of the same data.
+When `--mutation-authority-dir` (or `CUMG_MUTATION_AUTHORITY_DIR`) is supplied, the brief also inspects the current shared single-writer owner/epoch read-only. Failure to inspect that state is reported as `unavailable`; it does not alter the reconciliation result or become recovery authority. Omitting the directory is explicit `not_requested`, not an inferred healthy state.
+
+```bash
+v2_maint incident-brief \
+  --state-dir /var/lib/cumg-v2/hub \
+  --agent-state-dir /var/lib/cumg-v2/agent \
+  --operation-id op_... \
+  --mutation-authority-dir /var/lib/cumg-v2/mutation-authority \
+  --format text
+```
+
+Optional host/backend observations may be supplied through an owner-private JSON file. The input is intentionally a closed schema: it accepts only allowlisted source, collection time, bounded relation, and finding enums. There is **no input field for evidence authority or free-form log text**. CUMG assigns every accepted finding `observational_only`; `collector_unavailable` becomes `unavailable`. Absence findings remain explicitly marked as absence-of-evidence and are never promoted to proof of non-execution. Example:
+
+```json
+{
+  "schema_version": 1,
+  "observations": [
+    {
+      "source": "macos_launchservices",
+      "collected_at_ms": 1788148800000,
+      "relation": "bounded_around_dispatch",
+      "finding": "no_matching_launch_record_observed"
+    },
+    {
+      "source": "macos_runningboard",
+      "collected_at_ms": 1788148800000,
+      "relation": "bounded_around_dispatch",
+      "finding": "no_matching_process_start_observed"
+    },
+    {
+      "source": "cua",
+      "collected_at_ms": 1788148800000,
+      "relation": "bounded_around_dispatch",
+      "finding": "no_success_response_observed"
+    }
+  ]
+}
+```
+
+Store that file with owner-only permissions and pass `--diagnostics-file /secure/tmp/incident-diagnostics.json`. Unknown fields, source/finding mismatches, schema mismatches, zero timestamps, more than 16 observations, or attempts to add an `authority` field fail closed. Contradictory observational findings are surfaced rather than heuristically resolved; if an observational result conflicts with exact authoritative terminal evidence, the contradiction is visible while the CUMG audit remains controlling. Raw command/argv/cwd/env, typed text, URLs, clipboard or screenshot data, credentials/tokens, recovery locators, raw request fingerprints, unrestricted host logs, and arbitrary collector prose do not belong in this file or the normal brief.
+
+The intended Human flow is `quarantine -> incident-brief -> explanation/review -> Human selection of only a CUMG-supported decision -> existing authenticated recovery`. An Agent may organize or explain the brief, but the brief grants no recovery authority and the Agent must not infer a new decision from confidence or host heuristics.
+
 For shell/process/text-input deployments that want privacy-preserving candidate matching, provision one private file of at least 32 bytes and configure the Hub with `CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE`. The file must be readable only by the Hub/operator account and must not be committed or copied into logs. The Hub HMACs the canonical shell/process request or typed-text payload before dispatch; no raw request or typed text is persisted for this purpose. `type_text` also persists its bounded shape envelope even when the HMAC key is not configured; in that case candidate equality is unavailable. To compare a locally-held candidate request, place that candidate JSON in a private file and run:
 
 ```bash

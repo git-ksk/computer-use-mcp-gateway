@@ -7,6 +7,7 @@ use computer_use_mcp_gateway::{
     },
     v2_execution_safety::RetirementPolicy,
     v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control},
+    v2_incident_brief::{build_incident_brief_read_only, render_incident_brief_text},
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_secret_text,
     v2_maintenance::{
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 
 const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_REQUEST_BYTES: u64 = 256 * 1024;
+const MAX_INCIDENT_DIAGNOSTICS_BYTES: u64 = 64 * 1024;
 const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 
 fn handoff_is_idle(socket: &std::path::Path) -> bool {
@@ -95,6 +97,24 @@ enum Command {
         #[arg(long)]
         operation_id: String,
     },
+    /// Produce one read-only operator incident brief from the authoritative reconciliation audit.
+    /// Optional diagnostics are bounded observational findings and can never create recovery authority.
+    IncidentBrief {
+        #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_AGENT_STATE_DIR")]
+        agent_state_dir: PathBuf,
+        #[arg(long)]
+        operation_id: String,
+        /// Optional shared mutation-authority directory; inspection is read-only.
+        #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
+        mutation_authority_dir: Option<PathBuf>,
+        /// Owner-private schema-v1 JSON containing only allowlisted diagnostic findings.
+        #[arg(long)]
+        diagnostics_file: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "json")]
+        format: IncidentBriefFormat,
+    },
     /// Compare one local candidate shell/process/text-input request to a quarantined request.
     /// Output is only same_request, different_request, or unavailable; request content
     /// and the keyed fingerprint are never printed.
@@ -153,6 +173,12 @@ impl From<MutationAuthorityRoleArg> for MutationAuthorityRole {
             MutationAuthorityRoleArg::V2 => Self::V2,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IncidentBriefFormat {
+    Json,
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -296,6 +322,36 @@ fn main() -> Result<()> {
                 audit_reconciliation_read_only(&state_dir, &agent_state_dir, &operation_id)
                     .context("read-only reconciliation readiness audit failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::IncidentBrief {
+            state_dir,
+            agent_state_dir,
+            operation_id,
+            mutation_authority_dir,
+            diagnostics_file,
+            format,
+        } => {
+            let diagnostics_text = diagnostics_file
+                .as_deref()
+                .map(|path| {
+                    load_secret_text(path, MAX_INCIDENT_DIAGNOSTICS_BYTES)
+                        .context("failed to load private bounded incident diagnostics")
+                })
+                .transpose()?;
+            let brief = build_incident_brief_read_only(
+                &state_dir,
+                &agent_state_dir,
+                &operation_id,
+                mutation_authority_dir.as_deref(),
+                diagnostics_text.as_deref(),
+            )
+            .context("read-only incident brief generation failed")?;
+            match format {
+                IncidentBriefFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&brief)?);
+                }
+                IncidentBriefFormat::Text => println!("{}", render_incident_brief_text(&brief)),
+            }
         }
         Command::MutationAuthorityInit {
             authority_dir,
