@@ -24,6 +24,11 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
+# The installer imports verifier modules from inside the immutable release artifact. Inspection
+# must not mutate that artifact by creating __pycache__ entries, because the closed manifest is
+# verified both before and after extraction and unexpected files fail closed.
+sys.dont_write_bytecode = True
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 

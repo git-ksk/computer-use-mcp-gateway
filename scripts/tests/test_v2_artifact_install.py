@@ -122,6 +122,9 @@ class ArtifactInstallTests(unittest.TestCase):
             preflight_only=False,
         )
 
+    def test_support_imports_do_not_write_bytecode_into_artifact(self):
+        self.assertTrue(mod.sys.dont_write_bytecode)
+
     def test_profile_rejects_non_https_resource(self):
         profile = json.loads(self.profile().read_text())
         profile["mcp_resource"] = "http://example.invalid/mcp"
