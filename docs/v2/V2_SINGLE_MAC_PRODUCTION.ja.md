@@ -131,6 +131,19 @@ rollback bundle は old-binary / old-state / Handoff-code の明示的 evidence 
 
 expired-recovery abandonment は signed checkpoint を削除する前に private append-only JSONL audit を書きます。record は timestamp、recovery epoch、prior closed recovery status、bounded result code のみです。locator、process/window/context/intervention ID、principal、action digest、TURN credential、Human input、payload は保存しません。audit append が失敗した場合は abandonment を拒否し、recovery を authoritative のまま維持します。
 
+## Unified operator status
+
+この profile の通常の最初の診断には `v2_status` を使います。reviewed LaunchAgent が導入済みなら、Hub/Agent plist から Handoff control socket、Cua command/version、mutation-authority path という必要な exact non-secret field だけを read-only で取得し、それ以外は `v2_doctor` と同じ bounded single-Mac default を使います。
+
+```bash
+"$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_status"
+"$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_status" --json
+```
+
+JSON schema v1 が stable machine-readable contract です。overall operator status、Agent/control-plane connectivity、backend status、#226 の5つの readiness lane、quarantine/replay-safety と #233 incident-review availability、privacy-bounded Handoff lifecycle、mutation-authority owner/epoch、verified runtime identity、#234 maintenance status/phase、stable な `primary_reason` と supported `next_action` を返します。takeover locator、intervention/recovery ID/epoch、device/principal identity、command/argv/cwd/env、typed text、URL、screenshot、clipboard、credential、grant、fingerprint は出力しません。
+
+`v2_status` は composition-only です。ある lane の `ready` は別 lane の authorization ではなく、quarantine resolve、mutation authority switch、Handoff resume/cancel、upgrade retry/resume、operation replay はできません。`review_incident` は #233 incident-brief、`complete_recovery` は既存の explicit Handoff/recovery flow、`inspect_upgrade` は `v2_maint upgrade-status`、configuration/backend code は `v2_doctor` または backend diagnostics へ進むための案内です。evidence が unknown/mismatch の場合は `unknown` / `unavailable` / `action_required` に fail closed し、healthy と推測しません。
+
 ## `v2_doctor`
 
 `v2_doctor` は read-only です。quarantine resolve、work dispatch、secret content read、raw command/result/desktop data 出力は行いません。
@@ -143,7 +156,7 @@ durable blocking operation が存在する場合、supported effectful lane は 
 
 standard profile では次を確認します。
 
-- runtime manifest schema 3、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_recover` / `v2_recovery_enclave_helper` / `v2_grant_signer` の exact SHA-256 identity;
+- runtime manifest schema 3、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_status` / `v2_recover` / `v2_recovery_enclave_helper` / `v2_grant_signer` の exact SHA-256 identity;
 - authoritative Hub checkpoint の readability と current registry/capability schema;
 - enrolled single-Mac device が 1 台だけであることと current generation;
 - Agent checkpoint readability と exact Hub/Agent generation pairing;

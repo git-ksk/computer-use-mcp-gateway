@@ -81,12 +81,14 @@ class ReleaseCandidateTests(unittest.TestCase):
             set(mod.expected_binary_paths("macos")),
         )
         self.assertIn("bin/v2_doctor", mod.expected_binary_paths("macos"))
+        self.assertIn("bin/v2_status", mod.expected_binary_paths("macos"))
 
     def test_windows_zip_candidate_round_trip_omits_unix_only_binaries(self):
         bundle = self.extract("windows")
         mod.verify_bundle_dir(bundle)
         paths = mod.expected_binary_paths("windows")
         self.assertNotIn("bin/v2_doctor.exe", paths)
+        self.assertNotIn("bin/v2_status.exe", paths)
         self.assertNotIn("bin/v2_grant_signer.exe", paths)
         self.assertNotIn("bin/v2_handoff_ctl.exe", paths)
         self.assertTrue((bundle / "bin/v2_hub.exe").is_file())

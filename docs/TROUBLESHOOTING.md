@@ -16,6 +16,14 @@ MCP client
 
 Do not debug a remote client until the local Cua and gateway checks pass.
 
+For the reviewed single-Mac V2 profile, start with the unified read-only status before choosing a subsystem-specific command:
+
+```bash
+"$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_status"
+```
+
+Use `--json` for the stable schema consumed by Agent/UI automation. The status view composes existing doctor/readiness, quarantine, Handoff, mutation-authority, runtime-manifest, and durable-upgrade observations; it never clears quarantine, resumes Handoff/maintenance, switches authority, or replays work. Follow its bounded `next_action` code (`review_incident`, `complete_recovery`, `inspect_upgrade`, `check_backend`, `fix_configuration`, `inspect_doctor`, or `finish_handoff`) rather than inferring recovery from liveness.
+
 ## `cua-driver: command not found`
 
 Open a new terminal after installation. On macOS/Linux, Cua normally exposes the CLI through `~/.local/bin`; ensure that directory is on `PATH`.

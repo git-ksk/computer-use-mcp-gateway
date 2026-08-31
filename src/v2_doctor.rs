@@ -371,7 +371,7 @@ fn verify_runtime_manifest(
             "package_version_differs_from_doctor",
         );
     }
-    let mut required = vec!["v2_hub", "v2_agent", "v2_maint", "v2_doctor"];
+    let mut required = vec!["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_status"];
     #[cfg(target_os = "macos")]
     required.extend(["v2_recover", "v2_recovery_enclave_helper"]);
     if config.grant_signer_launchd_label.is_some() || config.grant_signer_socket.is_some() {
@@ -1828,6 +1828,7 @@ mod tests {
             "v2_agent",
             "v2_maint",
             "v2_doctor",
+            "v2_status",
             "v2_recover",
             "v2_recovery_enclave_helper",
             "v2_grant_signer",
