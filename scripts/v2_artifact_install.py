@@ -243,6 +243,10 @@ def render_plists(bundle: Path, profile: dict[str, object], root: Path, run_root
         if data.get("Label") != label:
             raise InstallError(f"LaunchAgent label mismatch: {filename}")
         dst = out / filename
+        # LaunchAgents contain only validated non-secret configuration and paths that point to
+        # separately provisioned secret files; provisioning bytes never enter `text`. CodeQL's
+        # sensitive-storage model treats the *_SECRET_FILE path fields as secret material.
+        # codeql[py/clear-text-storage-sensitive-data]
         dst.write_text(text, encoding="utf-8")
         dst.chmod(0o600)
 

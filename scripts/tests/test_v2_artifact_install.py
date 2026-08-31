@@ -192,6 +192,10 @@ class ArtifactInstallTests(unittest.TestCase):
         self.assertEqual(runtime_manifest["hub_agent_schema_version"], 4)
         self.assertEqual({x["name"] for x in runtime_manifest["binaries"]}, set(mod.RUNTIME_BINARIES))
         self.assertTrue((installed / "mutation-authority").is_dir())
+        for filename in mod.PLISTS.values():
+            plist_text = (self.root / "LaunchAgents" / filename).read_text(encoding="utf-8")
+            for secret_name in mod.SECRET_FILES:
+                self.assertNotIn(f"secret-{secret_name}", plist_text)
 
         bootstraps = [x for x in calls if x[:2] == ["launchctl", "bootstrap"]]
         self.assertEqual(
