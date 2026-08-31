@@ -6,10 +6,10 @@
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
     ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner, ReconciliationStatus,
-    RequestFingerprintComparison, ResolutionRecord, RetirementAuthority, RetirementDisposition,
-    RetirementPolicy, RetirementRecord, TextInputTargetEvidence, compare_request_fingerprint,
-    fingerprint_process_request, fingerprint_shell_request, fingerprint_text_input_candidate,
-    retirement_policy_for_capability,
+    RequestFingerprintComparison, ResolutionRecord, RetirementAuthority, RetirementCapacity,
+    RetirementDisposition, RetirementPolicy, RetirementRecord, TextInputTargetEvidence,
+    compare_request_fingerprint, fingerprint_process_request, fingerprint_shell_request,
+    fingerprint_text_input_candidate, retirement_policy_for_capability,
 };
 use crate::v2_m0::{
     CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
@@ -132,6 +132,7 @@ pub struct AutoResolutionInspection {
 pub struct AutoResolutionInspectionReport {
     pub auto_resolved: Vec<AutoResolutionInspection>,
     pub retired_indeterminate: Vec<RetirementInspection>,
+    pub retirement_capacity: RetirementCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -465,6 +466,7 @@ pub fn inspect_auto_resolutions_read_only(
     Ok(AutoResolutionInspectionReport {
         auto_resolved,
         retired_indeterminate,
+        retirement_capacity: execution.retirement_capacity(),
     })
 }
 
@@ -1284,10 +1286,10 @@ where
     let (_registry, mut execution) = state
         .restore(limits)
         .map_err(MaintenanceError::Persistence)?;
-    // Preflight the input writer contract before performing the in-memory
-    // authority-bearing transition. Retirement intentionally upgrades only the
-    // nested execution-safety schema to v5 because older schemas cannot represent
-    // an unknown-outcome tombstone truthfully.
+    // Preflight the authoritative input writer contract before performing the
+    // in-memory authority-bearing transition. A successful retirement is then
+    // published with the current execution-safety schema because older schemas
+    // cannot represent the v11 split replay-tombstone/history model after rotation.
     execution
         .snapshot_for_restart_compatible_with(source_execution_schema)
         .map_err(|_| MaintenanceError::PersistenceCompatibility {
@@ -1308,16 +1310,28 @@ where
         .find(|device| device.device_id == inspection.operation.device_id)
         .map(|device| device.generation)
         .ok_or(MaintenanceError::RetirementDeviceMissing)?;
-    let (_next, retirement) = execution
-        .retire_indeterminate(
-            operation_id,
-            RetirementAuthority::LocalMaintenanceOperator,
-            policy,
-            reason,
-            current_device_generation,
-            now_ms,
-        )
-        .map_err(MaintenanceError::Execution)?;
+    let (_next, retirement) = match execution.retire_indeterminate(
+        operation_id,
+        RetirementAuthority::LocalMaintenanceOperator,
+        policy,
+        reason,
+        current_device_generation,
+        now_ms,
+    ) {
+        Ok(result) => result,
+        Err(ExecutionError::RetirementCapacityExhausted) => {
+            crate::v2_observability::retirement_capacity_exhausted();
+            tracing::warn!(
+                event = "v2_retirement_capacity_exhausted",
+                outcome = "rejected",
+                "offline retirement refused because permanent replay tombstone capacity is exhausted"
+            );
+            return Err(MaintenanceError::Execution(
+                ExecutionError::RetirementCapacityExhausted,
+            ));
+        }
+        Err(error) => return Err(MaintenanceError::Execution(error)),
+    };
     if execution
         .retirements()
         .last()
@@ -1335,6 +1349,7 @@ where
         .restore(limits)
         .map_err(MaintenanceError::Persistence)?;
     let checkpoint_path = commit(&checkpoint, &candidate).map_err(MaintenanceError::Persistence)?;
+    crate::v2_observability::retirement_capacity_observed(execution.retirement_capacity());
     Ok(OfflineRetirementResult {
         retirement,
         checkpoint: checkpoint_path,
