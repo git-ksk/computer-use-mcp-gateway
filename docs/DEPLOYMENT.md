@@ -663,6 +663,8 @@ All MCP clients connected to one V1 gateway ultimately share one serialized phys
 
 A trusted development Mac that intentionally co-locates Hub, external grant signer, Agent, and Cua should use the reviewed single-Mac profile rather than hand-written LaunchAgents. See [`v2/V2_SINGLE_MAC_PRODUCTION.md`](v2/V2_SINGLE_MAC_PRODUCTION.md). Its upgrade helper preserves Hub drain/quarantine semantics, archives a version-paired rollback asset, writes a payload-free runtime identity manifest, and requires a healthy read-only `v2_doctor` result after restart.
 
+The reviewed upgrade also persists an owner-private atomic maintenance transaction at `v2/maintenance/upgrade-transaction.json`. `v2_maint upgrade-status` reads that record without taking recovery authority and reports the last durable phase plus exact source pair, bounded outcome class, target runtime generation, rollback asset identity, mutation-authority owner/epoch, and completion gates. Caller disconnect does not cause automatic resume/retry: if the record remains `in_progress`, inspect the one-shot launchd job and the durable phase before taking any new maintenance action. Source builds default to two Cargo jobs and require at least 6144 MiB free before the transaction starts; build `ENOSPC` is classified before service drain/install.
+
 ## Local-user online quarantine recovery
 
 The optional online quarantine-recovery path is documented in [`v2/V2_ONLINE_RECOVERY.md`](v2/V2_ONLINE_RECOVERY.md). It does not expose recovery through northbound MCP and does not make the Agent device key a resolver credential.

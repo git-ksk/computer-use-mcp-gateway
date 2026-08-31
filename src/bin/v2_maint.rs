@@ -15,6 +15,7 @@ use computer_use_mcp_gateway::{
         inspect_auto_resolutions_read_only, inspect_quarantines_read_only,
         resolve_indeterminate_offline, retire_indeterminate_offline,
     },
+    v2_upgrade_transaction::{read_upgrade_transaction, upgrade_transaction_path},
 };
 use std::path::PathBuf;
 
@@ -130,6 +131,15 @@ enum Command {
         request_file: PathBuf,
         #[arg(long, env = "CUMG_V2_AUDIT_FINGERPRINT_SECRET_FILE")]
         fingerprint_secret_file: PathBuf,
+    },
+    /// Inspect the latest durable single-Mac upgrade transaction. This is read-only and never resumes maintenance.
+    UpgradeStatus {
+        /// Override the install root used to locate v2/maintenance/upgrade-transaction.json.
+        #[arg(long, env = "CUMG_V2_INSTALL_ROOT")]
+        install_root: Option<PathBuf>,
+        /// Override the exact transaction file. Mainly useful for recovery tooling/tests.
+        #[arg(long, env = "CUMG_V2_UPGRADE_TRANSACTION_FILE")]
+        transaction_file: Option<PathBuf>,
     },
     /// Initialize the private shared V1/V2 mutation-authority state.
     MutationAuthorityInit {
@@ -352,6 +362,30 @@ fn main() -> Result<()> {
                 }
                 IncidentBriefFormat::Text => println!("{}", render_incident_brief_text(&brief)),
             }
+        }
+        Command::UpgradeStatus {
+            install_root,
+            transaction_file,
+        } => {
+            let path = match transaction_file {
+                Some(path) => path,
+                None => {
+                    let root = match install_root {
+                        Some(root) => root,
+                        None => {
+                            let home = std::env::var_os("HOME").context(
+                                "HOME is required to locate the default CUMG install root",
+                            )?;
+                            PathBuf::from(home)
+                                .join("Library/Application Support/computer-use-mcp-gateway")
+                        }
+                    };
+                    upgrade_transaction_path(&root)
+                }
+            };
+            let status = read_upgrade_transaction(&path)
+                .context("read-only upgrade transaction inspection failed")?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Command::MutationAuthorityInit {
             authority_dir,

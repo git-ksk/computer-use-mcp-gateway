@@ -22,6 +22,8 @@ Environment overrides:
   CUMG_V2_MACOS_TEAM_ID       required; exact 10-character Apple Developer Team ID
   CUMG_V2_HANDOFF_SOURCE_ROOT required after first pinned cutover; reviewed Handoff checkout
   CUMG_V2_EXPECTED_HANDOFF_COMMIT required; exact reviewed mcp-execution-handoff commit
+  CUMG_V2_CARGO_BUILD_JOBS   default: 2; bounded source-build parallelism (1..8)
+  CUMG_V2_MIN_BUILD_FREE_MIB default: 6144; pre-build free-space floor
   CUMG_V1_GATEWAY_LABEL      default: com.sawadakousuke.computer-use-mcp-gateway
 USAGE
 }
@@ -72,6 +74,17 @@ MACOS_CODESIGN_FINGERPRINT="${CUMG_V2_MACOS_CODESIGN_FINGERPRINT:-}"
 MACOS_CODESIGN_IDENTITY="${CUMG_V2_MACOS_CODESIGN_IDENTITY:-}"
 MACOS_TEAM_ID="${CUMG_V2_MACOS_TEAM_ID:-}"
 EXPECTED_HANDOFF_COMMIT="${CUMG_V2_EXPECTED_HANDOFF_COMMIT:-}"
+CARGO_BUILD_JOBS="${CUMG_V2_CARGO_BUILD_JOBS:-2}"
+MIN_BUILD_FREE_MIB="${CUMG_V2_MIN_BUILD_FREE_MIB:-6144}"
+UPGRADE_TRANSACTION_HELPER="$REPO_ROOT/scripts/v2_upgrade_transaction.py"
+UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/upgrade-transaction.json"
+[[ "$CARGO_BUILD_JOBS" =~ ^[1-8]$ ]] || { echo "REFUSED reason=invalid_cargo_build_jobs" >&2; exit 2; }
+[[ "$MIN_BUILD_FREE_MIB" =~ ^[0-9]+$ && "$MIN_BUILD_FREE_MIB" -ge 1024 && "$MIN_BUILD_FREE_MIB" -le 65536 ]] || {
+  echo "REFUSED reason=invalid_min_build_free_mib" >&2; exit 2
+}
+[[ -f "$UPGRADE_TRANSACTION_HELPER" && ! -L "$UPGRADE_TRANSACTION_HELPER" ]] || {
+  echo "REFUSED reason=upgrade_transaction_helper_missing_or_unsafe" >&2; exit 2
+}
 [[ -n "$EXPECTED_CUA_VERSION" ]] || { echo "REFUSED reason=expected_cua_version_required" >&2; exit 2; }
 [[ -n "$MACOS_CODESIGN_FINGERPRINT" || -n "$MACOS_CODESIGN_IDENTITY" ]] || {
   echo "REFUSED reason=macos_codesign_selector_required" >&2; exit 2;
@@ -359,11 +372,61 @@ stable_codesign() {
   verify_stable_codesign "$pathname" "$identifier"
 }
 
-echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required"
+BUILD_FREE_KIB="$(df -Pk "$REPO_ROOT" | awk 'NR==2 {print $4}')"
+[[ "$BUILD_FREE_KIB" =~ ^[0-9]+$ ]] || { echo "REFUSED reason=build_capacity_unavailable" >&2; exit 2; }
+if (( BUILD_FREE_KIB < MIN_BUILD_FREE_MIB * 1024 )); then
+  echo "REFUSED reason=insufficient_build_capacity required_mib=$MIN_BUILD_FREE_MIB" >&2
+  exit 2
+fi
+BUILD_FREE_MIB=$((BUILD_FREE_KIB / 1024))
+echo "PREFLIGHT_OK source_commit=$HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required build_jobs=$CARGO_BUILD_JOBS build_free_mib=$BUILD_FREE_MIB"
 [[ "$PRELIGHT_ONLY" == "1" ]] && exit 0
 
-cargo build --release --locked \
-  --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_recover --bin v2_grant_signer
+UPGRADE_FAILURE_STATUS="failed_before_install"
+UPGRADE_FAILURE_REASON="phase_failed"
+UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+UPGRADE_TRANSACTION_ACTIVE=0
+python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" start \
+  --cumg-source-commit "$HEAD" --handoff-source-commit "$HANDOFF_HEAD" >/dev/null || {
+  echo "REFUSED reason=upgrade_transaction_start_failed" >&2; exit 2
+}
+UPGRADE_TRANSACTION_ACTIVE=1
+upgrade_transaction_exit() {
+  local code=$?
+  trap - EXIT
+  if [[ "$code" != "0" && "$UPGRADE_TRANSACTION_ACTIVE" == "1" ]]; then
+    python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" fail \
+      --status "$UPGRADE_FAILURE_STATUS" --reason "$UPGRADE_FAILURE_REASON" \
+      --operator-action "$UPGRADE_OPERATOR_ACTION" >/dev/null 2>&1 || true
+  fi
+  exit "$code"
+}
+trap upgrade_transaction_exit EXIT
+tx_advance() {
+  python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" advance "$@" >/dev/null || {
+    UPGRADE_FAILURE_STATUS="operator_action_required"
+    UPGRADE_FAILURE_REASON="transaction_update_failed"
+    UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+    echo "REFUSED reason=upgrade_transaction_update_failed" >&2
+    exit 2
+  }
+}
+
+BUILD_ERR="$(mktemp "${TMPDIR:-/tmp}/cumg-v2-build.XXXXXX")"
+if ! cargo build -j "$CARGO_BUILD_JOBS" --release --locked \
+  --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_recover --bin v2_grant_signer 2>"$BUILD_ERR"; then
+  cat "$BUILD_ERR" >&2
+  if grep -Eqi 'No space left on device|ENOSPC|os error 28' "$BUILD_ERR"; then
+    UPGRADE_FAILURE_REASON="build_storage_exhausted"
+    UPGRADE_OPERATOR_ACTION="restore_capacity_and_retry"
+  else
+    UPGRADE_FAILURE_REASON="build_failed"
+  fi
+  rm -f "$BUILD_ERR"
+  exit 2
+fi
+cat "$BUILD_ERR" >&2
+rm -f "$BUILD_ERR"
 "$REPO_ROOT/scripts/build-macos-recovery-helper.sh" "$REPO_ROOT/target/release/v2_recovery_enclave_helper" >/dev/null
 for name in v2_hub v2_agent v2_maint v2_doctor v2_recover v2_recovery_enclave_helper v2_grant_signer; do
   [[ -x "target/release/$name" ]] || { echo "REFUSED reason=build_output_missing binary=$name" >&2; exit 2; }
@@ -378,6 +441,7 @@ stable_codesign "target/release/v2_recovery_enclave_helper" "com.github.git-ksk.
   echo "REFUSED reason=recovery_helper_stable_codesign_failed" >&2; exit 2;
 }
 
+tx_advance --phase handoff_stage
 HANDOFF_RUNTIME_COMMAND="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_COMMAND' "$AGENT_PLIST" 2>/dev/null || true)"
 [[ "$HANDOFF_RUNTIME_COMMAND" == /* && -x "$HANDOFF_RUNTIME_COMMAND" ]] || {
   echo "REFUSED reason=handoff_runtime_command_missing_or_unsafe" >&2; exit 2;
@@ -432,6 +496,7 @@ CURRENT_HANDOFF_RUNTIME="$(dirname "$CURRENT_HANDOFF_SCRIPT")"
 }
 NEW_RUNTIME_NAME="runtime-${HEAD:0:12}-${HANDOFF_HEAD:0:12}"
 NEW_HANDOFF_RUNTIME="$HANDOFF_DIR/$NEW_RUNTIME_NAME"
+tx_advance --runtime-generation "$NEW_RUNTIME_NAME"
 NEW_HANDOFF_RUNTIME_CREATED=0
 NEW_HANDOFF_HELPERS=""
 
@@ -550,10 +615,12 @@ PYRUNTIMEGEN
   # Rewrite staged helper destinations after the atomic directory rename.
   NEW_HANDOFF_HELPERS="${NEW_HANDOFF_HELPERS//$STAGE_RUNTIME/$NEW_HANDOFF_RUNTIME}"
 fi
+tx_advance --flag handoff_runtime_paired
 
 MUTATION_AUTHORITY_CREATED=0
 STAMP="$(date '+%Y%m%dT%H%M%S%z')"
 ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
+tx_advance --phase backup --rollback-asset "$(basename "$ROLLBACK")"
 umask 077
 mkdir -p "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
 chmod 700 "$ROLLBACK" "$ROLLBACK/bin" "$ROLLBACK/state" "$ROLLBACK/launchd" "$ROLLBACK/handoff"
@@ -614,12 +681,16 @@ PYARCHIVE
 printf '%s' "$NEW_HANDOFF_HELPERS" > "$ROLLBACK/handoff/new-paths.tsv"
 chmod 600 "$ROLLBACK/handoff/new-paths.tsv"
 printf '%s\n' "$HEAD" > "$ROLLBACK/replacement-source-commit.txt"
+tx_advance --flag rollback_asset_created
 
 hub_pid() {
   launchctl print "$DOMAIN/$HUB_LABEL" 2>/dev/null | awk '/^[[:space:]]*pid = / {print $3; exit}'
 }
 
 # Hub first: close admission and allow its own bounded drain while Agent remains connected.
+tx_advance --phase service_drain
+UPGRADE_FAILURE_STATUS="failed_closed_after_stop"
+UPGRADE_OPERATOR_ACTION="inspect_rollback_before_recovery"
 OLD_HUB_PID="$(hub_pid || true)"
 [[ -n "$OLD_HUB_PID" ]] || { echo "REFUSED reason=hub_pid_unavailable rollback=$ROLLBACK" >&2; exit 2; }
 kill -TERM "$OLD_HUB_PID"
@@ -652,6 +723,9 @@ STOPPED_QUARANTINE_JSON="$("$BIN_DIR/v2_maint" inspect-quarantine --state-dir "$
 }
 STOPPED_QUARANTINE_COUNT="$(printf '%s' "$STOPPED_QUARANTINE_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("quarantines", [])))')"
 if [[ "$STOPPED_QUARANTINE_COUNT" != "0" ]]; then
+  UPGRADE_FAILURE_STATUS="operator_action_required"
+  UPGRADE_FAILURE_REASON="quarantine_created_during_drain"
+  UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
   [[ "$EXTERNAL_SIGNER" == "1" ]] && launchctl bootstrap "$DOMAIN" "$SIGNER_PLIST" >/dev/null 2>&1 || true
   launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
   sleep 1
@@ -660,6 +734,8 @@ if [[ "$STOPPED_QUARANTINE_COUNT" != "0" ]]; then
   exit 2
 fi
 
+tx_advance --flag quarantine_clear
+tx_advance --phase authority_migration
 if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
   if ! target/release/v2_maint mutation-authority-init \
     --authority-dir "$MUTATION_AUTHORITY_DIR" --owner v2 >/dev/null; then
@@ -668,8 +744,24 @@ if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
   fi
   MUTATION_AUTHORITY_CREATED=1
 fi
+AUTHORITY_JSON="$(target/release/v2_maint mutation-authority-status --authority-dir "$MUTATION_AUTHORITY_DIR")" || {
+  UPGRADE_FAILURE_REASON="mutation_authority_status_failed"
+  echo "REFUSED reason=mutation_authority_status_failed rollback=$ROLLBACK services_stopped=1" >&2
+  exit 2
+}
+AUTHORITY_OWNER="$(printf '%s' "$AUTHORITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("owner", ""))')"
+AUTHORITY_EPOCH="$(printf '%s' "$AUTHORITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("epoch", ""))')"
+[[ "$AUTHORITY_OWNER" == "v2" && "$AUTHORITY_EPOCH" =~ ^[1-9][0-9]*$ ]] || {
+  UPGRADE_FAILURE_REASON="mutation_authority_not_v2"
+  echo "REFUSED reason=mutation_authority_not_v2 rollback=$ROLLBACK services_stopped=1" >&2
+  exit 2
+}
+tx_advance --mutation-owner "$AUTHORITY_OWNER" --mutation-epoch "$AUTHORITY_EPOCH" --flag mutation_authority_verified
 
 restore_preinstall_profile() {
+  UPGRADE_FAILURE_STATUS="operator_action_required"
+  UPGRADE_FAILURE_REASON="preinstall_restore_attempted"
+  UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
   cp -p "$ROLLBACK/launchd/$(basename "$AGENT_PLIST")" "$AGENT_PLIST" 2>/dev/null || true
   if [[ "$MUTATION_AUTHORITY_CREATED" == "1" && "$MUTATION_AUTHORITY_DIR" == "$ROOT/mutation-authority" ]]; then
     rm -rf "$MUTATION_AUTHORITY_DIR" 2>/dev/null || true
@@ -693,6 +785,7 @@ restore_preinstall_profile() {
   fi
 }
 
+tx_advance --phase install
 if ! python3 - "$HANDOFF_ENV_FILE" "$NEW_HANDOFF_RUNTIME/handoff-root" "$ROLLBACK/handoff/new-paths.tsv" <<'PYENVREWRITE'
 import os, pathlib, sys, tempfile
 path = pathlib.Path(sys.argv[1])
@@ -798,9 +891,13 @@ print(json.dumps({
 PY
 chmod 600 "$MANIFEST_TMP"
 mv -f "$MANIFEST_TMP" "$ROOT/runtime-manifest.json"
+tx_advance --phase restart
 
 fail_poststart() {
   local reason="$1"
+  UPGRADE_FAILURE_STATUS="failed_closed_after_stop"
+  UPGRADE_FAILURE_REASON="$reason"
+  UPGRADE_OPERATOR_ACTION="inspect_rollback_before_recovery"
   echo "POSTSTART_FAILED reason=$reason rollback=$ROLLBACK" >&2
   if launchctl print "$DOMAIN/$HUB_LABEL" >/dev/null 2>&1; then
     local pid
@@ -834,6 +931,8 @@ if ! python3 "$MUTATION_AUTHORITY_PREFLIGHT" \
   --legacy-plist "$LEGACY_GATEWAY_PLIST" --agent-plist "$AGENT_PLIST"; then
   fail_poststart "mutation_authority_preflight"
 fi
+tx_advance --flag launchd_topology_safe --flag services_restarted
+tx_advance --phase post_verify
 
 DOCTOR_ARGS=(
   --hub-state-dir "$HUB_STATE"
@@ -851,6 +950,7 @@ if [[ "$EXTERNAL_SIGNER" == "1" ]]; then
 else
   # Use a deliberately missing optional service only if the current doctor CLI grows a signer-mode flag.
   # The legacy profile is not the reviewed default and therefore skips automatic doctor success.
+  UPGRADE_FAILURE_REASON="legacy_in_process_signer_requires_manual_doctor"
   echo "POSTSTART_FAILED reason=legacy_in_process_signer_requires_manual_doctor rollback=$ROLLBACK" >&2
   exit 3
 fi
@@ -871,6 +971,11 @@ for _attempt in $(seq 1 15); do
 done
 [[ "$DOCTOR_OK" == "1" ]] || fail_poststart "doctor"
 printf '%s\n' "$DOCTOR_OUTPUT"
+tx_advance --flag runtime_manifest_verified --flag quarantine_clear --flag doctor_healthy
+tx_advance --phase cleanup
+UPGRADE_FAILURE_STATUS="operator_action_required"
+UPGRADE_FAILURE_REASON="cleanup_safety_refusal"
+UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
 if ! python3 "$REPO_ROOT/scripts/v2_handoff_runtime_cleanup.py" \
   --install-root "$ROOT" \
   --agent-plist "$AGENT_PLIST" \
@@ -883,4 +988,13 @@ if ! python3 "$REPO_ROOT/scripts/v2_handoff_runtime_cleanup.py" \
   echo "CLEANUP_DEFERRED reason=safety_refusal" >&2
   exit 4
 fi
+tx_advance --flag cleanup_completed
+python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" complete >/dev/null || {
+  UPGRADE_FAILURE_STATUS="operator_action_required"
+  UPGRADE_FAILURE_REASON="transaction_completion_failed"
+  UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+  echo "REFUSED reason=upgrade_transaction_completion_failed" >&2
+  exit 4
+}
+UPGRADE_TRANSACTION_ACTIVE=0
 echo "UPGRADE_OK source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD runtime_generation=$NEW_RUNTIME_NAME rollback=$ROLLBACK"

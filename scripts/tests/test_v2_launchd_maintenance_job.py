@@ -14,6 +14,13 @@ mod = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = mod
 SPEC.loader.exec_module(mod)
 
+TX_SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "v2_upgrade_transaction.py"
+TX_SPEC = importlib.util.spec_from_file_location("v2_upgrade_transaction_ci", TX_SCRIPT)
+assert TX_SPEC and TX_SPEC.loader
+txmod = importlib.util.module_from_spec(TX_SPEC)
+sys.modules[TX_SPEC.name] = txmod
+TX_SPEC.loader.exec_module(txmod)
+
 DOMAIN = "gui/501"
 LEGACY = "com.git-ksk.cumg-v2-upgrade-once.1787651265"
 
@@ -169,6 +176,8 @@ class LaunchdMaintenanceTests(unittest.TestCase):
                 "HOME": "/Users/test",
                 "CUMG_V2_EXPECTED_CUA_VERSION": "0.19.3",
                 "CUMG_V2_MACOS_TEAM_ID": "ABCDEFGHIJ",
+                "CUMG_V2_CARGO_BUILD_JOBS": "2",
+                "CUMG_V2_MIN_BUILD_FREE_MIB": "6144",
                 "AWS_SECRET_ACCESS_KEY": "must-not-cross",
                 "GITHUB_TOKEN": "must-not-cross",
             },
@@ -176,8 +185,30 @@ class LaunchdMaintenanceTests(unittest.TestCase):
         )
         self.assertEqual(environment["CUMG_V2_MAINTENANCE_JOB_LABEL"], label)
         self.assertEqual(environment["CUMG_V2_EXPECTED_CUA_VERSION"], "0.19.3")
+        self.assertEqual(environment["CUMG_V2_CARGO_BUILD_JOBS"], "2")
+        self.assertEqual(environment["CUMG_V2_MIN_BUILD_FREE_MIB"], "6144")
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
         self.assertNotIn("GITHUB_TOKEN", environment)
+
+    def test_upgrade_transaction_survives_caller_disconnect_at_representative_phases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for phase in ("service_drain", "post_verify"):
+                path = pathlib.Path(temp) / phase / "upgrade-transaction.json"
+                txmod.start(path, "a" * 40, "b" * 40, f"upgrade-{phase}")
+                txmod.advance(path, phase=phase)
+                persisted = txmod._read(path)
+                self.assertEqual(persisted["status"], "in_progress")
+                self.assertEqual(persisted["phase"], phase)
+
+    def test_upgrade_script_has_bounded_build_and_durable_phase_contract(self):
+        upgrade = pathlib.Path(__file__).resolve().parents[1] / "v2-single-mac-upgrade.sh"
+        text = upgrade.read_text(encoding="utf-8")
+        self.assertIn('CARGO_BUILD_JOBS="${CUMG_V2_CARGO_BUILD_JOBS:-2}"', text)
+        self.assertIn('MIN_BUILD_FREE_MIB="${CUMG_V2_MIN_BUILD_FREE_MIB:-6144}"', text)
+        self.assertIn('UPGRADE_FAILURE_REASON="build_storage_exhausted"', text)
+        for phase in ("handoff_stage", "backup", "service_drain", "authority_migration", "install", "restart", "post_verify", "cleanup"):
+            self.assertIn(f"tx_advance --phase {phase}", text)
+        self.assertIn('--state-file "$UPGRADE_TRANSACTION_FILE" complete', text)
 
     def test_xpcproxy_transition_is_not_mistaken_for_completed_job(self):
         label = "com.github.git-ksk.cumg-v2-maintenance.upgrade.1.2.deadbeef"

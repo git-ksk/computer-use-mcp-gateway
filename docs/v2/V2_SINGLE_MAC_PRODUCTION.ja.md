@@ -81,6 +81,19 @@ exact target の `runtime-<cumg>-<handoff>` generation がすでに存在する�
 
 オンライン recovery の Secure Enclave helper も bounded one-shot subprocess です。`v2_recover` は helper 完了を最大60秒に制限し、LocalAuthentication が応答しない場合は helper を kill/reap して `recovery_helper_timeout` を返します。user deny/cancel は `recovery_user_presence_denied`、明確な LocalAuthentication unavailable は `recovery_helper_auth_unavailable` と区別します。いずれも authorization を publish せず quarantine を変更しません。timeout/cancel 後の再試行では `v2_recover status` で current challenge を再検証し、fresh な明示操作として実行してください。timeout から recovery decision を推論してはいけません。
 
+
+artifact-backed install が通常経路になるまで、source build は意図的に bounded にします。`CUMG_V2_CARGO_BUILD_JOBS` は default `2`、許可範囲は `1..8`、`CUMG_V2_MIN_BUILD_FREE_MIB` は default `6144` です。preflight は probe file を作らず free space を読み、floor 未満なら maintenance transaction、service drain、mutation-authority migration、install より前に拒否します。preflight 後の Cargo build で `ENOSPC` / `No space left on device` が発生した場合は `build_storage_exhausted` として記録し、installed runtime と mutation authority を変更する前に終了します。capacity recovery のために Git WIP / untracked file を自動削除することはありません。
+
+preflight 成功後の実 upgrade は owner-private な `v2/maintenance/upgrade-transaction.json` を atomic replace で更新します。この record は operational evidence だけであり、quarantine clear、upgrade resume/retry、mutation authority transfer、rollback restore、desktop work replay の authority にはなりません。exact CUMG/Handoff source commit、current phase、bounded status、target runtime generation、rollback bundle identity、mutation-authority owner/epoch、explicit completion gate を記録します。`completed` は runtime manifest verification、safe launchd topology、V2 mutation authority、quarantine=0、paired Handoff runtime、service restart、healthy `v2_doctor`、rollback 作成、cleanup がすべて記録された場合だけ成立します。
+
+MCP/client 側が途中で disconnect / timeout した場合、手作業で state を掘らず durable record を確認します。
+
+```bash
+v2_maint upgrade-status
+```
+
+`in_progress` は「最後の durable phase がここ」という意味だけで、別の upgrade を開始してよいという意味ではありません。`scripts/v2_launchd_maintenance_job.py inspect` で one-shot launchd job を確認し、active なら同じ invocation をそのまま完了させます。job が inactive なのに transaction が `in_progress` のままなら incomplete として扱い、新規 run の前に inspection が必要です。`failed_before_install` は install boundary 前の失敗、`failed_closed_after_stop` は service が意図的に停止状態かもしれないため記録済み rollback asset を確認してから recovery、`operator_action_required` は restore/cleanup/status update 後に自動でclean conclusionを証明できなかった状態です。新しい transaction は `in_progress` / `failed_closed_after_stop` / `operator_action_required` record を上書きしません。
+
 single-Mac maintenance は明示的な one-shot に限定します。upgrade/recovery command に `launchctl submit` を使ってはいけません。underspecified な submitted job では launchd が persistence/relaunch behavior を推論する場合があります。upgrade helper の reviewed launchd wrapper は `scripts/v2_launchd_maintenance_job.py run-upgrade` です。owner-private な temporary plist に `RunAtLoad=true` / `KeepAlive=false` を明記し、upgrade helper が必要とする closed な non-secret environment allowlist だけを渡します。upgrade が non-zero で終了した場合も launchd の `runs` が1を超えないことを検証し、return 前に必ず job を bootout して temporary plist を削除します。failed upgrade の retry は行いません。
 
 upgrade 前には wrapper と `v2-single-mac-upgrade.sh` の両方が current GUI launchd domain から known current/legacy CUMG maintenance label を検査します。wrapper 自身の exact current label 以外に loaded job があれば `stale_maintenance_jobs` で拒否し、active job は自動停止しません。privacy-bounded な state/runs/last-exit の確認には `scripts/v2_launchd_maintenance_job.py inspect` を使います。stale job が running でないことを確認した後だけ `cleanup-stale` で bootout し、matching private temporary plist のみ削除できます。matching maintenance job が active の間は cleanup 自体を拒否します。

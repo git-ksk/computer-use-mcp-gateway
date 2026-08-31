@@ -50,6 +50,7 @@ pub(crate) mod v2_terminal_pty;
 mod v2_terminal_pty_acceptance;
 pub(crate) mod v2_terminal_pty_handoff;
 pub mod v2_tls_lifecycle;
+pub mod v2_upgrade_transaction;
 
 #[cfg(windows)]
 mod v2_windows_acl;
