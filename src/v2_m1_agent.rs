@@ -50,8 +50,9 @@ use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryAuthorization, RecoveryError, RecoveryResolved, clear_authorization,
     clear_recovery_handoff, clear_recovery_resolved, load_authorization, load_challenge,
-    store_challenge, store_recovery_resolved, validate_authorization_against_challenge,
-    verify_recovery_challenge, verify_recovery_resolved_for_authorization,
+    recovery_decision_name, store_challenge, store_recovery_resolved,
+    validate_authorization_against_challenge, verify_recovery_challenge,
+    verify_recovery_resolved_for_authorization,
 };
 use crate::v2_operator_handoff::{
     VerificationToken, is_exact_verification_candidate, is_phase1_protected_command,
@@ -1058,8 +1059,8 @@ impl AgentService {
                                 operation_id = %resolved.operation_id,
                                 device_id = %session.device_id,
                                 generation = session.generation,
-                                outcome = "resolved",
-                                "Hub durably resolved quarantine after local user authorization"
+                                outcome = recovery_decision_name(resolved.decision),
+                                "Hub durably completed local-user recovery without replaying the old operation"
                             );
                         }
                         HubToAgent::BackendSessionEnd(remote) => {

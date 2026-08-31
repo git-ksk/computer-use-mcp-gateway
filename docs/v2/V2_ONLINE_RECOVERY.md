@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](V2_ONLINE_RECOVERY.ja.md)
 
-Status: **implemented behind explicit recovery-key provisioning; physical Secure Enclave user-presence acceptance remains a release gate.**
+Status: **implemented behind explicit recovery-key provisioning; trusted physical macOS Secure Enclave user-presence acceptance is complete and the same authority is reused by current-state acceptance.**
 
 This document defines the online recovery path for a desktop that entered durable `Indeterminate` quarantine. It removes the normal operational need to stop the Hub and run offline maintenance, without weakening the existing no-auto-replay or persistence-gated recovery boundary.
 
@@ -27,7 +27,8 @@ Agent verifies Hub identity/current generation
         v
 cumg-v2-recover status / local inspection
         |
-        | exact user decision
+        | exact Human choice:
+        | historical resolution OR current-state acceptance
         | Secure Enclave user-presence signature
         v
 Agent relays signed RecoveryAuthorization
@@ -35,7 +36,8 @@ Agent relays signed RecoveryAuthorization
         v
 Hub verifies recovery key + challenge + quarantine CAS
         |
-        | resolve_indeterminate + durable checkpoint
+        | resolve_indeterminate OR reviewed tombstone retirement
+        | + durable checkpoint
         v
 Hub-signed RecoveryResolved acknowledgement
         |
@@ -59,17 +61,18 @@ The local authorization binds the exact challenge plus:
 
 - a random recovery request ID;
 - audit assessment;
-- one explicit decision: `confirmed_completed` or `confirmed_not_executed`;
+- one explicit signed decision: `confirmed_completed`, `confirmed_not_executed`, or recovery-schema-v2 `current_state_accepted`;
+- for `current_state_accepted`, the exact reviewed retirement policy (`transient_ui_interaction_v1`) as additional signed data;
 - bounded evidence metadata (maximum 1 KiB);
 - a P-256/SHA-256 signature from the separately provisioned recovery key.
 
-Changing the decision, operation, device, generation, fingerprint, nonce, expiry, assessment, or evidence after signing invalidates the signature or challenge match.
+Changing the decision, current-state policy, operation, device, generation, fingerprint, nonce, expiry, assessment, or evidence after signing invalidates the signature or challenge match. Online-recovery schema v2 introduces the policy-bound `current_state_accepted` decision; schema v1 remains accepted only for the older historical resolution shape and cannot authorize current-state acceptance.
 
 ## Audit assessment and privacy
 
 The normal V2 checkpoint deliberately excludes raw GUI commands, screenshots, backend responses, clipboard data, credentials, and other high-sensitivity payloads. A generic post-hoc Agent audit therefore cannot safely prove whether an arbitrary GUI side effect completed.
 
-The initial local recovery CLI reports `audit_assessment=inconclusive`. The local user inspects the current desktop and explicitly chooses the resolution. This is preferable to manufacturing a false automatic proof. Future capability-specific audit providers may return `completed` or `not_executed` only when they can establish that state without widening the persisted privacy boundary.
+The local recovery CLI reports `audit_assessment=inconclusive` when generic post-hoc evidence cannot prove history. The local Human then has two deliberately different choices. `resolve` is only for an explicit historical claim (`confirmed_completed` or `confirmed_not_executed`). `accept-current-state` makes no historical claim at all: it means only “I inspected the current screen. This state is acceptable to continue from.” For that path the historical operation remains `Indeterminate`. This separation is preferable to manufacturing a false automatic proof. Future capability-specific audit providers may return `completed` or `not_executed` only when they can establish that state without widening the persisted privacy boundary.
 
 Evidence is metadata only. It must not contain screenshots, raw command/result payloads, credentials, typed secrets, or unrelated desktop content.
 
@@ -86,11 +89,13 @@ The Hub accepts an online authorization only when all of the following remain tr
 7. the current durable quarantine fingerprint is unchanged;
 8. evidence is bounded and the request shape is canonical.
 
-Resolution reuses the existing `resolve_indeterminate` state transition. The Hub snapshots the fail-closed execution state, applies the resolution, and persists the new checkpoint. If persistence fails, the in-memory execution controller is restored to the quarantined snapshot and no success acknowledgement is sent.
+Historical `confirmed_completed` / `confirmed_not_executed` decisions reuse the existing `resolve_indeterminate` transition. `current_state_accepted` is different: the Hub requires online-recovery schema v2, `audit_assessment=inconclusive`, the exact `transient_ui_interaction_v1` policy, a current authenticated registry generation exactly matching the authorization, and a generation strictly newer than the ambiguous dispatch. The existing retirement policy then independently restricts the operation to `Scroll` or `MovePointer`; `Shell`, process, filesystem, text/input, browser mutation, and every other capability fail closed even with a valid local-user signature.
 
-A successful resolution never resumes or replays the old operation. Even `confirmed_not_executed` only reopens the desktop for a **new** operation ID.
+Current-state acceptance reuses the permanent retired-indeterminate replay tombstone, not terminal resolution. The durable operation remains `Indeterminate`, no terminal receipt/result is created, and the audit records `outcome=unknown`, `disposition=current_state_accepted`, `authority=local_user_presence`, the reviewed policy/generations, bounded Human evidence metadata, and `replayed=false`. Only the device quarantine is removed.
 
-A duplicate delivery of the same accepted request ID in the same live recovery exchange is acknowledged idempotently. A conflicting decision is not allowed to replace a prior resolution.
+Both transitions are persistence-gated. The Hub snapshots the fail-closed execution state, applies the selected transition, and persists the new checkpoint. If persistence fails, the in-memory execution controller is restored to the quarantined snapshot and no success acknowledgement is sent. Neither path resumes or replays the old operation; subsequent work always uses a **new** operation ID.
+
+A duplicate delivery of the exact same accepted request ID in the same live recovery exchange is acknowledged idempotently. A conflicting decision, policy, or evidence statement is not allowed to replace the accepted authorization.
 
 ## Local handoff
 
@@ -173,7 +178,21 @@ v2_recover resolve \
   --wait-secs 30
 ```
 
-`resolve` still requires macOS user presence, and `confirm` can re-check an already-published request using its exact safe metadata. A missing acknowledgement, timeout, stale receipt, or mismatch is not success and does not authorize retry/replay. These low-level commands do not supersede the normal `guide` flow.
+For a reviewed low-impact `Scroll`/`MovePointer` ambiguity where history cannot be proven but the local Human explicitly accepts the present screen as the continuation point, use the separate command instead of `resolve`:
+
+```bash
+v2_recover accept-current-state \
+  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
+  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
+  --evidence "local human inspected and accepted the current screen as the continuation point" \
+  --wait-secs 30
+```
+
+Before the user-presence prompt, this command explicitly reports `historical_execution_outcome=indeterminate`, `operator_observation=current_state_accepted`, `operational_disposition=current_state_accepted`, the reviewed retirement policy, and `old_operation_replayed=false`. Screen observation itself is not authority; the separately provisioned recovery-key signature and all Hub-side policy/generation/quarantine checks are still required.
+
+`resolve` and `accept-current-state` both require macOS user presence. `confirm` can re-check an already-published request using its exact safe decision/policy metadata. `guide` remains the canonical flow for authoritative historical decisions from the incident brief; it does not silently widen its closed decision set with current-state acceptance. The separate `accept-current-state` command is therefore an explicit Human escape hatch only for the narrow reviewed low-impact policy. A missing acknowledgement, timeout, stale receipt, or mismatch is not success and does not authorize retry/replay.
 
 ## Key lifecycle and failure cases
 
@@ -196,7 +215,11 @@ Automated coverage must include:
 - bounded/non-empty evidence;
 - durable Hub resolution and no old-operation replay;
 - duplicate accepted-request acknowledgement and conflicting/stale authorization rejection;
-- owner-private durable acknowledgement receipt, exact CLI confirmation binding, and publication-vs-completion distinction.
+- owner-private durable acknowledgement receipt, exact CLI confirmation binding, and publication-vs-completion distinction;
+- current-state acceptance remaining historically `Indeterminate` with no terminal receipt/result;
+- `Scroll`/`MovePointer` allowlist enforcement plus `Shell`/high-impact refusal;
+- equal/stale-generation refusal, persistence-failure rollback, restart durability, exact old-ID replay rejection, and fresh-ID admission;
+- online-recovery schema-v2 decision/policy signature binding and fail-closed legacy-schema refusal.
 
 Before enabling the macOS online path in a release, a trusted physical Mac must additionally prove:
 
@@ -210,8 +233,10 @@ Before enabling the macOS online path in a release, a trusted physical Mac must 
 8. a new operation succeeds afterward;
 9. the old ambiguous operation is never replayed.
 
+Issue #137 does not introduce a new cryptographic/user-presence provider: `accept-current-state` uses the same already-accepted Secure Enclave helper, key material, challenge, signature and relay path. Its new safety claims are the decision/policy semantics, generation/capability gates, persistence rollback, durable unknown-outcome tombstone and wording distinction; those are covered deterministically. A new physical acceptance is required if the user-presence provider or its authority boundary changes.
+
 ## Protocol compatibility and challenge renewal
 
-Online recovery is part of the current `HUB_AGENT_SCHEMA_VERSION = 4` application protocol. Schema validation remains fail-closed, so a deployment enabling this release must upgrade Hub and Agent as a coordinated pair rather than relying on mixed-version rolling compatibility. V1 gateway behavior is unchanged.
+Online recovery is part of the current `HUB_AGENT_SCHEMA_VERSION = 5` application protocol. Schema validation remains fail-closed, so a deployment enabling this release must upgrade Hub and Agent as a coordinated pair rather than relying on mixed-version rolling compatibility. V1 gateway behavior is unchanged.
 
 A recovery challenge expires after 300 seconds (5 minutes). While the desktop remains quarantined, normal authenticated Agent heartbeats cause the Hub to re-check the pending challenge and issue a fresh nonce-bound challenge after expiry. An operator therefore does not need to restart the Hub or Agent merely because a local approval window elapsed. Receiving a fresh challenge invalidates the prior local authorization handoff.

@@ -7,7 +7,7 @@
 //! macOS that key is intended to live in the Secure Enclave with user-presence
 //! access control; the Agent only relays the resulting authorization.
 
-use crate::v2_execution_safety::{DesktopQuarantine, IndeterminateReason};
+use crate::v2_execution_safety::{DesktopQuarantine, IndeterminateReason, RetirementPolicy};
 use crate::v2_m0_execution::IndeterminateResolution;
 use crate::v2_m0_transport::HubIdentity;
 use crate::v2_m1_keys::{KeyMaterialError, load_public_trust_bytes};
@@ -20,7 +20,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 1;
+pub const ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 2;
+const LEGACY_ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 1;
 pub const RECOVERY_CHALLENGE_TTL_MS: u64 = 300_000;
 pub const MAX_RECOVERY_EVIDENCE_BYTES: usize = 1024;
 pub const MAX_RECOVERY_FILE_BYTES: usize = 16 * 1024;
@@ -40,6 +41,14 @@ pub enum RecoveryAuditAssessment {
     Completed,
     NotExecuted,
     Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryDecision {
+    ConfirmedCompleted,
+    ConfirmedNotExecuted,
+    CurrentStateAccepted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +79,9 @@ pub struct RecoveryAuthorization {
     pub challenge_nonce: [u8; 32],
     pub challenge_expires_at_ms: u64,
     pub audit_assessment: RecoveryAuditAssessment,
-    pub decision: IndeterminateResolution,
+    pub decision: RecoveryDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_state_policy: Option<RetirementPolicy>,
     /// Bounded local-user evidence metadata only. Raw command/result/screenshot
     /// material is intentionally excluded from this protocol.
     pub evidence: String,
@@ -85,7 +96,9 @@ pub struct RecoveryResolved {
     pub device_id: String,
     pub operation_id: String,
     pub current_generation: u64,
-    pub decision: IndeterminateResolution,
+    pub decision: RecoveryDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_state_policy: Option<RetirementPolicy>,
     pub resolved_at_ms: u64,
     pub signature: Vec<u8>,
 }
@@ -212,9 +225,49 @@ pub fn new_authorization(
     decision: IndeterminateResolution,
     evidence: impl Into<String>,
 ) -> Result<RecoveryAuthorization, RecoveryError> {
+    let decision = match decision {
+        IndeterminateResolution::ConfirmedCompleted => RecoveryDecision::ConfirmedCompleted,
+        IndeterminateResolution::ConfirmedNotExecuted => RecoveryDecision::ConfirmedNotExecuted,
+        IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
+            return Err(RecoveryError::InvalidMessage);
+        }
+    };
+    new_authorization_with_decision(challenge, audit_assessment, decision, None, evidence)
+}
+
+pub fn new_current_state_acceptance_authorization(
+    challenge: &RecoveryChallenge,
+    policy: RetirementPolicy,
+    evidence: impl Into<String>,
+) -> Result<RecoveryAuthorization, RecoveryError> {
+    if challenge.schema_version < ONLINE_RECOVERY_SCHEMA_VERSION {
+        return Err(RecoveryError::UnsupportedSchema);
+    }
+    new_authorization_with_decision(
+        challenge,
+        RecoveryAuditAssessment::Inconclusive,
+        RecoveryDecision::CurrentStateAccepted,
+        Some(policy),
+        evidence,
+    )
+}
+
+fn new_authorization_with_decision(
+    challenge: &RecoveryChallenge,
+    audit_assessment: RecoveryAuditAssessment,
+    decision: RecoveryDecision,
+    current_state_policy: Option<RetirementPolicy>,
+    evidence: impl Into<String>,
+) -> Result<RecoveryAuthorization, RecoveryError> {
+    validate_schema(challenge.schema_version)?;
     let evidence = evidence.into();
     validate_evidence(&evidence)?;
-    let _ = resolution_name(&decision)?;
+    validate_recovery_decision(
+        challenge.schema_version,
+        audit_assessment,
+        decision,
+        current_state_policy,
+    )?;
     let mut random = [0_u8; 16];
     OsRng.fill_bytes(&mut random);
     let mut request_id = String::from("rec_");
@@ -223,7 +276,7 @@ pub fn new_authorization(
         let _ = write!(&mut request_id, "{byte:02x}");
     }
     Ok(RecoveryAuthorization {
-        schema_version: ONLINE_RECOVERY_SCHEMA_VERSION,
+        schema_version: challenge.schema_version,
         request_id,
         device_id: challenge.device_id.clone(),
         operation_id: challenge.operation_id.clone(),
@@ -234,6 +287,7 @@ pub fn new_authorization(
         challenge_expires_at_ms: challenge.expires_at_ms,
         audit_assessment,
         decision,
+        current_state_policy,
         evidence,
         signature: Vec::new(),
     })
@@ -247,7 +301,12 @@ pub fn validate_authorization_against_challenge(
     validate_schema(challenge.schema_version)?;
     validate_schema(authorization.schema_version)?;
     validate_evidence(&authorization.evidence)?;
-    let _ = resolution_name(&authorization.decision)?;
+    validate_recovery_decision(
+        authorization.schema_version,
+        authorization.audit_assessment,
+        authorization.decision,
+        authorization.current_state_policy,
+    )?;
     if authorization.request_id.len() != 36
         || !authorization.request_id.starts_with("rec_")
         || !authorization.request_id[4..]
@@ -259,7 +318,8 @@ pub fn validate_authorization_against_challenge(
     if now_ms > challenge.expires_at_ms || now_ms > authorization.challenge_expires_at_ms {
         return Err(RecoveryError::ExpiredChallenge);
     }
-    if authorization.device_id != challenge.device_id
+    if authorization.schema_version != challenge.schema_version
+        || authorization.device_id != challenge.device_id
         || authorization.operation_id != challenge.operation_id
         || authorization.quarantine_generation != challenge.quarantine_generation
         || authorization.current_generation != challenge.current_generation
@@ -278,12 +338,13 @@ pub fn build_recovery_resolved(
     resolved_at_ms: u64,
 ) -> Result<RecoveryResolved, RecoveryError> {
     let mut resolved = RecoveryResolved {
-        schema_version: ONLINE_RECOVERY_SCHEMA_VERSION,
+        schema_version: authorization.schema_version,
         request_id: authorization.request_id.clone(),
         device_id: authorization.device_id.clone(),
         operation_id: authorization.operation_id.clone(),
         current_generation: authorization.current_generation,
-        decision: authorization.decision.clone(),
+        decision: authorization.decision,
+        current_state_policy: authorization.current_state_policy,
         resolved_at_ms,
         signature: Vec::new(),
     };
@@ -328,6 +389,7 @@ pub fn verify_recovery_resolved_for_authorization(
     )?;
     if resolved.operation_id != authorization.operation_id
         || resolved.decision != authorization.decision
+        || resolved.current_state_policy != authorization.current_state_policy
     {
         return Err(RecoveryError::ChallengeMismatch);
     }
@@ -414,6 +476,12 @@ pub fn authorization_signing_bytes(
 ) -> Result<Vec<u8>, RecoveryError> {
     validate_schema(authorization.schema_version)?;
     validate_evidence(&authorization.evidence)?;
+    validate_recovery_decision(
+        authorization.schema_version,
+        authorization.audit_assessment,
+        authorization.decision,
+        authorization.current_state_policy,
+    )?;
     let mut bytes = Vec::new();
     push_bytes(&mut bytes, AUTHORIZATION_DOMAIN);
     bytes.extend_from_slice(&authorization.schema_version.to_be_bytes());
@@ -429,7 +497,13 @@ pub fn authorization_signing_bytes(
         &mut bytes,
         audit_assessment_name(authorization.audit_assessment),
     );
-    push_str(&mut bytes, resolution_name(&authorization.decision)?);
+    push_str(&mut bytes, recovery_decision_name(authorization.decision));
+    if authorization.schema_version >= ONLINE_RECOVERY_SCHEMA_VERSION {
+        push_str(
+            &mut bytes,
+            current_state_policy_name(authorization.current_state_policy),
+        );
+    }
     push_str(&mut bytes, &authorization.evidence);
     Ok(bytes)
 }
@@ -459,13 +533,22 @@ fn resolved_signing_bytes(resolved: &RecoveryResolved) -> Result<Vec<u8>, Recove
     push_str(&mut bytes, &resolved.device_id);
     push_str(&mut bytes, &resolved.operation_id);
     bytes.extend_from_slice(&resolved.current_generation.to_be_bytes());
-    push_str(&mut bytes, resolution_name(&resolved.decision)?);
+    push_str(&mut bytes, recovery_decision_name(resolved.decision));
+    if resolved.schema_version >= ONLINE_RECOVERY_SCHEMA_VERSION {
+        push_str(
+            &mut bytes,
+            current_state_policy_name(resolved.current_state_policy),
+        );
+    }
     bytes.extend_from_slice(&resolved.resolved_at_ms.to_be_bytes());
     Ok(bytes)
 }
 
 fn validate_schema(version: u16) -> Result<(), RecoveryError> {
-    if version == ONLINE_RECOVERY_SCHEMA_VERSION {
+    if matches!(
+        version,
+        LEGACY_ONLINE_RECOVERY_SCHEMA_VERSION | ONLINE_RECOVERY_SCHEMA_VERSION
+    ) {
         Ok(())
     } else {
         Err(RecoveryError::UnsupportedSchema)
@@ -489,15 +572,42 @@ fn push_str(output: &mut Vec<u8>, value: &str) {
     push_bytes(output, value.as_bytes());
 }
 
-fn resolution_name(value: &IndeterminateResolution) -> Result<&'static str, RecoveryError> {
-    match value {
-        IndeterminateResolution::ConfirmedCompleted => Ok("confirmed_completed"),
-        IndeterminateResolution::ConfirmedNotExecuted => Ok("confirmed_not_executed"),
-        // This bounded text-input state is intentionally offline-only. Online recovery
-        // remains the reviewed two-decision local-user contract from #100.
-        IndeterminateResolution::ConfirmedEffectAppliedUncommitted => {
-            Err(RecoveryError::InvalidMessage)
+fn validate_recovery_decision(
+    schema_version: u16,
+    audit_assessment: RecoveryAuditAssessment,
+    decision: RecoveryDecision,
+    current_state_policy: Option<RetirementPolicy>,
+) -> Result<(), RecoveryError> {
+    match decision {
+        RecoveryDecision::ConfirmedCompleted | RecoveryDecision::ConfirmedNotExecuted => {
+            if current_state_policy.is_some() {
+                return Err(RecoveryError::InvalidMessage);
+            }
         }
+        RecoveryDecision::CurrentStateAccepted => {
+            if schema_version < ONLINE_RECOVERY_SCHEMA_VERSION
+                || audit_assessment != RecoveryAuditAssessment::Inconclusive
+                || current_state_policy != Some(RetirementPolicy::TransientUiInteractionV1)
+            {
+                return Err(RecoveryError::InvalidMessage);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub const fn recovery_decision_name(value: RecoveryDecision) -> &'static str {
+    match value {
+        RecoveryDecision::ConfirmedCompleted => "confirmed_completed",
+        RecoveryDecision::ConfirmedNotExecuted => "confirmed_not_executed",
+        RecoveryDecision::CurrentStateAccepted => "current_state_accepted",
+    }
+}
+
+fn current_state_policy_name(value: Option<RetirementPolicy>) -> &'static str {
+    match value {
+        None => "none",
+        Some(RetirementPolicy::TransientUiInteractionV1) => "transient_ui_interaction_v1",
     }
 }
 
@@ -1338,10 +1448,68 @@ mod tests {
             .unwrap();
 
         let mut tampered = authorization.clone();
-        tampered.decision = IndeterminateResolution::ConfirmedNotExecuted;
+        tampered.decision = RecoveryDecision::ConfirmedNotExecuted;
         assert!(matches!(
             verifier.verify_authorization(&challenge, &tampered, 101),
             Err(RecoveryError::InvalidRecoverySignature)
+        ));
+    }
+
+    #[test]
+    fn current_state_acceptance_is_v2_only_policy_bound_and_signature_bound() {
+        let hub = HubIdentity::generate();
+        let challenge = build_recovery_challenge(&hub, &quarantine(), 5, 100).unwrap();
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let verifier = RecoveryVerifier::from_x963_bytes(key.public_key().as_ref()).unwrap();
+        let mut authorization = new_current_state_acceptance_authorization(
+            &challenge,
+            RetirementPolicy::TransientUiInteractionV1,
+            "local human accepted the present screen, not a historical outcome",
+        )
+        .unwrap();
+        assert_eq!(
+            authorization.decision,
+            RecoveryDecision::CurrentStateAccepted
+        );
+        assert_eq!(
+            authorization.current_state_policy,
+            Some(RetirementPolicy::TransientUiInteractionV1)
+        );
+        assert_eq!(
+            authorization.audit_assessment,
+            RecoveryAuditAssessment::Inconclusive
+        );
+        let bytes = authorization_signing_bytes(&authorization).unwrap();
+        authorization.signature = key.sign(&rng, &bytes).unwrap().as_ref().to_vec();
+        verifier
+            .verify_authorization(&challenge, &authorization, 101)
+            .unwrap();
+
+        let mut policy_stripped = authorization.clone();
+        policy_stripped.current_state_policy = None;
+        assert!(matches!(
+            verifier.verify_authorization(&challenge, &policy_stripped, 101),
+            Err(RecoveryError::InvalidMessage)
+        ));
+        let mut historical_claim = authorization.clone();
+        historical_claim.decision = RecoveryDecision::ConfirmedCompleted;
+        assert!(matches!(
+            verifier.verify_authorization(&challenge, &historical_claim, 101),
+            Err(RecoveryError::InvalidMessage)
+        ));
+
+        let mut legacy_challenge = challenge.clone();
+        legacy_challenge.schema_version = LEGACY_ONLINE_RECOVERY_SCHEMA_VERSION;
+        assert!(matches!(
+            new_current_state_acceptance_authorization(
+                &legacy_challenge,
+                RetirementPolicy::TransientUiInteractionV1,
+                "legacy schema cannot gain current-state authority",
+            ),
+            Err(RecoveryError::UnsupportedSchema)
         ));
     }
 

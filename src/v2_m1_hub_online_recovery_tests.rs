@@ -1,11 +1,13 @@
 use super::*;
-use crate::v2_execution_safety::ExecutionEvidence;
+use crate::v2_execution_safety::{
+    ExecutionEvidence, RetirementAuthority, RetirementDisposition, RetirementPolicy,
+};
 use crate::v2_m0::{DeviceCapability, DeviceIdentity, GrantAuthority};
 use crate::v2_m0_execution::{ExecutionError, HubOperationState, OperationRef};
 use crate::v2_m1_grpc::decode_hub_frame;
 use crate::v2_online_recovery::{
-    RECOVERY_PUBLIC_KEY_FILENAME, RecoveryAuditAssessment, authorization_signing_bytes,
-    new_authorization,
+    RECOVERY_PUBLIC_KEY_FILENAME, RecoveryAuditAssessment, RecoveryDecision,
+    authorization_signing_bytes, new_authorization, new_current_state_acceptance_authorization,
 };
 use ring::{
     rand::SystemRandom,
@@ -54,6 +56,32 @@ fn config(state_dir: PathBuf) -> HubServiceConfig {
         max_queued_per_device: 1,
         max_agent_sessions: 2,
         max_agent_session_starts_per_minute: 30,
+    }
+}
+
+fn recovery_capabilities(revision: u64, capability: DeviceCapability) -> CapabilityAdvertisement {
+    CapabilityAdvertisement {
+        backend: "cua".into(),
+        backend_version: "0.19.3".into(),
+        platform: "darwin-arm64".into(),
+        capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+        revision,
+        supported: vec![capability],
+    }
+}
+
+fn advance_registry_generation(
+    persistent: &mut PersistentHubState,
+    device_id: &str,
+    generation: u64,
+    capability: DeviceCapability,
+) {
+    for revision in 1..=generation {
+        let session = persistent
+            .registry
+            .connect(device_id, recovery_capabilities(revision, capability))
+            .unwrap();
+        assert_eq!(session.generation, revision);
     }
 }
 
@@ -180,7 +208,7 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     // Reusing the request id with a conflicting decision must not be treated as
     // an idempotent replay of the original authorization.
     let mut conflicting = authorization.clone();
-    conflicting.decision = IndeterminateResolution::ConfirmedNotExecuted;
+    conflicting.decision = RecoveryDecision::ConfirmedNotExecuted;
     assert!(matches!(
         hub.handle_recovery_authorization(conflicting, &outbound, current_generation, &clock,)
             .await,
@@ -232,4 +260,342 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     drop(restarted_handle);
     drop(restarted);
     let _ = std::fs::remove_dir_all(state_dir);
+}
+
+#[tokio::test]
+async fn signed_current_state_acceptance_is_persistence_gated_restart_safe_and_never_replays() {
+    let state_dir = temp_dir("current-state-acceptance-hub-state");
+    let (recovery_key, recovery_public) = recovery_key();
+    let recovery_public_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
+    std::fs::write(&recovery_public_path, recovery_public).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &recovery_public_path,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
+
+    let device_identity = DeviceIdentity::generate();
+    let hub_identity = HubIdentity::generate();
+    let grant_authority = GrantAuthority::generate();
+    let material = HubProvisionedMaterial {
+        hub_identity: hub_identity.clone(),
+        grant_signer: grant_authority.into(),
+        device_verifier: device_identity.verifying_key(),
+        device_rotation: None,
+    };
+    let (hub, handle) = SingleDeviceHub::new(config(state_dir.clone()), material.clone()).unwrap();
+    let operation_id = "op_13713713713713713713713713713713".to_string();
+    let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+    let historical_generation = 7;
+    let current_generation = 8;
+
+    {
+        let mut persistent = hub.inner.persistent.lock().await;
+        advance_registry_generation(
+            &mut persistent,
+            hub.device_id(),
+            current_generation,
+            DeviceCapability::Scroll,
+        );
+        let operation = OperationRef {
+            device_id: hub.device_id().to_owned(),
+            device_generation: historical_generation,
+            operation_id: operation_id.clone(),
+        };
+        assert!(matches!(
+            persistent
+                .execution
+                .prepare(operation, owner.clone(), DeviceCapability::Scroll, 10,)
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        persistent
+            .execution
+            .mark_dispatched(&operation_id, &owner, historical_generation, 11)
+            .unwrap();
+        persistent
+            .execution
+            .mark_indeterminate(
+                &operation_id,
+                &owner,
+                historical_generation,
+                IndeterminateReason::BackendOutcomeUnproven,
+                12,
+            )
+            .unwrap();
+        persist_locked(&hub.inner, &persistent).unwrap();
+    }
+
+    let quarantine = handle.desktop_quarantine().await.unwrap();
+    let challenge =
+        build_recovery_challenge(&hub_identity, &quarantine, current_generation, 100).unwrap();
+    hub.inner.recovery_runtime.lock().await.pending = Some(challenge.clone());
+    let authorization = sign(
+        &recovery_key,
+        new_current_state_acceptance_authorization(
+            &challenge,
+            RetirementPolicy::TransientUiInteractionV1,
+            "local human inspected the current screen and explicitly accepted it as the continuation point",
+        )
+        .unwrap(),
+    );
+    let (outbound, mut inbound) = mpsc::channel(4);
+    let clock = TrustedSessionClock::new(100);
+
+    // The authority-bearing transition is checkpoint-gated. A failed publication
+    // must restore the exact pre-acceptance quarantine and leave no retirement.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(matches!(
+            hub.handle_recovery_authorization(
+                authorization.clone(),
+                &outbound,
+                current_generation,
+                &clock,
+            )
+            .await,
+            Err(HubServiceError::Persistence(_))
+        ));
+        assert_eq!(
+            handle.desktop_quarantine().await.unwrap().operation_id,
+            operation_id
+        );
+        assert!(handle.retirement_records().await.is_empty());
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    hub.handle_recovery_authorization(authorization.clone(), &outbound, current_generation, &clock)
+        .await
+        .unwrap();
+    assert!(handle.desktop_quarantine().await.is_none());
+    assert!(handle.operation_receipt(&operation_id).await.is_none());
+    assert!(handle.resolution_records().await.is_empty());
+    let recovery = handle
+        .operation_recovery_as(owner.clone(), &operation_id)
+        .await
+        .unwrap();
+    assert_eq!(recovery.state, HubOperationState::Indeterminate);
+    let retirements = handle.retirement_records().await;
+    assert_eq!(retirements.len(), 1);
+    assert_eq!(retirements[0].operation.operation_id, operation_id);
+    assert_eq!(
+        retirements[0].outcome,
+        crate::v2_execution_safety::RetirementOutcome::Unknown
+    );
+    assert_eq!(
+        retirements[0].disposition,
+        RetirementDisposition::CurrentStateAccepted
+    );
+    assert_eq!(
+        retirements[0].authority,
+        RetirementAuthority::LocalUserPresence
+    );
+    assert_eq!(
+        retirements[0].policy,
+        RetirementPolicy::TransientUiInteractionV1
+    );
+    assert_eq!(
+        retirements[0].authorized_device_generation,
+        current_generation
+    );
+    assert!(!retirements[0].replayed);
+
+    let first_ack = inbound.recv().await.unwrap().unwrap();
+    let HubToAgent::RecoveryResolved(first_ack) = decode_hub_frame(first_ack).unwrap() else {
+        panic!("expected signed current-state acceptance acknowledgement");
+    };
+    assert_eq!(first_ack.decision, RecoveryDecision::CurrentStateAccepted);
+    assert_eq!(
+        first_ack.current_state_policy,
+        Some(RetirementPolicy::TransientUiInteractionV1)
+    );
+
+    // Exact retransmission is idempotent, but the same request id cannot be used
+    // to change the Human statement or turn acceptance into historical truth.
+    hub.handle_recovery_authorization(authorization.clone(), &outbound, current_generation, &clock)
+        .await
+        .unwrap();
+    let duplicate_ack = inbound.recv().await.unwrap().unwrap();
+    let HubToAgent::RecoveryResolved(duplicate_ack) = decode_hub_frame(duplicate_ack).unwrap()
+    else {
+        panic!("expected duplicate current-state acknowledgement");
+    };
+    assert_eq!(duplicate_ack.request_id, authorization.request_id);
+    assert_eq!(handle.retirement_records().await.len(), 1);
+
+    let mut conflicting = authorization.clone();
+    conflicting.decision = RecoveryDecision::ConfirmedCompleted;
+    conflicting.current_state_policy = None;
+    assert!(matches!(
+        hub.handle_recovery_authorization(conflicting, &outbound, current_generation, &clock)
+            .await,
+        Err(HubServiceError::OnlineRecovery(
+            RecoveryError::ChallengeMismatch
+        ))
+    ));
+    assert_eq!(handle.retirement_records().await.len(), 1);
+
+    drop(handle);
+    drop(hub);
+    let (restarted, restarted_handle) =
+        SingleDeviceHub::new(config(state_dir.clone()), material).unwrap();
+    assert!(restarted_handle.desktop_quarantine().await.is_none());
+    assert!(
+        restarted_handle
+            .operation_receipt(&operation_id)
+            .await
+            .is_none()
+    );
+    let recovery = restarted_handle
+        .operation_recovery_as(owner.clone(), &operation_id)
+        .await
+        .unwrap();
+    assert_eq!(recovery.state, HubOperationState::Indeterminate);
+    let retirements = restarted_handle.retirement_records().await;
+    assert_eq!(retirements.len(), 1);
+    assert_eq!(
+        retirements[0].disposition,
+        RetirementDisposition::CurrentStateAccepted
+    );
+    {
+        let mut persistent = restarted.inner.persistent.lock().await;
+        assert!(matches!(
+            persistent.execution.prepare(
+                OperationRef {
+                    device_id: restarted.device_id().to_owned(),
+                    device_generation: current_generation + 1,
+                    operation_id: operation_id.clone(),
+                },
+                owner.clone(),
+                DeviceCapability::Scroll,
+                200,
+            ),
+            Err(ExecutionError::OperationReplay)
+        ));
+        assert!(
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: restarted.device_id().to_owned(),
+                        device_generation: current_generation + 1,
+                        operation_id: "op_137fresh137fresh137fresh137fres".to_string(),
+                    },
+                    owner,
+                    DeviceCapability::Scroll,
+                    201,
+                )
+                .is_ok()
+        );
+    }
+
+    drop(restarted_handle);
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(state_dir);
+}
+
+#[tokio::test]
+async fn signed_current_state_acceptance_fails_closed_for_shell_and_equal_generation() {
+    for (suffix, capability, historical_generation, current_generation) in [
+        ("shell", DeviceCapability::Shell, 7_u64, 8_u64),
+        ("stale", DeviceCapability::Scroll, 7_u64, 7_u64),
+    ] {
+        let state_dir = temp_dir(&format!("current-state-refusal-{suffix}"));
+        let (recovery_key, recovery_public) = recovery_key();
+        let recovery_public_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
+        std::fs::write(&recovery_public_path, recovery_public).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &recovery_public_path,
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        let device_identity = DeviceIdentity::generate();
+        let hub_identity = HubIdentity::generate();
+        let grant_authority = GrantAuthority::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: hub_identity.clone(),
+            grant_signer: grant_authority.into(),
+            device_verifier: device_identity.verifying_key(),
+            device_rotation: None,
+        };
+        let (hub, handle) = SingleDeviceHub::new(config(state_dir.clone()), material).unwrap();
+        let operation_id = format!("op_137{suffix:0<29}");
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        {
+            let mut persistent = hub.inner.persistent.lock().await;
+            advance_registry_generation(
+                &mut persistent,
+                hub.device_id(),
+                current_generation,
+                capability,
+            );
+            let operation = OperationRef {
+                device_id: hub.device_id().to_owned(),
+                device_generation: historical_generation,
+                operation_id: operation_id.clone(),
+            };
+            persistent
+                .execution
+                .prepare(operation, owner.clone(), capability, 10)
+                .unwrap();
+            persistent
+                .execution
+                .mark_dispatched(&operation_id, &owner, historical_generation, 11)
+                .unwrap();
+            persistent
+                .execution
+                .mark_indeterminate(
+                    &operation_id,
+                    &owner,
+                    historical_generation,
+                    IndeterminateReason::BackendOutcomeUnproven,
+                    12,
+                )
+                .unwrap();
+            persist_locked(&hub.inner, &persistent).unwrap();
+        }
+        let quarantine = handle.desktop_quarantine().await.unwrap();
+        let challenge =
+            build_recovery_challenge(&hub_identity, &quarantine, current_generation, 100).unwrap();
+        hub.inner.recovery_runtime.lock().await.pending = Some(challenge.clone());
+        let authorization = sign(
+            &recovery_key,
+            new_current_state_acceptance_authorization(
+                &challenge,
+                RetirementPolicy::TransientUiInteractionV1,
+                "local presence must not bypass policy or generation fencing",
+            )
+            .unwrap(),
+        );
+        let (outbound, _inbound) = mpsc::channel(2);
+        let clock = TrustedSessionClock::new(100);
+        assert!(matches!(
+            hub.handle_recovery_authorization(
+                authorization,
+                &outbound,
+                current_generation,
+                &clock,
+            )
+            .await,
+            Err(HubServiceError::Execution(ExecutionError::InvalidTransition))
+        ));
+        assert_eq!(
+            handle.desktop_quarantine().await.unwrap().operation_id,
+            operation_id
+        );
+        assert!(handle.retirement_records().await.is_empty());
+        drop(handle);
+        drop(hub);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
 }

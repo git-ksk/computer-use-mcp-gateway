@@ -23,7 +23,7 @@ use std::{
     time::Instant,
 };
 
-pub const HUB_AGENT_SCHEMA_VERSION: u16 = 4;
+pub const HUB_AGENT_SCHEMA_VERSION: u16 = 5;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_HANDOFF_CONTROL_BYTES: usize = 4 * 1024;
 

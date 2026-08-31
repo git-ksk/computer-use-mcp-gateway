@@ -9,7 +9,7 @@ use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
     OperationAdmissionMetadata, OperationDispatchBinding, OperationExecutionLane, OperationOwner,
     OperationRecoverySnapshot, ReconciliationStatus, RecoverableOperationResult, ResolutionRecord,
-    terminal_evidence_for_device_result,
+    RetirementRecord, terminal_evidence_for_device_result,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -39,9 +39,9 @@ use crate::v2_m1_persistence::{
 };
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
-    RecoveryAuditAssessment, RecoveryAuthorization, RecoveryChallenge, RecoveryError,
-    RecoveryResolved, RecoveryVerifier, build_recovery_challenge, build_recovery_resolved,
-    quarantine_fingerprint,
+    RecoveryAuditAssessment, RecoveryAuthorization, RecoveryChallenge, RecoveryDecision,
+    RecoveryError, RecoveryResolved, RecoveryVerifier, build_recovery_challenge,
+    build_recovery_resolved, quarantine_fingerprint, recovery_decision_name,
 };
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use ed25519_dalek::VerifyingKey;
@@ -1957,14 +1957,49 @@ impl SingleDeviceHub {
                 ));
             }
             let rollback = persistent.execution.snapshot_for_restart();
-            let resolver = OperationOwner::new("cumg://local-user-recovery", verifier.key_id())?;
-            persistent.execution.resolve_indeterminate(
-                &authorization.operation_id,
-                resolver,
-                authorization.decision.clone(),
-                authorization.evidence.clone(),
-                resolved_at_ms,
-            )?;
+            match authorization.decision {
+                RecoveryDecision::ConfirmedCompleted => {
+                    let resolver =
+                        OperationOwner::new("cumg://local-user-recovery", verifier.key_id())?;
+                    persistent.execution.resolve_indeterminate(
+                        &authorization.operation_id,
+                        resolver,
+                        IndeterminateResolution::ConfirmedCompleted,
+                        authorization.evidence.clone(),
+                        resolved_at_ms,
+                    )?;
+                }
+                RecoveryDecision::ConfirmedNotExecuted => {
+                    let resolver =
+                        OperationOwner::new("cumg://local-user-recovery", verifier.key_id())?;
+                    persistent.execution.resolve_indeterminate(
+                        &authorization.operation_id,
+                        resolver,
+                        IndeterminateResolution::ConfirmedNotExecuted,
+                        authorization.evidence.clone(),
+                        resolved_at_ms,
+                    )?;
+                }
+                RecoveryDecision::CurrentStateAccepted => {
+                    let current_session = persistent
+                        .registry
+                        .current_session(&self.inner.device_id)
+                        .map_err(HubServiceError::Control)?;
+                    if current_session.generation != authorization.current_generation {
+                        return Err(HubServiceError::StaleSession);
+                    }
+                    let policy = authorization.current_state_policy.ok_or(
+                        HubServiceError::OnlineRecovery(RecoveryError::ChallengeMismatch),
+                    )?;
+                    persistent.execution.accept_current_state(
+                        &authorization.operation_id,
+                        policy,
+                        authorization.evidence.clone(),
+                        authorization.current_generation,
+                        resolved_at_ms,
+                    )?;
+                }
+            }
             if let Err(error) = persist_locked(&self.inner, &persistent) {
                 persistent.execution = AuthoritativeOperationController::restore_after_restart(
                     self.inner.config.admission_limits(),
@@ -1998,8 +2033,8 @@ impl SingleDeviceHub {
                 RecoveryAuditAssessment::NotExecuted => "not_executed",
                 RecoveryAuditAssessment::Inconclusive => "inconclusive",
             },
-            outcome = crate::v2_observability::resolution_name(&authorization.decision),
-            "local-user-authorized online recovery durably cleared desktop quarantine"
+            outcome = recovery_decision_name(authorization.decision),
+            "local-user-authorized online recovery durably cleared desktop quarantine without replay"
         );
         send_hub(outbound, HubToAgent::RecoveryResolved(ack)).await
     }
@@ -2593,6 +2628,11 @@ impl HubHandle {
     pub async fn resolution_records(&self) -> Vec<ResolutionRecord> {
         let persistent = self.inner.persistent.lock().await;
         persistent.execution.resolutions().to_vec()
+    }
+
+    pub async fn retirement_records(&self) -> Vec<RetirementRecord> {
+        let persistent = self.inner.persistent.lock().await;
+        persistent.execution.retirements().to_vec()
     }
 }
 

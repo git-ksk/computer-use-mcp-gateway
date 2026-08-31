@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 9;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 10;
+const EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 9;
 const RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 8;
 const EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 7;
 const PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 6;
@@ -140,10 +141,28 @@ pub enum RetirementPolicy {
     TransientUiInteractionV1,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetirementDisposition {
+    #[default]
+    Retired,
+    CurrentStateAccepted,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetirementAuthority {
     LocalMaintenanceOperator,
+    LocalUserPresence,
+}
+
+struct RetirementTransition {
+    disposition: RetirementDisposition,
+    authority: RetirementAuthority,
+    requested_policy: RetirementPolicy,
+    reason: String,
+    authorized_device_generation: u64,
+    now_ms: u64,
 }
 
 pub const fn retirement_policy_for_capability(
@@ -724,6 +743,8 @@ pub struct RetirementRecord {
     pub indeterminate_reason: IndeterminateReason,
     pub prior_reconciliation_status: ReconciliationStatus,
     pub policy: RetirementPolicy,
+    #[serde(default)]
+    pub disposition: RetirementDisposition,
     pub authority: RetirementAuthority,
     /// Bounded operator-supplied retirement rationale. Never include raw command,
     /// result, desktop content, credentials, URLs, or other sensitive payloads.
@@ -749,6 +770,16 @@ impl RetirementRecord {
                     | ReconciliationStatus::UnrecoverableEvidenceGap
             )
             && retirement_policy_for_capability(self.capability) == Some(self.policy)
+            && matches!(
+                (self.disposition, self.authority),
+                (
+                    RetirementDisposition::Retired,
+                    RetirementAuthority::LocalMaintenanceOperator
+                ) | (
+                    RetirementDisposition::CurrentStateAccepted,
+                    RetirementAuthority::LocalUserPresence
+                )
+            )
             && !self.reason.trim().is_empty()
             && self.reason.len() <= MAX_RETIREMENT_REASON_BYTES
             && self.authorized_device_generation > self.operation.device_generation
@@ -1542,9 +1573,8 @@ impl AuthoritativeOperationController {
     }
 
     /// Retire a permanently unknowable, policy-eligible indeterminate operation
-    /// without asserting a synthetic execution outcome. Retirement is allowed
-    /// only after a strictly newer durable device generation fences the original
-    /// session and only for a reviewed capability allowlist.
+    /// without asserting a synthetic execution outcome. Offline maintenance keeps
+    /// its historical `retired` disposition and local-maintenance authority.
     pub fn retire_indeterminate(
         &mut self,
         operation_id: &str,
@@ -1554,7 +1584,59 @@ impl AuthoritativeOperationController {
         authorized_device_generation: u64,
         now_ms: u64,
     ) -> Result<(CompletionDecision, RetirementRecord), ExecutionError> {
-        let reason = reason.into();
+        if authority != RetirementAuthority::LocalMaintenanceOperator {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        self.retire_indeterminate_with_disposition(
+            operation_id,
+            RetirementTransition {
+                disposition: RetirementDisposition::Retired,
+                authority,
+                requested_policy,
+                reason: reason.into(),
+                authorized_device_generation,
+                now_ms,
+            },
+        )
+    }
+
+    /// Accept the currently observed desktop as a continuation point without
+    /// changing the historical `Indeterminate` outcome. This path is deliberately
+    /// distinct from terminal resolution and requires local-user-presence authority.
+    pub fn accept_current_state(
+        &mut self,
+        operation_id: &str,
+        requested_policy: RetirementPolicy,
+        reason: impl Into<String>,
+        authorized_device_generation: u64,
+        now_ms: u64,
+    ) -> Result<(CompletionDecision, RetirementRecord), ExecutionError> {
+        self.retire_indeterminate_with_disposition(
+            operation_id,
+            RetirementTransition {
+                disposition: RetirementDisposition::CurrentStateAccepted,
+                authority: RetirementAuthority::LocalUserPresence,
+                requested_policy,
+                reason: reason.into(),
+                authorized_device_generation,
+                now_ms,
+            },
+        )
+    }
+
+    fn retire_indeterminate_with_disposition(
+        &mut self,
+        operation_id: &str,
+        transition: RetirementTransition,
+    ) -> Result<(CompletionDecision, RetirementRecord), ExecutionError> {
+        let RetirementTransition {
+            disposition,
+            authority,
+            requested_policy,
+            reason,
+            authorized_device_generation,
+            now_ms,
+        } = transition;
         if reason.trim().is_empty() || reason.len() > MAX_RETIREMENT_REASON_BYTES {
             return Err(ExecutionError::InvalidOperation);
         }
@@ -1612,6 +1694,7 @@ impl AuthoritativeOperationController {
             indeterminate_reason,
             prior_reconciliation_status,
             policy,
+            disposition,
             authority,
             reason,
             authorized_device_generation,
@@ -2024,10 +2107,30 @@ impl AuthoritativeOperationController {
             .recoveries
             .iter()
             .any(|record| matches!(record.result, RecoverableOperationResult::EffectfulStatus));
+        let has_v10_state = snapshot.retirements.iter().any(|record| {
+            record.disposition == RetirementDisposition::CurrentStateAccepted
+                || record.authority == RetirementAuthority::LocalUserPresence
+        });
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v10_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version =
+                        EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v9_state {
+                if has_v9_state || has_v10_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2044,7 +2147,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v8_state || has_v9_state {
+                if has_v8_state || has_v9_state || has_v10_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2060,7 +2163,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v7_state || has_v8_state || has_v9_state {
+                if has_v7_state || has_v8_state || has_v9_state || has_v10_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2075,7 +2178,7 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v6_state || has_v7_state || has_v8_state || has_v9_state {
+                if has_v6_state || has_v7_state || has_v8_state || has_v9_state || has_v10_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2090,7 +2193,13 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v5_state || has_v6_state || has_v7_state || has_v8_state || has_v9_state {
+                if has_v5_state
+                    || has_v6_state
+                    || has_v7_state
+                    || has_v8_state
+                    || has_v9_state
+                    || has_v10_state
+                {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.retirements.clear();
@@ -2117,6 +2226,7 @@ impl AuthoritativeOperationController {
                     || has_v7_state
                     || has_v8_state
                     || has_v9_state
+                    || has_v10_state
                 {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
@@ -2146,6 +2256,7 @@ impl AuthoritativeOperationController {
                     || has_v7_state
                     || has_v8_state
                     || has_v9_state
+                    || has_v10_state
                     || snapshot.operations.iter().any(|record| {
                         !record.audit.is_empty() || record.request_fingerprint.is_some()
                     })
@@ -2178,6 +2289,7 @@ impl AuthoritativeOperationController {
                     || has_v7_state
                     || has_v8_state
                     || has_v9_state
+                    || has_v10_state
                     || !snapshot.recoveries.is_empty()
                     || snapshot.operations.iter().any(|record| {
                         record.recoverable_result.is_some()
@@ -2221,6 +2333,7 @@ impl AuthoritativeOperationController {
                 | PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION
                 | RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION
+                | EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -2275,6 +2388,14 @@ impl AuthoritativeOperationController {
             return Err(ExecutionError::InvalidSnapshot);
         }
         if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && snapshot.retirements.iter().any(|record| {
+                record.disposition == RetirementDisposition::CurrentStateAccepted
+                    || record.authority == RetirementAuthority::LocalUserPresence
+            })
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
             && (snapshot.operations.iter().any(|record| {
                 matches!(
                     record.recoverable_result,
@@ -3871,6 +3992,101 @@ mod tests {
     }
 
     #[test]
+    fn current_state_acceptance_preserves_indeterminate_tombstone_and_requires_v10() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 8,
+        };
+        let mut ledger = AuthoritativeOperationController::new(limits).unwrap();
+        ledger
+            .prepare(
+                op("op-current-state-scroll", 4),
+                alice(),
+                DeviceCapability::Scroll,
+                100,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-current-state-scroll", &alice(), 4, 110)
+            .unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-current-state-scroll",
+                &alice(),
+                4,
+                IndeterminateReason::BackendOutcomeUnproven,
+                120,
+            )
+            .unwrap();
+
+        let (_next, retirement) = ledger
+            .accept_current_state(
+                "op-current-state-scroll",
+                RetirementPolicy::TransientUiInteractionV1,
+                "local human explicitly accepted the current screen as the continuation point",
+                5,
+                130,
+            )
+            .unwrap();
+        assert_eq!(retirement.outcome, RetirementOutcome::Unknown);
+        assert_eq!(
+            retirement.disposition,
+            RetirementDisposition::CurrentStateAccepted
+        );
+        assert_eq!(retirement.authority, RetirementAuthority::LocalUserPresence);
+        assert_eq!(
+            retirement.policy,
+            RetirementPolicy::TransientUiInteractionV1
+        );
+        assert_eq!(retirement.authorized_device_generation, 5);
+        assert!(!retirement.replayed);
+        assert_eq!(
+            ledger.state("op-current-state-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(ledger.receipt("op-current-state-scroll").is_none());
+        assert!(ledger.quarantine("desktop-a").is_none());
+        assert_eq!(ledger.retirements(), &[retirement.clone()]);
+
+        assert_eq!(
+            ledger.prepare(
+                op("op-current-state-scroll", 5),
+                alice(),
+                DeviceCapability::Scroll,
+                140,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert!(
+            ledger
+                .prepare(
+                    op("op-fresh-after-current-state", 5),
+                    alice(),
+                    DeviceCapability::Scroll,
+                    141,
+                )
+                .is_ok()
+        );
+
+        assert_eq!(
+            ledger.snapshot_for_restart_compatible_with(
+                EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        );
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.schema_version, EXECUTION_SAFETY_SCHEMA_VERSION);
+        let restored =
+            AuthoritativeOperationController::restore_after_restart(limits, snapshot).unwrap();
+        assert_eq!(
+            restored.state("op-current-state-scroll"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(restored.quarantine("desktop-a").is_none());
+        assert_eq!(restored.retirements(), &[retirement]);
+    }
+
+    #[test]
     fn retirement_requires_newer_generation_and_rejects_high_impact_capabilities() {
         let mut stale = controller();
         stale
@@ -3905,6 +4121,17 @@ mod tests {
             Err(ExecutionError::InvalidTransition)
         );
         assert!(stale.quarantine("desktop-a").is_some());
+        assert_eq!(
+            stale.accept_current_state(
+                "op-stale-retire",
+                RetirementPolicy::TransientUiInteractionV1,
+                "equal generation must not authorize current-state acceptance",
+                7,
+                5,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert!(stale.quarantine("desktop-a").is_some());
 
         let mut dangerous = controller();
         dangerous
@@ -3935,6 +4162,17 @@ mod tests {
                 "high impact must fail closed",
                 4,
                 13,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert!(dangerous.quarantine("desktop-a").is_some());
+        assert_eq!(
+            dangerous.accept_current_state(
+                "op-shell-unknown",
+                RetirementPolicy::TransientUiInteractionV1,
+                "signed local presence cannot widen the reviewed capability allowlist",
+                4,
+                14,
             ),
             Err(ExecutionError::InvalidTransition)
         );

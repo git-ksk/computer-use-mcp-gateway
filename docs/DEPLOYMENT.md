@@ -183,6 +183,8 @@ Execution-safety schema v8 persists the recovery-evidence lane marker. While `v2
 
 Execution-safety schema v9 additionally persists a payload-free terminal recovery marker for effectful Desktop/Browser calls. If such a marker exists, rollback to a v8 reader is rejected; operators must use a version-paired Hub/maintenance binary rather than stripping recovery state. The marker contains no GUI/browser payload and does not authorize replay.
 
+Execution-safety schema v10 persists the distinction between ordinary offline `retired` and local-user-presence `current_state_accepted` retirement. A state containing the latter cannot roll back to a v9 reader because doing so would erase the authority/disposition distinction while leaving the permanent tombstone. Keep Hub/maintenance binaries version-paired; never strip the record to force rollback.
+
 The command prints only `"same_request"`, `"different_request"`, or `"unavailable"`; it does not print the candidate, stored fingerprint, key identifier, or key. A different/rotated key intentionally yields `unavailable`, not `different_request`. Matching proves only request correlation. It never proves completion, clears quarantine, changes retry safety, or authorizes replay. Arbitrary shell text is never parsed to infer idempotency or postconditions. Remove the temporary candidate file according to the deployment's sensitive-file handling policy after use.
 
 ### Authoritative self-reconciliation after reconnect/restart
@@ -677,4 +679,4 @@ The existing `v2_maint` offline resolver remains required as break-glass for an 
 
 ### Online recovery upgrade compatibility
 
-Online recovery is part of the versioned Hub-Agent application protocol. The current protocol schema is `HUB_AGENT_SCHEMA_VERSION = 4`; schema mismatch is rejected fail-closed. Deploy the matching Hub and Agent as a coordinated upgrade and do not assume mixed-version rolling operation across this boundary. This does not change V1 gateway compatibility.
+Online recovery is part of the versioned Hub-Agent application protocol. The current protocol schema is `HUB_AGENT_SCHEMA_VERSION = 5`; schema mismatch is rejected fail-closed. Deploy the matching Hub and Agent as a coordinated upgrade and do not assume mixed-version rolling operation across this boundary. This does not change V1 gateway compatibility.

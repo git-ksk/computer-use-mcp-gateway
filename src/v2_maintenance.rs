@@ -6,8 +6,8 @@
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
     ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner, ReconciliationStatus,
-    RequestFingerprintComparison, ResolutionRecord, RetirementAuthority, RetirementPolicy,
-    RetirementRecord, TextInputTargetEvidence, compare_request_fingerprint,
+    RequestFingerprintComparison, ResolutionRecord, RetirementAuthority, RetirementDisposition,
+    RetirementPolicy, RetirementRecord, TextInputTargetEvidence, compare_request_fingerprint,
     fingerprint_process_request, fingerprint_shell_request, fingerprint_text_input_candidate,
     retirement_policy_for_capability,
 };
@@ -445,7 +445,7 @@ pub fn inspect_auto_resolutions_read_only(
             authorized_device_generation: retirement.authorized_device_generation,
             capability: crate::v2_observability::capability_name(retirement.capability).to_owned(),
             execution_outcome: "indeterminate".to_owned(),
-            operational_disposition: "retired".to_owned(),
+            operational_disposition: retirement_disposition_name(retirement.disposition).to_owned(),
             indeterminate_reason: crate::v2_observability::indeterminate_reason_name(
                 retirement.indeterminate_reason,
             )
@@ -993,9 +993,17 @@ const fn retirement_policy_name(policy: RetirementPolicy) -> &'static str {
     }
 }
 
+const fn retirement_disposition_name(disposition: RetirementDisposition) -> &'static str {
+    match disposition {
+        RetirementDisposition::Retired => "retired",
+        RetirementDisposition::CurrentStateAccepted => "current_state_accepted",
+    }
+}
+
 const fn retirement_authority_name(authority: RetirementAuthority) -> &'static str {
     match authority {
         RetirementAuthority::LocalMaintenanceOperator => "local_maintenance_operator",
+        RetirementAuthority::LocalUserPresence => "local_user_presence",
     }
 }
 
