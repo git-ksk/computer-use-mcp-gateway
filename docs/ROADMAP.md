@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-08-27: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.3.0`.**
+Status as of 2026-08-31: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.3.0`.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -49,6 +49,19 @@ Current priorities:
 - keep docs-only/editorial work version-neutral unless an immutable corrected release snapshot is operationally necessary.
 
 A compatible fix merged after `v0.3.0` may contribute to a future `0.3.1`; the roadmap does not require a release merely because maintenance commits exist.
+
+### Immediate product-readiness execution order
+
+The current priority is to finish the **single-Mac operator/product path before expanding recovery parity to additional desktop platforms**. Cross-platform recovery remains important, but adding another platform-backed recovery provider does not remove the largest current usability gaps for an already supported deployment.
+
+Use this ordering unless new evidence exposes a released safety regression:
+
+1. **Foundations that can proceed independently:** #226 lane-scoped readiness, #233 operator-ready incident brief, and #234 durable/inspectable single-Mac upgrade transactions.
+2. **Unified operator surface:** #235 composes those signals into one privacy-safe status view instead of duplicating their authority or state machines.
+3. **Guided product workflows:** #236 guides quarantine recovery through explicit Human choice and durable completion verification; #237 moves the reviewed single-Mac install/upgrade path from source-tree compilation to verified artifacts. These may proceed in parallel after their prerequisites are available.
+4. **Then broaden Recovery & Reconciliation:** #217 and its split providers #227 (Windows Hello/WebAuthn) and #228 (Linux FIDO2 UV) remain `0.4.0` work.
+
+This is a sequencing decision, not a de-scope of Windows/Linux recovery. The partially implemented #227 work should be preserved, but further provider implementation is deferred while the `0.3.x` product-readiness path is incomplete. Resume it when the operator path above is coherent and Windows is being admitted as a supported recovery target, or earlier only if concrete production evidence makes Windows online recovery a higher-priority safety/operability requirement.
 
 ### Legacy V1 retirement candidate
 
@@ -144,8 +157,8 @@ This queue records the practical result of continuing Handoff integration and ph
 
 The repository's open issues are intentionally classified by working milestone so work cannot silently fall out of roadmap visibility. These milestones are ordering/admission guidance, not a promise that every listed item ships together if evidence later requires a split or defer.
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 owns the cross-cutting product-readiness gate; #224 adds version-paired release-candidate artifacts with fresh-extraction smoke; #215 evaluates a formally supported hosted Cloud Run Hub without moving desktop execution into Cloud Run; #109 closes the online-recovery CLI confirmation gap; #115 makes `Indeterminate` operator UX actionable without replay; #104 separates filesystem observation roots from process cwd roots; #111 establishes repeatable latency/concurrency evidence; #96 investigates the exact Unix descendant-containment boundary.
-- **`0.4.0 — Recovery & Reconciliation`:** #103 extends durable operation identity/status to effectful Desktop/Browser calls; #137 adds reviewed local-Human acceptance of current state without rewriting historical truth; #136 separates permanent replay tombstones from bounded detailed retirement history; #217 extends separate user-presence online recovery authority to reviewed Windows/Linux providers without a software-key fallback.
+- **`0.3.x — Product Readiness & Stabilization`:** #213 owns the cross-cutting product-readiness gate. The active operator/product sequence is #226/#233/#234 -> #235 -> #236/#237. #224 is complete and provides the release-candidate artifact boundary consumed by #237. Other compatible work includes #215 hosted-Hub design, #109 durable online-recovery completion confirmation, #115 actionable `Indeterminate` UX, #104 filesystem/process-root separation, #111 latency/concurrency evidence, and the bounded #96 Unix containment investigation.
+- **`0.4.0 — Recovery & Reconciliation`:** #103 extends durable operation identity/status to effectful Desktop/Browser calls; #137 adds reviewed local-Human acceptance of current state without rewriting historical truth; #136 separates permanent replay tombstones from bounded detailed retirement history; #217 owns cross-platform user-presence recovery parity, split into #227 Windows Hello/WebAuthn and #228 Linux FIDO2 UV. These provider implementations intentionally follow the immediate `0.3.x` product-readiness sequence unless production evidence changes the priority.
 - **`0.5.0 — Multi-principal Identity`:** #139 adds generic provider-neutral OIDC/JWT identity while preserving the existing exact authorizer; #221 adds typed backend-neutral semantic constraints as a narrow-only layer without turning CUMG into a generic policy engine.
 - **`0.6.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
 - **`0.7.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle and #114 adds separately sandboxed Playwright/E2E execution.

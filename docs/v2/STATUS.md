@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](STATUS.ja.md)
 
-Status as of 2026-08-27:
+Status as of 2026-08-31:
 
 - **Desktop semantic path:** complete and accepted, including same-context native element click/type/key targeting and real-Cua background AX element-action evidence.
 - **Browser core semantic path:** complete and accepted for prepare, bind, inspect, navigate, click, type, dialog, and pointer semantics.
@@ -16,6 +16,7 @@ Status as of 2026-08-27:
 - **Host reliability and diagnostics:** `v2_doctor` distinguishes a proven in-band diagnostic self-observation from real blocking quarantine without changing restart-safety state. Browser staging startup failures emit bounded local stage/I/O diagnostics. Controlled `StorageFull` injection proves Agent checkpoint persistence exhaustion can terminate the Agent fail closed and therefore surface remotely as `agent_offline`; the prior committed checkpoint/replay barriers remain authoritative, normal service-manager reconnect works after capacity returns, and `v2_doctor` exposes only coarse read-only state/temp capacity signals.
 - **Process/shell response-loss recovery:** `execute_process` and `shell` accept a stable caller-retained `operation_id`, and the Hub exposes read-only `get_operation` for owner/capability-scoped recovery without replay or Agent liveness. Proven terminal output is persisted before northbound delivery and survives Agent generation rollover in a bounded recovery archive (8 entries / 256 KiB encoded total). Unknown/evicted references never make the original operation retry-safe.
 - **Local-user online quarantine recovery:** implemented behind explicit recovery-key provisioning. The Agent device key is not recovery authority; a fresh Hub-signed challenge is resolved only by a separately pinned P-256 endpoint recovery key. The initial macOS signer uses a Secure Enclave key with user-presence access control. Automated protocol/persistence coverage and trusted physical acceptance are complete: authorization was published only after local user presence, the ambiguous operation resolved durably, restart preserved the resolution, and the old operation was not replayed.
+- **Current productization priority:** macOS online recovery is sufficient for the current single-Mac reference path; the immediate work is operator/product integration (#226/#233/#234 -> #235 -> #236/#237). Cross-platform recovery parity remains planned under #217 for `0.4.0`, with #227 Windows Hello/WebAuthn and #228 Linux FIDO2 UV intentionally deferred until that product-readiness sequence is coherent or concrete production evidence justifies pulling a provider forward.
 - **V1 compatibility:** V1 remains available for regression/reference and existing deployments. V1 regression/conformance coverage remains required during V2 work; the remaining #14/#15 observations are explicitly blocked on upstream Cua rather than treated as active CUMG release blockers.
 
 ## Active contracts

@@ -50,6 +50,19 @@ completion provable?
 
 `v0.3.0` 後に merge された compatible fix は将来の `0.3.1` に含められますが、maintenance commit が存在するだけで release を必須にはしません。
 
+### 直近の Product Readiness 実行順
+
+現在は、**追加 desktop platform の recovery parity より先に single-Mac の operator/product path を完成させる**ことを優先します。cross-platform recovery は重要ですが、新しい platform-backed recovery provider を追加しても、すでに supported な deployment に残る最大の usability gap は解消しません。
+
+released safety regression を示す新しい evidence がない限り、次の順序を使います。
+
+1. **独立して進められる foundation:** #226 lane-scoped readiness、#233 operator-ready incident brief、#234 durable / inspectable single-Mac upgrade transaction。
+2. **統合 operator surface:** #235 がそれらの signal を、authority/state machine を複製せず1つの privacy-safe status view にまとめる。
+3. **guided product workflow:** #236 が explicit Human choice と durable completion verification を通る quarantine recovery を案内し、#237 が reviewed single-Mac install/upgrade を source-tree compilation から verified artifact へ移す。prerequisite が揃えば両者は並行可能。
+4. **その後 Recovery & Reconciliation を拡張:** #217 と split provider の #227（Windows Hello/WebAuthn）、#228（Linux FIDO2 UV）は `0.4.0` work とする。
+
+これは Windows/Linux recovery の de-scope ではなく、実行順の決定です。途中まで実装済みの #227 work は保持しますが、`0.3.x` Product Readiness path が未完の間は provider 実装の続行を defer します。上記 operator path が一貫したものになり、Windows を supported recovery target として admit するときに再開します。ただし concrete production evidence により Windows online recovery がより高い safety/operability priority になった場合は前倒しできます。
+
 ### Legacy V1 retirement candidate
 
 `v1_gateway` は regression/reference と、まだ存在する可能性のある legacy deployment のため `main` に保持します。独立した `0.1.x` maintenance line ではなく、routine backport もしません。推奨 runtime は V2 Hub + Agent です。
@@ -144,8 +157,8 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 repository の open issue は、work が roadmap の可視性から黙って抜け落ちないよう working milestone ごとに分類します。これらの milestone は ordering / admission guidance であり、evidence により split / defer が必要になった場合まで同時 ship を約束するものではありません。
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate、#224 が version-paired release-candidate artifact / fresh-extraction smoke、#215 が desktop execution を Cloud Run へ移さず formally supported hosted Cloud Run Hub を評価し、#109 が online-recovery CLI の durable completion confirmation、#115 が replay しない actionable `Indeterminate` operator UX、#104 が filesystem observation root と process cwd root の分離、#111 が再現可能な latency / concurrency evidence、#96 が Unix descendant containment の正確な boundary 調査を所有します。
-- **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離、#217 が software-key fallback なしで reviewed Windows/Linux provider へ separate user-presence online recovery authority を拡張します。
+- **`0.3.x — Product Readiness & Stabilization`:** #213 が横断 Product Readiness gate を所有します。active な operator/product sequence は #226/#233/#234 -> #235 -> #236/#237 です。#224 は完了済みで、#237 が利用する release-candidate artifact boundary を提供します。その他の compatible work は #215 hosted-Hub design、#109 durable online-recovery completion confirmation、#115 actionable `Indeterminate` UX、#104 filesystem/process-root separation、#111 latency/concurrency evidence、bounded な #96 Unix containment investigation です。
+- **`0.4.0 — Recovery & Reconciliation`:** #103 が effectful Desktop/Browser call の durable operation identity/status、#137 が historical truth を書き換えない reviewed local-Human current-state acceptance、#136 が permanent replay tombstone と bounded detailed retirement history の分離、#217 が cross-platform user-presence recovery parity を所有し、#227 Windows Hello/WebAuthn と #228 Linux FIDO2 UV に split しています。production evidence が priority を変えない限り、これら provider 実装は直近 `0.3.x` Product Readiness sequence の後に進めます。
 - **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity、#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
 - **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。
 - **`0.7.0 — Managed Developer Execution`:** #106 が explicit managed-job lifecycle、#114 が separately sandboxed Playwright/E2E execution を追加します。

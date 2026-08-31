@@ -2,7 +2,7 @@
 
 > この日本語版は [`STATUS.md`](STATUS.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-08-27 時点の状況:
+2026-08-31 時点の状況:
 
 - **Desktop semantic path:** complete / accepted。same-context の native element click/type/key targeting と、real-Cua による background AX element-action evidence を含みます。
 - **Browser core semantic path:** prepare、bind、inspect、navigate、click、type、dialog、pointer semantics まで complete / accepted です。
@@ -16,6 +16,7 @@
 - **Host reliability / diagnostics:** `v2_doctor` は restart-safety state を変更せず、authoritative に証明できる in-band diagnostic self-observation と本当の blocking quarantine を区別します。Browser staging startup failure は bounded local stage/I/O diagnostic を出します。controlled `StorageFull` injection により、Agent checkpoint persistence の容量枯渇が Agent を fail-closed exit させ、remote では `agent_offline` として見えることを確認済みです。失敗前の committed checkpoint / replay barrier は authoritative のまま維持され、容量復旧後は通常の service-manager reconnect で回復します。`v2_doctor` は state/temp filesystem の容量について coarse / read-only signal だけを公開します。
 - **Process/shell response-loss recovery:** `execute_process` / `shell` は caller が保持できる stable `operation_id` を受け取り、Hub は replay せず、Agent liveness に依存しない owner/capability-scoped read-only `get_operation` を公開します。proven terminal output は northbound delivery より先に persist し、Agent generation rollover 後も bounded recovery archive（最大8件 / encoded total 256 KiB）で保持します。unknown/evicted reference になっても original operation が retry-safe になったことを意味しません。
 - **Local-user online quarantine recovery:** explicit recovery-key provisioning の背後で実装済みです。Agent device key は recovery authority ではなく、fresh Hub-signed challenge は separately pinned P-256 endpoint recovery key だけで解決できます。初期 macOS signer は user-presence access control 付き Secure Enclave key を使用します。automated protocol/persistence coverage と trusted physical acceptance は完了し、local user presence 後にのみ authorization が publish され、ambiguous operation は durably resolve、restart 後も resolution を維持し、旧 operation は replay されませんでした。
+- **現在の productization priority:** current single-Mac reference path では macOS online recovery で必要な安全な回復 authority は成立しています。直近は operator/product integration（#226/#233/#234 -> #235 -> #236/#237）を優先します。cross-platform recovery parity は #217 配下の `0.4.0` work として維持し、#227 Windows Hello/WebAuthn と #228 Linux FIDO2 UV は、Product Readiness sequence が一貫するか concrete production evidence により前倒しが必要になるまで intentionally defer します。
 - **V1 compatibility:** V1 は regression/reference と既存 deployment 向けに引き続き利用できます。V2 作業中も V1 regression/conformance coverage は必須です。残る #14/#15 は upstream Cua に blocked された observation として扱い、active CUMG release blocker にはしません。
 
 ## 有効な契約
