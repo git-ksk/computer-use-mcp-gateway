@@ -391,7 +391,8 @@ def wait_for_one_shot_completion(
 
 def run_upgrade_one_shot(
     *,
-    repo_root: pathlib.Path,
+    repo_root: pathlib.Path | None,
+    artifact_bundle: pathlib.Path | None = None,
     domain: str,
     launchctl: str,
     job_dir: pathlib.Path,
@@ -404,8 +405,22 @@ def run_upgrade_one_shot(
 ) -> int:
     _validate_domain(domain)
     assert_no_stale_jobs(domain=domain, launchctl=launchctl, runner=runner)
-    repo_root = repo_root.resolve(strict=True)
-    upgrade = repo_root / "scripts/v2-single-mac-upgrade.sh"
+    if artifact_bundle is not None:
+        artifact_bundle = artifact_bundle.resolve(strict=True)
+        if artifact_bundle.is_symlink() or not artifact_bundle.is_dir():
+            raise MaintenanceError("artifact_bundle_missing_or_unsafe")
+        upgrade = artifact_bundle / "install/v2-single-mac-upgrade.sh"
+        working_directory = artifact_bundle
+        program_arguments = [
+            "/bin/bash", str(upgrade), "--artifact-bundle", str(artifact_bundle)
+        ]
+    else:
+        if repo_root is None:
+            raise MaintenanceError("upgrade_source_required")
+        repo_root = repo_root.resolve(strict=True)
+        upgrade = repo_root / "scripts/v2-single-mac-upgrade.sh"
+        working_directory = repo_root
+        program_arguments = ["/bin/bash", str(upgrade)]
     if not upgrade.is_file() or upgrade.is_symlink():
         raise MaintenanceError("upgrade_helper_missing_or_unsafe")
     root = _secure_job_dir(job_dir)
@@ -414,8 +429,8 @@ def run_upgrade_one_shot(
     plist_path = root / f"{label}.plist"
     payload = build_one_shot_plist(
         label=label,
-        program_arguments=["/bin/bash", str(upgrade)],
-        working_directory=repo_root,
+        program_arguments=program_arguments,
+        working_directory=working_directory,
         environment=safe_upgrade_environment(environment, job_label=label),
     )
     _write_private_plist(plist_path, payload)
@@ -486,10 +501,17 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("cleanup-stale")
 
     run = sub.add_parser("run-upgrade")
-    run.add_argument(
+    source = run.add_mutually_exclusive_group()
+    source.add_argument(
         "--repo-root",
         type=pathlib.Path,
-        default=pathlib.Path(__file__).resolve().parents[1],
+        default=None,
+        help="maintainer-only source checkout; defaults to this script's repository when artifact is omitted",
+    )
+    source.add_argument(
+        "--artifact-bundle",
+        type=pathlib.Path,
+        help="verified extracted single-Mac artifact bundle (normal operator path)",
     )
     run.add_argument("--timeout-secs", type=float, default=DEFAULT_TIMEOUT_SECS)
     return parser
@@ -532,8 +554,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"MAINTENANCE_JOBS_CLEANUP_OK cleaned={cleaned}")
             return 0
         if args.command == "run-upgrade":
+            repo_root = args.repo_root
+            if repo_root is None and args.artifact_bundle is None:
+                repo_root = pathlib.Path(__file__).resolve().parents[1]
             exit_code = run_upgrade_one_shot(
-                repo_root=args.repo_root,
+                repo_root=repo_root,
+                artifact_bundle=args.artifact_bundle,
                 domain=args.domain,
                 launchctl=args.launchctl,
                 job_dir=args.job_dir,

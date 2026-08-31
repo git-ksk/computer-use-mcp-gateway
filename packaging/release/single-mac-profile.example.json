@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "device_id": "REPLACE_WITH_STABLE_DEVICE_ID",
+  "mcp_resource": "https://REPLACE_WITH_PUBLIC_RESOURCE/mcp",
+  "trusted_proxy_issuer": "REPLACE_WITH_ISSUER",
+  "trusted_proxy_subject": "REPLACE_WITH_SUBJECT",
+  "expected_cua_version": "0.19.3",
+  "cua_command": "/Users/REPLACE/.local/bin/cua-driver",
+  "handoff_runtime_command": "/opt/homebrew/bin/node",
+  "codesign_fingerprint": "REPLACE_WITH_40_HEX_CODESIGN_FINGERPRINT",
+  "macos_team_id": "REPLACE10CH"
+}

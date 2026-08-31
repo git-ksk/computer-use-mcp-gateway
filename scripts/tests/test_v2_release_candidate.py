@@ -24,6 +24,8 @@ SPEC.loader.exec_module(mod)
 class ReleaseCandidateTests(unittest.TestCase):
     COMMIT = "a" * 40
     VERSION = "0.3.0"
+    HANDOFF_COMMIT = "b" * 40
+    HUB_AGENT_SCHEMA = 4
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cumg-release-candidate-")
@@ -42,6 +44,16 @@ class ReleaseCandidateTests(unittest.TestCase):
             path.chmod(0o755)
         return binary_dir
 
+    def make_payload_dir(self) -> Path:
+        payload = self.root / "artifact-payload"
+        for relative in mod.MACOS_INSTALL_ASSETS:
+            path = payload.joinpath(*Path(relative).parts)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"fixture-{relative}\n".encode())
+            if relative.startswith("install/"):
+                path.chmod(0o755)
+        return payload
+
     def build(self, platform_name: str = "macos") -> tuple[Path, Path]:
         binary_dir = self.make_binary_dir(platform_name)
         output = self.root / f"dist-{platform_name}"
@@ -53,6 +65,9 @@ class ReleaseCandidateTests(unittest.TestCase):
                 source_commit=self.COMMIT,
                 platform=platform_name,
                 architecture="test-arch",
+                hub_agent_schema_version=self.HUB_AGENT_SCHEMA,
+                paired_handoff_commit=self.HANDOFF_COMMIT if platform_name == "macos" else None,
+                payload_dir=str(self.make_payload_dir()) if platform_name == "macos" else None,
             )
         )
         return archive, Path(f"{archive}.sha256")
@@ -78,10 +93,23 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertEqual(manifest["source_commit"], self.COMMIT)
         self.assertEqual(
             {record["path"] for record in manifest["files"]},
-            set(mod.expected_binary_paths("macos")),
+            set(mod.expected_artifact_paths("macos")),
         )
+        self.assertEqual(manifest["paired_handoff_commit"], self.HANDOFF_COMMIT)
+        self.assertEqual(manifest["hub_agent_schema_version"], self.HUB_AGENT_SCHEMA)
+        self.assertEqual(manifest["install_profile"], mod.INSTALL_PROFILE)
         self.assertIn("bin/v2_doctor", mod.expected_binary_paths("macos"))
         self.assertIn("bin/v2_status", mod.expected_binary_paths("macos"))
+        self.assertIn("bin/v2_recover", mod.expected_binary_paths("macos"))
+        self.assertIn("bin/v2_recovery_enclave_helper", mod.expected_binary_paths("macos"))
+        self.assertIn("components/handoff-runtime.tar.gz", mod.expected_artifact_paths("macos"))
+
+    def test_macos_candidate_rejects_tampered_install_asset(self):
+        bundle = self.extract("macos")
+        path = bundle / "install/v2_artifact_install.py"
+        path.write_bytes(path.read_bytes() + b"tamper")
+        with self.assertRaises(mod.CandidateError):
+            mod.verify_bundle_dir(bundle)
 
     def test_windows_zip_candidate_round_trip_omits_unix_only_binaries(self):
         bundle = self.extract("windows")
@@ -116,6 +144,9 @@ class ReleaseCandidateTests(unittest.TestCase):
                     source_commit="short",
                     platform="linux",
                     architecture="x64",
+                    hub_agent_schema_version=self.HUB_AGENT_SCHEMA,
+                    paired_handoff_commit=None,
+                    payload_dir=None,
                 )
             )
 
@@ -136,6 +167,9 @@ class ReleaseCandidateTests(unittest.TestCase):
                     source_commit=self.COMMIT,
                     platform="linux",
                     architecture="x64",
+                    hub_agent_schema_version=self.HUB_AGENT_SCHEMA,
+                    paired_handoff_commit=None,
+                    payload_dir=None,
                 )
             )
 
