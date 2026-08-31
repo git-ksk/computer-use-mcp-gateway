@@ -606,8 +606,12 @@ def smoke_bundle(bundle_root: Path) -> None:
         if relative not in record_by_path:
             raise CandidateError(f"packaged binary is missing from manifest: {relative}")
         binary = bundle_root.joinpath(*PurePosixPath(relative).parts)
+        # The Secure Enclave helper is an internal bounded IPC executable, not a Clap CLI.
+        # Its reviewed non-interactive smoke contract is --version; generate/sign/public would
+        # access key material or LocalAuthentication and must never be triggered by packaging CI.
+        smoke_arg = "--version" if binary.name == "v2_recovery_enclave_helper" else "--help"
         result = subprocess.run(
-            [str(binary), "--help"],
+            [str(binary), smoke_arg],
             cwd=bundle_root,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -643,7 +647,7 @@ def parser() -> argparse.ArgumentParser:
     verify_dir = commands.add_parser("verify-dir", help="verify an already-extracted bundle")
     verify_dir.add_argument("--bundle-dir", required=True)
 
-    smoke = commands.add_parser("smoke", help="run safe --help smoke from an extracted native bundle")
+    smoke = commands.add_parser("smoke", help="run safe non-effectful smoke from an extracted native bundle")
     smoke.add_argument("--bundle-dir", required=True)
     return root
 

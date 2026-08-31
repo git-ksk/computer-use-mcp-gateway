@@ -132,6 +132,8 @@ class ReleaseCandidateTests(unittest.TestCase):
         for call in run.call_args_list:
             binary = Path(call.args[0][0])
             self.assertTrue(binary.is_absolute())
+            expected_arg = "--version" if binary.name == "v2_recovery_enclave_helper" else "--help"
+            self.assertEqual(call.args[0][1], expected_arg)
 
     def test_invalid_source_commit_is_refused_before_artifact_creation(self):
         binary_dir = self.make_binary_dir("linux")
