@@ -207,3 +207,9 @@ sealed Secure Enclave recovery-key representation紛失、Agent接続不能、Se
 Online recoveryは現在の `HUB_AGENT_SCHEMA_VERSION = 5` application protocolの一部です。schema validationはfail-closedのままなので、このreleaseを有効にする際はHubとAgentを協調して更新し、mixed-version rolling compatibilityには依存しません。V1 gatewayの動作は変わりません。
 
 Recovery challengeは300秒（5分）で期限切れになります。desktopがquarantineのままなら、通常のauthenticated Agent heartbeatを契機にHubがpending challengeを再確認し、期限切れ後はfresh nonceを持つchallengeを再発行します。承認時間切れだけを理由にHub/Agentを再起動する必要はありません。fresh challenge受信時は以前のlocal authorization handoffを無効化します。
+
+### Windows Hello provider（#227、physical acceptance待ち）
+
+Windows provider は native Win32 WebAuthn broker と dedicated platform-authenticator ES256 credential を使用します。provisioning は `WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable`、platform attachment、required user verification を必須にし、CUMG が export するのは bounded credential ID と X9.63 public verifier を含む `recovery-webauthn-verifier.json` だけです。assertion は exact credential、RP ID `cumg-recovery.invalid`、platform attachment、signed UP+UV flags に固定します。external authenticator、password、software key、Agent key、unattended Task Scheduler fallback はありません。
+
+interactive Windows desktop で `v2_recover init-windows-hello --verifier-out <FILE>` を実行し、その public verifier を `<HUB_STATE_DIR>/recovery-webauthn-verifier.json` へ配置します。その後 `resolve-windows-hello` または `accept-current-state-windows-hello` を使用します。Windows Hello UI の approve/deny、exact quarantine の durable resolution、restart durability、no replay を physical acceptance で確認するまでは support 完了を主張せず、Windows の supported fallback は offline `v2_maint` のままです。

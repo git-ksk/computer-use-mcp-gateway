@@ -1399,7 +1399,10 @@ pub mod windows {
             &self,
             authorization: RecoveryAuthorization,
         ) -> Result<RecoveryAuthorization, RecoveryError> {
-            if !authorization.signature.is_empty() || !Self::is_available()? {
+            if !authorization.signature.is_empty() {
+                return Err(RecoveryError::InvalidMessage);
+            }
+            if !Self::is_available()? {
                 return Err(RecoveryError::PlatformUserVerificationUnavailable);
             }
             let hwnd = interactive_window()?;

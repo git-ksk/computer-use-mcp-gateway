@@ -309,4 +309,33 @@ fn recovery_cli_requires_explicit_secure_enclave_artifacts() {
     assert!(resolve_help.contains("--key-file"));
     assert!(resolve_help.contains("--secure-enclave-helper"));
     assert!(!resolve_help.contains("--key-label"));
+
+    let windows_init = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .args(["init-windows-hello", "--help"])
+        .output()
+        .unwrap();
+    assert!(windows_init.status.success());
+    let windows_init_help = String::from_utf8(windows_init.stdout).unwrap();
+    assert!(windows_init_help.contains("--verifier-out"));
+    assert!(!windows_init_help.contains("--key-file"));
+    assert!(!windows_init_help.contains("--secure-enclave-helper"));
+
+    let windows_resolve = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .args(["resolve-windows-hello", "--help"])
+        .output()
+        .unwrap();
+    assert!(windows_resolve.status.success());
+    let windows_resolve_help = String::from_utf8(windows_resolve.stdout).unwrap();
+    assert!(windows_resolve_help.contains("--verifier-file"));
+    assert!(windows_resolve_help.contains("--decision"));
+    assert!(!windows_resolve_help.contains("--key-file"));
+
+    let windows_current = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .args(["accept-current-state-windows-hello", "--help"])
+        .output()
+        .unwrap();
+    assert!(windows_current.status.success());
+    let windows_current_help = String::from_utf8(windows_current.stdout).unwrap();
+    assert!(windows_current_help.contains("--verifier-file"));
+    assert!(!windows_current_help.contains("--decision"));
 }
