@@ -46,6 +46,8 @@ const MAX_WEBAUTHN_AUTHENTICATOR_DATA_BYTES: usize = 4096;
 const MAX_WEBAUTHN_SIGNATURE_BYTES: usize = 256;
 pub(crate) const WEBAUTHN_FLAG_UP: u8 = 0x01;
 pub(crate) const WEBAUTHN_FLAG_UV: u8 = 0x04;
+#[cfg(any(windows, test))]
+const WEBAUTHN_FLAG_AT: u8 = 0x40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -410,6 +412,155 @@ fn validate_p256_public_key(bytes: &[u8]) -> Result<[u8; 65], RecoveryError> {
         return Err(RecoveryError::InvalidPublicKey);
     }
     Ok(public_key)
+}
+
+#[cfg(any(windows, test))]
+fn parse_attested_es256_public_key(
+    authenticator_data: &[u8],
+    expected_credential_id: &[u8],
+) -> Result<[u8; 65], RecoveryError> {
+    if authenticator_data.len() < 55 || expected_credential_id.is_empty() {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    let rp_hash = digest::digest(&digest::SHA256, WEBAUTHN_RECOVERY_RP_ID.as_bytes());
+    if &authenticator_data[..32] != rp_hash.as_ref() {
+        return Err(RecoveryError::WebAuthnRpMismatch);
+    }
+    let flags = authenticator_data[32];
+    if flags & WEBAUTHN_FLAG_UP == 0
+        || flags & WEBAUTHN_FLAG_UV == 0
+        || flags & WEBAUTHN_FLAG_AT == 0
+    {
+        return Err(RecoveryError::WebAuthnUserVerificationRequired);
+    }
+    let credential_len = usize::from(u16::from_be_bytes([
+        authenticator_data[53],
+        authenticator_data[54],
+    ]));
+    let credential_start = 55usize;
+    let credential_end = credential_start
+        .checked_add(credential_len)
+        .ok_or(RecoveryError::InvalidWebAuthnProof)?;
+    if credential_len == 0
+        || credential_end >= authenticator_data.len()
+        || &authenticator_data[credential_start..credential_end] != expected_credential_id
+    {
+        return Err(RecoveryError::WebAuthnCredentialMismatch);
+    }
+    parse_es256_cose_key(&authenticator_data[credential_end..])
+}
+
+#[cfg(any(windows, test))]
+fn parse_es256_cose_key(bytes: &[u8]) -> Result<[u8; 65], RecoveryError> {
+    let mut cursor = 0usize;
+    let entries = cbor_read_len(bytes, &mut cursor, 5)?;
+    if entries != 5 {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    let mut kty = None;
+    let mut alg = None;
+    let mut curve = None;
+    let mut x = None;
+    let mut y = None;
+    for _ in 0..entries {
+        let key = cbor_read_int(bytes, &mut cursor)?;
+        match key {
+            1 => kty = Some(cbor_read_int(bytes, &mut cursor)?),
+            3 => alg = Some(cbor_read_int(bytes, &mut cursor)?),
+            -1 => curve = Some(cbor_read_int(bytes, &mut cursor)?),
+            -2 => x = Some(cbor_read_fixed_bytes::<32>(bytes, &mut cursor)?),
+            -3 => y = Some(cbor_read_fixed_bytes::<32>(bytes, &mut cursor)?),
+            _ => return Err(RecoveryError::InvalidWebAuthnProof),
+        }
+    }
+    if cursor != bytes.len() || kty != Some(2) || alg != Some(-7) || curve != Some(1) {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    let mut public_key = [0u8; 65];
+    public_key[0] = 0x04;
+    public_key[1..33].copy_from_slice(&x.ok_or(RecoveryError::InvalidWebAuthnProof)?);
+    public_key[33..].copy_from_slice(&y.ok_or(RecoveryError::InvalidWebAuthnProof)?);
+    validate_p256_public_key(&public_key)
+}
+
+#[cfg(any(windows, test))]
+fn cbor_read_len(
+    bytes: &[u8],
+    cursor: &mut usize,
+    expected_major: u8,
+) -> Result<usize, RecoveryError> {
+    let (major, value) = cbor_read_head(bytes, cursor)?;
+    if major != expected_major {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    usize::try_from(value).map_err(|_| RecoveryError::InvalidWebAuthnProof)
+}
+
+#[cfg(any(windows, test))]
+fn cbor_read_int(bytes: &[u8], cursor: &mut usize) -> Result<i64, RecoveryError> {
+    let (major, value) = cbor_read_head(bytes, cursor)?;
+    let value = i64::try_from(value).map_err(|_| RecoveryError::InvalidWebAuthnProof)?;
+    match major {
+        0 => Ok(value),
+        1 => value
+            .checked_add(1)
+            .and_then(|value| value.checked_neg())
+            .ok_or(RecoveryError::InvalidWebAuthnProof),
+        _ => Err(RecoveryError::InvalidWebAuthnProof),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn cbor_read_fixed_bytes<const N: usize>(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<[u8; N], RecoveryError> {
+    let length = cbor_read_len(bytes, cursor, 2)?;
+    if length != N {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    let end = cursor
+        .checked_add(N)
+        .ok_or(RecoveryError::InvalidWebAuthnProof)?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or(RecoveryError::InvalidWebAuthnProof)?;
+    *cursor = end;
+    slice
+        .try_into()
+        .map_err(|_| RecoveryError::InvalidWebAuthnProof)
+}
+
+#[cfg(any(windows, test))]
+fn cbor_read_head(bytes: &[u8], cursor: &mut usize) -> Result<(u8, u64), RecoveryError> {
+    let first = *bytes
+        .get(*cursor)
+        .ok_or(RecoveryError::InvalidWebAuthnProof)?;
+    *cursor += 1;
+    let major = first >> 5;
+    let additional = first & 0x1f;
+    let value = match additional {
+        0..=23 => u64::from(additional),
+        24 => u64::from(cbor_take::<1>(bytes, cursor)?[0]),
+        25 => u64::from(u16::from_be_bytes(cbor_take::<2>(bytes, cursor)?)),
+        26 => u64::from(u32::from_be_bytes(cbor_take::<4>(bytes, cursor)?)),
+        _ => return Err(RecoveryError::InvalidWebAuthnProof),
+    };
+    Ok((major, value))
+}
+
+#[cfg(any(windows, test))]
+fn cbor_take<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], RecoveryError> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or(RecoveryError::InvalidWebAuthnProof)?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or(RecoveryError::InvalidWebAuthnProof)?;
+    *cursor = end;
+    slice
+        .try_into()
+        .map_err(|_| RecoveryError::InvalidWebAuthnProof)
 }
 
 fn decode_base64url_bounded(value: &str, max: usize) -> Result<Vec<u8>, RecoveryError> {
@@ -1104,6 +1255,298 @@ impl fmt::Display for RecoveryError {
 }
 
 impl std::error::Error for RecoveryError {}
+
+#[cfg(windows)]
+pub mod windows {
+    use super::*;
+    use std::ptr::{null, null_mut};
+    use std::slice;
+    use windows_sys::Win32::Networking::WindowsWebServices::*;
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    const WINDOWS_HELLO_TIMEOUT_MS: u32 = 60_000;
+    const HRESULT_ERROR_CANCELLED: u32 = 0x8007_04c7;
+    const HRESULT_NTE_USER_CANCELLED: u32 = 0x8009_0036;
+
+    pub struct WindowsHelloRecovery {
+        credential_id: Vec<u8>,
+    }
+
+    impl WindowsHelloRecovery {
+        pub fn is_available() -> Result<bool, RecoveryError> {
+            let mut available = 0;
+            let hr =
+                unsafe { WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable(&mut available) };
+            if hr < 0 {
+                return Err(map_hresult(hr));
+            }
+            Ok(available != 0)
+        }
+
+        pub fn create_new() -> Result<(Self, WebAuthnRecoveryVerifierDocument), RecoveryError> {
+            if !Self::is_available()? {
+                return Err(RecoveryError::PlatformUserVerificationUnavailable);
+            }
+            let hwnd = interactive_window()?;
+            let rp_id = wide(WEBAUTHN_RECOVERY_RP_ID);
+            let rp_name = wide("CUMG Recovery");
+            let user_name = wide("cumg-recovery");
+            let display_name = wide("CUMG Recovery");
+            let mut user_id = [0u8; 32];
+            OsRng.fill_bytes(&mut user_id);
+            let mut provisioning_challenge = [0u8; 32];
+            OsRng.fill_bytes(&mut provisioning_challenge);
+            let mut client_json = serde_json::to_vec(&WebAuthnClientData {
+                kind: "webauthn.create",
+                challenge: URL_SAFE_NO_PAD.encode(provisioning_challenge),
+                origin: WEBAUTHN_RECOVERY_ORIGIN,
+                cross_origin: false,
+            })
+            .map_err(|_| RecoveryError::InvalidMessage)?;
+
+            let rp = WEBAUTHN_RP_ENTITY_INFORMATION {
+                dwVersion: WEBAUTHN_RP_ENTITY_INFORMATION_CURRENT_VERSION,
+                pwszId: rp_id.as_ptr(),
+                pwszName: rp_name.as_ptr(),
+                pwszIcon: null(),
+            };
+            let user = WEBAUTHN_USER_ENTITY_INFORMATION {
+                dwVersion: WEBAUTHN_USER_ENTITY_INFORMATION_CURRENT_VERSION,
+                cbId: u32::try_from(user_id.len()).map_err(|_| RecoveryError::InvalidMessage)?,
+                pbId: user_id.as_mut_ptr(),
+                pwszName: user_name.as_ptr(),
+                pwszIcon: null(),
+                pwszDisplayName: display_name.as_ptr(),
+            };
+            let mut cose = WEBAUTHN_COSE_CREDENTIAL_PARAMETER {
+                dwVersion: WEBAUTHN_COSE_CREDENTIAL_PARAMETER_CURRENT_VERSION,
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+                lAlg: WEBAUTHN_COSE_ALGORITHM_ECDSA_P256_WITH_SHA256,
+            };
+            let cose_params = WEBAUTHN_COSE_CREDENTIAL_PARAMETERS {
+                cCredentialParameters: 1,
+                pCredentialParameters: &mut cose,
+            };
+            let client_data = WEBAUTHN_CLIENT_DATA {
+                dwVersion: WEBAUTHN_CLIENT_DATA_CURRENT_VERSION,
+                cbClientDataJSON: u32::try_from(client_json.len())
+                    .map_err(|_| RecoveryError::InvalidMessage)?,
+                pbClientDataJSON: client_json.as_mut_ptr(),
+                pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
+            };
+            let options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
+                dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_1,
+                dwTimeoutMilliseconds: WINDOWS_HELLO_TIMEOUT_MS,
+                dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
+                dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+                dwAttestationConveyancePreference: WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE,
+                ..Default::default()
+            };
+            let mut raw = null_mut();
+            let hr = unsafe {
+                WebAuthNAuthenticatorMakeCredential(
+                    hwnd,
+                    &rp,
+                    &user,
+                    &cose_params,
+                    &client_data,
+                    &options,
+                    &mut raw,
+                )
+            };
+            if hr < 0 {
+                return Err(map_hresult(hr));
+            }
+            let attestation = CredentialAttestation(raw);
+            let attestation_ref = attestation.get()?;
+            let credential_id = copy_bounded(
+                attestation_ref.pbCredentialId,
+                attestation_ref.cbCredentialId,
+                MAX_WEBAUTHN_CREDENTIAL_ID_BYTES,
+            )?;
+            let authenticator_data = copy_bounded(
+                attestation_ref.pbAuthenticatorData,
+                attestation_ref.cbAuthenticatorData,
+                MAX_WEBAUTHN_AUTHENTICATOR_DATA_BYTES,
+            )?;
+            let public_key = parse_attested_es256_public_key(&authenticator_data, &credential_id)?;
+            let verifier = RecoveryVerifier::from_webauthn_es256(&credential_id, &public_key)?;
+            let document = verifier
+                .webauthn_document()
+                .ok_or(RecoveryError::InvalidPublicKey)?;
+            Ok((Self { credential_id }, document))
+        }
+
+        pub fn from_verifier_document(bytes: &[u8]) -> Result<Self, RecoveryError> {
+            if bytes.is_empty() || bytes.len() > MAX_WEBAUTHN_VERIFIER_BYTES {
+                return Err(RecoveryError::InvalidPublicKey);
+            }
+            let document: WebAuthnRecoveryVerifierDocument =
+                serde_json::from_slice(bytes).map_err(|_| RecoveryError::InvalidPublicKey)?;
+            if document.schema_version != WEBAUTHN_VERIFIER_SCHEMA_VERSION {
+                return Err(RecoveryError::UnsupportedSchema);
+            }
+            let credential_id = decode_base64url_bounded(
+                &document.credential_id_base64url,
+                MAX_WEBAUTHN_CREDENTIAL_ID_BYTES,
+            )?;
+            RecoveryVerifier::from_webauthn_document(bytes)?;
+            Ok(Self { credential_id })
+        }
+
+        pub fn sign_authorization(
+            &self,
+            authorization: RecoveryAuthorization,
+        ) -> Result<RecoveryAuthorization, RecoveryError> {
+            if !authorization.signature.is_empty() || !Self::is_available()? {
+                return Err(RecoveryError::PlatformUserVerificationUnavailable);
+            }
+            let hwnd = interactive_window()?;
+            let rp_id = wide(WEBAUTHN_RECOVERY_RP_ID);
+            let mut client_json = webauthn_client_data_json(&authorization)?;
+            let client_data = WEBAUTHN_CLIENT_DATA {
+                dwVersion: WEBAUTHN_CLIENT_DATA_CURRENT_VERSION,
+                cbClientDataJSON: u32::try_from(client_json.len())
+                    .map_err(|_| RecoveryError::InvalidMessage)?,
+                pbClientDataJSON: client_json.as_mut_ptr(),
+                pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
+            };
+            let mut credential_id = self.credential_id.clone();
+            let mut credential = WEBAUTHN_CREDENTIAL {
+                dwVersion: WEBAUTHN_CREDENTIAL_CURRENT_VERSION,
+                cbId: u32::try_from(credential_id.len())
+                    .map_err(|_| RecoveryError::InvalidMessage)?,
+                pbId: credential_id.as_mut_ptr(),
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+            };
+            let credentials = WEBAUTHN_CREDENTIALS {
+                cCredentials: 1,
+                pCredentials: &mut credential,
+            };
+            let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
+                dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_1,
+                dwTimeoutMilliseconds: WINDOWS_HELLO_TIMEOUT_MS,
+                CredentialList: credentials,
+                dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
+                dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+                ..Default::default()
+            };
+            let mut raw = null_mut();
+            let hr = unsafe {
+                WebAuthNAuthenticatorGetAssertion(
+                    hwnd,
+                    rp_id.as_ptr(),
+                    &client_data,
+                    &options,
+                    &mut raw,
+                )
+            };
+            if hr < 0 {
+                return Err(map_hresult(hr));
+            }
+            let assertion = Assertion(raw);
+            let assertion_ref = assertion.get()?;
+            let returned_credential = copy_bounded(
+                assertion_ref.Credential.pbId,
+                assertion_ref.Credential.cbId,
+                MAX_WEBAUTHN_CREDENTIAL_ID_BYTES,
+            )?;
+            if returned_credential != self.credential_id {
+                return Err(RecoveryError::WebAuthnCredentialMismatch);
+            }
+            let authenticator_data = copy_bounded(
+                assertion_ref.pbAuthenticatorData,
+                assertion_ref.cbAuthenticatorData,
+                MAX_WEBAUTHN_AUTHENTICATOR_DATA_BYTES,
+            )?;
+            if authenticator_data.len() < 37 {
+                return Err(RecoveryError::InvalidWebAuthnProof);
+            }
+            let flags = authenticator_data[32];
+            if flags & WEBAUTHN_FLAG_UP == 0 || flags & WEBAUTHN_FLAG_UV == 0 {
+                return Err(RecoveryError::WebAuthnUserVerificationRequired);
+            }
+            let signature = copy_bounded(
+                assertion_ref.pbSignature,
+                assertion_ref.cbSignature,
+                MAX_WEBAUTHN_SIGNATURE_BYTES,
+            )?;
+            attach_webauthn_assertion_proof(
+                authorization,
+                &self.credential_id,
+                &authenticator_data,
+                &signature,
+            )
+        }
+    }
+
+    struct CredentialAttestation(*mut WEBAUTHN_CREDENTIAL_ATTESTATION);
+
+    impl CredentialAttestation {
+        fn get(&self) -> Result<&WEBAUTHN_CREDENTIAL_ATTESTATION, RecoveryError> {
+            unsafe { self.0.as_ref() }.ok_or(RecoveryError::PlatformAuthenticatorFailure)
+        }
+    }
+
+    impl Drop for CredentialAttestation {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { WebAuthNFreeCredentialAttestation(self.0) };
+            }
+        }
+    }
+
+    struct Assertion(*mut WEBAUTHN_ASSERTION);
+
+    impl Assertion {
+        fn get(&self) -> Result<&WEBAUTHN_ASSERTION, RecoveryError> {
+            unsafe { self.0.as_ref() }.ok_or(RecoveryError::PlatformAuthenticatorFailure)
+        }
+    }
+
+    impl Drop for Assertion {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { WebAuthNFreeAssertion(self.0) };
+            }
+        }
+    }
+
+    fn copy_bounded(pointer: *const u8, length: u32, max: usize) -> Result<Vec<u8>, RecoveryError> {
+        let length = usize::try_from(length).map_err(|_| RecoveryError::InvalidWebAuthnProof)?;
+        if pointer.is_null() || length == 0 || length > max {
+            return Err(RecoveryError::InvalidWebAuthnProof);
+        }
+        Ok(unsafe { slice::from_raw_parts(pointer, length) }.to_vec())
+    }
+
+    fn interactive_window() -> Result<windows_sys::Win32::Foundation::HWND, RecoveryError> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if !foreground.is_null() {
+            return Ok(foreground);
+        }
+        let console = unsafe { GetConsoleWindow() };
+        if console.is_null() {
+            Err(RecoveryError::PlatformUserVerificationUnavailable)
+        } else {
+            Ok(console)
+        }
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn map_hresult(hr: i32) -> RecoveryError {
+        match hr as u32 {
+            HRESULT_ERROR_CANCELLED | HRESULT_NTE_USER_CANCELLED => {
+                RecoveryError::UserPresenceDenied
+            }
+            _ => RecoveryError::PlatformAuthenticatorFailure,
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub mod macos {
@@ -1853,6 +2296,47 @@ mod tests {
             Err(RecoveryError::InvalidRecoverySignature)
         );
         assert_eq!(credential_id, b"cumg-recovery-credential");
+    }
+
+    #[test]
+    fn attested_es256_public_key_parser_requires_exact_rp_uv_and_credential() {
+        let credential_id = b"cumg-windows-hello-credential";
+        let mut cose = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+        cose.extend_from_slice(&[0x11; 32]);
+        cose.extend_from_slice(&[0x22, 0x58, 0x20]);
+        cose.extend_from_slice(&[0x22; 32]);
+        let mut auth = Vec::new();
+        auth.extend_from_slice(
+            digest::digest(&digest::SHA256, WEBAUTHN_RECOVERY_RP_ID.as_bytes()).as_ref(),
+        );
+        auth.push(WEBAUTHN_FLAG_UP | WEBAUTHN_FLAG_UV | WEBAUTHN_FLAG_AT);
+        auth.extend_from_slice(&0u32.to_be_bytes());
+        auth.extend_from_slice(&[0u8; 16]);
+        auth.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        auth.extend_from_slice(credential_id);
+        auth.extend_from_slice(&cose);
+
+        let public = parse_attested_es256_public_key(&auth, credential_id).unwrap();
+        assert_eq!(public[0], 0x04);
+        assert_eq!(&public[1..33], &[0x11; 32]);
+        assert_eq!(&public[33..], &[0x22; 32]);
+
+        let mut missing_uv = auth.clone();
+        missing_uv[32] &= !WEBAUTHN_FLAG_UV;
+        assert_eq!(
+            parse_attested_es256_public_key(&missing_uv, credential_id),
+            Err(RecoveryError::WebAuthnUserVerificationRequired)
+        );
+        assert_eq!(
+            parse_attested_es256_public_key(&auth, b"wrong"),
+            Err(RecoveryError::WebAuthnCredentialMismatch)
+        );
+        let mut wrong_rp = auth;
+        wrong_rp[0] ^= 1;
+        assert_eq!(
+            parse_attested_es256_public_key(&wrong_rp, credential_id),
+            Err(RecoveryError::WebAuthnRpMismatch)
+        );
     }
 
     #[test]
