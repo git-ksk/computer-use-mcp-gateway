@@ -5,7 +5,10 @@
 //! into one schema suitable for CLI/Agent/UI consumers.
 
 use crate::{
-    v2_doctor::{CheckStatus, DoctorReport, LaneReadiness, ReadinessLanes},
+    v2_doctor::{
+        CheckStatus, CheckpointReaderCompatibility, DoctorReport, LaneReadiness,
+        OperatorToolingStatus, ReadinessLanes, RuntimePairingStatus,
+    },
     v2_operator_handoff::{HandoffInterventionStatus, HandoffRuntimeStatus},
     v2_upgrade_transaction::{
         UpgradeTransactionPhase, UpgradeTransactionRecord, UpgradeTransactionStatus,
@@ -48,6 +51,9 @@ pub enum OperatorReasonCode {
     UpgradeActionRequired,
     MutationAuthorityMismatch,
     RuntimeUnverified,
+    RuntimeSkew,
+    CheckpointReaderIncompatible,
+    RuntimeCompatibilityUnknown,
     ControlPlaneUnavailable,
     BackendUnavailable,
     HandoffActive,
@@ -66,6 +72,9 @@ impl OperatorReasonCode {
             Self::UpgradeActionRequired => "upgrade_action_required",
             Self::MutationAuthorityMismatch => "mutation_authority_mismatch",
             Self::RuntimeUnverified => "runtime_unverified",
+            Self::RuntimeSkew => "runtime_skew",
+            Self::CheckpointReaderIncompatible => "checkpoint_reader_incompatible",
+            Self::RuntimeCompatibilityUnknown => "runtime_compatibility_unknown",
             Self::ControlPlaneUnavailable => "control_plane_unavailable",
             Self::BackendUnavailable => "backend_unavailable",
             Self::HandoffActive => "handoff_active",
@@ -253,6 +262,9 @@ pub struct OperatorRuntimeSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_commit: Option<String>,
     pub verification: RuntimeVerificationStatus,
+    pub runtime_pairing: RuntimePairingStatus,
+    pub operator_tooling: OperatorToolingStatus,
+    pub checkpoint_reader_compatibility: CheckpointReaderCompatibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -362,6 +374,9 @@ pub fn build_operator_status(
         } else {
             RuntimeVerificationStatus::Unverified
         },
+        runtime_pairing: doctor.runtime.runtime_pairing,
+        operator_tooling: doctor.runtime.operator_tooling,
+        checkpoint_reader_compatibility: doctor.runtime.checkpoint_reader_compatibility,
     };
     let maintenance = summarize_maintenance(upgrade_input);
 
@@ -515,6 +530,35 @@ fn primary_operator_state(
     OperatorReasonCode,
     OperatorNextAction,
 ) {
+    if runtime.checkpoint_reader_compatibility == CheckpointReaderCompatibility::Incompatible {
+        return (
+            OperatorOverallStatus::ActionRequired,
+            OperatorReasonCode::CheckpointReaderIncompatible,
+            OperatorNextAction::InspectUpgrade,
+        );
+    }
+    if runtime.runtime_pairing == RuntimePairingStatus::Skewed
+        || matches!(
+            runtime.operator_tooling,
+            OperatorToolingStatus::Stale | OperatorToolingStatus::Unavailable
+        )
+    {
+        return (
+            OperatorOverallStatus::ActionRequired,
+            OperatorReasonCode::RuntimeSkew,
+            OperatorNextAction::InspectUpgrade,
+        );
+    }
+    if runtime.runtime_pairing == RuntimePairingStatus::Unknown
+        || runtime.operator_tooling == OperatorToolingStatus::Unknown
+        || runtime.checkpoint_reader_compatibility == CheckpointReaderCompatibility::Unknown
+    {
+        return (
+            OperatorOverallStatus::ActionRequired,
+            OperatorReasonCode::RuntimeCompatibilityUnknown,
+            OperatorNextAction::InspectUpgrade,
+        );
+    }
     if recovery.quarantine == QuarantineStatus::Present {
         return (
             OperatorOverallStatus::ActionRequired,
@@ -700,6 +744,9 @@ pub fn render_operator_status_text(report: &OperatorStatusReport) -> String {
             "Recovery: {}\n",
             "Replay safe: {}\n",
             "Runtime: {} {}\n",
+            "Runtime pairing: {}\n",
+            "Operator tooling: {}\n",
+            "Checkpoint reader: {}\n",
             "Maintenance: {}\n",
             "Reason: {}\n",
             "Next action: {}"
@@ -716,6 +763,9 @@ pub fn render_operator_status_text(report: &OperatorStatusReport) -> String {
         replay_safe,
         report.runtime.verification.as_str(),
         report.runtime.package_version,
+        report.runtime.runtime_pairing.as_str(),
+        report.runtime.operator_tooling.as_str(),
+        report.runtime.checkpoint_reader_compatibility.as_str(),
         report.maintenance.status.as_str(),
         report.primary_reason.as_str(),
         report.next_action.as_str(),
@@ -763,6 +813,9 @@ mod tests {
                 package_version: "0.3.0".into(),
                 source_commit: Some("a".repeat(40)),
                 manifest_verified: true,
+                runtime_pairing: RuntimePairingStatus::Compatible,
+                operator_tooling: OperatorToolingStatus::Compatible,
+                checkpoint_reader_compatibility: CheckpointReaderCompatibility::Compatible,
             },
             hub: HubSummary {
                 state_schema: Some(8),
@@ -897,6 +950,45 @@ mod tests {
         assert!(!json.contains("checks"));
         assert!(!json.contains("detail"));
         assert!(!json.contains("operation_id"));
+    }
+
+    #[test]
+    fn runtime_skew_routes_to_upgrade_inspection_before_recovery_actions() {
+        let mut doctor = healthy_doctor();
+        doctor.runtime.manifest_verified = false;
+        doctor.runtime.runtime_pairing = RuntimePairingStatus::Skewed;
+        doctor.runtime.operator_tooling = OperatorToolingStatus::Stale;
+        doctor.runtime.checkpoint_reader_compatibility = CheckpointReaderCompatibility::Unknown;
+        let report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::NotConfigured,
+            UpgradeStatusInput::None,
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::ActionRequired);
+        assert_eq!(report.primary_reason, OperatorReasonCode::RuntimeSkew);
+        assert_eq!(report.next_action, OperatorNextAction::InspectUpgrade);
+        assert_eq!(
+            report.runtime.operator_tooling,
+            OperatorToolingStatus::Stale
+        );
+    }
+
+    #[test]
+    fn checkpoint_reader_incompatibility_has_direct_status_reason() {
+        let mut doctor = healthy_doctor();
+        doctor.runtime.checkpoint_reader_compatibility =
+            CheckpointReaderCompatibility::Incompatible;
+        let report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::NotConfigured,
+            UpgradeStatusInput::None,
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::ActionRequired);
+        assert_eq!(
+            report.primary_reason,
+            OperatorReasonCode::CheckpointReaderIncompatible
+        );
+        assert_eq!(report.next_action, OperatorNextAction::InspectUpgrade);
     }
 
     #[test]

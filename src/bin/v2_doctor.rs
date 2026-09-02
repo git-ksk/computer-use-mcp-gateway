@@ -113,6 +113,12 @@ fn main() -> ExitCode {
             report.readiness.lanes.effectful_execution.as_str(),
             report.readiness.lanes.browser_effectful_execution.as_str()
         );
+        println!(
+            "RUNTIME_PAIRING runtime_pairing={} operator_tooling={} checkpoint_reader_compatibility={}",
+            report.runtime.runtime_pairing.as_str(),
+            report.runtime.operator_tooling.as_str(),
+            report.runtime.checkpoint_reader_compatibility.as_str()
+        );
         if let Some(action) = &report.readiness.operator_action {
             println!("OPERATOR_ACTION {action}");
         }
