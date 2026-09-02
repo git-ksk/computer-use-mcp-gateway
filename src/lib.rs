@@ -39,6 +39,7 @@ pub mod v2_handoff_coordinator;
 pub mod v2_incident_brief;
 pub mod v2_interaction_context;
 pub mod v2_limits;
+pub mod v2_linux_fido2_recovery;
 pub mod v2_maintenance;
 pub mod v2_multi_device;
 pub mod v2_observability;

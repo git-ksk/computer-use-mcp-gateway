@@ -1,6 +1,6 @@
 # V2 online recovery acceptance
 
-Status: **automated gate complete on the refreshed PR head; trusted physical macOS Secure Enclave acceptance remains required before release.**
+Status: **automated recovery gate is permanent; trusted physical macOS Secure Enclave acceptance is recorded. Linux FIDO2/CTAP2 remains pre-support until the separate #228 physical UV-capable authenticator acceptance passes.**
 
 Canonical contract: [`../V2_ONLINE_RECOVERY.md`](../V2_ONLINE_RECOVERY.md).
 
@@ -21,9 +21,26 @@ The permanent automated suite must prove:
 - idempotent delivery only for the exact same signed authorization already accepted in the live exchange;
 - rejection of any altered authorization that reuses an accepted request ID, including a conflicting decision or changed evidence;
 - restart preserves the resolved tombstone and does not make the old operation replayable;
+- provider-neutral WebAuthn/CTAP ES256 verification rejects malformed proof, wrong credential/RP/challenge/signature, and missing signed UP/UV;
+- Linux FIDO2 command construction never requests U2F, keeps `pin` vs `builtin` UV explicit, and rejects malformed/oversized libfido2 output before authority publication;
 - existing offline `v2_maint` recovery remains available as break-glass.
 
 The ordinary project gates (`fmt`, `check --locked --all-targets`, tests, clippy `-D warnings`, documentation/link checks, passthrough contract) remain required because online recovery changes the Hub-Agent application schema.
+
+## Trusted physical Linux FIDO2 acceptance (#228)
+
+This gate is deliberately separate from implementation/CI and from Windows Hello acceptance. Until it passes, the Linux provider is an implementation candidate only and documentation/release notes must not claim Linux online-recovery support. Use an operator-controlled Linux desktop, a real UV-capable CTAP2 authenticator, and root-managed libfido2 1.17.0+ tools. Record the exact authenticator model/firmware, Linux distribution/kernel, libfido2 version, Cua version, and CUMG commit without recording PINs, credential private material, raw desktop payloads, or recovery evidence text.
+
+1. Select the exact `/dev/hidraw...` device and inspect it with the pinned `fido2-token -I` binary. Confirm CTAP2/FIDO2, ES256, UP, and the intended UV mechanism (`clientPin` for `--uv-mode pin`, or `uv` for `--uv-mode builtin`). U2F-only/no-UV devices must fail closed.
+2. Run `v2_recover init-linux-fido2` with an explicit root-owned tool directory and device. For PIN mode, confirm the PIN is requested by libfido2 on the controlling tty and never appears in argv/env/CUMG logs/files. For builtin mode, confirm no PIN fallback occurs.
+3. Install only the emitted bounded `recovery-webauthn-verifier.json` on the Hub and restart the Hub. The authenticator private key must remain on-device.
+4. Produce one real durable `Indeterminate` desktop quarantine and obtain a fresh Hub-signed challenge on a strictly current Agent generation.
+5. Attempt `resolve-linux-fido2` and cancel/fail UV. Confirm no `RecoveryAuthorization` is published and quarantine remains durable.
+6. Repeat with the wrong device/credential or wrong UV mode and confirm fail-closed behavior without silent authenticator switching.
+7. Retry with the exact provisioned device and complete UV. Confirm the Hub validates the shared WebAuthn/CTAP proof, durably resolves exactly one quarantine, and returns the exact signed `RecoveryResolved` acknowledgement.
+8. Confirm `old_operation_replayed=false`, a new operation ID may run, and restart preserves the resolution/tombstone.
+9. Exercise `accept-current-state-linux-fido2` only for the existing reviewed `Scroll`/`MovePointer` policy and confirm history remains `Indeterminate`; non-allowlisted capabilities remain rejected.
+10. Remove/unplug the authenticator or remove the Linux provider prerequisites and confirm offline `v2_maint` remains the documented supported break-glass path.
 
 ## Trusted physical Mac acceptance
 

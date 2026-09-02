@@ -259,6 +259,23 @@ fn recovery_cli_requires_explicit_secure_enclave_artifacts() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("export-public"));
 
+    assert!(help.contains("init-linux-fido2"));
+    assert!(help.contains("resolve-linux-fido2"));
+    assert!(help.contains("accept-current-state-linux-fido2"));
+
+    let linux_init = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
+        .args(["init-linux-fido2", "--help"])
+        .output()
+        .unwrap();
+    assert!(linux_init.status.success());
+    let linux_init_help = String::from_utf8(linux_init.stdout).unwrap();
+    assert!(linux_init_help.contains("--tool-dir"));
+    assert!(linux_init_help.contains("--device"));
+    assert!(linux_init_help.contains("--uv-mode"));
+    assert!(linux_init_help.contains("--verifier-out"));
+    assert!(linux_init_help.contains("pin"));
+    assert!(linux_init_help.contains("builtin"));
+
     let init = std::process::Command::new(env!("CARGO_BIN_EXE_v2_recover"))
         .args(["init-key", "--help"])
         .output()

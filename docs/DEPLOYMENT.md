@@ -677,6 +677,8 @@ The optional online quarantine-recovery path is documented in [`v2/V2_ONLINE_REC
 
 For macOS, install `v2_recover` plus the stable-signed `v2_recovery_enclave_helper` alongside `v2_agent`. Provision its Secure Enclave recovery key once from the logged-in Agent account into an owner-private sealed-key file, transfer only the exported P-256 public key through the authenticated administrative channel, and install it as `<HUB_STATE_DIR>/recovery-public-key.p256`. The Hub validates that file with the existing public trust-anchor symlink/permission rules and loads it only at startup. An absent verifier disables online recovery without changing fail-closed quarantine behavior.
 
+For Linux, #228 provides a pre-support FIDO2/CTAP2 provider candidate. It requires root-managed libfido2 1.17.0+ tools, an explicitly selected `/dev/...` authenticator, ES256, signed UP, and explicit `pin` or `builtin` UV. Provisioning installs only `recovery-webauthn-verifier.json` on the Hub; the credential private key remains in the authenticator. Do not claim Linux online recovery supported until the dedicated physical Linux acceptance passes. Deployments without those prerequisites continue to use offline `v2_maint`.
+
 The existing `v2_maint` offline resolver remains required as break-glass for an unreachable Agent, unavailable recovery key, failed local user-presence authorization, or damaged online recovery transport.
 
 ### Online recovery upgrade compatibility

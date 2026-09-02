@@ -44,8 +44,8 @@ const MAX_WEBAUTHN_VERIFIER_BYTES: usize = 4096;
 const MAX_WEBAUTHN_CREDENTIAL_ID_BYTES: usize = 1024;
 const MAX_WEBAUTHN_AUTHENTICATOR_DATA_BYTES: usize = 4096;
 const MAX_WEBAUTHN_SIGNATURE_BYTES: usize = 256;
-const WEBAUTHN_FLAG_UP: u8 = 0x01;
-const WEBAUTHN_FLAG_UV: u8 = 0x04;
+pub(crate) const WEBAUTHN_FLAG_UP: u8 = 0x01;
+pub(crate) const WEBAUTHN_FLAG_UV: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1051,6 +1051,8 @@ pub enum RecoveryError {
     WebAuthnCredentialMismatch,
     WebAuthnRpMismatch,
     WebAuthnUserVerificationRequired,
+    PlatformUserVerificationUnavailable,
+    PlatformAuthenticatorFailure,
 }
 
 impl RecoveryError {
@@ -1083,6 +1085,8 @@ impl RecoveryError {
             Self::WebAuthnCredentialMismatch => "recovery_webauthn_credential_mismatch",
             Self::WebAuthnRpMismatch => "recovery_webauthn_rp_mismatch",
             Self::WebAuthnUserVerificationRequired => "recovery_webauthn_uv_required",
+            Self::PlatformUserVerificationUnavailable => "recovery_platform_uv_unavailable",
+            Self::PlatformAuthenticatorFailure => "recovery_platform_authenticator_failure",
         }
     }
 }

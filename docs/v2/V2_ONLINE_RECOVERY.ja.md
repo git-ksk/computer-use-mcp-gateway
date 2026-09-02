@@ -2,7 +2,7 @@
 
 > 英語版 [`V2_ONLINE_RECOVERY.md`](V2_ONLINE_RECOVERY.md) が正本です。
 
-状態: **明示的な recovery key provisioning を前提に実装済み。trusted physical macOS Secure Enclave user-presence acceptance は完了済みで、current-state acceptance も同じ authority を再利用する。**
+状態: **明示的な recovery key provisioning を前提に実装済み。trusted physical macOS Secure Enclave user-presence acceptance は完了済み。Linux FIDO2/CTAP2 provider は automated contract coverage を持つ実装候補だが、独立した UV-capable authenticator 実機 acceptance が pass するまで Linux support は claim しない。**
 
 この機能は、desktop が durable `Indeterminate` quarantine に入った際、通常運用でHubを停止してoffline maintenanceを行わなくても、端末ユーザーの明示承認により安全に復帰できるようにするものです。既存の no-auto-replay と persistence-gated recovery は維持します。
 
@@ -12,9 +12,11 @@ Agent device identity は recovery authority ではありません。侵害さ�
 
 そこでmacOSでは、Agent keyとは別にP-256 recovery keyを小さなstable-signed CryptoKit helperでSecure Enclaveへ生成し、`userPresence + privateKeyUsage` 制約を付けます。永続化するのはSecure Enclaveのsealed `dataRepresentation`だけで、private key本体はSecure Enclave外へ出ません。sealed fileはCUMGがowner-privateに管理し、Hubには公開鍵だけをpinします。初回provisioningは既存sealed-key pathを再利用せず拒否し、sealed fileとHub側public-key fileの両方でpath/symlink/permissionをfail-closedに検証します。
 
-初期実装のローカル承認providerはmacOSのみです。Windows/Linuxに弱いsoftware-key fallbackは追加せず、同等のuser-presence providerがレビューされるまでは既存のoffline maintenanceを使用します。
+accepted production provider は引き続き macOS Secure Enclave です。Windows Hello は #227 で implementation / CI complete・physical acceptance pending、Linux は #228 で optional FIDO2/CTAP2 実装候補を持ちます。pending platform に弱い software-key fallback は追加せず、provider の明示 prerequisite を満たさない deployment は既存 offline maintenance を使用します。
 
 recovery core には **provider-neutral な WebAuthn/CTAP ES256 verifier contract** も含まれます。これは bounded な credential/public-key document、CUMG client-data への exact challenge binding、RP ID hash、credential ID、ES256 signature、UP/UV 両flagを検証する共有暗号部品です。この verifier の merge/test だけでは Windows Hello、Linux FIDO2、その他platform providerのsupportを**主張しません**。各platform providerはnative provisioning/assertionを別途実装し、supportをclaimする前にそれぞれphysical user-presence acceptanceをpassする必要があります。
+
+Linux candidate は `libfido2-dev` を build dependency にせず、distro で install された libfido2 command-line tools を optional runtime provider として使用します。CUMG は explicit な root-owned tool directory、explicit な `/dev/...` authenticator path、libfido2 tools 1.17.0 以上、CTAP2/FIDO2、ES256、signed user presence、さらに `pin`（Client PIN / PIN-UV Auth）または `builtin`（authenticator内蔵UV）の明示UV modeを要求します。PINをconfig/env/argv/log/CUMG stdinへ渡さず、`pin` modeではlibfido2がcontrolling ttyから取得できる場合だけ進みます。U2F用 `-u` は使用せず、shared Hub verifierもsigned UP/UV両bitがないassertionを独立して拒否します。
 
 ## フロー
 
@@ -31,7 +33,7 @@ cumg-v2-recover status / ユーザーがdesktopを確認
         |
         | exact Human choice:
         | historical resolution OR current-state acceptance
-        | Secure Enclave user-presence署名
+        | platform recovery-provider user-verification署名
         v
 Agentは署名済みRecoveryAuthorizationを中継するだけ
         |
@@ -79,6 +81,37 @@ historical `confirmed_completed` / `confirmed_not_executed` は既存 `resolve_i
 current-state acceptance は terminal resolution ではなく permanent retired-indeterminate replay tombstone を再利用します。durable operation は `Indeterminate`、terminal receipt/result は無し、audit は `outcome=unknown`、`disposition=current_state_accepted`、`authority=local_user_presence`、reviewed policy/generation、bounded Human evidence metadata、`replayed=false` を記録します。解除するのは device quarantine だけです。
 
 どちらの transition も persistence-gated で、checkpoint 永続化に失敗した場合は in-memory execution state を quarantine snapshot へ rollback し、success ACK は返しません。旧operationのresume/replayは一切行わず、後続workは必ず新しいoperation IDです。同一 accepted request ID の exact retransmission は同じ live recovery exchange 内で idempotent に ACK できますが、decision/policy/evidence の conflict は置換できません。
+
+## Linux FIDO2 実装候補
+
+このレーンは review / automated CI 用の実装まで進めていますが、#228 の physical Linux acceptance を記録するまでは **pre-support** です。libfido2 1.17.0+ tools を root 管理の distro/package path へ install し、使用する authenticator device を明示指定します。CUMG は device を自動選択・silent switch しません。`pin` mode は configured Client PIN、`builtin` mode は authenticator-integrated `uv` を要求し、mode間の silent fallback はしません。
+
+専用 ES256 recovery credential を provision します。
+
+```bash
+v2_recover init-linux-fido2 \
+  --tool-dir /usr/bin \
+  --device /dev/hidraw0 \
+  --uv-mode pin \
+  --verifier-out "$HOME/.config/cumg/recovery-webauthn-verifier.json"
+```
+
+bounded verifier document だけを authenticated administrative channel で Hub へ移し、`<HUB_STATE_DIR>/recovery-webauthn-verifier.json` として install して Hub を restart します。authenticator private key と PIN は Hub/Agent state になりません。fresh valid challenge に対しては同じ provider parameters で実行します。
+
+```bash
+v2_recover resolve-linux-fido2 \
+  --state-dir "$HOME/.local/state/cumg-v2-agent" \
+  --hub-public-key-file "$HOME/.config/cumg/hub.pub" \
+  --tool-dir /usr/bin \
+  --device /dev/hidraw0 \
+  --uv-mode pin \
+  --verifier-file "$HOME/.config/cumg/recovery-webauthn-verifier.json" \
+  --decision confirmed-completed \
+  --evidence "local user inspected the current desktop" \
+  --wait-secs 30
+```
+
+reviewed low-impact current-state path は同じ provider/verifier 引数で `accept-current-state-linux-fido2` を使用します。tool/device 欠落、CTAP2/ES256/UP/UV不足、PIN/biometric cancel/failure、malformed tool output、wrong credential/RP/challenge/signature、signed UP/UV不足はいずれも authorization publication 前に fail closed します。unsupported Linux deployment は offline `v2_maint` を継続使用します。
 
 ## macOS provisioning
 
