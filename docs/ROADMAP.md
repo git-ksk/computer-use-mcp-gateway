@@ -50,29 +50,28 @@ Current priorities:
 
 A compatible fix merged after `v0.3.0` may contribute to a future `0.3.1`; the roadmap does not require a release merely because maintenance commits exist.
 
-### Immediate product-readiness execution order
+### Immediate post-v0.3 execution order
 
-The current priority is to finish the **single-Mac operator/product path before expanding recovery parity to additional desktop platforms**. Cross-platform recovery remains important, but adding another platform-backed recovery provider does not remove the largest current usability gaps for an already supported deployment.
+The `0.3.x` Product Readiness closeout is complete. `0.4.0` Recovery & Reconciliation should now be executed as **three explicit lanes** so a manual physical-acceptance gate does not unnecessarily serialize unrelated implementation work: shared/provider implementation, physical platform acceptance, and parallel dogfood hardening.
 
-The `0.3.x` Product Readiness closeout is now complete; the table below records the completed gate and the explicitly non-blocking stabilization/future work:
-
-| Closeout track | Issues | Status | Blocks current `0.3.x` closeout? |
+| `0.4.0` track | Issues / PR | Status | Release role |
 | --- | --- | --- | --- |
-| Operator/recovery foundation | #226, #233, #234, #235, #109 | Complete | No |
-| Guided quarantine recovery | #236 | Complete | No |
-| Artifact-backed install/upgrade | #237 | Complete | No — implemented closeout evidence |
-| Cross-cutting Product Readiness closeout | #213 | Complete | No — standing gate is now [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) |
-| Compatible stabilization backlog | #215, #115, #104, #111, bounded #96 work | Parallel/deferred | No, unless new evidence exposes a released regression |
-| Cross-platform recovery parity | #217, #227, #228 | Planned for `0.4.0` | No |
+| Core recovery semantics | #103, #137, #136 | Complete | Baseline complete |
+| Shared WebAuthn/CTAP verifier | #256 | Next / active | Required shared dependency for Windows/Linux parity; no platform support claim by itself |
+| Windows Hello provider | #227 / PR #252 | Implementation + CI green; physical acceptance pending | Blocks Windows online-recovery support/parity closeout, but must not block unrelated implementation |
+| Linux FIDO2 UV provider | #228 | Proceed after the shared verifier lands; physical acceptance required before support claim | Blocks Linux online-recovery support/parity closeout only if Linux provider support is claimed |
+| Recovery dogfood hardening | #253, #254, #115, #255 | Parallel | Non-blocking unless implementation/evidence exposes a released safety or recovery invariant failure |
+| Other compatible stabilization | #215, #104, #111, bounded #96 work | Parallel/deferred | Non-blocking unless new evidence exposes a released regression |
 
 Use this ordering unless new evidence exposes a released safety regression:
 
-1. **Completed operator/recovery workflow:** #226 lane-scoped readiness, #233 operator-ready incident brief, #234 durable/inspectable single-Mac upgrade transactions, #235 unified operator status, #109 exact durable online-recovery completion confirmation, and #236 guided quarantine recovery are complete.
-2. **Complete the product workflow:** #237 provides the reviewed single-Mac source-free artifact install/upgrade path with exact CUMG/Handoff pairing, fail-closed verification, one-shot upgrade, paired rollback, and installed doctor/status verification.
-3. **Completed cross-cutting gate:** #213 reviewed the resulting single-Mac product path end to end and established [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) as the standing per-release gate. The compatible stabilization backlog remains non-blocking unless its evidence invalidates a release invariant.
-4. **Broaden Recovery & Reconciliation in dependency order:** #103 durable effectful operation identity/status, #137 reviewed local-Human current-state acceptance, and #136 permanent replay-tombstone / bounded-history separation are complete; next #217/#227/#228 complete cross-platform user-presence recovery parity.
+1. **Keep the completed recovery core fixed:** #103 durable effectful operation identity/status, #137 reviewed local-Human current-state acceptance, and #136 permanent replay-tombstone / bounded-history separation are complete and remain the `0.4.0` semantic baseline.
+2. **Decouple shared protocol work from manual Windows acceptance:** #256 extracts the provider-neutral WebAuthn/CTAP ES256 verifier from PR #252 into an independently reviewable change. The shared verifier may merge without claiming Windows/Linux provider support.
+3. **Run provider implementation and physical acceptance as separate lanes:** keep #227 / PR #252 preserved with all automated checks green while physical Windows Hello acceptance is pending. Once #256 lands, #228 may implement the Linux FIDO2 UV provider against the same verifier contract instead of waiting for the Windows physical test. Any platform support claim still requires that platform's explicit physical acceptance.
+4. **Use physical-acceptance wait time for bounded recovery hardening:** prioritize #253 installed runtime/operator-tool skew detection and #254 recovery-key readiness, then #115 actionable `device_indeterminate` guidance and #255 Human historical-resolution guidance. These are compatible `0.4`-era dogfood improvements, not automatic release blockers; promote one only if its evidence shows an existing safety/recovery invariant is not actually satisfied.
+5. **Close cross-platform parity deliberately:** #217 closes only when the platform providers actually claimed as supported have the required implementation, user-presence proof, durable recovery/no-replay evidence, and physical acceptance. A pending manual acceptance must remain visible as an acceptance gate rather than being described as unimplemented work.
 
-This is a sequencing decision, not a de-scope of Windows/Linux recovery. The `0.3.x` Product Readiness path is complete. The partially implemented #227 work remains preserved but is not an immediate dependency of #103/#137/#136; resume platform-provider implementation in its dedicated parity slot, or earlier only if concrete production evidence makes Windows/Linux online recovery a higher-priority safety/operability requirement.
+This sequencing keeps the release boundary narrow: it avoids turning `0.4.0` into an unbounded backlog-clearing exercise while also avoiding idle time when a physical Windows/Linux acceptance step is inconvenient or unavailable. `0.5.0` authorization/identity work remains separate; in particular #221 may continue design review, but implementation is not pulled into the recovery milestone.
 
 ### Legacy V1 retirement candidate
 
@@ -95,8 +94,8 @@ CUMG is now past the initial V2 production-hardening release. Post-v0.3 work sho
 The working sequence is:
 
 - **`0.3.x` — Product Readiness & Stabilization:** #237 and the #213 cross-cutting closeout are complete; future releases reuse the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate. The #226/#233/#234/#235/#109/#236 operator/recovery foundation and #224 release-candidate artifact boundary are complete. Compatible non-blocking stabilization may continue through #215, #115, #104, #111, and the bounded investigation/documentation part of #96 without making the milestone an unbounded backlog-clearing exercise.
-- **`0.4.0` — Recovery & Reconciliation:** #103, #137, and #136 are complete. Permanent replay denial is separated from bounded detailed retirement history, and effectful Desktop/Browser work has caller-retained durable operation identity/status, and reviewed `Scroll`/`MovePointer` ambiguity can be retired as `current_state_accepted` only after exact local-user-presence authorization while historical outcome remains `Indeterminate` and the old ID remains permanently non-replayable. Next is cross-platform user-presence recovery parity (#217/#227/#228).
-- **`0.5.0` — Multi-principal Identity:** add provider-neutral OIDC/JWT caller identity (#139) while preserving the existing exact `principal -> device -> capability` authorizer and existing single-principal/introspection adapters.
+- **`0.4.0` — Recovery & Reconciliation:** #103, #137, and #136 are complete. Next, #256 extracts the shared WebAuthn/CTAP verifier so #227 Windows Hello and #228 Linux FIDO2 provider work do not serialize on a manual platform acceptance. PR #252 is implementation/CI-complete but remains explicitly physical-Windows-acceptance pending. In parallel, #253/#254/#115/#255 form a bounded non-blocking recovery-dogfood hardening lane unless new evidence exposes a released invariant failure. #217 remains the parity umbrella and physical acceptance is required before claiming each platform provider supported.
+- **`0.5.0` — Multi-principal Identity & Authorization:** add provider-neutral OIDC/JWT caller identity (#139) and narrow-only typed semantic constraints (#221) while preserving the existing exact `principal -> device -> capability` authorizer, single-principal/introspection adapters, and separate grant/recovery/Handoff authorities.
 - **`0.6.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through bounded retrievable output (#83), ranged/deterministic filesystem observation (#105), and atomic workspace mutation under explicitly separate writable roots (#107).
 - **`0.7.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106) and separately sandboxed Playwright/E2E execution (#114), informed by the Unix containment investigation in #96 rather than by background-shell escape compatibility.
 
