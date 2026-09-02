@@ -8,7 +8,7 @@ use linux_fido2::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 use computer_use_mcp_gateway::v2_online_recovery::{
     RecoveryAuditAssessment, new_authorization, new_current_state_acceptance_authorization,
     recovery_decision_name, store_authorization,
@@ -30,7 +30,7 @@ use computer_use_mcp_gateway::{
     },
     v2_operator_status::OperatorOverallStatus,
 };
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
