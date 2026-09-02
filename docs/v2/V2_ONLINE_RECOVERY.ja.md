@@ -14,6 +14,8 @@ Agent device identity は recovery authority ではありません。侵害さ�
 
 初期実装のローカル承認providerはmacOSのみです。Windows/Linuxに弱いsoftware-key fallbackは追加せず、同等のuser-presence providerがレビューされるまでは既存のoffline maintenanceを使用します。
 
+recovery core には **provider-neutral な WebAuthn/CTAP ES256 verifier contract** も含まれます。これは bounded な credential/public-key document、CUMG client-data への exact challenge binding、RP ID hash、credential ID、ES256 signature、UP/UV 両flagを検証する共有暗号部品です。この verifier の merge/test だけでは Windows Hello、Linux FIDO2、その他platform providerのsupportを**主張しません**。各platform providerはnative provisioning/assertionを別途実装し、supportをclaimする前にそれぞれphysical user-presence acceptanceをpassする必要があります。
+
 ## フロー
 
 ```text

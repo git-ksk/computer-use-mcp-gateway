@@ -11,6 +11,7 @@ use crate::v2_execution_safety::{DesktopQuarantine, IndeterminateReason, Retirem
 use crate::v2_m0_execution::IndeterminateResolution;
 use crate::v2_m0_transport::HubIdentity;
 use crate::v2_m1_keys::{KeyMaterialError, load_public_trust_bytes};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier as _, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
 use ring::{digest, signature};
@@ -26,6 +27,9 @@ pub const RECOVERY_CHALLENGE_TTL_MS: u64 = 300_000;
 pub const MAX_RECOVERY_EVIDENCE_BYTES: usize = 1024;
 pub const MAX_RECOVERY_FILE_BYTES: usize = 16 * 1024;
 pub const RECOVERY_PUBLIC_KEY_FILENAME: &str = "recovery-public-key.p256";
+pub const RECOVERY_WEBAUTHN_VERIFIER_FILENAME: &str = "recovery-webauthn-verifier.json";
+pub const WEBAUTHN_RECOVERY_RP_ID: &str = "cumg-recovery.invalid";
+pub const WEBAUTHN_RECOVERY_ORIGIN: &str = "https://cumg-recovery.invalid";
 pub const RECOVERY_CHALLENGE_FILENAME: &str = "recovery-challenge.json";
 pub const RECOVERY_AUTHORIZATION_FILENAME: &str = "recovery-authorization.json";
 pub const RECOVERY_RESOLVED_FILENAME: &str = "recovery-resolved.json";
@@ -34,6 +38,14 @@ const CHALLENGE_DOMAIN: &[u8] = b"cumg-v2-online-recovery-challenge-v1";
 const AUTHORIZATION_DOMAIN: &[u8] = b"cumg-v2-online-recovery-authorization-v1";
 const RESULT_DOMAIN: &[u8] = b"cumg-v2-online-recovery-result-v1";
 const FINGERPRINT_DOMAIN: &[u8] = b"cumg-v2-quarantine-fingerprint-v1";
+const WEBAUTHN_PROOF_SCHEMA_VERSION: u16 = 1;
+const WEBAUTHN_VERIFIER_SCHEMA_VERSION: u16 = 1;
+const MAX_WEBAUTHN_VERIFIER_BYTES: usize = 4096;
+const MAX_WEBAUTHN_CREDENTIAL_ID_BYTES: usize = 1024;
+const MAX_WEBAUTHN_AUTHENTICATOR_DATA_BYTES: usize = 4096;
+const MAX_WEBAUTHN_SIGNATURE_BYTES: usize = 256;
+const WEBAUTHN_FLAG_UP: u8 = 0x01;
+const WEBAUTHN_FLAG_UV: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,41 +115,159 @@ pub struct RecoveryResolved {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebAuthnRecoveryVerifierDocument {
+    pub schema_version: u16,
+    pub credential_id_base64url: String,
+    pub public_key_x963_base64url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebAuthnAssertionProof {
+    schema_version: u16,
+    credential_id_base64url: String,
+    authenticator_data_base64url: String,
+    signature_base64url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WebAuthnClientData<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    challenge: String,
+    origin: &'a str,
+    #[serde(rename = "crossOrigin")]
+    cross_origin: bool,
+}
+
+#[derive(Clone)]
+enum RecoveryVerifierKind {
+    DirectP256 {
+        public_key: [u8; 65],
+    },
+    WebAuthnEs256 {
+        credential_id: Vec<u8>,
+        public_key: [u8; 65],
+    },
+}
+
 #[derive(Clone)]
 pub struct RecoveryVerifier {
-    public_key: [u8; 65],
+    kind: RecoveryVerifierKind,
 }
 
 impl RecoveryVerifier {
     pub fn from_x963_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
-        let public_key: [u8; 65] = bytes
-            .try_into()
-            .map_err(|_| RecoveryError::InvalidPublicKey)?;
-        if public_key[0] != 0x04 {
+        let public_key = validate_p256_public_key(bytes)?;
+        Ok(Self {
+            kind: RecoveryVerifierKind::DirectP256 { public_key },
+        })
+    }
+
+    pub fn from_webauthn_es256(
+        credential_id: &[u8],
+        public_key: &[u8],
+    ) -> Result<Self, RecoveryError> {
+        if credential_id.is_empty() || credential_id.len() > MAX_WEBAUTHN_CREDENTIAL_ID_BYTES {
             return Err(RecoveryError::InvalidPublicKey);
         }
-        Ok(Self { public_key })
+        let public_key = validate_p256_public_key(public_key)?;
+        Ok(Self {
+            kind: RecoveryVerifierKind::WebAuthnEs256 {
+                credential_id: credential_id.to_vec(),
+                public_key,
+            },
+        })
     }
 
     pub fn load_optional(state_dir: &Path) -> Result<Option<Self>, RecoveryError> {
-        let path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
-        let bytes = match load_public_trust_bytes(&path, 65) {
-            Ok(bytes) => bytes,
+        let direct_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
+        let webauthn_path = state_dir.join(RECOVERY_WEBAUTHN_VERIFIER_FILENAME);
+        let direct = match load_public_trust_bytes(&direct_path, 65) {
+            Ok(bytes) => Some(bytes),
             Err(KeyMaterialError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
+                None
             }
             Err(_) => return Err(RecoveryError::UnsafeTrustAnchor),
         };
-        Self::from_x963_bytes(&bytes).map(Some)
+        let webauthn =
+            match load_public_trust_bytes(&webauthn_path, MAX_WEBAUTHN_VERIFIER_BYTES as u64) {
+                Ok(bytes) => Some(bytes),
+                Err(KeyMaterialError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    None
+                }
+                Err(_) => return Err(RecoveryError::UnsafeTrustAnchor),
+            };
+        match (direct, webauthn) {
+            (None, None) => Ok(None),
+            (Some(bytes), None) => Self::from_x963_bytes(&bytes).map(Some),
+            (None, Some(bytes)) => Self::from_webauthn_document(&bytes).map(Some),
+            (Some(_), Some(_)) => Err(RecoveryError::ConflictingRecoveryVerifiers),
+        }
+    }
+
+    pub fn from_webauthn_document(bytes: &[u8]) -> Result<Self, RecoveryError> {
+        if bytes.is_empty() || bytes.len() > MAX_WEBAUTHN_VERIFIER_BYTES {
+            return Err(RecoveryError::InvalidPublicKey);
+        }
+        let document: WebAuthnRecoveryVerifierDocument =
+            serde_json::from_slice(bytes).map_err(|_| RecoveryError::InvalidPublicKey)?;
+        if document.schema_version != WEBAUTHN_VERIFIER_SCHEMA_VERSION {
+            return Err(RecoveryError::UnsupportedSchema);
+        }
+        let credential_id = decode_base64url_bounded(
+            &document.credential_id_base64url,
+            MAX_WEBAUTHN_CREDENTIAL_ID_BYTES,
+        )?;
+        let public_key = decode_base64url_bounded(&document.public_key_x963_base64url, 65)?;
+        Self::from_webauthn_es256(&credential_id, &public_key)
+    }
+
+    pub fn webauthn_document(&self) -> Option<WebAuthnRecoveryVerifierDocument> {
+        match &self.kind {
+            RecoveryVerifierKind::DirectP256 { .. } => None,
+            RecoveryVerifierKind::WebAuthnEs256 {
+                credential_id,
+                public_key,
+            } => Some(WebAuthnRecoveryVerifierDocument {
+                schema_version: WEBAUTHN_VERIFIER_SCHEMA_VERSION,
+                credential_id_base64url: URL_SAFE_NO_PAD.encode(credential_id),
+                public_key_x963_base64url: URL_SAFE_NO_PAD.encode(public_key),
+            }),
+        }
     }
 
     pub fn public_key_bytes(&self) -> [u8; 65] {
-        self.public_key
+        match &self.kind {
+            RecoveryVerifierKind::DirectP256 { public_key }
+            | RecoveryVerifierKind::WebAuthnEs256 { public_key, .. } => *public_key,
+        }
     }
 
     pub fn key_id(&self) -> String {
-        let digest = digest::digest(&digest::SHA256, &self.public_key);
-        let mut out = String::from("p256:");
+        let mut material = Vec::new();
+        match &self.kind {
+            RecoveryVerifierKind::DirectP256 { public_key } => {
+                material.extend_from_slice(public_key);
+            }
+            RecoveryVerifierKind::WebAuthnEs256 {
+                credential_id,
+                public_key,
+            } => {
+                material.extend_from_slice(credential_id);
+                material.extend_from_slice(public_key);
+            }
+        }
+        let digest = digest::digest(&digest::SHA256, &material);
+        let prefix = match &self.kind {
+            RecoveryVerifierKind::DirectP256 { .. } => "p256:",
+            RecoveryVerifierKind::WebAuthnEs256 { .. } => "webauthn-es256:",
+        };
+        let mut out = String::from(prefix);
         for byte in &digest.as_ref()[..8] {
             use std::fmt::Write as _;
             let _ = write!(&mut out, "{byte:02x}");
@@ -153,10 +283,146 @@ impl RecoveryVerifier {
     ) -> Result<(), RecoveryError> {
         validate_authorization_against_challenge(challenge, authorization, now_ms)?;
         let message = authorization_signing_bytes(authorization)?;
-        signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, self.public_key)
-            .verify(&message, &authorization.signature)
-            .map_err(|_| RecoveryError::InvalidRecoverySignature)
+        match &self.kind {
+            RecoveryVerifierKind::DirectP256 { public_key } => {
+                signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, public_key)
+                    .verify(&message, &authorization.signature)
+                    .map_err(|_| RecoveryError::InvalidRecoverySignature)
+            }
+            RecoveryVerifierKind::WebAuthnEs256 {
+                credential_id,
+                public_key,
+            } => verify_webauthn_authorization_proof(
+                credential_id,
+                public_key,
+                authorization,
+                &message,
+            ),
+        }
     }
+}
+
+pub fn webauthn_client_data_json(
+    authorization: &RecoveryAuthorization,
+) -> Result<Vec<u8>, RecoveryError> {
+    let signing_bytes = authorization_signing_bytes(authorization)?;
+    let challenge = digest::digest(&digest::SHA256, &signing_bytes);
+    serde_json::to_vec(&WebAuthnClientData {
+        kind: "webauthn.get",
+        challenge: URL_SAFE_NO_PAD.encode(challenge.as_ref()),
+        origin: WEBAUTHN_RECOVERY_ORIGIN,
+        cross_origin: false,
+    })
+    .map_err(|_| RecoveryError::InvalidMessage)
+}
+
+pub fn attach_webauthn_assertion_proof(
+    mut authorization: RecoveryAuthorization,
+    credential_id: &[u8],
+    authenticator_data: &[u8],
+    assertion_signature: &[u8],
+) -> Result<RecoveryAuthorization, RecoveryError> {
+    if !authorization.signature.is_empty()
+        || credential_id.is_empty()
+        || credential_id.len() > MAX_WEBAUTHN_CREDENTIAL_ID_BYTES
+        || authenticator_data.len() < 37
+        || authenticator_data.len() > MAX_WEBAUTHN_AUTHENTICATOR_DATA_BYTES
+        || assertion_signature.is_empty()
+        || assertion_signature.len() > MAX_WEBAUTHN_SIGNATURE_BYTES
+    {
+        return Err(RecoveryError::InvalidMessage);
+    }
+    let proof = WebAuthnAssertionProof {
+        schema_version: WEBAUTHN_PROOF_SCHEMA_VERSION,
+        credential_id_base64url: URL_SAFE_NO_PAD.encode(credential_id),
+        authenticator_data_base64url: URL_SAFE_NO_PAD.encode(authenticator_data),
+        signature_base64url: URL_SAFE_NO_PAD.encode(assertion_signature),
+    };
+    authorization.signature =
+        serde_json::to_vec(&proof).map_err(|_| RecoveryError::InvalidMessage)?;
+    if authorization.signature.len() > MAX_RECOVERY_FILE_BYTES / 2 {
+        return Err(RecoveryError::InvalidMessage);
+    }
+    Ok(authorization)
+}
+
+fn verify_webauthn_authorization_proof(
+    expected_credential_id: &[u8],
+    public_key: &[u8; 65],
+    authorization: &RecoveryAuthorization,
+    signing_bytes: &[u8],
+) -> Result<(), RecoveryError> {
+    if authorization.signature.is_empty()
+        || authorization.signature.len() > MAX_RECOVERY_FILE_BYTES / 2
+    {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    let proof: WebAuthnAssertionProof = serde_json::from_slice(&authorization.signature)
+        .map_err(|_| RecoveryError::InvalidWebAuthnProof)?;
+    if proof.schema_version != WEBAUTHN_PROOF_SCHEMA_VERSION {
+        return Err(RecoveryError::UnsupportedSchema);
+    }
+    let credential_id = decode_base64url_bounded(
+        &proof.credential_id_base64url,
+        MAX_WEBAUTHN_CREDENTIAL_ID_BYTES,
+    )?;
+    if credential_id != expected_credential_id {
+        return Err(RecoveryError::WebAuthnCredentialMismatch);
+    }
+    let authenticator_data = decode_base64url_bounded(
+        &proof.authenticator_data_base64url,
+        MAX_WEBAUTHN_AUTHENTICATOR_DATA_BYTES,
+    )?;
+    if authenticator_data.len() < 37 {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    let rp_hash = digest::digest(&digest::SHA256, WEBAUTHN_RECOVERY_RP_ID.as_bytes());
+    if &authenticator_data[..32] != rp_hash.as_ref() {
+        return Err(RecoveryError::WebAuthnRpMismatch);
+    }
+    let flags = authenticator_data[32];
+    if flags & WEBAUTHN_FLAG_UP == 0 || flags & WEBAUTHN_FLAG_UV == 0 {
+        return Err(RecoveryError::WebAuthnUserVerificationRequired);
+    }
+    let signature_bytes =
+        decode_base64url_bounded(&proof.signature_base64url, MAX_WEBAUTHN_SIGNATURE_BYTES)?;
+    let client_data = serde_json::to_vec(&WebAuthnClientData {
+        kind: "webauthn.get",
+        challenge: URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, signing_bytes).as_ref()),
+        origin: WEBAUTHN_RECOVERY_ORIGIN,
+        cross_origin: false,
+    })
+    .map_err(|_| RecoveryError::InvalidMessage)?;
+    let client_hash = digest::digest(&digest::SHA256, &client_data);
+    let mut signed = Vec::with_capacity(authenticator_data.len() + client_hash.as_ref().len());
+    signed.extend_from_slice(&authenticator_data);
+    signed.extend_from_slice(client_hash.as_ref());
+    signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, public_key)
+        .verify(&signed, &signature_bytes)
+        .map_err(|_| RecoveryError::InvalidRecoverySignature)
+}
+
+fn validate_p256_public_key(bytes: &[u8]) -> Result<[u8; 65], RecoveryError> {
+    let public_key: [u8; 65] = bytes
+        .try_into()
+        .map_err(|_| RecoveryError::InvalidPublicKey)?;
+    if public_key[0] != 0x04 {
+        return Err(RecoveryError::InvalidPublicKey);
+    }
+    Ok(public_key)
+}
+
+fn decode_base64url_bounded(value: &str, max: usize) -> Result<Vec<u8>, RecoveryError> {
+    if value.is_empty() || value.len() > max.saturating_mul(2).saturating_add(16) {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| RecoveryError::InvalidWebAuthnProof)?;
+    if decoded.is_empty() || decoded.len() > max {
+        return Err(RecoveryError::InvalidWebAuthnProof);
+    }
+    Ok(decoded)
 }
 
 pub fn build_recovery_challenge(
@@ -780,6 +1046,11 @@ pub enum RecoveryError {
     KeyAlreadyExists,
     AuthorizationAlreadyPending,
     UserPresenceDenied,
+    ConflictingRecoveryVerifiers,
+    InvalidWebAuthnProof,
+    WebAuthnCredentialMismatch,
+    WebAuthnRpMismatch,
+    WebAuthnUserVerificationRequired,
 }
 
 impl RecoveryError {
@@ -807,6 +1078,11 @@ impl RecoveryError {
             Self::KeyAlreadyExists => "recovery_key_already_exists",
             Self::AuthorizationAlreadyPending => "recovery_authorization_pending",
             Self::UserPresenceDenied => "recovery_user_presence_denied",
+            Self::ConflictingRecoveryVerifiers => "recovery_conflicting_verifiers",
+            Self::InvalidWebAuthnProof => "recovery_webauthn_invalid_proof",
+            Self::WebAuthnCredentialMismatch => "recovery_webauthn_credential_mismatch",
+            Self::WebAuthnRpMismatch => "recovery_webauthn_rp_mismatch",
+            Self::WebAuthnUserVerificationRequired => "recovery_webauthn_uv_required",
         }
     }
 }
@@ -828,7 +1104,7 @@ impl std::error::Error for RecoveryError {}
 #[cfg(target_os = "macos")]
 pub mod macos {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Serialize};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -1452,6 +1728,143 @@ mod tests {
         assert!(matches!(
             verifier.verify_authorization(&challenge, &tampered, 101),
             Err(RecoveryError::InvalidRecoverySignature)
+        ));
+    }
+
+    fn webauthn_authorization(
+        flags: u8,
+    ) -> (
+        RecoveryChallenge,
+        RecoveryVerifier,
+        RecoveryAuthorization,
+        Vec<u8>,
+    ) {
+        let hub = HubIdentity::generate();
+        let challenge = build_recovery_challenge(&hub, &quarantine(), 5, 100).unwrap();
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let credential_id = b"cumg-recovery-credential".to_vec();
+        let verifier =
+            RecoveryVerifier::from_webauthn_es256(&credential_id, key.public_key().as_ref())
+                .unwrap();
+        let authorization = new_authorization(
+            &challenge,
+            RecoveryAuditAssessment::Inconclusive,
+            IndeterminateResolution::ConfirmedCompleted,
+            "user verified the local recovery action",
+        )
+        .unwrap();
+        let mut authenticator_data = Vec::new();
+        authenticator_data.extend_from_slice(
+            digest::digest(&digest::SHA256, WEBAUTHN_RECOVERY_RP_ID.as_bytes()).as_ref(),
+        );
+        authenticator_data.push(flags);
+        authenticator_data.extend_from_slice(&1_u32.to_be_bytes());
+        let client_data = webauthn_client_data_json(&authorization).unwrap();
+        let client_hash = digest::digest(&digest::SHA256, &client_data);
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(client_hash.as_ref());
+        let assertion_signature = key.sign(&rng, &signed).unwrap();
+        let authorization = attach_webauthn_assertion_proof(
+            authorization,
+            &credential_id,
+            &authenticator_data,
+            assertion_signature.as_ref(),
+        )
+        .unwrap();
+        (challenge, verifier, authorization, credential_id)
+    }
+
+    #[test]
+    fn webauthn_authorization_requires_exact_credential_rp_up_uv_and_signature() {
+        let (challenge, verifier, authorization, credential_id) =
+            webauthn_authorization(WEBAUTHN_FLAG_UP | WEBAUTHN_FLAG_UV);
+        verifier
+            .verify_authorization(&challenge, &authorization, 101)
+            .unwrap();
+
+        let (_, _, no_uv, _) = webauthn_authorization(WEBAUTHN_FLAG_UP);
+        assert_eq!(
+            verifier.verify_authorization(&challenge, &no_uv, 101),
+            Err(RecoveryError::ChallengeMismatch),
+            "a proof from another exact challenge must fail before proof evaluation"
+        );
+
+        let (uv_challenge, uv_verifier, missing_uv, _) = webauthn_authorization(WEBAUTHN_FLAG_UP);
+        assert_eq!(
+            uv_verifier.verify_authorization(&uv_challenge, &missing_uv, 101),
+            Err(RecoveryError::WebAuthnUserVerificationRequired)
+        );
+
+        let (up_challenge, up_verifier, missing_up, _) = webauthn_authorization(WEBAUTHN_FLAG_UV);
+        assert_eq!(
+            up_verifier.verify_authorization(&up_challenge, &missing_up, 101),
+            Err(RecoveryError::WebAuthnUserVerificationRequired)
+        );
+
+        let mut malformed = authorization.clone();
+        malformed.signature = b"not-json".to_vec();
+        assert_eq!(
+            verifier.verify_authorization(&challenge, &malformed, 101),
+            Err(RecoveryError::InvalidWebAuthnProof)
+        );
+
+        let proof: WebAuthnAssertionProof =
+            serde_json::from_slice(&authorization.signature).unwrap();
+        let mut wrong_credential = proof.clone();
+        wrong_credential.credential_id_base64url = URL_SAFE_NO_PAD.encode(b"wrong-credential");
+        let mut changed = authorization.clone();
+        changed.signature = serde_json::to_vec(&wrong_credential).unwrap();
+        assert_eq!(
+            verifier.verify_authorization(&challenge, &changed, 101),
+            Err(RecoveryError::WebAuthnCredentialMismatch)
+        );
+
+        let mut wrong_rp = proof.clone();
+        let mut auth_data = URL_SAFE_NO_PAD
+            .decode(&wrong_rp.authenticator_data_base64url)
+            .unwrap();
+        auth_data[..32].copy_from_slice(digest::digest(&digest::SHA256, b"wrong.invalid").as_ref());
+        wrong_rp.authenticator_data_base64url = URL_SAFE_NO_PAD.encode(&auth_data);
+        changed.signature = serde_json::to_vec(&wrong_rp).unwrap();
+        assert_eq!(
+            verifier.verify_authorization(&challenge, &changed, 101),
+            Err(RecoveryError::WebAuthnRpMismatch)
+        );
+
+        let mut wrong_signature = proof.clone();
+        wrong_signature.signature_base64url = URL_SAFE_NO_PAD.encode(b"invalid-signature");
+        changed.signature = serde_json::to_vec(&wrong_signature).unwrap();
+        assert_eq!(
+            verifier.verify_authorization(&challenge, &changed, 101),
+            Err(RecoveryError::InvalidRecoverySignature)
+        );
+
+        let mut tampered = authorization.clone();
+        tampered.decision = RecoveryDecision::ConfirmedNotExecuted;
+        assert_eq!(
+            verifier.verify_authorization(&challenge, &tampered, 101),
+            Err(RecoveryError::InvalidRecoverySignature)
+        );
+        assert_eq!(credential_id, b"cumg-recovery-credential");
+    }
+
+    #[test]
+    fn webauthn_verifier_document_is_bounded_and_round_trips() {
+        let (_, verifier, _, _) = webauthn_authorization(WEBAUTHN_FLAG_UP | WEBAUTHN_FLAG_UV);
+        let document = verifier.webauthn_document().unwrap();
+        let encoded = serde_json::to_vec(&document).unwrap();
+        let restored = RecoveryVerifier::from_webauthn_document(&encoded).unwrap();
+        assert_eq!(restored.public_key_bytes(), verifier.public_key_bytes());
+        assert!(restored.key_id().starts_with("webauthn-es256:"));
+
+        let mut invalid = document;
+        invalid.credential_id_base64url = String::new();
+        assert!(matches!(
+            RecoveryVerifier::from_webauthn_document(&serde_json::to_vec(&invalid).unwrap()),
+            Err(RecoveryError::InvalidWebAuthnProof)
         ));
     }
 
