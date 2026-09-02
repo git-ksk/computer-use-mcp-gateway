@@ -14,6 +14,8 @@ Online recovery therefore uses a separately provisioned endpoint recovery key. O
 
 The initial implementation is intentionally macOS-only for local approval. Windows and Linux do not gain a weaker software-key substitute; they continue to use the existing explicit offline maintenance path until an equivalent reviewed user-presence provider exists.
 
+The recovery core also contains a **provider-neutral WebAuthn/CTAP ES256 verifier contract**. It validates the bounded credential/public-key document, exact CUMG client-data challenge binding, RP ID hash, credential ID, ES256 signature, and both UP/UV flags. That verifier is shared cryptographic plumbing only: merging or testing it does **not** claim Windows Hello, Linux FIDO2, or any other platform provider as supported. Each platform provider must separately implement native provisioning/assertion behavior and pass its own physical user-presence acceptance before support is claimed.
+
 ## Protocol
 
 ```text
