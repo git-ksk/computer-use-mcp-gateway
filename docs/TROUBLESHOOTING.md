@@ -157,7 +157,7 @@ This is separate from backend desktop serialization and separate from reverse-pr
 
 ## V2 returns `device_indeterminate`
 
-`device_indeterminate` means an **earlier state-changing operation has an unproven outcome and is already quarantining the device**. The returned `blocking_operation_id` names that earlier ambiguous operation; it is not a new retry ID for the request that was just refused. Do not replay the old operation or clear state merely because the Agent reconnects.
+`device_indeterminate` means an **earlier state-changing operation has an unproven outcome and is already quarantining the device**. The operation may already have executed. The returned `blocking_operation_id` names that earlier ambiguous operation; it is not a new retry ID for the request that was just refused. Northbound tool errors therefore return `execution_may_have_occurred=true`, `retry_safe=false`, `blind_replay_safe=false`, `next_action=get_operation_then_reconcile` when the exact blocking ID is available, and `follow_up_effectful_operation=new_operation_id_required`. Do not replay the old operation or clear state merely because the Agent reconnects. Use `get_operation(blocking_operation_id)` first when available; if it remains indeterminate, reconcile with the reviewed recovery path or independent read-only observation before creating any new effectful operation.
 
 For the normal single-Mac operator path, use the guided recovery workflow instead of memorizing the individual inspection/resolution commands:
 

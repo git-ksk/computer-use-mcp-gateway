@@ -263,6 +263,12 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
         Err(HubCommandError::DeviceIndeterminate { operation_id })
             if operation_id == ambiguous_click_operation
     ));
+    let ambiguous_click_calls = std::fs::read_to_string(&ambiguous_click_marker)?;
+    assert_eq!(
+        ambiguous_click_calls.lines().count(),
+        1,
+        "quarantine rejection must not redispatch the ambiguous effect"
+    );
     handle
         .resolve_indeterminate(
             &ambiguous_click_operation,
