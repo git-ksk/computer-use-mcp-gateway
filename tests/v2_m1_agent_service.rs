@@ -391,6 +391,7 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
         hub_endpoint: format!("https://localhost:{}", address.port()),
         hub_domain: "localhost".into(),
         device_id,
+        allowed_file_roots: vec![cwd.clone()],
         allowed_cwd_roots: vec![cwd],
         state_dir: state_dir.clone(),
         heartbeat_interval: Duration::from_millis(50),

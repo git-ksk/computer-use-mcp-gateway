@@ -249,7 +249,7 @@ desktop では別の outbound Agent を実行します。
 cargo run --locked --bin v2_agent -- --help
 ```
 
-Hub endpoint/domain、stable device ID、device secret、Hub/grant public key、TLS root、state directory、allowed cwd root を設定します。GUI capability に Cua を使う場合は次を設定します。
+Hub endpoint/domain、stable device ID、device secret、Hub/grant public key、TLS root、state directory、process/shell 用 cwd root、read-only filesystem 用の別 root を設定します。`CUMG_V2_ALLOWED_CWD_ROOTS` は process/shell working directory だけ、`CUMG_V2_ALLOWED_FILE_ROOTS` は `ReadFile`/`ListDirectory` だけを制御し、cwd から file root への暗黙 fallback はありません。旧設定から upgrade して同じ read behavior を維持したい場合は、旧 cwd root list を新 file-root setting へ明示的にコピーして startup を確認した後、file root を独立して狭めます。file root の未設定/空設定は read authority を広げず Agent startup を fail closed します。GUI capability に Cua を使う場合は次を設定します。
 
 ```text
 CUMG_V2_CUA_COMMAND=cua-driver

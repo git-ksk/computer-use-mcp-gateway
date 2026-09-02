@@ -105,6 +105,7 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
             hub_endpoint: format!("https://localhost:{}", address.port()),
             hub_domain: "localhost".into(),
             device_id,
+            allowed_file_roots: vec![cwd.clone()],
             allowed_cwd_roots: vec![cwd.clone()],
             state_dir: temp_dir("v2-real-cua-agent-state"),
             heartbeat_interval: Duration::from_millis(100),

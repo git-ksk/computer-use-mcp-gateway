@@ -14,6 +14,7 @@
     "--grant-public-key-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\enrollment\\agent\\trust\\grant.pub",
     "--tls-root-der-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\enrollment\\agent\\trust\\tls-root.der",
     "--state-dir", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\state\\agent",
-    "--allowed-cwd-root", "D:\\StudioProjects"
+    "--allowed-cwd-root", "D:\\StudioProjects",
+    "--allowed-file-root", "D:\\StudioProjects"
   ]
 }

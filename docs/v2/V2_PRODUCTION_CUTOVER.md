@@ -36,6 +36,8 @@ Migration is in-memory and non-destructive. Restore validates the old checkpoint
 
 Before an in-place upgrade:
 
+Issue #104 separates process/shell cwd roots from read-only filesystem observation roots. Upgrading an older Agent configuration therefore requires an explicit `CUMG_V2_ALLOWED_FILE_ROOTS` / `--allowed-file-root` migration. The new Agent does **not** inherit file roots from `CUMG_V2_ALLOWED_CWD_ROOTS`: omission/empty configuration fails startup. To preserve previous read behavior intentionally, copy the reviewed old cwd root list into the new file-root setting for the first upgraded start, then narrow it independently. Packaged examples already include the new setting.
+
 1. archive the current Hub/Agent state directories, exact binaries/hashes, policy, and service configuration;
 2. run the candidate against a copy of the durable state when practical and require successful restore before touching the supervised service;
 3. stop/restart through the normal supervisor path without editing the checkpoint JSON;

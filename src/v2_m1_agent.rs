@@ -142,6 +142,7 @@ pub struct AgentServiceConfig {
     pub hub_domain: String,
     pub device_id: String,
     pub allowed_cwd_roots: Vec<PathBuf>,
+    pub allowed_file_roots: Vec<PathBuf>,
     pub state_dir: PathBuf,
     pub heartbeat_interval: Duration,
     pub reconnect: ReconnectPolicy,
@@ -171,6 +172,11 @@ impl AgentServiceConfig {
         if self.allowed_cwd_roots.is_empty() {
             return Err(AgentServiceError::InvalidConfig(
                 "at least one allowed cwd root is required",
+            ));
+        }
+        if self.allowed_file_roots.is_empty() {
+            return Err(AgentServiceError::InvalidConfig(
+                "at least one allowed file root is required",
             ));
         }
         if let Some(cua) = &self.cua {
@@ -259,7 +265,7 @@ impl AgentService {
                 .map_err(AgentServiceError::Process)?,
         );
         let filesystem = FilesystemExecutor::new(
-            FilesystemPolicy::new(config.allowed_cwd_roots.clone())
+            FilesystemPolicy::new(config.allowed_file_roots.clone())
                 .map_err(AgentServiceError::Filesystem)?,
         );
         // Loading the checkpoint first establishes/hardens the private state root.
@@ -2524,6 +2530,7 @@ mod tests {
             hub_endpoint: "http://localhost:7443".into(),
             hub_domain: "localhost".into(),
             device_id: "dev-a".into(),
+            allowed_file_roots: vec![std::env::current_dir().unwrap()],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: std::env::temp_dir().join("cumg-v2-agent-config-test"),
             heartbeat_interval: Duration::from_secs(5),
@@ -2537,6 +2544,122 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(AgentServiceError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn filesystem_observation_roots_are_independent_from_process_cwd_roots() {
+        use crate::v2_m0::{DeviceIdentity, GrantAuthority, ProcessRequest};
+        use crate::v2_m0_transport::HubIdentity;
+
+        let base = std::env::temp_dir().join(format!(
+            "cumg-v2-agent-file-roots-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let file_root = base.join("observable");
+        let process_only = base.join("process-only");
+        let state_dir = base.join("state");
+        std::fs::create_dir_all(&file_root).unwrap();
+        std::fs::create_dir_all(&process_only).unwrap();
+        std::fs::write(file_root.join("visible.txt"), b"visible").unwrap();
+        std::fs::write(
+            process_only.join("not-readable.txt"),
+            b"private-to-file-api",
+        )
+        .unwrap();
+
+        let config = AgentServiceConfig {
+            hub_endpoint: "https://localhost:7443".into(),
+            hub_domain: "localhost".into(),
+            device_id: "dev-file-roots".into(),
+            allowed_cwd_roots: vec![base.clone()],
+            allowed_file_roots: vec![file_root.clone()],
+            state_dir: state_dir.clone(),
+            heartbeat_interval: Duration::from_secs(5),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_secs(1),
+                max_attempts: 3,
+            },
+            cua: None,
+        };
+        let device = DeviceIdentity::generate();
+        let hub = HubIdentity::generate();
+        let grant = GrantAuthority::generate();
+        let service = AgentService::new(
+            config,
+            AgentProvisionedMaterial {
+                device_identity: device,
+                trusted_hub: hub.verifier(),
+                grant_verifier: grant.verifier(),
+                additional_grant_verifiers: vec![],
+                hub_rotation: None,
+                tls_root_der: vec![1],
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            service
+                .filesystem
+                .read_file(file_root.join("visible.txt").to_str().unwrap()),
+            Ok(DeviceResult::FileContents { .. })
+        ));
+        assert!(matches!(
+            service
+                .filesystem
+                .read_file(process_only.join("not-readable.txt").to_str().unwrap()),
+            Err(FilesystemError::PathDenied)
+        ));
+        assert!(matches!(
+            service
+                .filesystem
+                .list_directory(process_only.to_str().unwrap()),
+            Err(FilesystemError::PathDenied)
+        ));
+
+        let missing_program = process_only.join("missing-program");
+        let process = ProcessRequest {
+            program: missing_program.to_string_lossy().into_owned(),
+            args: vec![],
+            cwd: process_only.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        };
+        assert!(matches!(
+            service
+                .executor
+                .execute(&process, &ProcessCancellation::default()),
+            Err(ProcessError::Spawn(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn missing_file_roots_fail_closed_without_cwd_fallback() {
+        let mut config = AgentServiceConfig {
+            hub_endpoint: "https://localhost:7443".into(),
+            hub_domain: "localhost".into(),
+            device_id: "dev-file-roots-missing".into(),
+            allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
+            allowed_file_roots: vec![std::env::current_dir().unwrap()],
+            state_dir: std::env::temp_dir().join("cumg-v2-agent-file-roots-missing"),
+            heartbeat_interval: Duration::from_secs(5),
+            reconnect: ReconnectPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_secs(1),
+                max_attempts: 3,
+            },
+            cua: None,
+        };
+        config.allowed_file_roots.clear();
+        assert!(matches!(
+            config.validate(),
+            Err(AgentServiceError::InvalidConfig(
+                "at least one allowed file root is required"
+            ))
         ));
     }
 
@@ -2600,6 +2723,7 @@ mod tests {
             hub_endpoint: "https://localhost:7443".into(),
             hub_domain: "localhost".into(),
             device_id: "dev-custom-backend".into(),
+            allowed_file_roots: vec![std::env::current_dir().unwrap()],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: state_dir.clone(),
             heartbeat_interval: Duration::from_secs(5),
@@ -2670,6 +2794,7 @@ mod tests {
             hub_endpoint: "https://localhost:7443".into(),
             hub_domain: "localhost".into(),
             device_id: "dev-rotation".into(),
+            allowed_file_roots: vec![std::env::current_dir().unwrap()],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: state_dir.clone(),
             heartbeat_interval: Duration::from_secs(5),

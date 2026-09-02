@@ -266,6 +266,7 @@ threat model は deployment に引き続き次の external responsibility を要
 - raw TCP/TLS handshake flood は host firewall/security group と、使用する場合は reviewed reverse proxy/load balancer で制限する。application-layer limit は transport accept 後から始まる。
 - application-key recovery material と systemd/macOS credential file を repository 外で保護する。old Hub/device key の loss を ordinary continuity rotation に silently convert しない。
 - `ExecuteProcess` / `Shell` は exact `Dangerous` capability であり filesystem sandbox ではない。cwd/root check は arbitrary process argv / shell syntax を制限しない。
+- `ReadFile` / `ListDirectory` は別の explicit file-root policy を使う。file root は process cwd root より狭くでき、cwd から暗黙推測せず、canonicalization / symlink-escape denial を維持し、設定欠落時は Agent startup を fail closed する。
 - macOS GUI automation は operator-controlled Cua/TCC trust boundary に依存する。compromised Agent / desktop backend は上記 non-compromise guarantee の対象外。
 - default telemetry は payload-free のままにする。collector/proxy body logging や high-sensitivity debug capture の enable は別 sensitive-data boundary を作る。
 - `indeterminate` operation は persistence-gated な settlement が存在するまで quarantined のままにする。network recovery、backend reconnect、service restart だけでは settlement ではなく、replay permission にもならない。automatic な例外は同じ prior dispatch binding に対する exact signed terminal evidence だけで、missing/mismatch evidence は operator-required / fail-closed のまま。
