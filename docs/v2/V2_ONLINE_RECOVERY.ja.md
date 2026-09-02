@@ -133,6 +133,8 @@ exportされるのは公開鍵だけです。operator-authenticated provisioning
 
 Hubは起動時にverifierを読むため、初回provisioning後はHub再起動が必要です。verifier未設定ならonline recoveryが無効になるだけで、quarantine自体が弱くなることはありません。
 
+初回provisioning後とruntime upgrade後にはincident前にinstalled `v2_status --json`（または `v2_doctor --json`）を実行し、`recovery.key_readiness` を確認します。`ready` はowner-private sealed representationをexact manifest-verified installed helperで再openでき、exportしたpublic keyがHub verifierと一致することを意味します。このreadiness probeはhelperのnon-interactive `public` operationだけを使い、sign、LocalAuthentication prompt、key create/rotate、Hub/Agent state変更は一切行いません。`sealed_key_missing` / `hub_verifier_missing` / `public_key_mismatch` / `helper_unavailable` / `readiness_unknown` はexplicit review/provisioningが必要です。`unprovisioned` は両側とも未設定で、通常operationとoffline `v2_maint` は利用可能ですがonline recoveryは未準備です。`key_next_action=provision_recovery` からこの `init-key` flowへ進みます。
+
 quarantine発生後の canonical operator workflow は `v2_recover guide` です。
 
 ```bash

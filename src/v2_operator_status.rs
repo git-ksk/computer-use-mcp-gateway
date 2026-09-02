@@ -7,7 +7,7 @@
 use crate::{
     v2_doctor::{
         CheckStatus, CheckpointReaderCompatibility, DoctorReport, LaneReadiness,
-        OperatorToolingStatus, ReadinessLanes, RuntimePairingStatus,
+        OperatorToolingStatus, ReadinessLanes, RecoveryKeyReadinessStatus, RuntimePairingStatus,
     },
     v2_operator_handoff::{HandoffInterventionStatus, HandoffRuntimeStatus},
     v2_upgrade_transaction::{
@@ -54,6 +54,7 @@ pub enum OperatorReasonCode {
     RuntimeSkew,
     CheckpointReaderIncompatible,
     RuntimeCompatibilityUnknown,
+    RecoveryKeyNotReady,
     ControlPlaneUnavailable,
     BackendUnavailable,
     HandoffActive,
@@ -75,6 +76,7 @@ impl OperatorReasonCode {
             Self::RuntimeSkew => "runtime_skew",
             Self::CheckpointReaderIncompatible => "checkpoint_reader_incompatible",
             Self::RuntimeCompatibilityUnknown => "runtime_compatibility_unknown",
+            Self::RecoveryKeyNotReady => "recovery_key_not_ready",
             Self::ControlPlaneUnavailable => "control_plane_unavailable",
             Self::BackendUnavailable => "backend_unavailable",
             Self::HandoffActive => "handoff_active",
@@ -95,6 +97,7 @@ pub enum OperatorNextAction {
     InspectDoctor,
     CheckBackend,
     FinishHandoff,
+    ProvisionRecovery,
 }
 
 impl OperatorNextAction {
@@ -108,6 +111,7 @@ impl OperatorNextAction {
             Self::InspectDoctor => "inspect_doctor",
             Self::CheckBackend => "check_backend",
             Self::FinishHandoff => "finish_handoff",
+            Self::ProvisionRecovery => "provision_recovery",
         }
     }
 }
@@ -182,6 +186,8 @@ pub struct RecoverySummary {
     pub replay_safe: Option<bool>,
     pub recovery_mode: String,
     pub incident_review: IncidentReviewAvailability,
+    pub key_readiness: RecoveryKeyReadinessStatus,
+    pub key_next_action: OperatorNextAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -454,6 +460,18 @@ fn summarize_recovery(doctor: &DoctorReport) -> RecoverySummary {
         replay_safe: (quarantine == QuarantineStatus::Present).then_some(false),
         recovery_mode: doctor.hub.recovery_mode.clone(),
         incident_review,
+        key_readiness: doctor.recovery_key_readiness.status,
+        key_next_action: match doctor.recovery_key_readiness.status {
+            RecoveryKeyReadinessStatus::Ready | RecoveryKeyReadinessStatus::Unsupported => {
+                OperatorNextAction::None
+            }
+            RecoveryKeyReadinessStatus::Unprovisioned
+            | RecoveryKeyReadinessStatus::SealedKeyMissing
+            | RecoveryKeyReadinessStatus::HubVerifierMissing
+            | RecoveryKeyReadinessStatus::PublicKeyMismatch
+            | RecoveryKeyReadinessStatus::HelperUnavailable
+            | RecoveryKeyReadinessStatus::ReadinessUnknown => OperatorNextAction::ProvisionRecovery,
+        },
     }
 }
 
@@ -627,6 +645,26 @@ fn primary_operator_state(
             OperatorNextAction::FixConfiguration,
         );
     }
+    if recovery.key_readiness == RecoveryKeyReadinessStatus::PublicKeyMismatch {
+        return (
+            OperatorOverallStatus::ActionRequired,
+            OperatorReasonCode::RecoveryKeyNotReady,
+            OperatorNextAction::ProvisionRecovery,
+        );
+    }
+    if matches!(
+        recovery.key_readiness,
+        RecoveryKeyReadinessStatus::SealedKeyMissing
+            | RecoveryKeyReadinessStatus::HubVerifierMissing
+            | RecoveryKeyReadinessStatus::HelperUnavailable
+            | RecoveryKeyReadinessStatus::ReadinessUnknown
+    ) {
+        return (
+            OperatorOverallStatus::Degraded,
+            OperatorReasonCode::RecoveryKeyNotReady,
+            OperatorNextAction::ProvisionRecovery,
+        );
+    }
     if control.backend == BackendStatus::Unavailable {
         return (
             OperatorOverallStatus::Degraded,
@@ -742,6 +780,7 @@ pub fn render_operator_status_text(report: &OperatorStatusReport) -> String {
             "Browser effectful execution: {}\n",
             "Human Handoff: {}\n",
             "Recovery: {}\n",
+            "Online recovery key: {} (next: {})\n",
             "Replay safe: {}\n",
             "Runtime: {} {}\n",
             "Runtime pairing: {}\n",
@@ -760,6 +799,8 @@ pub fn render_operator_status_text(report: &OperatorStatusReport) -> String {
         report.lanes.browser_effectful_execution.as_str(),
         report.handoff.status.as_str(),
         report.recovery.quarantine.as_str(),
+        report.recovery.key_readiness.as_str(),
+        report.recovery.key_next_action.as_str(),
         replay_safe,
         report.runtime.verification.as_str(),
         report.runtime.package_version,
@@ -816,6 +857,9 @@ mod tests {
                 runtime_pairing: RuntimePairingStatus::Compatible,
                 operator_tooling: OperatorToolingStatus::Compatible,
                 checkpoint_reader_compatibility: CheckpointReaderCompatibility::Compatible,
+            },
+            recovery_key_readiness: crate::v2_doctor::RecoveryKeyReadinessSummary {
+                status: RecoveryKeyReadinessStatus::Ready,
             },
             hub: HubSummary {
                 state_schema: Some(8),
@@ -1018,6 +1062,65 @@ mod tests {
             report.lanes.effectful_execution,
             LaneReadiness::IndeterminateFenced
         );
+    }
+
+    #[test]
+    fn unprovisioned_online_recovery_is_visible_without_breaking_normal_health() {
+        let mut doctor = healthy_doctor();
+        doctor.recovery_key_readiness.status = RecoveryKeyReadinessStatus::Unprovisioned;
+        let report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::NotConfigured,
+            UpgradeStatusInput::None,
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::Healthy);
+        assert_eq!(
+            report.recovery.key_readiness,
+            RecoveryKeyReadinessStatus::Unprovisioned
+        );
+        assert_eq!(
+            report.recovery.key_next_action,
+            OperatorNextAction::ProvisionRecovery
+        );
+    }
+
+    #[test]
+    fn missing_or_mismatched_recovery_key_routes_to_explicit_provisioning() {
+        let handoff = idle_handoff();
+        for status in [
+            RecoveryKeyReadinessStatus::SealedKeyMissing,
+            RecoveryKeyReadinessStatus::HubVerifierMissing,
+            RecoveryKeyReadinessStatus::HelperUnavailable,
+            RecoveryKeyReadinessStatus::ReadinessUnknown,
+        ] {
+            let mut doctor = healthy_doctor();
+            doctor.recovery_key_readiness.status = status;
+            let report = build_operator_status(
+                &doctor,
+                HandoffStatusInput::Available(&handoff),
+                UpgradeStatusInput::None,
+            );
+            assert_eq!(report.overall, OperatorOverallStatus::Degraded);
+            assert_eq!(
+                report.primary_reason,
+                OperatorReasonCode::RecoveryKeyNotReady
+            );
+            assert_eq!(report.next_action, OperatorNextAction::ProvisionRecovery);
+        }
+
+        let mut doctor = healthy_doctor();
+        doctor.recovery_key_readiness.status = RecoveryKeyReadinessStatus::PublicKeyMismatch;
+        let report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::Available(&handoff),
+            UpgradeStatusInput::None,
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::ActionRequired);
+        assert_eq!(
+            report.primary_reason,
+            OperatorReasonCode::RecoveryKeyNotReady
+        );
+        assert_eq!(report.next_action, OperatorNextAction::ProvisionRecovery);
     }
 
     #[test]

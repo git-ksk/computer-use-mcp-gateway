@@ -48,6 +48,10 @@ struct Args {
     mutation_authority_dir: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
     handoff_control_socket: Option<PathBuf>,
+    #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+    recovery_key_file: Option<PathBuf>,
+    #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+    recovery_helper: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -139,6 +143,14 @@ fn main() -> ExitCode {
         mutation_authority_dir,
         handoff_control_socket: handoff_control_socket.clone(),
         maintenance_job_exclude_label: None,
+        recovery_key_file: args.recovery_key_file.or_else(|| {
+            Some(
+                home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed"),
+            )
+        }),
+        recovery_helper: args
+            .recovery_helper
+            .or_else(|| Some(root.join("bin/v2_recovery_enclave_helper"))),
     };
     let doctor = run_doctor(&doctor_config);
 
