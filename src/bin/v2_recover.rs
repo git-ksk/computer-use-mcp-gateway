@@ -18,7 +18,8 @@ use computer_use_mcp_gateway::{
     v2_guided_recovery::{
         GuidedRecoveryDisposition, GuidedRecoveryPlan, GuidedRecoveryPostDisposition,
         classify_guided_recovery_post_status, compose_guided_recovery_plan,
-        decision_name as guided_decision_name, revalidate_guided_recovery_selection,
+        decision_name as guided_decision_name, revalidate_guided_human_historical_selection,
+        revalidate_guided_recovery_selection,
     },
     v2_incident_brief::{build_incident_brief_read_only, render_incident_brief_text},
     v2_m0_execution::IndeterminateResolution,
@@ -268,6 +269,31 @@ impl RecoveryDecisionArg {
 const MAX_GUIDED_DIAGNOSTICS_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "macos")]
 const GUIDED_RECOVERY_EVIDENCE: &str = "guided_recovery_authoritative_incident_review_v1";
+#[cfg(target_os = "macos")]
+const GUIDED_HUMAN_HISTORICAL_EVIDENCE: &str = "guided_recovery_human_historical_assertion_v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidedRecoverySelection {
+    Authoritative(ReconciliationSupportedDecision),
+    HumanHistorical(ReconciliationSupportedDecision),
+}
+
+impl GuidedRecoverySelection {
+    #[cfg(target_os = "macos")]
+    const fn decision(self) -> ReconciliationSupportedDecision {
+        match self {
+            Self::Authoritative(decision) | Self::HumanHistorical(decision) => decision,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const fn authority_name(self) -> &'static str {
+        match self {
+            Self::Authoritative(_) => "authoritative_reconciliation",
+            Self::HumanHistorical(_) => "human_historical_assertion",
+        }
+    }
+}
 
 #[derive(Debug)]
 struct GuidedRecoveryArgs {
@@ -530,9 +556,9 @@ fn load_guided_review(args: &GuidedRecoveryArgs) -> Result<GuidedRecoveryReview>
     })
 }
 
-fn prompt_guided_decision(
+fn prompt_authoritative_guided_decision(
     plan: &GuidedRecoveryPlan,
-) -> Result<Option<ReconciliationSupportedDecision>> {
+) -> Result<Option<GuidedRecoverySelection>> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
         anyhow::bail!(
@@ -563,9 +589,58 @@ fn prompt_guided_decision(
             .checked_sub(1)
             .and_then(|offset| plan.supported_decisions.get(offset))
         {
-            return Ok(Some(*decision));
+            return Ok(Some(GuidedRecoverySelection::Authoritative(*decision)));
         }
         println!("Unsupported selection; the authoritative decision set was not widened.");
+    }
+}
+
+fn prompt_human_historical_assertion(
+    plan: &GuidedRecoveryPlan,
+) -> Result<Option<GuidedRecoverySelection>> {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        anyhow::bail!(
+            "Human historical assertion requires an interactive Human terminal; use --json for read-only planning"
+        );
+    }
+    if !plan.human_historical_assertion.available
+        || plan.human_historical_assertion.automatic_selection_allowed
+        || !plan.supported_decisions.is_empty()
+    {
+        anyhow::bail!("Human historical assertion is not available for this reviewed plan");
+    }
+
+    println!("\nCUMG cannot determine the historical outcome from authoritative evidence.");
+    println!(
+        "Do not guess. Choose a historical assertion only if you personally observed this exact operation."
+    );
+    println!("  0) I do not know / keep quarantine");
+    println!("  1) I directly observed this exact operation complete");
+    println!("  2) I directly observed this exact operation did not execute");
+    loop {
+        print!("Select a Human historical assertion: ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        if stdin.read_line(&mut input)? == 0 {
+            return Ok(None);
+        }
+        match input.trim() {
+            "0" | "q" | "quit" | "cancel" => return Ok(None),
+            "1" => {
+                return Ok(Some(GuidedRecoverySelection::HumanHistorical(
+                    ReconciliationSupportedDecision::ConfirmedCompleted,
+                )));
+            }
+            "2" => {
+                return Ok(Some(GuidedRecoverySelection::HumanHistorical(
+                    ReconciliationSupportedDecision::ConfirmedNotExecuted,
+                )));
+            }
+            _ => println!(
+                "Invalid selection; choose 1/2 only for direct personal observation, or 0 to keep quarantine."
+            ),
+        }
     }
 }
 
@@ -597,12 +672,13 @@ fn guide(args: GuidedRecoveryArgs) -> Result<()> {
         reviewed.plan.old_operation_replayed
     );
 
-    match reviewed.plan.disposition {
+    let selected = match reviewed.plan.disposition {
         GuidedRecoveryDisposition::KeepQuarantine => {
-            println!("guided_outcome=keep_quarantine");
-            println!("authorization=not_published");
-            println!("durable_completion=not_verified");
-            return Ok(());
+            if reviewed.plan.human_historical_assertion.available {
+                prompt_human_historical_assertion(&reviewed.plan)?
+            } else {
+                None
+            }
         }
         GuidedRecoveryDisposition::Reinspect => {
             println!("guided_outcome=re_review_required");
@@ -610,12 +686,14 @@ fn guide(args: GuidedRecoveryArgs) -> Result<()> {
             println!("durable_completion=not_verified");
             anyhow::bail!("exact recovery binding does not match the reviewed quarantine");
         }
-        GuidedRecoveryDisposition::HumanSelectionRequired => {}
-    }
+        GuidedRecoveryDisposition::HumanSelectionRequired => {
+            prompt_authoritative_guided_decision(&reviewed.plan)?
+        }
+    };
 
-    let Some(selected) = prompt_guided_decision(&reviewed.plan)? else {
+    let Some(selected) = selected else {
         println!("guided_outcome=keep_quarantine");
-        println!("human_selection=cancelled");
+        println!("human_selection=unknown_or_cancelled");
         println!("authorization=not_published");
         println!("durable_completion=not_verified");
         return Ok(());
@@ -625,8 +703,15 @@ fn guide(args: GuidedRecoveryArgs) -> Result<()> {
     // helper below samples the signed challenge both before and after the brief
     // read, so generation/fingerprint/nonce changes fail before signing.
     let fresh = load_guided_review(&args)?;
-    if let Err(error) = revalidate_guided_recovery_selection(&reviewed.plan, &fresh.plan, selected)
-    {
+    let revalidation = match selected {
+        GuidedRecoverySelection::Authoritative(decision) => {
+            revalidate_guided_recovery_selection(&reviewed.plan, &fresh.plan, decision)
+        }
+        GuidedRecoverySelection::HumanHistorical(decision) => {
+            revalidate_guided_human_historical_selection(&reviewed.plan, &fresh.plan, decision)
+        }
+    };
+    if let Err(error) = revalidation {
         println!("guided_outcome=re_review_required");
         println!("authorization=not_published");
         println!("durable_completion=not_verified");
@@ -733,23 +818,48 @@ fn publish_guided_authorization(
     key_file: &Path,
     secure_enclave_helper: &Path,
     challenge: &RecoveryChallenge,
-    selected: ReconciliationSupportedDecision,
+    selected: GuidedRecoverySelection,
 ) -> Result<ExpectedRecoveryCompletion> {
     use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
-    let (assessment, decision) = match selected {
-        ReconciliationSupportedDecision::ConfirmedCompleted => (
-            RecoveryAuditAssessment::Completed,
-            IndeterminateResolution::ConfirmedCompleted,
-        ),
-        ReconciliationSupportedDecision::ConfirmedNotExecuted => (
+    let selected_decision = selected.decision();
+    let decision = match selected_decision {
+        ReconciliationSupportedDecision::ConfirmedCompleted => {
+            IndeterminateResolution::ConfirmedCompleted
+        }
+        ReconciliationSupportedDecision::ConfirmedNotExecuted => {
+            IndeterminateResolution::ConfirmedNotExecuted
+        }
+    };
+    let (assessment, evidence) = match selected {
+        GuidedRecoverySelection::Authoritative(
+            ReconciliationSupportedDecision::ConfirmedCompleted,
+        ) => (RecoveryAuditAssessment::Completed, GUIDED_RECOVERY_EVIDENCE),
+        GuidedRecoverySelection::Authoritative(
+            ReconciliationSupportedDecision::ConfirmedNotExecuted,
+        ) => (
             RecoveryAuditAssessment::NotExecuted,
-            IndeterminateResolution::ConfirmedNotExecuted,
+            GUIDED_RECOVERY_EVIDENCE,
+        ),
+        GuidedRecoverySelection::HumanHistorical(_) => (
+            RecoveryAuditAssessment::Inconclusive,
+            GUIDED_HUMAN_HISTORICAL_EVIDENCE,
         ),
     };
-    let authorization =
-        new_authorization(challenge, assessment, decision, GUIDED_RECOVERY_EVIDENCE)
-            .context("failed to construct exact guided recovery authorization")?;
-    println!("human_selection={}", guided_decision_name(selected));
+    let authorization = new_authorization(challenge, assessment, decision, evidence)
+        .context("failed to construct exact guided recovery authorization")?;
+    println!(
+        "human_selection={}",
+        guided_decision_name(selected_decision)
+    );
+    println!("decision_authority={}", selected.authority_name());
+    println!(
+        "audit_assessment={}",
+        match assessment {
+            RecoveryAuditAssessment::Completed => "completed",
+            RecoveryAuditAssessment::NotExecuted => "not_executed",
+            RecoveryAuditAssessment::Inconclusive => "inconclusive",
+        }
+    );
     println!("user_presence=required");
     let key = MacRecoveryKey::load(secure_enclave_helper, key_file)
         .context("recovery key is not provisioned")?;
@@ -774,7 +884,7 @@ fn publish_guided_authorization(
     _key_file: &Path,
     _secure_enclave_helper: &Path,
     _challenge: &RecoveryChallenge,
-    _selected: ReconciliationSupportedDecision,
+    _selected: GuidedRecoverySelection,
 ) -> Result<ExpectedRecoveryCompletion> {
     bail!("local user-presence recovery approval is supported only on macOS")
 }

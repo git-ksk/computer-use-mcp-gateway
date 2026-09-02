@@ -2,7 +2,9 @@
 //!
 //! This module never signs, publishes, clears quarantine, replays work, or creates
 //! recovery authority. `IncidentBrief.cumg.supported_decisions` remains the only
-//! decision source; the signed recovery challenge supplies the exact online binding.
+//! authoritative reconciliation decision source. When that set is empty, the plan
+//! may expose a separately labelled interactive-Human historical assertion path;
+//! that path never mutates or widens `supported_decisions`.
 
 use crate::{
     v2_incident_brief::{IncidentBrief, IncidentHumanSummary},
@@ -12,7 +14,7 @@ use crate::{
 };
 use serde::Serialize;
 
-pub const GUIDED_RECOVERY_SCHEMA_VERSION: u16 = 1;
+pub const GUIDED_RECOVERY_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +52,21 @@ struct GuidedRecoveryAuthorityBinding {
     challenge_expires_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidedHistoricalAssertionAuthority {
+    LocalHumanUserPresence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuidedHumanHistoricalAssertion {
+    pub available: bool,
+    pub authority: GuidedHistoricalAssertionAuthority,
+    pub requires_interactive_human: bool,
+    pub automatic_selection_allowed: bool,
+    pub choices: Vec<ReconciliationSupportedDecision>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GuidedRecoveryPlan {
     pub schema_version: u16,
@@ -58,6 +75,9 @@ pub struct GuidedRecoveryPlan {
     pub operation: GuidedRecoveryOperation,
     /// Exact closed set copied from the authoritative reconciliation audit.
     pub supported_decisions: Vec<ReconciliationSupportedDecision>,
+    /// Separate Human-only historical assertion path. These choices are never
+    /// copied into or treated as authoritative `supported_decisions`.
+    pub human_historical_assertion: GuidedHumanHistoricalAssertion,
     pub incident: IncidentHumanSummary,
     pub observational_diagnostics_present: bool,
     pub old_operation_replayed: bool,
@@ -122,6 +142,23 @@ pub fn compose_guided_recovery_plan(
         )
     };
 
+    let human_historical_assertion_available =
+        binding_matches && brief.cumg.supported_decisions.is_empty();
+    let human_historical_assertion = GuidedHumanHistoricalAssertion {
+        available: human_historical_assertion_available,
+        authority: GuidedHistoricalAssertionAuthority::LocalHumanUserPresence,
+        requires_interactive_human: true,
+        automatic_selection_allowed: false,
+        choices: if human_historical_assertion_available {
+            vec![
+                ReconciliationSupportedDecision::ConfirmedCompleted,
+                ReconciliationSupportedDecision::ConfirmedNotExecuted,
+            ]
+        } else {
+            Vec::new()
+        },
+    };
+
     GuidedRecoveryPlan {
         schema_version: GUIDED_RECOVERY_SCHEMA_VERSION,
         disposition,
@@ -134,6 +171,7 @@ pub fn compose_guided_recovery_plan(
             capability: brief.operation.capability.clone(),
         },
         supported_decisions: brief.cumg.supported_decisions.clone(),
+        human_historical_assertion,
         incident: brief.human_summary.clone(),
         observational_diagnostics_present: !brief.diagnostics.is_empty(),
         old_operation_replayed: brief.cumg.replay_old_operation,
@@ -159,6 +197,34 @@ pub fn revalidate_guided_recovery_selection(
         return Err(GuidedRecoveryRevalidationError::ReinspectRequired);
     }
     if !fresh.allows(selected) {
+        return Err(GuidedRecoveryRevalidationError::DecisionNoLongerSupported);
+    }
+    Ok(())
+}
+
+/// Revalidate a separately labelled Human historical assertion immediately
+/// before signing. The authoritative decision set must remain empty; a newly
+/// available authoritative decision forces re-review instead of silently
+/// converting the Human assertion into machine-supported evidence.
+pub fn revalidate_guided_human_historical_selection(
+    reviewed: &GuidedRecoveryPlan,
+    fresh: &GuidedRecoveryPlan,
+    selected: ReconciliationSupportedDecision,
+) -> Result<(), GuidedRecoveryRevalidationError> {
+    if reviewed.disposition != GuidedRecoveryDisposition::KeepQuarantine
+        || fresh.disposition != GuidedRecoveryDisposition::KeepQuarantine
+        || reviewed.authority_binding.is_none()
+        || reviewed.authority_binding != fresh.authority_binding
+        || reviewed.review_snapshot != fresh.review_snapshot
+        || !reviewed.supported_decisions.is_empty()
+        || !fresh.supported_decisions.is_empty()
+        || !reviewed.human_historical_assertion.available
+        || !fresh.human_historical_assertion.available
+        || reviewed.human_historical_assertion != fresh.human_historical_assertion
+    {
+        return Err(GuidedRecoveryRevalidationError::ReinspectRequired);
+    }
+    if !fresh.human_historical_assertion.choices.contains(&selected) {
         return Err(GuidedRecoveryRevalidationError::DecisionNoLongerSupported);
     }
     Ok(())
@@ -291,6 +357,15 @@ mod tests {
         let plan = compose_guided_recovery_plan(&brief(Vec::new()), &challenge());
         assert_eq!(plan.disposition, GuidedRecoveryDisposition::KeepQuarantine);
         assert!(plan.supported_decisions.is_empty());
+        assert!(plan.human_historical_assertion.available);
+        assert!(!plan.human_historical_assertion.automatic_selection_allowed);
+        assert_eq!(
+            plan.human_historical_assertion.choices,
+            vec![
+                ReconciliationSupportedDecision::ConfirmedCompleted,
+                ReconciliationSupportedDecision::ConfirmedNotExecuted,
+            ]
+        );
         assert!(!plan.old_operation_replayed);
     }
 
@@ -337,6 +412,8 @@ mod tests {
         let plan = compose_guided_recovery_plan(&incident, &challenge());
         assert!(plan.observational_diagnostics_present);
         assert!(plan.supported_decisions.is_empty());
+        assert!(plan.human_historical_assertion.available);
+        assert!(!plan.human_historical_assertion.automatic_selection_allowed);
         assert_eq!(plan.disposition, GuidedRecoveryDisposition::KeepQuarantine);
     }
 
@@ -389,6 +466,50 @@ mod tests {
     }
 
     #[test]
+    fn human_historical_assertion_revalidates_only_while_authoritative_set_stays_empty() {
+        let reviewed = compose_guided_recovery_plan(&brief(Vec::new()), &challenge());
+        let fresh = compose_guided_recovery_plan(&brief(Vec::new()), &challenge());
+        assert_eq!(
+            revalidate_guided_human_historical_selection(
+                &reviewed,
+                &fresh,
+                ReconciliationSupportedDecision::ConfirmedCompleted,
+            ),
+            Ok(())
+        );
+
+        let authoritative_now = compose_guided_recovery_plan(
+            &brief(vec![ReconciliationSupportedDecision::ConfirmedCompleted]),
+            &challenge(),
+        );
+        assert_eq!(
+            revalidate_guided_human_historical_selection(
+                &reviewed,
+                &authoritative_now,
+                ReconciliationSupportedDecision::ConfirmedCompleted,
+            ),
+            Err(GuidedRecoveryRevalidationError::ReinspectRequired)
+        );
+    }
+
+    #[test]
+    fn stale_challenge_blocks_human_historical_assertion_before_signing() {
+        let incident = brief(Vec::new());
+        let reviewed = compose_guided_recovery_plan(&incident, &challenge());
+        let mut changed = challenge();
+        changed.nonce = [9; 32];
+        let fresh = compose_guided_recovery_plan(&incident, &changed);
+        assert_eq!(
+            revalidate_guided_human_historical_selection(
+                &reviewed,
+                &fresh,
+                ReconciliationSupportedDecision::ConfirmedNotExecuted,
+            ),
+            Err(GuidedRecoveryRevalidationError::ReinspectRequired)
+        );
+    }
+
+    #[test]
     fn healthy_post_recovery_status_is_distinct_from_durable_completion_only() {
         assert_eq!(
             classify_guided_recovery_post_status(true, true, true, OperatorOverallStatus::Healthy),
@@ -423,6 +544,31 @@ mod tests {
                 OperatorOverallStatus::ActionRequired,
             ),
             GuidedRecoveryPostDisposition::VerifiedWithUnrelatedStatusProblem
+        );
+    }
+
+    #[test]
+    fn json_contract_separates_authoritative_decisions_from_human_assertion() {
+        let plan = compose_guided_recovery_plan(&brief(Vec::new()), &challenge());
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["supported_decisions"], serde_json::json!([]));
+        assert_eq!(value["human_historical_assertion"]["available"], true);
+        assert_eq!(
+            value["human_historical_assertion"]["authority"],
+            "local_human_user_presence"
+        );
+        assert_eq!(
+            value["human_historical_assertion"]["requires_interactive_human"],
+            true
+        );
+        assert_eq!(
+            value["human_historical_assertion"]["automatic_selection_allowed"],
+            false
+        );
+        assert_eq!(
+            value["human_historical_assertion"]["choices"],
+            serde_json::json!(["confirmed_completed", "confirmed_not_executed"])
         );
     }
 
