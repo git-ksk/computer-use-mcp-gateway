@@ -76,6 +76,7 @@ fn agent_config(
         hub_endpoint: endpoint,
         hub_domain: "localhost".into(),
         device_id,
+        allowed_file_roots: vec![cwd.clone()],
         allowed_cwd_roots: vec![cwd],
         state_dir,
         heartbeat_interval: Duration::from_millis(100),

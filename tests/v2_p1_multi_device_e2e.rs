@@ -105,6 +105,7 @@ fn agent_config(
         hub_endpoint: endpoint,
         hub_domain: "localhost".into(),
         device_id,
+        allowed_file_roots: roots.clone(),
         allowed_cwd_roots: roots,
         state_dir,
         // Recovery semantics are the subject of this E2E, not a 150 ms ACK deadline.

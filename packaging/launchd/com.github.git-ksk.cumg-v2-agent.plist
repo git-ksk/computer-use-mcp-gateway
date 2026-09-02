@@ -19,6 +19,7 @@
     <key>CUMG_V2_TLS_ROOT_DER_FILE</key><string>@HOME@/Library/Application Support/cumg-v2-agent/trust/tls-root.der</string>
     <key>CUMG_V2_STATE_DIR</key><string>@HOME@/Library/Application Support/cumg-v2-agent/state</string>
     <key>CUMG_V2_ALLOWED_CWD_ROOTS</key><string>@HOME@</string>
+    <key>CUMG_V2_ALLOWED_FILE_ROOTS</key><string>@HOME@</string>
     <key>CUMG_V2_CUA_COMMAND</key><string>@HOME@/.local/bin/cua-driver</string>
     <key>CUMG_V2_CUA_ARGS</key><string>mcp</string>
     <key>CUMG_V2_CUA_BACKEND_VERSION</key><string>0.19.3</string>

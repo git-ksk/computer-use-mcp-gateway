@@ -250,7 +250,7 @@ The desktop runs a separate outbound Agent:
 cargo run --locked --bin v2_agent -- --help
 ```
 
-Configure the Hub endpoint/domain, stable device ID, device secret, Hub/grant public keys, TLS root, state directory, and allowed cwd roots. To use Cua for the GUI capabilities, configure:
+Configure the Hub endpoint/domain, stable device ID, device secret, Hub/grant public keys, TLS root, state directory, process/shell cwd roots, and the separate read-only filesystem roots. `CUMG_V2_ALLOWED_CWD_ROOTS` governs only process/shell working directories; `CUMG_V2_ALLOWED_FILE_ROOTS` governs only `ReadFile`/`ListDirectory`. There is no implicit cwd-to-file fallback. On upgrade from an older configuration, explicitly copy the old cwd root list into the new file-root setting if identical read behavior is required, verify startup, then narrow file roots independently. Missing/empty file roots fail Agent startup rather than silently broadening read authority. To use Cua for the GUI capabilities, configure:
 
 ```text
 CUMG_V2_CUA_COMMAND=cua-driver

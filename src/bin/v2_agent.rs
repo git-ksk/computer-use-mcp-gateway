@@ -52,6 +52,14 @@ struct Config {
         required = true
     )]
     allowed_cwd_roots: Vec<PathBuf>,
+    /// Read-only filesystem observation roots. No implicit fallback to cwd roots.
+    #[arg(
+        long = "allowed-file-root",
+        env = "CUMG_V2_ALLOWED_FILE_ROOTS",
+        value_delimiter = ',',
+        required = true
+    )]
+    allowed_file_roots: Vec<PathBuf>,
     #[arg(long, env = "CUMG_V2_HEARTBEAT_SECS", default_value_t = 15)]
     heartbeat_secs: u64,
     #[arg(long, env = "CUMG_V2_RECONNECT_INITIAL_MS", default_value_t = 250)]
@@ -200,6 +208,7 @@ async fn main() -> Result<()> {
         hub_domain: args.hub_domain,
         device_id: args.device_id,
         allowed_cwd_roots: args.allowed_cwd_roots,
+        allowed_file_roots: args.allowed_file_roots,
         state_dir: args.state_dir,
         heartbeat_interval: Duration::from_secs(args.heartbeat_secs),
         reconnect: ReconnectPolicy {
