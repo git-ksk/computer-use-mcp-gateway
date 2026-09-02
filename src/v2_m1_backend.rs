@@ -4191,6 +4191,7 @@ mod tests {
         assert_eq!(args["element_token"], "backend-element-token");
         assert_eq!(args["pid"], 42);
         assert_eq!(args["window_id"], 7);
+        assert_eq!(args["text"], "hello");
 
         let (tool, args) = map_command(&DeviceCommand::KeyboardInput {
             context_id: Some(context),

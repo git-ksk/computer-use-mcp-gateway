@@ -1693,6 +1693,7 @@ mod tests {
                     audit: OperationAuditMetadata::empty(),
                     request_fingerprint: None,
                     evidence_envelope: Some(envelope),
+                    semantic_constraint: None,
                 },
                 100,
             )
@@ -1739,6 +1740,7 @@ mod tests {
                     audit: OperationAuditMetadata::empty(),
                     request_fingerprint: None,
                     evidence_envelope: Some(envelope),
+                    semantic_constraint: None,
                 },
                 100,
             )
@@ -1804,6 +1806,7 @@ mod tests {
                     },
                     request_fingerprint: Some(fingerprint.clone()),
                     evidence_envelope: None,
+                    semantic_constraint: None,
                 },
                 100,
             )

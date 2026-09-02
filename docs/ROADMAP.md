@@ -50,7 +50,7 @@ The `0.4.0` candidate intentionally consolidates the work that had previously be
 | Shared WebAuthn/CTAP verifier | #256 / PR #258 | Complete | Required shared recovery dependency; no platform support claim by itself |
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | Implementation + CI complete; physical signed-token dogfood pending | Included implementation; provider-specific support claim waits for acceptance |
-| Typed semantic authorization | #221 | Active implementation | **Required `0.4.0` implementation gate** |
+| Typed semantic authorization | #221 | Implementation complete in candidate change | Included after merge/CI |
 | Windows Hello recovery | #227 / PR #252 | Implementation + CI green; physical acceptance pending | Optional platform support gate; base `0.4.0` release need not claim Windows recovery support |
 | Linux FIDO2 UV recovery | #228 / PR #259 | Implementation + CI complete; physical acceptance pending | Optional platform support gate; base `0.4.0` release need not claim Linux recovery support |
 | Cross-platform recovery parity umbrella | #217 | Physical acceptance dependent | May remain open until each platform actually advertised as supported has evidence |
@@ -58,7 +58,7 @@ The `0.4.0` candidate intentionally consolidates the work that had previously be
 
 Use this order for the release candidate:
 
-1. **Finish #221** and merge the typed, backend-neutral semantic constraint boundary with full regression/CI and EN/JA normative documentation.
+1. **Merge/verify #221**: implementation is complete in the candidate change; require full regression/CI and EN/JA normative documentation before treating the gate as closed.
 2. **Run the `0.4.0` release closeout** against the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate: version/durable-schema compatibility, source-free candidate artifacts, clean install/upgrade/rollback, doctor/status, recovery/no-replay, dependency/CodeQL, docs, and release notes.
 3. **Complete #139 signed-token dogfood before advertising generic signed-token identity as release-supported.** The implementation may be present in the artifact while that explicit support claim remains acceptance-gated.
 4. **Keep #227/#228 physical gates honest.** Their code can ship in the candidate, but Windows Hello or Linux FIDO2 online recovery is not advertised as supported until its own physical acceptance passes. #217 closes only after the claimed platform set is actually proven.
@@ -87,7 +87,7 @@ CUMG is now past the initial V2 production-hardening release. Post-v0.3 work sho
 The working sequence is:
 
 - **`0.3.x` — released baseline / compatible maintenance:** #213 Product Readiness closeout, #237 artifact-backed install/upgrade, #104 filesystem-root separation, #111 reproducible benchmark, and bounded #96 investigation are complete. #215 Cloud Run design is complete but hosted support remains a future NO-GO implementation track rather than an open-ended `0.3.x` release blocker.
-- **`0.4.0` — Recovery, Identity & Semantic Authorization:** consolidate the completed recovery/reconciliation work (#103/#137/#136/#253/#254/#115/#255/#256), provider-neutral OIDC/JWT identity (#139), and typed backend-neutral semantic authorization (#221). #221 completion plus normal release closeout are the active implementation gates. #139/#227/#228 retain explicit physical/support-claim acceptance where applicable; unaccepted platform providers are not advertised as supported merely because their code is present.
+- **`0.4.0` — Recovery, Identity & Semantic Authorization:** consolidate the completed recovery/reconciliation work (#103/#137/#136/#253/#254/#115/#255/#256), provider-neutral OIDC/JWT identity (#139), and typed backend-neutral semantic authorization (#221). #221 implementation is complete in the candidate change; merge/CI plus normal release closeout remain. #139/#227/#228 retain explicit physical/support-claim acceptance where applicable; unaccepted platform providers are not advertised as supported merely because their code is present.
 - **`0.5.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through bounded retrievable output (#83), ranged/deterministic filesystem observation (#105), and atomic workspace mutation under explicitly separate writable roots (#107).
 - **`0.6.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106), separately sandboxed Playwright/E2E execution (#114), and optional Linux cgroup-v2 execution containment (#267), informed by completed #96 rather than by background-shell escape compatibility.
 
@@ -160,7 +160,7 @@ This queue records the practical result of continuing Handoff integration and ph
 The repository's open issues are classified by the revised release sequence so work cannot silently fall out of roadmap visibility. Milestones are ordering/admission guidance; an optional support-claim acceptance issue may remain open after the base artifact is released if that support claim is explicitly withheld.
 
 - **`0.3.x — released baseline / maintenance`:** no blocking implementation gate remains. #215 is removed from the patch-line milestone: its design is complete, Cloud Run remains unsupported, and future implementation is tracked as a separate hosted-deployment concern rather than keeping `0.3.x` artificially open.
-- **`0.4.0 — Recovery, Identity & Semantic Authorization`:** #221 is the active implementation gate. #139 implementation is merged and physical signed-token dogfood remains; #227/#228 implementation is present with platform-specific physical acceptance pending under #217. Those acceptance items gate their respective support claims, not unrelated `0.4.0` capabilities.
+- **`0.4.0 — Recovery, Identity & Semantic Authorization`:** #221 implementation is complete in the candidate change; merge/CI is the remaining feature gate. #139 implementation is merged and physical signed-token dogfood remains; #227/#228 implementation is present with platform-specific physical acceptance pending under #217. Those acceptance items gate their respective support claims, not unrelated `0.4.0` capabilities.
 - **`0.5.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
 - **`0.6.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle, #114 adds separately sandboxed Playwright/E2E execution, and #267 owns optional Linux cgroup-v2 containment.
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.
@@ -190,7 +190,7 @@ principal -> stable device -> exact DeviceCapability
 
 The adapter remains provider-neutral and fail closed. It verifies signature, issuer, audience, time claims, subject, asymmetric algorithm policy, and bounded JWKS caching/rotation before producing the existing CUMG principal. Caller-supplied identity headers and MCP `clientInfo` remain audit metadata only and never become authorization authority.
 
-Issue [#221](https://github.com/git-ksk/computer-use-mcp-gateway/issues/221) is the remaining authorization implementation gate for the candidate. It adds typed, backend-neutral, narrow-only semantic constraints at the finalized command boundary without turning CUMG into a generic policy engine. Exact capability authorization, grant signing, Handoff, recovery authority, quarantine, and no-auto-replay remain separate authorities.
+Issue [#221](https://github.com/git-ksk/computer-use-mcp-gateway/issues/221) implements typed, backend-neutral, narrow-only semantic constraints at the finalized command boundary without turning CUMG into a generic policy engine. Exact capability authorization, grant signing, Handoff, recovery authority, quarantine, and no-auto-replay remain separate authorities.
 
 This integrated release does **not** make CUMG an identity provider, account database, session manager, generic policy engine, or token issuer. Existing RFC 7662 introspection and explicitly single-principal trusted-proxy deployments remain supported choices, and optional signed-token/platform support claims remain acceptance-gated.
 

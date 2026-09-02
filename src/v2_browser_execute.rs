@@ -2025,7 +2025,10 @@ mod tests {
             backend_tab_id: "tab".into(),
             url: "https://example.com".into(),
         };
-        assert_eq!(map_command(&navigate).unwrap().0, "browser_navigate");
+        let (tool, args) = map_command(&navigate).unwrap();
+        assert_eq!(tool, "browser_navigate");
+        let args = args.unwrap();
+        assert_eq!(args.get("url"), Some(&json!("https://example.com")));
 
         let click = BrowserBackendCommand::Click {
             context_id: CONTEXT.into(),

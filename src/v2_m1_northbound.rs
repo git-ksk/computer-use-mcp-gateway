@@ -30,7 +30,8 @@ use crate::{
     v2_execution_safety::{
         OperationAdmissionMetadata, OperationAuditMetadata, OperationEvidenceEnvelope,
         OperationOwner, OperationRequestFingerprint, RecoverableOperationResult,
-        fingerprint_process_request, fingerprint_shell_request, text_input_evidence_envelope,
+        SemanticConstraintAdmissionEvidence, fingerprint_process_request,
+        fingerprint_shell_request, text_input_evidence_envelope,
     },
     v2_handoff_coordinator::{HandoffAdmission, HandoffCoordinator, HandoffCoordinatorError},
     v2_interaction_context::{
@@ -50,6 +51,7 @@ use crate::{
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_hub::{HubCommandError, HubHandle},
+    v2_semantic_constraints::{SemanticConstraintError, SemanticConstraintPolicy},
 };
 use async_trait::async_trait;
 use axum::{
@@ -1166,10 +1168,19 @@ struct NorthboundOperationCall {
     audit: OperationAuditMetadata,
 }
 
+/// Private binding between the exact finalized CUMG command and the semantic
+/// constraint decision that admitted it. Ordinary northbound dispatch consumes
+/// only this wrapper so constrained fields cannot be rebuilt after authorization.
+struct AuthorizedSemanticCommand {
+    command: DeviceCommand,
+    semantic_constraint: Option<SemanticConstraintAdmissionEvidence>,
+}
+
 #[derive(Clone)]
 pub struct V2NorthboundMcp {
     hub: HubHandle,
     authorizer: Arc<dyn DeviceCapabilityAuthorizer>,
+    semantic_constraints: Option<Arc<SemanticConstraintPolicy>>,
     request_fingerprint_secret: Option<Arc<[u8]>>,
     handoff_coordinator: Option<Arc<HandoffCoordinator>>,
     interactions: Arc<TokioMutex<NorthboundInteractionState>>,
@@ -1214,6 +1225,7 @@ impl V2NorthboundMcp {
         Self {
             hub,
             authorizer,
+            semantic_constraints: None,
             request_fingerprint_secret: None,
             handoff_coordinator: None,
             interactions: Arc::new(TokioMutex::new(NorthboundInteractionState::new())),
@@ -1228,6 +1240,18 @@ impl V2NorthboundMcp {
     pub fn with_handoff_coordinator(mut self, coordinator: Arc<HandoffCoordinator>) -> Self {
         self.handoff_coordinator = Some(coordinator);
         self
+    }
+
+    /// Installs one immutable operator-reviewed semantic constraint snapshot.
+    /// A different revision requires a Hub restart; there is no Agent/caller hot-reload path.
+    pub fn with_semantic_constraints(
+        mut self,
+        policy: SemanticConstraintPolicy,
+    ) -> Result<Self, HubCommandError> {
+        self.hub
+            .install_semantic_constraint_snapshot(policy.revision(), policy.digest())?;
+        self.semantic_constraints = Some(Arc::new(policy));
+        Ok(self)
     }
 
     fn auth_context(
@@ -1262,6 +1286,57 @@ impl V2NorthboundMcp {
                 );
                 capability_not_authorized_error()
             })
+    }
+
+    fn authorize_final_command(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        command: DeviceCommand,
+    ) -> Result<AuthorizedSemanticCommand, McpError> {
+        let capability = command.capability();
+        // Repeat exact-capability authorization at the finalized-command seam.
+        // Early discovery/request checks are advisory; this is the dispatch authority boundary.
+        self.authorize(principal, capability)?;
+        let semantic_constraint = match self.semantic_constraints.as_ref() {
+            Some(policy) => match policy.evaluate(&command) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    let (reason, kind) = match error {
+                        SemanticConstraintError::Denied => ("denied", "constraint_denied"),
+                        SemanticConstraintError::UnsupportedSubject => {
+                            ("unsupported_subject", "constraint_unsupported")
+                        }
+                        SemanticConstraintError::InvalidPolicy => {
+                            ("invalid_policy", "constraint_unavailable")
+                        }
+                    };
+                    tracing::warn!(
+                        event = "v2_semantic_constraint_denied",
+                        capability = crate::v2_observability::capability_name(capability),
+                        constraint_revision = policy.revision(),
+                        constraint_snapshot = policy.digest(),
+                        outcome = "denied",
+                        reason,
+                        error_code = "semantic_constraint_denied",
+                        "final semantic command was denied before provider dispatch"
+                    );
+                    return Err(McpError::invalid_request(
+                        "Semantic authorization constraint denied the operation",
+                        Some(json!({
+                            "code": "semantic_constraint_denied",
+                            "reason": kind,
+                            "constraint_revision": policy.revision(),
+                            "constraint_snapshot": policy.digest(),
+                        })),
+                    ));
+                }
+            },
+            None => None,
+        };
+        Ok(AuthorizedSemanticCommand {
+            command,
+            semantic_constraint,
+        })
     }
 
     fn context_access_allowed(
@@ -2007,21 +2082,15 @@ impl V2NorthboundMcp {
             Err(error) => return Err(error),
         };
         let public_operation_id = operation.operation_id.clone();
+        let command = DeviceCommand::StageBrowserUploadFile {
+            context_id: request.context_id,
+            file_name: request.file_name,
+            data_base64: BrowserUploadPayload::after_contract_validation(request.data_base64),
+            expected_bytes: expected_bytes as u64,
+        };
+        let authorized = self.authorize_final_command(principal, command)?;
         let execution = self
-            .execute_command(
-                principal,
-                DeviceCommand::StageBrowserUploadFile {
-                    context_id: request.context_id,
-                    file_name: request.file_name,
-                    data_base64: BrowserUploadPayload::after_contract_validation(
-                        request.data_base64,
-                    ),
-                    expected_bytes: expected_bytes as u64,
-                },
-                Some(&binding),
-                operation,
-                context,
-            )
+            .execute_command(principal, authorized, Some(&binding), operation, context)
             .await;
         let result = match execution {
             Ok(result) => result,
@@ -2080,11 +2149,12 @@ impl V2NorthboundMcp {
         let command = DeviceCommand::Browser {
             command: prepared.command.clone(),
         };
+        let authorized = self.authorize_final_command(principal, command)?;
         let public_operation_id = operation.operation_id.clone();
         let result = match self
             .execute_command(
                 principal,
-                command,
+                authorized,
                 Some(&prepared.binding),
                 operation,
                 context,
@@ -2660,11 +2730,15 @@ impl V2NorthboundMcp {
     async fn execute_command(
         &self,
         principal: &AuthenticatedClientPrincipal,
-        command: DeviceCommand,
+        authorized: AuthorizedSemanticCommand,
         interaction_binding: Option<&InteractionContextBinding>,
         operation: NorthboundOperationCall,
         context: &RequestContext<RoleServer>,
     ) -> Result<DeviceResult, McpError> {
+        let AuthorizedSemanticCommand {
+            command,
+            semantic_constraint,
+        } = authorized;
         let handoff = self
             .handoff_admission(principal, &command, interaction_binding)
             .await?;
@@ -2679,6 +2753,7 @@ impl V2NorthboundMcp {
             audit,
             request_fingerprint,
             evidence_envelope,
+            semantic_constraint,
         };
         let pending = if let Some(admission) = handoff.as_ref() {
             if admission.verification_local_to_agent {
@@ -3346,11 +3421,12 @@ impl ServerHandler for V2NorthboundMcp {
             _ => None,
         };
 
+        let authorized = self.authorize_final_command(&auth.principal, command)?;
         let public_operation_id = recoverable_effectful_call.then(|| operation_id.clone());
         let mut result = match self
             .execute_command(
                 &auth.principal,
-                command,
+                authorized,
                 interaction_binding.as_ref(),
                 NorthboundOperationCall {
                     operation_id,
@@ -3839,6 +3915,11 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         HubCommandError::CancelledBeforeDispatch => (
             "Operation was cancelled before dispatch",
             "cancelled_before_dispatch",
+            None,
+        ),
+        HubCommandError::SemanticConstraintSnapshotStale => (
+            "Semantic authorization snapshot changed before dispatch",
+            "semantic_constraint_snapshot_stale",
             None,
         ),
         HubCommandError::GrantSigningUnavailable => {
@@ -6358,6 +6439,139 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         path
+    }
+
+    #[test]
+    fn finalized_semantic_authorization_is_narrow_only_and_privacy_bounded() {
+        use crate::{
+            v2_m0::{DeviceIdentity, GrantAuthority},
+            v2_m0_transport::HubIdentity,
+            v2_m1_hub::{HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
+        };
+
+        let state_dir = temp_state_dir("semantic-final-command");
+        let device_identity = DeviceIdentity::generate();
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device_identity.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let device_id = hub.device_id().to_owned();
+        let principal =
+            AuthenticatedClientPrincipal::new("https://auth.example", "semantic-user").unwrap();
+        let mut exact = ClientAuthorizationPolicy::default();
+        exact.allow_device_capability(&principal, &device_id, DeviceCapability::TypeText);
+        exact.allow_device_capability(&principal, &device_id, DeviceCapability::BrowserNavigate);
+        let semantic = SemanticConstraintPolicy::from_json(
+            r#"{"revision":9,"rules":[
+                {"kind":"type_text_max_utf8_bytes","rule_id":"text-small","max_utf8_bytes":5},
+                {"kind":"browser_navigate_requested_origins","rule_id":"nav-prod","allowed_origins":["https://example.com"]}
+            ]}"#,
+        )
+        .unwrap();
+        let service = V2NorthboundMcp::new(handle, exact)
+            .with_semantic_constraints(semantic)
+            .unwrap();
+
+        let allowed_text = service
+            .authorize_final_command(
+                &principal,
+                DeviceCommand::TypeText {
+                    text: "éé".into()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            allowed_text.command.capability(),
+            DeviceCapability::TypeText
+        );
+        let evidence = allowed_text.semantic_constraint.unwrap();
+        assert_eq!(evidence.revision, 9);
+        assert_eq!(evidence.kind, "type_text_max_utf8_bytes");
+        assert_eq!(evidence.rule_id, "text-small");
+        assert_eq!(evidence.snapshot_digest.len(), 64);
+
+        let secret_text = "TOP_SECRET_VALUE";
+        let denied = match service.authorize_final_command(
+            &principal,
+            DeviceCommand::TypeText {
+                text: secret_text.into(),
+            },
+        ) {
+            Ok(_) => panic!("oversized finalized text unexpectedly authorized"),
+            Err(error) => error,
+        };
+        let denied_debug = format!("{denied:?}");
+        assert!(denied_debug.contains("semantic_constraint_denied"));
+        assert!(!denied_debug.contains(secret_text));
+
+        let allowed_url = "https://example.com/private?token=URL_SECRET_VALUE";
+        let allowed_nav = service
+            .authorize_final_command(
+                &principal,
+                DeviceCommand::Browser {
+                    command: BrowserBackendCommand::Navigate {
+                        context_id: "ctx".into(),
+                        backend_target_id: "target".into(),
+                        backend_tab_id: "tab".into(),
+                        url: allowed_url.into(),
+                    },
+                },
+            )
+            .unwrap();
+        match &allowed_nav.command {
+            DeviceCommand::Browser {
+                command: BrowserBackendCommand::Navigate { url, .. },
+            } => assert_eq!(url, allowed_url),
+            _ => panic!("expected finalized browser navigation"),
+        }
+        assert_eq!(allowed_nav.semantic_constraint.unwrap().rule_id, "nav-prod");
+
+        let denied_url = "https://evil.example/private?token=EVIL_URL_SECRET";
+        let denied = match service.authorize_final_command(
+            &principal,
+            DeviceCommand::Browser {
+                command: BrowserBackendCommand::Navigate {
+                    context_id: "ctx".into(),
+                    backend_target_id: "target".into(),
+                    backend_tab_id: "tab".into(),
+                    url: denied_url.into(),
+                },
+            },
+        ) {
+            Ok(_) => panic!("disallowed finalized origin unexpectedly authorized"),
+            Err(error) => error,
+        };
+        let denied_debug = format!("{denied:?}");
+        assert!(denied_debug.contains("semantic_constraint_denied"));
+        assert!(!denied_debug.contains(denied_url));
+        assert!(!denied_debug.contains("EVIL_URL_SECRET"));
+
+        let other = AuthenticatedClientPrincipal::new("https://auth.example", "other").unwrap();
+        let exact_denied = match service
+            .authorize_final_command(&other, DeviceCommand::TypeText { text: "ok".into() })
+        {
+            Ok(_) => panic!("semantic policy unexpectedly widened exact capability authority"),
+            Err(error) => error,
+        };
+        assert!(format!("{exact_denied:?}").contains("capability_not_authorized"));
+
+        drop(hub);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
