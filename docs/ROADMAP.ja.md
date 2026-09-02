@@ -34,44 +34,37 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Current maintenance line: `0.3.x`
+## Released baseline: `0.3.x`; active candidate: `0.4.0`
 
-`0.3.x` は released V2 Production Hardening / Operational Readiness direction を維持します。その contract と互換な work は、新しい milestone number を作るのではなく patch line に残します。
+`v0.3.0` は released V2 Production Hardening / Operational Readiness baseline のままです。互換修正は patch candidate になり得ますが、現在の feature release candidate は **`v0.4.0`** です。
 
-現在の priority:
+`0.4.0` candidate は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を意図的に統合します。まだ `v0.4.0` release/tag は一度も出していないため、すでに統合が進んだ機能を人工的な minor 境界で分けても meaningful な compatibility boundary にはなりません。
 
-- authoritative operation / quarantine / resolution / no-auto-replay state machine を維持する;
-- live control schema v9 と capability-advertisement schema v5 の behavior を明示した状態で維持する。capability schema v5 は signed / payload-free reconciliation-report boundary を追加する reviewed change で、mixed version は fail closed する;
-- Cua Driver upgrade を pinned / repeatable evidence を伴う reviewed compatibility change として扱う;
-- security、dependency、documentation、packaging、CI、conformance、soak、resource-regression quality を維持する;
-- V1 固有で残る compatibility observation（#14 / #15）は active CUMG release blocker とせず、対応する upstream Cua issue に blocked された状態を明示する;
-- compatible な runtime/security/reliability defect は PATCH candidate として修正する;
-- docs-only/editorial work は、immutable な corrected release snapshot が operationally 必要な場合を除き version-neutral とする。
+### `0.4.0` integrated release plan
 
-`v0.3.0` 後に merge された compatible fix は将来の `0.3.1` に含められますが、maintenance commit が存在するだけで release を必須にはしません。
-
-### 直近の post-v0.3 実行順
-
-`0.3.x` Product Readiness closeout は完了済みです。`0.4.0` Recovery & Reconciliation は、manual な physical acceptance gate が無関係な実装を直列化しないよう、**shared/provider implementation、physical platform acceptance、parallel dogfood hardening の3レーン**に分けて進めます。
+`0.4.0` は working **Recovery, Identity & Semantic Authorization** release とします。 canonical candidate scope / support-claim matrix は [`v2/V2_040_RELEASE_SCOPE.ja.md`](v2/V2_040_RELEASE_SCOPE.ja.md) に固定します。recovery/reconciliation foundation、provider-neutral multi-principal identity、typed semantic authorization boundary をまとめつつ、optional platform/hosted support claim は artifact 本体より狭く保ちます。
 
 | `0.4.0` track | Issues / PR | Status | Release role |
 | --- | --- | --- | --- |
-| Core recovery semantics | #103, #137, #136 | Complete | baseline 完了 |
-| Shared WebAuthn/CTAP verifier | #256 / PR #258 | 完了 | provider-neutral shared dependency は main へ反映済み。単独では platform support を claim しない |
-| Windows Hello provider | #227 / PR #252 | implementation + CI green、physical acceptance pending | Windows online-recovery support/parity closeout は block するが、無関係な実装は block しない |
-| Linux FIDO2 UV provider | #228 / PR #259 | implementation + CI complete、physical acceptance pending | Linux support claim 前に UV-capable FIDO2 実機 acceptance 必須 |
-| Recovery dogfood hardening | #253, #254, #115, #255 | 完了 | implementation/evidence が released safety/recovery invariant failure を示さない限り non-blocking |
-| その他 compatible stabilization | #215, #104, #111, #96 | #104/#111 完了、#96 調査完了・Linux follow-up #267、#215 は design complete・implementation/acceptance pending | released regression の新 evidence がない限り non-blocking |
+| Core recovery semantics | #103, #137, #136 | Complete | Required baseline |
+| Shared WebAuthn/CTAP verifier | #256 / PR #258 | Complete | Required shared recovery dependency。単独ではplatform support claimを意味しない |
+| Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
+| Multi-principal OIDC/JWT identity | #139 / PR #269 | implementation + CI complete、physical signed-token dogfood pending | implementation は含める。provider-specific support claim は acceptance 待ち |
+| Typed semantic authorization | #221 | Active implementation | **Required `0.4.0` implementation gate** |
+| Windows Hello recovery | #227 / PR #252 | implementation + CI green、physical acceptance pending | optional platform support gate。base `0.4.0` が Windows recovery support をclaimする必要はない |
+| Linux FIDO2 UV recovery | #228 / PR #259 | implementation + CI complete、physical acceptance pending | optional platform support gate。base `0.4.0` が Linux recovery support をclaimする必要はない |
+| Cross-platform recovery parity umbrella | #217 | physical acceptance dependent | 実際にsupport claimするplatform setのevidenceが揃うまでOPEN可 |
+| Hosted Cloud Run Hub | #215 | design complete、implementation/acceptance pending | **`0.4.0` support claimではない**。future hosted-deployment track |
 
-released safety regression を示す新しい evidence がない限り、次の順序を使います。
+release candidate は次の順で進めます。
 
-1. **完了済み recovery core を固定:** #103 durable effectful operation identity/status、#137 reviewed local-Human current-state acceptance、#136 permanent replay tombstone / bounded detailed history 分離は完了済みで、`0.4.0` semantic baseline とします。
-2. **shared protocol boundary を固定:** #256 / PR #258 は完了し、provider-neutral WebAuthn/CTAP ES256 verifier は Windows/Linux provider support を claim せず `main` へ反映済みです。
-3. **provider implementation と physical acceptance を別レーンで進行:** #227 / PR #252 は automated check green の実装を保持し、physical Windows Hello acceptance pending を明示します。#228 / PR #259 Linux FIDO2 UV provider は merged shared verifier に対して Windows 実機確認を待たず implementation / CI complete まで進んでいます。ただし各 platform の support claim には、その platform の explicit physical acceptance が必要です。
-4. **physical-acceptance 待ち時間を bounded recovery hardening に使用:** #253 installed runtime/operator-tool skew detection と #254 recovery-key readiness は完了済みで、#115 actionable `device_indeterminate` guidance と #255 Human historical-resolution guidance は完了済みです。これらは compatible な `0.4`-era dogfood improvement であり自動的な release blocker にはしません。既存 safety/recovery invariant が満たされていない evidence が出た場合だけ blocker へ昇格します。
-5. **cross-platform parity を意図的にclose:** #217 は、実際に supported と claim する platform provider が required implementation、user-presence proof、durable recovery/no-replay evidence、physical acceptance を満たした場合だけ close します。manual acceptance pending は「未実装」ではなく acceptance gate として明示します。
+1. **#221を完了**し、typed backend-neutral semantic constraint boundary、full regression/CI、EN/JA normative docsをmergeする。
+2. standing [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateで **`0.4.0` release closeout** を行う。version/durable-schema compatibility、source-free candidate artifact、clean install/upgrade/rollback、doctor/status、recovery/no-replay、dependency/CodeQL、docs、release noteを対象にする。
+3. generic signed-token identityをrelease-supportedと表現する前に **#139 signed-token dogfood** を完了する。artifactにimplementationが入っていても、acceptance前はsupport claimを保留できる。
+4. **#227/#228 physical gateを正直に維持**する。codeはcandidateへ含められるが、各physical acceptanceが通るまでWindows Hello/Linux FIDO2 online recoveryをsupportedとは表現しない。#217はclaimed platform setが実証された後にcloseする。
+5. **#215 implementationをrelease gateへ引き込まない。** Cloud Run designはmain上の有用なevidenceだが、hosted Hub supportは別contractのdurable-state/fencing/ingress/acceptanceが実装されるまでNO-GOのままにする。
 
-この sequencing により `0.4.0` を無制限な backlog-clearing exercise にせず、Windows/Linux の physical acceptance が面倒または実行不能な期間も開発を止めません。`0.5.0` authorization/identity work は分離したままとし、#221 は design review を先行してよいものの implementation を recovery milestone へ取り込みません。
+これはrelease scopeの統合であり、acceptanceの弱体化ではありません。artifactに実装が含まれても、**support claimをcompiled surfaceより狭くする**ことがあり、その境界はrelease note/statusで明示します。
 
 ### Legacy V1 retirement candidate
 
@@ -93,13 +86,12 @@ CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 �
 
 現在の作業順:
 
-- **`0.3.x` — Product Readiness & Stabilization:** #237 と #213 cross-cutting closeout は完了済みです。future release は恒久 [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gate を再利用します。#226/#233/#234/#235/#109/#236 の operator/recovery foundation と #224 release-candidate artifact boundary は完了済みで、#115 actionable indeterminate UX も完了済みです。#104 least-privilege filesystem-root separation は完了済みです。#111 reproducible performance benchmark は完了済みです。#215 Cloud Run Hub support-gate design は完了済みですが、durable-state/fencing/ingress implementation と acceptance は未完了です。#96 Unix containment の bounded 調査は完了済みです。stronger Linux implementation は managed-execution milestone の #267 へ分離しました。
-- **`0.4.0` — Recovery & Reconciliation:** #103 / #137 / #136 は完了済みです。shared WebAuthn/CTAP verifier は #256 / PR #258 で完了済みです。#227 Windows Hello は implementation / CI complete・physical Windows acceptance pending のまま、#228 / PR #259 Linux FIDO2 も implementation / CI complete・physical Linux acceptance pending です。#253 runtime/operator-tool skew detection と #254 recovery-key readiness は完了済み、#115 actionable indeterminate guidance と #255 Human historical-resolution guidance は完了済みで、bounded non-blocking recovery-dogfood hardening lane は完了し、released invariant failure の新 evidence が出た場合だけ blocker に昇格します。#217 は parity umbrella のままで、各 platform provider の support claim 前に physical acceptance を必須とします。
-- **`0.5.0` — Multi-principal Identity & Authorization:** #139 provider-neutral OIDC/JWT caller identity は implementation complete・physical signed-token acceptance pending です。既存 exact `principal -> device -> capability` authorizer、single-principal / introspection adapter、独立した grant/recovery/Handoff authority を維持し、次に #221 narrow-only typed semantic constraint へ進みます。
-- **`0.6.0` — Least-privilege Workspace:** #83 の bounded retrievable output、#105 の ranged / deterministic filesystem observation、#107 の明示的 writable root 下での atomic workspace mutation により Dangerous shell authority への依存を減らす。
-- **`0.7.0` — Managed Developer Execution:** #106 の explicitly managed long-running job、#114 の separately sandboxed Playwright/E2E execution、#267 の optional Linux cgroup-v2 execution containment を追加。completed #96 Unix containment 調査を前提にし、background-shell escape compatibility は作らない。
+- **`0.3.x` — released baseline / compatible maintenance:** #213 Product Readiness closeout、#237 artifact-backed install/upgrade、#104 filesystem-root separation、#111 reproducible benchmark、bounded #96 investigationは完了済み。#215 Cloud Run designも完了済みだが、hosted supportはopen-endedな`0.3.x` blockerではなくfuture NO-GO implementation trackとする。
+- **`0.4.0` — Recovery, Identity & Semantic Authorization:** 完了済みrecovery/reconciliation (#103/#137/#136/#253/#254/#115/#255/#256)、provider-neutral OIDC/JWT identity (#139)、typed backend-neutral semantic authorization (#221)を統合する。active implementation gateは#221 completion +通常release closeout。#139/#227/#228は必要なphysical/support-claim acceptanceを明示的に保持し、未accept platform providerをcodeがあるだけでsupportedとは表現しない。
+- **`0.5.0` — Least-privilege Workspace:** #83 bounded retrievable output、#105 ranged/deterministic filesystem observation、#107 explicit writable root配下のatomic workspace mutationでDangerous shell authorityへの依存を減らす。
+- **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
-implementation evidence により area の combine / split / defer、または compatible patch 扱いが妥当と分かった場合は release number を動かしてよいものとします。number より dependency / safety boundary を優先します。
+minor numberはworking release boundaryでありcalendar promiseではありません。optional platform/providerのsupport claimはexplicit acceptanceまで保留できます。implementation evidenceがsplit/deferを要求する場合はnumberingよりsafety boundaryを優先します。
 
 ### 横断 Product Readiness track
 
@@ -165,24 +157,22 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 
 ### 現在の open issue inventory
 
-repository の open issue は、work が roadmap の可視性から黙って抜け落ちないよう working milestone ごとに分類します。これらの milestone は ordering / admission guidance であり、evidence により split / defer が必要になった場合まで同時 ship を約束するものではありません。
+open issue はrevised release sequenceで分類し、roadmap visibilityからsilentに落ちないようにします。milestoneはordering/admission guidanceです。optional support-claim acceptanceは、そのsupport claimを明示的に保留する限りbase artifact release後もOPENのままにできます。
 
-- **`0.3.x — Product Readiness & Stabilization`:** #213 final cross-cutting Product Readiness gate は完了済みで、今後は [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) が standing gate を引き継ぎます。#226/#233/#234/#235/#109/#236 の operator/recovery foundation と #115 actionable indeterminate UX は完了済みで、#224 も completed release-candidate artifact boundary を提供します。artifact-backed install/upgrade #237 と #213 cross-cutting closeout は完了済みで、blocking `0.3.x` implementation/gate は残っていません。#104 filesystem-root separation は完了済みです。#111 reproducible performance benchmark は完了済みです。#215 Cloud Run Hub support-gate design は完了済みですが implementation/acceptance はopenのままです。#96 Unix containment の bounded 調査は完了済みです。Linux cgroup-v2 hardening は `0.7.0` の #267 で別途継続します。
-- **`0.4.0 — Recovery & Reconciliation`:** #103/#137/#136 と shared verifier #256 は完了済みです。#227 Windows Hello/WebAuthn と #228 / PR #259 Linux FIDO2 UV は implementation/CI complete ですが、#217 配下で各platformのphysical acceptance gateを別途維持します。#253 runtime/operator skew と #254 recovery-key readiness は完了済みで、#115 actionable indeterminate guidance と #255 Human historical-resolution guidance は完了済みです。新しい evidence がない限り bounded recovery dogfood-hardening の残件はありません。
-- **`0.5.0 — Multi-principal Identity`:** #139 provider-neutral OIDC/JWT identity は existing exact authorizer を維持したまま implementation complete・physical acceptance pending です。#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
-- **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。
-- **`0.7.0 — Managed Developer Execution`:** #106 が explicit managed-job lifecycle、#114 が separately sandboxed Playwright/E2E execution、#267 が completed #96 investigation を受けた optional Linux cgroup-v2 execution containment を担当します。
-- **Upstream-blocked V1 compatibility:** #14（`get_screen_size` session/escalation）と #15（`list_apps` live-process discovery mismatch）は upstream Cua 待ちのまま、active post-v0.3 milestone を意図的に付けません。V1 を deliberate に retire する場合は no-longer-applicable になる可能性があります。
+- **`0.3.x — released baseline / maintenance`:** blocking implementation gateは残っていません。#215はpatch-line milestoneから外し、design complete / Cloud Run unsupportedのfuture hosted-deployment concernとして扱います。
+- **`0.4.0 — Recovery, Identity & Semantic Authorization`:** active implementation gateは#221です。#139 implementationはmerge済みでphysical signed-token dogfood待ち、#227/#228もimplementation済みで#217配下のplatform-specific physical acceptance待ちです。これらは各support claimをgateしますが、無関係な`0.4.0` capabilityをblockしません。
+- **`0.5.0 — Least-privilege Workspace`:** #83 bounded retrievable process/shell output、#105 ranged/deterministic filesystem observation、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation。
+- **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
+- **Future / evidence-driven:** #215 hosted Cloud Run Hub implementationと#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
+- **Upstream-blocked V1 compatibility:** #14/#15はupstream Cua blockedのままでactive CUMG release blockerではない。
 
-open issue がこの inventory または他の明示的 roadmap section に存在しない場合、roadmap は stale とみなし、milestone / release closeout を宣言する前に修正します。
+open issueがこのinventoryまたは別のexplicit roadmap sectionに現れない場合はroadmap staleとして、release closeout前に修正します。
 
-Cua authorization / product-boundary research #219 は [`v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md`](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md) で完了し、admit した follow-up は #221 と #222 です。
+Cua authorization/product-boundary research #219 は [`v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md`](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md) で完了し、admitしたfollow-upは#221と#222です。
 
-### `0.5.0` candidate: multi-principal northbound identity
+### `0.4.0` identity / semantic-authorization component
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は `0.3.x` stabilization / `0.4.0` Recovery & Reconciliation contract には**意図的に含めません**。distinct authenticated principal が必要な deployment 向けの provider-neutral signed-token path として、現在の作業順では `0.5.0` northbound-authentication expansion に置きます。正確なrelease numberは上記admission/evidence ruleに従います。
-
-implemented #139 architecture は次です。
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は、別の`0.5.0`ではなくintegrated `0.4.0` candidateへ移します。implementationはmerge済みで、verified external identityを既存`AuthenticatedClientPrincipal`へ落とし込み、exact principal/device/capability authorizationは変更しません。physical signed-token dogfoodが#139の最後のsupport-claim acceptanceです。
 
 ```text
 external OAuth/OIDC identity provider
@@ -198,11 +188,11 @@ DeviceCapabilityAuthorizer
 principal -> stable device -> exact DeviceCapability
 ```
 
-adapter は provider-neutral / fail-closed を維持します。signature、issuer、audience、time claim、subject、algorithm policy、bounded な JWKS caching/rotation を検証した後にだけ既存 CUMG principal を生成します。caller-supplied identity header と MCP `clientInfo` は audit metadata のままで、authorization authority にはしません。
+adapterはprovider-neutral / fail closedのままです。signature、issuer、audience、time claim、subject、asymmetric algorithm policy、bounded JWKS cache/rotationを検証してから既存CUMG principalを生成します。caller-supplied identity headerとMCP `clientInfo`はaudit metadataでありauthorization authorityにはなりません。
 
-この work により CUMG を identity provider、account database、session manager、token issuer にはしません。既存 RFC 7662 introspection と、明示的に single-principal とする trusted-proxy adapter は引き続き deployment option として維持します。signed-token deployment では、fixed-principal local proxy bridge が identity 確立だけのために存在する場合は取り除けます。一方、reverse proxy / tunnel は transport、origin hardening、rate limiting、defense in depth のために残して構いません。
+Issue [#221](https://github.com/git-ksk/computer-use-mcp-gateway/issues/221) がcandidateの残るauthorization implementation gateです。finalized command boundaryへtyped/backend-neutral/narrow-only semantic constraintを追加し、CUMGをgeneric policy engineにはしません。exact capability authorization、grant signing、Handoff、recovery authority、quarantine、no-auto-replayは独立authorityのままです。
 
-automated acceptance では少なくとも2つの verified subject が既存 `DeviceCapabilityAuthorizer` を通じて異なる exact device/capability decision を受けることを証明済みで、bad signature / issuer / audience / time / key / subject / algorithm は fail closed、既存 authentication adapter に regression がないことを確認します。#139 close 前の最終 acceptance として physical signed-token dogfood が残ります。
+このintegrated releaseはCUMGをidentity provider、account database、session manager、generic policy engine、token issuerにはしません。RFC 7662 introspectionとexplicit single-principal trusted-proxyも引き続きdeployment choiceで、optional signed-token/platform support claimはacceptance-gatedです。
 
 ### Remaining semantic parity decisions
 

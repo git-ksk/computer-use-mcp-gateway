@@ -69,4 +69,4 @@ post-v0.3 の初回 Product Readiness gate は以下の evidence で完了しま
 - [`v2/V2_SINGLE_MAC_PRODUCTION.ja.md`](v2/V2_SINGLE_MAC_PRODUCTION.ja.md): reviewed single-Mac profile の lifecycle、diagnostics、recovery、rollback。 [`v2/V2_BACKUP_RESTORE.ja.md`](v2/V2_BACKUP_RESTORE.ja.md): coherent backup/restore boundary。
 - [`TESTING.md`](TESTING.md)、[`VERSIONING.ja.md`](VERSIONING.ja.md)、[`DEPLOYMENT.md`](DEPLOYMENT.md)、[`v2/STATUS.ja.md`](v2/STATUS.ja.md): compatibility/release/operations/acceptance evidence。
 
-#213 close は compatible stabilization や future-platform issue の全完了を意味しません。#215/#115/#104/#111/bounded #96 は released invariant failure の新 evidence がない限り non-blocking stabilization です。#217/#227/#228 を含む Recovery & Reconciliation 拡張は後続 milestone work のままです。
+#213 close はすべてのfuture-platform / hosted-deployment issue完了を意味しません。#104/#111/#115 と bounded #96 investigation は完了済みです。#215 Cloud Run designも完了していますが、hosted supportはfuture NO-GO implementation/acceptance trackのままです。active `0.4.0` candidateはRecovery & Reconciliation、multi-principal identity、semantic authorizationを統合し、#217/#227/#228と#139のsupport claimにはroadmap記載のexplicit acceptance boundaryを維持します。
