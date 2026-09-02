@@ -144,6 +144,8 @@ JSON schema v1 が stable machine-readable contract です。overall operator st
 
 `v2_status` は composition-only です。ある lane の `ready` は別 lane の authorization ではなく、quarantine resolve、mutation authority switch、Handoff resume/cancel、upgrade retry/resume、operation replay はできません。`review_incident` は #233 incident-brief、`complete_recovery` は既存の explicit Handoff/recovery flow、`inspect_upgrade` は `v2_maint upgrade-status`、configuration/backend code は `v2_doctor` または backend diagnostics へ進むための案内です。evidence が unknown/mismatch の場合は `unknown` / `unavailable` / `action_required` に fail closed し、healthy と推測しません。
 
+runtime section は incident 前に3つの read-only compatibility signal も返します: `runtime_pairing=compatible|skewed|unknown`、`operator_tooling=compatible|stale|unavailable|unknown`、`checkpoint_reader_compatibility=compatible|incompatible|unknown` です。runtime pairing は owner-private な schema-3 manifest、installed Hub/Agent/operator binary の exact SHA-256 identity、さらに直接起動された `v2_status` / `v2_doctor` では実際に実行中の executable digest から導出します。checkpoint reader check は authoritative Hub checkpoint の bounded schema metadata だけを読み、state を変更しません。skew/stale、checkpoint より明示的に古い reader、または pairing evidence 不明の場合、`v2_status` は `next_action=inspect_upgrade` を返します。authority-bearing recovery の前に durable upgrade status を確認し、review済み version-paired runtime を復元してください。source checkout の新しい `v2_maint` だけを古い install へコピーする ad-hoc repair は support しません。
+
 ## `v2_doctor`
 
 `v2_doctor` は read-only です。quarantine resolve、work dispatch、secret content read、raw command/result/desktop data 出力は行いません。

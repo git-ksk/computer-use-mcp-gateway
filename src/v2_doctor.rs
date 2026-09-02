@@ -1,8 +1,11 @@
 use crate::mutation_authority::inspect_mutation_authority;
+use crate::v2_execution_safety::EXECUTION_SAFETY_SCHEMA_VERSION;
 use crate::v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control};
 use crate::v2_m0::{CapabilityClass, DeviceCapability};
 use crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION;
-use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, HubPersistentState};
+use crate::v2_m1_persistence::{
+    AgentPersistentState, CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION,
+};
 use crate::v2_maintenance::inspect_quarantines_read_only;
 use crate::v2_operator_handoff::HandoffRuntimeStatus;
 use crate::v2_tls_lifecycle::{CertificateFormat, CertificateHealth, inspect_certificate_file};
@@ -62,11 +65,70 @@ pub struct DoctorCheck {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePairingStatus {
+    Compatible,
+    Skewed,
+    Unknown,
+}
+
+impl RuntimePairingStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Skewed => "skewed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorToolingStatus {
+    Compatible,
+    Stale,
+    Unavailable,
+    Unknown,
+}
+
+impl OperatorToolingStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointReaderCompatibility {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
+impl CheckpointReaderCompatibility {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Incompatible => "incompatible",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeSummary {
     pub package_version: String,
     pub source_commit: Option<String>,
     pub manifest_verified: bool,
+    pub runtime_pairing: RuntimePairingStatus,
+    pub operator_tooling: OperatorToolingStatus,
+    pub checkpoint_reader_compatibility: CheckpointReaderCompatibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -190,8 +252,16 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         package_version: env!("CARGO_PKG_VERSION").to_owned(),
         source_commit: None,
         manifest_verified: false,
+        runtime_pairing: RuntimePairingStatus::Unknown,
+        operator_tooling: OperatorToolingStatus::Unknown,
+        checkpoint_reader_compatibility: CheckpointReaderCompatibility::Unknown,
     };
     verify_runtime_manifest(config, &mut runtime, &mut checks);
+    runtime.checkpoint_reader_compatibility = inspect_checkpoint_reader_compatibility(
+        &config.hub_state_dir,
+        runtime.operator_tooling,
+        &mut checks,
+    );
     inspect_storage_capacity(&config.agent_state_dir, "agent_state_capacity", &mut checks);
     inspect_storage_capacity(&std::env::temp_dir(), "temp_capacity", &mut checks);
 
@@ -327,6 +397,13 @@ fn inspect_mutation_authority_for_doctor(
     }
 }
 
+fn is_operator_runtime_binary(name: &str) -> bool {
+    matches!(
+        name,
+        "v2_maint" | "v2_doctor" | "v2_status" | "v2_recover" | "v2_recovery_enclave_helper"
+    )
+}
+
 fn verify_runtime_manifest(
     config: &DoctorConfig,
     runtime: &mut RuntimeSummary,
@@ -363,12 +440,16 @@ fn verify_runtime_manifest(
         return;
     }
     runtime.source_commit = Some(manifest.source_commit.clone());
+    runtime.runtime_pairing = RuntimePairingStatus::Compatible;
+    runtime.operator_tooling = OperatorToolingStatus::Compatible;
     if manifest.package_version != env!("CARGO_PKG_VERSION") {
+        runtime.runtime_pairing = RuntimePairingStatus::Skewed;
+        runtime.operator_tooling = OperatorToolingStatus::Stale;
         push(
             checks,
             "runtime_manifest",
             CheckStatus::Warning,
-            "package_version_differs_from_doctor",
+            "package_version_differs_from_operator",
         );
     }
     let mut required = vec!["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_status"];
@@ -379,6 +460,10 @@ fn verify_runtime_manifest(
     }
     for name in required {
         let Some(entry) = manifest.binaries.iter().find(|entry| entry.name == name) else {
+            runtime.runtime_pairing = RuntimePairingStatus::Skewed;
+            if is_operator_runtime_binary(name) {
+                runtime.operator_tooling = OperatorToolingStatus::Unavailable;
+            }
             push(
                 checks,
                 "runtime_manifest",
@@ -388,6 +473,8 @@ fn verify_runtime_manifest(
             return;
         };
         if entry.sha256.len() != 64 || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            runtime.runtime_pairing = RuntimePairingStatus::Unknown;
+            runtime.operator_tooling = OperatorToolingStatus::Unknown;
             push(
                 checks,
                 "runtime_manifest",
@@ -400,6 +487,10 @@ fn verify_runtime_manifest(
         match sha256_file(&path) {
             Ok(actual) if actual.eq_ignore_ascii_case(&entry.sha256) => {}
             Ok(_) => {
+                runtime.runtime_pairing = RuntimePairingStatus::Skewed;
+                if is_operator_runtime_binary(name) {
+                    runtime.operator_tooling = OperatorToolingStatus::Stale;
+                }
                 push(
                     checks,
                     "runtime_manifest",
@@ -409,6 +500,10 @@ fn verify_runtime_manifest(
                 return;
             }
             Err(_) => {
+                runtime.runtime_pairing = RuntimePairingStatus::Skewed;
+                if is_operator_runtime_binary(name) {
+                    runtime.operator_tooling = OperatorToolingStatus::Unavailable;
+                }
                 push(
                     checks,
                     "runtime_manifest",
@@ -419,8 +514,121 @@ fn verify_runtime_manifest(
             }
         }
     }
+
+    // `v2_status` and `v2_doctor` are often invoked directly by an operator. Verify
+    // the executable that is actually running, not only another file with the same
+    // basename under --binary-dir. Test harness executables deliberately skip this
+    // check because they are not production operator tools.
+    if let Ok(current) = std::env::current_exe()
+        && let Some(name) = current.file_name().and_then(|value| value.to_str())
+        && matches!(name, "v2_status" | "v2_doctor")
+        && let Some(entry) = manifest.binaries.iter().find(|entry| entry.name == name)
+    {
+        match sha256_file(&current) {
+            Ok(actual) if actual.eq_ignore_ascii_case(&entry.sha256) => {}
+            Ok(_) => {
+                runtime.runtime_pairing = RuntimePairingStatus::Skewed;
+                runtime.operator_tooling = OperatorToolingStatus::Stale;
+                push(
+                    checks,
+                    "runtime_manifest",
+                    CheckStatus::Error,
+                    "running_operator_digest_mismatch",
+                );
+                return;
+            }
+            Err(_) => {
+                runtime.runtime_pairing = RuntimePairingStatus::Unknown;
+                runtime.operator_tooling = OperatorToolingStatus::Unknown;
+                push(
+                    checks,
+                    "runtime_manifest",
+                    CheckStatus::Error,
+                    "running_operator_unreadable",
+                );
+                return;
+            }
+        }
+    }
+
     runtime.manifest_verified = true;
     push(checks, "runtime_manifest", CheckStatus::Ok, "verified");
+}
+
+fn inspect_checkpoint_reader_compatibility(
+    hub_state_dir: &Path,
+    operator_tooling: OperatorToolingStatus,
+    checks: &mut Vec<DoctorCheck>,
+) -> CheckpointReaderCompatibility {
+    let store = match CheckpointStore::new(hub_state_dir.to_path_buf(), "hub") {
+        Ok(store) => store,
+        Err(_) => {
+            push(
+                checks,
+                "checkpoint_reader_compatibility",
+                CheckStatus::Warning,
+                "state_identity_unavailable",
+            );
+            return CheckpointReaderCompatibility::Unknown;
+        }
+    };
+    let raw = match store.load_latest::<serde_json::Value>() {
+        Ok(raw) => raw,
+        Err(_) => {
+            push(
+                checks,
+                "checkpoint_reader_compatibility",
+                CheckStatus::Warning,
+                "checkpoint_schema_unavailable",
+            );
+            return CheckpointReaderCompatibility::Unknown;
+        }
+    };
+    let state_schema = raw
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok());
+    let execution_schema = raw
+        .get("execution")
+        .and_then(|value| value.get("schema_version"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok());
+    if state_schema != Some(M1_STATE_SCHEMA_VERSION)
+        || execution_schema.is_some_and(|value| value > EXECUTION_SAFETY_SCHEMA_VERSION)
+    {
+        push(
+            checks,
+            "checkpoint_reader_compatibility",
+            CheckStatus::Error,
+            "checkpoint_newer_than_reader",
+        );
+        return CheckpointReaderCompatibility::Incompatible;
+    }
+    if state_schema.is_none() || execution_schema.is_none() {
+        push(
+            checks,
+            "checkpoint_reader_compatibility",
+            CheckStatus::Warning,
+            "checkpoint_schema_unknown",
+        );
+        return CheckpointReaderCompatibility::Unknown;
+    }
+    if operator_tooling != OperatorToolingStatus::Compatible {
+        push(
+            checks,
+            "checkpoint_reader_compatibility",
+            CheckStatus::Warning,
+            "operator_reader_identity_unverified",
+        );
+        return CheckpointReaderCompatibility::Unknown;
+    }
+    push(
+        checks,
+        "checkpoint_reader_compatibility",
+        CheckStatus::Ok,
+        "compatible",
+    );
+    CheckpointReaderCompatibility::Compatible
 }
 
 fn inspect_hub(
@@ -1873,6 +2081,9 @@ mod tests {
             package_version: env!("CARGO_PKG_VERSION").into(),
             source_commit: None,
             manifest_verified: false,
+            runtime_pairing: RuntimePairingStatus::Unknown,
+            operator_tooling: OperatorToolingStatus::Unknown,
+            checkpoint_reader_compatibility: CheckpointReaderCompatibility::Unknown,
         };
         let mut checks = Vec::new();
         verify_runtime_manifest(&config, &mut runtime, &mut checks);
@@ -1885,6 +2096,135 @@ mod tests {
                 detail: "verified".into(),
             }]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_manifest_detects_stale_operator_binary_before_incident() {
+        let root = temp_dir("manifest-stale-operator");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let names = [
+            "v2_hub",
+            "v2_agent",
+            "v2_maint",
+            "v2_doctor",
+            "v2_status",
+            "v2_recover",
+            "v2_recovery_enclave_helper",
+        ];
+        let mut binaries = Vec::new();
+        for name in names {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("paired-{name}")).unwrap();
+            binaries.push(serde_json::json!({"name": name, "sha256": sha256_file(&path).unwrap()}));
+        }
+        std::fs::write(bin.join("v2_maint"), b"older-maintenance-binary").unwrap();
+        let manifest = root.join("runtime-manifest.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 3,
+                "hub_agent_schema_version": HUB_AGENT_SCHEMA_VERSION,
+                "source_commit": "0123456789abcdef0123456789abcdef01234567",
+                "package_version": env!("CARGO_PKG_VERSION"),
+                "binaries": binaries
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = DoctorConfig {
+            hub_state_dir: root.join("hub"),
+            agent_state_dir: root.join("agent"),
+            runtime_manifest: manifest,
+            binary_dir: bin,
+            hub_launchd_label: "hub".into(),
+            agent_launchd_label: "agent".into(),
+            grant_signer_launchd_label: None,
+            grant_signer_socket: None,
+            tls_server_certificate: None,
+            tls_root_certificate: None,
+            cua_command: None,
+            expected_cua_version: None,
+            mutation_authority_dir: None,
+            handoff_control_socket: None,
+            maintenance_job_exclude_label: None,
+        };
+        let mut runtime = RuntimeSummary {
+            package_version: env!("CARGO_PKG_VERSION").into(),
+            source_commit: None,
+            manifest_verified: false,
+            runtime_pairing: RuntimePairingStatus::Unknown,
+            operator_tooling: OperatorToolingStatus::Unknown,
+            checkpoint_reader_compatibility: CheckpointReaderCompatibility::Unknown,
+        };
+        let mut checks = Vec::new();
+        verify_runtime_manifest(&config, &mut runtime, &mut checks);
+        assert!(!runtime.manifest_verified);
+        assert_eq!(runtime.runtime_pairing, RuntimePairingStatus::Skewed);
+        assert_eq!(runtime.operator_tooling, OperatorToolingStatus::Stale);
+        assert!(checks.iter().any(|check| {
+            check.name == "runtime_manifest"
+                && check.status == CheckStatus::Error
+                && check.detail == "binary_digest_mismatch"
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_reader_reports_future_schema_incompatibility_directly() {
+        let root = temp_dir("future-checkpoint-reader");
+        let hub = root.join("hub");
+        CheckpointStore::new(&hub, "hub")
+            .unwrap()
+            .save(&serde_json::json!({
+                "schema_version": M1_STATE_SCHEMA_VERSION,
+                "execution": {
+                    "schema_version": EXECUTION_SAFETY_SCHEMA_VERSION + 1
+                }
+            }))
+            .unwrap();
+        let mut checks = Vec::new();
+        let compatibility = inspect_checkpoint_reader_compatibility(
+            &hub,
+            OperatorToolingStatus::Compatible,
+            &mut checks,
+        );
+        assert_eq!(compatibility, CheckpointReaderCompatibility::Incompatible);
+        assert_eq!(
+            checks,
+            vec![DoctorCheck {
+                name: "checkpoint_reader_compatibility".into(),
+                status: CheckStatus::Error,
+                detail: "checkpoint_newer_than_reader".into(),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_reader_requires_paired_operator_identity_before_green() {
+        let root = temp_dir("checkpoint-reader-identity");
+        let hub = root.join("hub");
+        CheckpointStore::new(&hub, "hub")
+            .unwrap()
+            .save(&serde_json::json!({
+                "schema_version": M1_STATE_SCHEMA_VERSION,
+                "execution": {
+                    "schema_version": EXECUTION_SAFETY_SCHEMA_VERSION
+                }
+            }))
+            .unwrap();
+        let mut checks = Vec::new();
+        assert_eq!(
+            inspect_checkpoint_reader_compatibility(
+                &hub,
+                OperatorToolingStatus::Stale,
+                &mut checks,
+            ),
+            CheckpointReaderCompatibility::Unknown
+        );
+        assert_eq!(checks[0].detail, "operator_reader_identity_unverified");
         let _ = std::fs::remove_dir_all(root);
     }
 
