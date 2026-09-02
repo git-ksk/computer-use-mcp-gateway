@@ -7,6 +7,7 @@ use crate::v2_m1_persistence::{
     AgentPersistentState, CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION,
 };
 use crate::v2_maintenance::inspect_quarantines_read_only;
+#[cfg(target_os = "macos")]
 use crate::v2_online_recovery::RecoveryVerifier;
 use crate::v2_operator_handoff::HandoffRuntimeStatus;
 use crate::v2_tls_lifecycle::{CertificateFormat, CertificateHealth, inspect_certificate_file};
@@ -682,6 +683,7 @@ fn inspect_checkpoint_reader_compatibility(
     CheckpointReaderCompatibility::Compatible
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryPublicKeyInput {
     Missing,
@@ -690,6 +692,7 @@ enum RecoveryPublicKeyInput {
     Unknown,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn classify_recovery_key_readiness(
     hub: RecoveryPublicKeyInput,
     local: RecoveryPublicKeyInput,
@@ -721,6 +724,7 @@ fn classify_recovery_key_readiness(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn inspect_hub_recovery_public_key(state_dir: &Path) -> RecoveryPublicKeyInput {
     match RecoveryVerifier::load_optional(state_dir) {
         Ok(Some(verifier)) if verifier.webauthn_document().is_none() => {
@@ -778,53 +782,45 @@ fn inspect_local_recovery_public_key(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn inspect_local_recovery_public_key(
-    _config: &DoctorConfig,
-    _runtime_manifest_verified: bool,
-) -> RecoveryPublicKeyInput {
-    RecoveryPublicKeyInput::Missing
-}
-
+#[cfg(target_os = "macos")]
 fn inspect_recovery_key_readiness(
     config: &DoctorConfig,
     runtime_manifest_verified: bool,
     checks: &mut Vec<DoctorCheck>,
 ) -> RecoveryKeyReadinessSummary {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (config, runtime_manifest_verified);
-        return RecoveryKeyReadinessSummary {
-            status: RecoveryKeyReadinessStatus::Unsupported,
-        };
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let hub = inspect_hub_recovery_public_key(&config.hub_state_dir);
-        let local = inspect_local_recovery_public_key(config, runtime_manifest_verified);
-        let status = classify_recovery_key_readiness(hub, local);
-        let (check_status, detail) = match status {
-            RecoveryKeyReadinessStatus::Ready => (CheckStatus::Ok, "ready"),
-            RecoveryKeyReadinessStatus::Unprovisioned => (CheckStatus::Ok, "unprovisioned"),
-            RecoveryKeyReadinessStatus::SealedKeyMissing => {
-                (CheckStatus::Warning, "sealed_key_missing")
-            }
-            RecoveryKeyReadinessStatus::HubVerifierMissing => {
-                (CheckStatus::Warning, "hub_verifier_missing")
-            }
-            RecoveryKeyReadinessStatus::PublicKeyMismatch => {
-                (CheckStatus::Error, "public_key_mismatch")
-            }
-            RecoveryKeyReadinessStatus::HelperUnavailable => {
-                (CheckStatus::Warning, "helper_unavailable")
-            }
-            RecoveryKeyReadinessStatus::ReadinessUnknown => {
-                (CheckStatus::Warning, "readiness_unknown")
-            }
-            RecoveryKeyReadinessStatus::Unsupported => unreachable!(),
-        };
-        push(checks, "recovery_key_readiness", check_status, detail);
-        RecoveryKeyReadinessSummary { status }
+    let hub = inspect_hub_recovery_public_key(&config.hub_state_dir);
+    let local = inspect_local_recovery_public_key(config, runtime_manifest_verified);
+    let status = classify_recovery_key_readiness(hub, local);
+    let (check_status, detail) = match status {
+        RecoveryKeyReadinessStatus::Ready => (CheckStatus::Ok, "ready"),
+        RecoveryKeyReadinessStatus::Unprovisioned => (CheckStatus::Ok, "unprovisioned"),
+        RecoveryKeyReadinessStatus::SealedKeyMissing => {
+            (CheckStatus::Warning, "sealed_key_missing")
+        }
+        RecoveryKeyReadinessStatus::HubVerifierMissing => {
+            (CheckStatus::Warning, "hub_verifier_missing")
+        }
+        RecoveryKeyReadinessStatus::PublicKeyMismatch => {
+            (CheckStatus::Error, "public_key_mismatch")
+        }
+        RecoveryKeyReadinessStatus::HelperUnavailable => {
+            (CheckStatus::Warning, "helper_unavailable")
+        }
+        RecoveryKeyReadinessStatus::ReadinessUnknown => (CheckStatus::Warning, "readiness_unknown"),
+        RecoveryKeyReadinessStatus::Unsupported => unreachable!(),
+    };
+    push(checks, "recovery_key_readiness", check_status, detail);
+    RecoveryKeyReadinessSummary { status }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn inspect_recovery_key_readiness(
+    _config: &DoctorConfig,
+    _runtime_manifest_verified: bool,
+    _checks: &mut [DoctorCheck],
+) -> RecoveryKeyReadinessSummary {
+    RecoveryKeyReadinessSummary {
+        status: RecoveryKeyReadinessStatus::Unsupported,
     }
 }
 
