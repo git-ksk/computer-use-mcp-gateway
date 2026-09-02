@@ -31,7 +31,7 @@ Public states are:
 - `timed_out` — the bounded process/shell timeout fired and process-tree termination was proven;
 - `indeterminate` — completion cannot be proven; the existing quarantine/no-replay rules remain authoritative.
 
-`original_retry_safe` is always `false`. Recovery is the safe alternative to blindly retrying a mutating command.
+`original_retry_safe` is always `false`. Recovery is the safe alternative to blindly retrying a mutating command. A northbound `device_indeterminate` error also carries bounded actionable guidance: `execution_may_have_occurred=true`, `blind_replay_safe=false`, `next_action=get_operation_then_reconcile`, and `follow_up_effectful_operation=new_operation_id_required`. If the exact `get_operation` lookup itself remains `indeterminate`, its next action is `reconcile_indeterminate`. These fields are derived from the authoritative operation state, never from command-text heuristics. A later effectful attempt is a new operation only after reconciliation; it never replays the quarantined operation.
 
 ## Durable result boundary
 

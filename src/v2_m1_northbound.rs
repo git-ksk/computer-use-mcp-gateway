@@ -2554,9 +2554,10 @@ impl V2NorthboundMcp {
         self.authorize(principal, recovery.capability)?;
 
         let state = public_recovery_state(recovery.state, recovery.result.as_ref());
+        let public_operation_id = recovery.operation.operation_id.clone();
         let mut payload = json!({
             "type": "operation_status",
-            "operation_id": recovery.operation.operation_id,
+            "operation_id": public_operation_id,
             "state": state,
             "capability": crate::v2_observability::capability_name(recovery.capability),
             "original_retry_safe": false,
@@ -2564,6 +2565,9 @@ impl V2NorthboundMcp {
         if let Some(reason) = recovery.indeterminate_reason {
             payload["indeterminate_reason"] =
                 json!(crate::v2_observability::indeterminate_reason_name(reason));
+        }
+        if state == "indeterminate" {
+            add_indeterminate_guidance(&mut payload, "reconcile_indeterminate");
         }
         if let Some(receipt) = recovery.receipt {
             payload["finalized_at_ms"] = json!(receipt.finalized_at_ms);
@@ -3807,17 +3811,24 @@ fn mcp_error_with_operation_id(mut error: McpError, operation_id: &str) -> McpEr
     error
 }
 
+fn add_indeterminate_guidance(payload: &mut Value, next_action: &'static str) {
+    payload["execution_may_have_occurred"] = json!(true);
+    payload["blind_replay_safe"] = json!(false);
+    payload["next_action"] = json!(next_action);
+    payload["follow_up_effectful_operation"] = json!("new_operation_id_required");
+}
+
 fn hub_error_to_mcp(error: HubCommandError) -> McpError {
     let (message, code, blocking_operation_id) = match error {
         HubCommandError::AgentOffline => ("Agent is offline", "agent_offline", None),
         HubCommandError::Busy => ("Device is busy", "busy", None),
         HubCommandError::DeviceIndeterminate { operation_id } => (
-            "Device execution state is indeterminate",
+            "Operation outcome is indeterminate; execution may already have occurred",
             "device_indeterminate",
             Some(operation_id),
         ),
         HubCommandError::Indeterminate => (
-            "Device execution state is indeterminate",
+            "Operation outcome is indeterminate; execution may already have occurred",
             "device_indeterminate",
             None,
         ),
@@ -3881,8 +3892,18 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         ),
     };
     let mut data = json!({"code": code});
-    if let Some(operation_id) = blocking_operation_id {
+    if let Some(operation_id) = blocking_operation_id.as_deref() {
         data["blocking_operation_id"] = json!(operation_id);
+    }
+    if code == "device_indeterminate" {
+        add_indeterminate_guidance(
+            &mut data,
+            if blocking_operation_id.is_some() {
+                "get_operation_then_reconcile"
+            } else {
+                "inspect_reconciliation_status"
+            },
+        );
     }
     McpError::invalid_request(message, Some(data))
 }
@@ -3914,13 +3935,23 @@ fn execution_error_response(error: McpError) -> CallToolResponse {
         "message": error.message,
         "retry_safe": false,
     });
-    if let Some(operation_id) = error
+    let blocking_operation_id = error
         .data
         .as_ref()
         .and_then(|value| value.get("blocking_operation_id"))
-        .and_then(Value::as_str)
-    {
+        .and_then(Value::as_str);
+    if let Some(operation_id) = blocking_operation_id {
         payload["blocking_operation_id"] = json!(operation_id);
+    }
+    if code == "device_indeterminate" {
+        add_indeterminate_guidance(
+            &mut payload,
+            if blocking_operation_id.is_some() {
+                "get_operation_then_reconcile"
+            } else {
+                "inspect_reconciliation_status"
+            },
+        );
     }
     CallToolResult::error(vec![ContentBlock::text(payload.to_string())]).into()
 }
@@ -7054,6 +7085,17 @@ mod tests {
             public_recovery_state(HubOperationState::Dispatched, None),
             "running"
         );
+        let mut guidance = json!({});
+        add_indeterminate_guidance(&mut guidance, "get_operation_then_reconcile");
+        assert_eq!(
+            guidance,
+            json!({
+                "execution_may_have_occurred": true,
+                "blind_replay_safe": false,
+                "next_action": "get_operation_then_reconcile",
+                "follow_up_effectful_operation": "new_operation_id_required"
+            })
+        );
     }
 
     #[test]
@@ -7233,6 +7275,10 @@ mod tests {
         };
         assert!(serialized.contains("device_indeterminate"));
         assert!(serialized.contains("retry_safe"));
+        assert!(serialized.contains("execution_may_have_occurred"));
+        assert!(serialized.contains("blind_replay_safe"));
+        assert!(serialized.contains("get_operation_then_reconcile"));
+        assert!(serialized.contains("new_operation_id_required"));
         assert!(serialized.contains("blocking_operation_id"));
         assert!(serialized.contains("op_0123456789abcdef0123456789abcdef"));
         assert!(!serialized.contains("ExceptionGroup"));
@@ -7318,6 +7364,9 @@ mod tests {
         .unwrap();
         assert!(offline.contains("agent_offline"));
         assert!(indeterminate.contains("device_indeterminate"));
+        assert!(indeterminate.contains("execution_may_have_occurred"));
+        assert!(indeterminate.contains("inspect_reconciliation_status"));
+        assert!(indeterminate.contains("new_operation_id_required"));
         assert!(policy.contains("working_directory_denied"));
     }
 

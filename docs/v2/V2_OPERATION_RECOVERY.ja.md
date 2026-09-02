@@ -31,7 +31,7 @@ public state は次のとおりです。
 - `timed_out` — bounded timeout が発火し process-tree termination が証明された;
 - `indeterminate` — completion を証明できない。既存 quarantine / no-replay rule が引き続き authoritative。
 
-`original_retry_safe` は常に `false` です。mutating command の blind retry ではなく recovery を使います。
+`original_retry_safe` は常に `false` です。mutating command の blind retry ではなく recovery を使います。northbound error が `device_indeterminate` の場合は、bounded な actionable guidance として `execution_may_have_occurred=true`、`blind_replay_safe=false`、`next_action=get_operation_then_reconcile`、`follow_up_effectful_operation=new_operation_id_required` を返します。exact `get_operation` がまだ `indeterminate` の場合は `next_action=reconcile_indeterminate` へ進みます。これらは authoritative operation state から導出し、command text の heuristic 解析は行いません。reconciliation 後に effectful work を続ける場合も fresh operation ID の新規operationとして実行し、quarantine中のold operationをreplayしません。
 
 ## Durable result boundary
 
