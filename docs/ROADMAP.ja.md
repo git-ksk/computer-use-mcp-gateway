@@ -60,7 +60,7 @@ completion provable?
 | Shared WebAuthn/CTAP verifier | #256 / PR #258 | 完了 | provider-neutral shared dependency は main へ反映済み。単独では platform support を claim しない |
 | Windows Hello provider | #227 / PR #252 | implementation + CI green、physical acceptance pending | Windows online-recovery support/parity closeout は block するが、無関係な実装は block しない |
 | Linux FIDO2 UV provider | #228 / PR #259 | implementation + CI complete、physical acceptance pending | Linux support claim 前に UV-capable FIDO2 実機 acceptance 必須 |
-| Recovery dogfood hardening | #253, #254, #115, #255 | #253 はこの変更で implementation complete。#254/#115/#255 は parallel | implementation/evidence が released safety/recovery invariant failure を示さない限り non-blocking |
+| Recovery dogfood hardening | #253, #254, #115, #255 | #253 完了、#254 はこの変更で implementation complete、#115/#255 は parallel | implementation/evidence が released safety/recovery invariant failure を示さない限り non-blocking |
 | その他 compatible stabilization | #215, #104, #111, bounded #96 work | Parallel/deferred | released regression の新 evidence がない限り non-blocking |
 
 released safety regression を示す新しい evidence がない限り、次の順序を使います。
@@ -68,7 +68,7 @@ released safety regression を示す新しい evidence がない限り、次の�
 1. **完了済み recovery core を固定:** #103 durable effectful operation identity/status、#137 reviewed local-Human current-state acceptance、#136 permanent replay tombstone / bounded detailed history 分離は完了済みで、`0.4.0` semantic baseline とします。
 2. **shared protocol boundary を固定:** #256 / PR #258 は完了し、provider-neutral WebAuthn/CTAP ES256 verifier は Windows/Linux provider support を claim せず `main` へ反映済みです。
 3. **provider implementation と physical acceptance を別レーンで進行:** #227 / PR #252 は automated check green の実装を保持し、physical Windows Hello acceptance pending を明示します。#228 / PR #259 Linux FIDO2 UV provider は merged shared verifier に対して Windows 実機確認を待たず implementation / CI complete まで進んでいます。ただし各 platform の support claim には、その platform の explicit physical acceptance が必要です。
-4. **physical-acceptance 待ち時間を bounded recovery hardening に使用:** #253 installed runtime/operator-tool skew detection は実装済みとし、次に #254 recovery-key readiness、その後 #115 actionable `device_indeterminate` guidance と #255 Human historical-resolution guidance を進めます。これらは compatible な `0.4`-era dogfood improvement であり自動的な release blocker にはしません。既存 safety/recovery invariant が満たされていない evidence が出た場合だけ blocker へ昇格します。
+4. **physical-acceptance 待ち時間を bounded recovery hardening に使用:** #253 installed runtime/operator-tool skew detection と #254 recovery-key readiness は完了し、次に #115 actionable `device_indeterminate` guidance、その後 #255 Human historical-resolution guidance を進めます。これらは compatible な `0.4`-era dogfood improvement であり自動的な release blocker にはしません。既存 safety/recovery invariant が満たされていない evidence が出た場合だけ blocker へ昇格します。
 5. **cross-platform parity を意図的にclose:** #217 は、実際に supported と claim する platform provider が required implementation、user-presence proof、durable recovery/no-replay evidence、physical acceptance を満たした場合だけ close します。manual acceptance pending は「未実装」ではなく acceptance gate として明示します。
 
 この sequencing により `0.4.0` を無制限な backlog-clearing exercise にせず、Windows/Linux の physical acceptance が面倒または実行不能な期間も開発を止めません。`0.5.0` authorization/identity work は分離したままとし、#221 は design review を先行してよいものの implementation を recovery milestone へ取り込みません。

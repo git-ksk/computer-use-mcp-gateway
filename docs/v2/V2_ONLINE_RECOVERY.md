@@ -163,6 +163,8 @@ v2_recover init-key \
 
 The Hub state directory and public-key file must satisfy the existing trust-anchor parent/symlink/permission checks. Restarting the Hub after first provisioning is required because the verifier is loaded at Hub startup. Removing the verifier disables online recovery; it does not weaken quarantine semantics.
 
+After first provisioning and after every runtime upgrade, run installed `v2_status --json` (or `v2_doctor --json`) before an incident and inspect `recovery.key_readiness`. `ready` means the owner-private sealed representation can be reopened by the exact manifest-verified installed helper and its exported public key equals the Hub verifier. This readiness probe invokes only the helper's non-interactive `public` operation; it never signs, prompts for LocalAuthentication, creates/rotates keys, or changes Hub/Agent state. `sealed_key_missing`, `hub_verifier_missing`, `public_key_mismatch`, `helper_unavailable`, and `readiness_unknown` require explicit review/provisioning. `unprovisioned` means neither side is configured: normal operation and offline `v2_maint` remain available, but online recovery is not ready and `key_next_action=provision_recovery` points to this `init-key` flow.
+
 When quarantine occurs, the connected Agent receives a fresh challenge. The canonical operator workflow is `v2_recover guide`:
 
 ```bash

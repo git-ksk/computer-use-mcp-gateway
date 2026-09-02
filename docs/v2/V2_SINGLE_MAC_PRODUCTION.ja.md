@@ -140,11 +140,13 @@ expired-recovery abandonment は signed checkpoint を削除する前に private
 "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_status" --json
 ```
 
-JSON schema v1 が stable machine-readable contract です。overall operator status、Agent/control-plane connectivity、backend status、#226 の5つの readiness lane、quarantine/replay-safety と #233 incident-review availability、privacy-bounded Handoff lifecycle、mutation-authority owner/epoch、verified runtime identity、#234 maintenance status/phase、stable な `primary_reason` と supported `next_action` を返します。takeover locator、intervention/recovery ID/epoch、device/principal identity、command/argv/cwd/env、typed text、URL、screenshot、clipboard、credential、grant、fingerprint は出力しません。
+JSON schema v1 が stable machine-readable contract です。overall operator status、Agent/control-plane connectivity、backend status、#226 の5つの readiness lane、quarantine/replay-safety と #233 incident-review availability、privacy-bounded Handoff lifecycle、mutation-authority owner/epoch、verified runtime identity、read-only online-recovery key readiness、#234 maintenance status/phase、stable な `primary_reason` と supported `next_action` を返します。takeover locator、intervention/recovery ID/epoch、device/principal identity、command/argv/cwd/env、typed text、URL、screenshot、clipboard、credential、grant、fingerprint、private recovery-key material は出力しません。
 
 `v2_status` は composition-only です。ある lane の `ready` は別 lane の authorization ではなく、quarantine resolve、mutation authority switch、Handoff resume/cancel、upgrade retry/resume、operation replay はできません。`review_incident` は #233 incident-brief、`complete_recovery` は既存の explicit Handoff/recovery flow、`inspect_upgrade` は `v2_maint upgrade-status`、configuration/backend code は `v2_doctor` または backend diagnostics へ進むための案内です。evidence が unknown/mismatch の場合は `unknown` / `unavailable` / `action_required` に fail closed し、healthy と推測しません。
 
 runtime section は incident 前に3つの read-only compatibility signal も返します: `runtime_pairing=compatible|skewed|unknown`、`operator_tooling=compatible|stale|unavailable|unknown`、`checkpoint_reader_compatibility=compatible|incompatible|unknown` です。runtime pairing は owner-private な schema-3 manifest、installed Hub/Agent/operator binary の exact SHA-256 identity、さらに直接起動された `v2_status` / `v2_doctor` では実際に実行中の executable digest から導出します。checkpoint reader check は authoritative Hub checkpoint の bounded schema metadata だけを読み、state を変更しません。skew/stale、checkpoint より明示的に古い reader、または pairing evidence 不明の場合、`v2_status` は `next_action=inspect_upgrade` を返します。authority-bearing recovery の前に durable upgrade status を確認し、review済み version-paired runtime を復元してください。source checkout の新しい `v2_maint` だけを古い install へコピーする ad-hoc repair は support しません。
+
+macOS online-recovery provider では `recovery.key_readiness` も `ready` / `unprovisioned` / `sealed_key_missing` / `hub_verifier_missing` / `public_key_mismatch` / `helper_unavailable` / `readiness_unknown`（他platformでは `unsupported`）を返します。このcheckはstrictly read-onlyで、keyのcreate/rotateやsign/user-presence operationは実行しません。local sealed representationが存在する場合だけ、runtime manifestでexact identityをverify済みのinstalled `v2_recovery_enclave_helper public` を実行し、その公開鍵をHub verifierとlocal比較します。`unprovisioned` は通常/offline operationを壊しませんが `recovery.key_next_action=provision_recovery` を表示します。partial provisioning/helper failureは同じremediation付きdegraded、public-key mismatchはaction-requiredです。修復はexplicit `v2_recover init-key` とreviewed public-verifier transferで行い、diagnosticはtrustを自動修復しません。
 
 ## `v2_doctor`
 
@@ -160,6 +162,7 @@ standard profile では次を確認します。
 
 - runtime manifest schema 3、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_status` / `v2_recover` / `v2_recovery_enclave_helper` / `v2_grant_signer` の exact SHA-256 identity;
 - authoritative Hub checkpoint の readability と current registry/capability schema;
+- macOS online-recovery readiness: local sealed-key presence、exact manifest-verified helper availability、user-presence promptなしでのHub verifierとのpublic-key一致;
 - enrolled single-Mac device が 1 台だけであることと current generation;
 - Agent checkpoint readability と exact Hub/Agent generation pairing;
 - live quarantine count;

@@ -43,6 +43,12 @@ struct Args {
     /// Current reviewed one-shot maintenance label. Only this exact label is excluded from stale-job diagnostics.
     #[arg(long, env = "CUMG_V2_MAINTENANCE_JOB_LABEL")]
     maintenance_job_exclude_label: Option<String>,
+    /// Owner-private local Secure Enclave sealed recovery-key representation. Read-only diagnostics never create or rotate it.
+    #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+    recovery_key_file: Option<PathBuf>,
+    /// Stable-signed Secure Enclave recovery helper used only for the non-interactive `public` operation.
+    #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+    recovery_helper: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -95,6 +101,14 @@ fn main() -> ExitCode {
             .or_else(|| Some(root.join("mutation-authority"))),
         handoff_control_socket: args.handoff_control_socket,
         maintenance_job_exclude_label: args.maintenance_job_exclude_label,
+        recovery_key_file: args.recovery_key_file.or_else(|| {
+            Some(
+                home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed"),
+            )
+        }),
+        recovery_helper: args
+            .recovery_helper
+            .or_else(|| Some(root.join("bin/v2_recovery_enclave_helper"))),
     };
     let report = run_doctor(&config);
     if args.json {
@@ -118,6 +132,10 @@ fn main() -> ExitCode {
             report.runtime.runtime_pairing.as_str(),
             report.runtime.operator_tooling.as_str(),
             report.runtime.checkpoint_reader_compatibility.as_str()
+        );
+        println!(
+            "ONLINE_RECOVERY readiness={}",
+            report.recovery_key_readiness.status.as_str()
         );
         if let Some(action) = &report.readiness.operator_action {
             println!("OPERATOR_ACTION {action}");

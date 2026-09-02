@@ -7,6 +7,7 @@ use crate::v2_m1_persistence::{
     AgentPersistentState, CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION,
 };
 use crate::v2_maintenance::inspect_quarantines_read_only;
+use crate::v2_online_recovery::RecoveryVerifier;
 use crate::v2_operator_handoff::HandoffRuntimeStatus;
 use crate::v2_tls_lifecycle::{CertificateFormat, CertificateHealth, inspect_certificate_file};
 use ring::digest::{Context as DigestContext, SHA256};
@@ -48,6 +49,8 @@ pub struct DoctorConfig {
     pub mutation_authority_dir: Option<PathBuf>,
     pub handoff_control_socket: Option<PathBuf>,
     pub maintenance_job_exclude_label: Option<String>,
+    pub recovery_key_file: Option<PathBuf>,
+    pub recovery_helper: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -198,12 +201,57 @@ pub struct ReadinessSummary {
     pub operator_action: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryKeyReadinessStatus {
+    Ready,
+    Unprovisioned,
+    SealedKeyMissing,
+    HubVerifierMissing,
+    PublicKeyMismatch,
+    HelperUnavailable,
+    ReadinessUnknown,
+    Unsupported,
+}
+
+impl RecoveryKeyReadinessStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unprovisioned => "unprovisioned",
+            Self::SealedKeyMissing => "sealed_key_missing",
+            Self::HubVerifierMissing => "hub_verifier_missing",
+            Self::PublicKeyMismatch => "public_key_mismatch",
+            Self::HelperUnavailable => "helper_unavailable",
+            Self::ReadinessUnknown => "readiness_unknown",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    pub const fn needs_operator_action(self) -> bool {
+        matches!(
+            self,
+            Self::SealedKeyMissing
+                | Self::HubVerifierMissing
+                | Self::PublicKeyMismatch
+                | Self::HelperUnavailable
+                | Self::ReadinessUnknown
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryKeyReadinessSummary {
+    pub status: RecoveryKeyReadinessStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
     pub schema_version: u16,
     pub overall: String,
     pub readiness: ReadinessSummary,
     pub runtime: RuntimeSummary,
+    pub recovery_key_readiness: RecoveryKeyReadinessSummary,
     pub hub: HubSummary,
     pub agent: AgentSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +310,8 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         runtime.operator_tooling,
         &mut checks,
     );
+    let recovery_key_readiness =
+        inspect_recovery_key_readiness(config, runtime.manifest_verified, &mut checks);
     inspect_storage_capacity(&config.agent_state_dir, "agent_state_capacity", &mut checks);
     inspect_storage_capacity(&std::env::temp_dir(), "temp_capacity", &mut checks);
 
@@ -345,6 +395,7 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         overall,
         readiness,
         runtime,
+        recovery_key_readiness,
         hub,
         agent,
         mutation_authority,
@@ -629,6 +680,152 @@ fn inspect_checkpoint_reader_compatibility(
         "compatible",
     );
     CheckpointReaderCompatibility::Compatible
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryPublicKeyInput {
+    Missing,
+    Available([u8; 65]),
+    HelperUnavailable,
+    Unknown,
+}
+
+fn classify_recovery_key_readiness(
+    hub: RecoveryPublicKeyInput,
+    local: RecoveryPublicKeyInput,
+) -> RecoveryKeyReadinessStatus {
+    match (hub, local) {
+        (RecoveryPublicKeyInput::Missing, RecoveryPublicKeyInput::Missing) => {
+            RecoveryKeyReadinessStatus::Unprovisioned
+        }
+        (RecoveryPublicKeyInput::Available(_), RecoveryPublicKeyInput::Missing) => {
+            RecoveryKeyReadinessStatus::SealedKeyMissing
+        }
+        (RecoveryPublicKeyInput::Missing, RecoveryPublicKeyInput::Available(_)) => {
+            RecoveryKeyReadinessStatus::HubVerifierMissing
+        }
+        (RecoveryPublicKeyInput::Available(hub), RecoveryPublicKeyInput::Available(local)) => {
+            if hub == local {
+                RecoveryKeyReadinessStatus::Ready
+            } else {
+                RecoveryKeyReadinessStatus::PublicKeyMismatch
+            }
+        }
+        (_, RecoveryPublicKeyInput::HelperUnavailable) => {
+            RecoveryKeyReadinessStatus::HelperUnavailable
+        }
+        (RecoveryPublicKeyInput::HelperUnavailable, _) => {
+            RecoveryKeyReadinessStatus::ReadinessUnknown
+        }
+        _ => RecoveryKeyReadinessStatus::ReadinessUnknown,
+    }
+}
+
+fn inspect_hub_recovery_public_key(state_dir: &Path) -> RecoveryPublicKeyInput {
+    match RecoveryVerifier::load_optional(state_dir) {
+        Ok(Some(verifier)) if verifier.webauthn_document().is_none() => {
+            RecoveryPublicKeyInput::Available(verifier.public_key_bytes())
+        }
+        Ok(Some(_)) => RecoveryPublicKeyInput::Unknown,
+        Ok(None) => RecoveryPublicKeyInput::Missing,
+        Err(_) => RecoveryPublicKeyInput::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_local_recovery_public_key(
+    config: &DoctorConfig,
+    runtime_manifest_verified: bool,
+) -> RecoveryPublicKeyInput {
+    use crate::v2_online_recovery::macos::MacRecoveryKey;
+    let Some(key_file) = config.recovery_key_file.as_deref() else {
+        return RecoveryPublicKeyInput::Missing;
+    };
+    match std::fs::symlink_metadata(key_file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RecoveryPublicKeyInput::Missing;
+        }
+        Err(_) => return RecoveryPublicKeyInput::Unknown,
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return RecoveryPublicKeyInput::Unknown;
+        }
+        Ok(_) => {}
+    }
+    let Some(helper) = config.recovery_helper.as_deref() else {
+        return RecoveryPublicKeyInput::HelperUnavailable;
+    };
+    let expected_helper = config.binary_dir.join("v2_recovery_enclave_helper");
+    if !runtime_manifest_verified || helper != expected_helper {
+        return RecoveryPublicKeyInput::HelperUnavailable;
+    }
+    let key = match MacRecoveryKey::load(helper, key_file) {
+        Ok(key) => key,
+        Err(crate::v2_online_recovery::RecoveryError::RecoveryHelperUnavailable)
+        | Err(crate::v2_online_recovery::RecoveryError::InvalidPath) => {
+            return RecoveryPublicKeyInput::HelperUnavailable;
+        }
+        Err(_) => return RecoveryPublicKeyInput::Unknown,
+    };
+    match key.public_key_bytes() {
+        Ok(public) => RecoveryPublicKeyInput::Available(public),
+        Err(crate::v2_online_recovery::RecoveryError::RecoveryHelperUnavailable)
+        | Err(crate::v2_online_recovery::RecoveryError::RecoveryHelperProtocol)
+        | Err(crate::v2_online_recovery::RecoveryError::RecoveryHelperTimeout)
+        | Err(crate::v2_online_recovery::RecoveryError::RecoveryHelperAbnormalExit) => {
+            RecoveryPublicKeyInput::HelperUnavailable
+        }
+        Err(_) => RecoveryPublicKeyInput::Unknown,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn inspect_local_recovery_public_key(
+    _config: &DoctorConfig,
+    _runtime_manifest_verified: bool,
+) -> RecoveryPublicKeyInput {
+    RecoveryPublicKeyInput::Missing
+}
+
+fn inspect_recovery_key_readiness(
+    config: &DoctorConfig,
+    runtime_manifest_verified: bool,
+    checks: &mut Vec<DoctorCheck>,
+) -> RecoveryKeyReadinessSummary {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (config, runtime_manifest_verified);
+        return RecoveryKeyReadinessSummary {
+            status: RecoveryKeyReadinessStatus::Unsupported,
+        };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let hub = inspect_hub_recovery_public_key(&config.hub_state_dir);
+        let local = inspect_local_recovery_public_key(config, runtime_manifest_verified);
+        let status = classify_recovery_key_readiness(hub, local);
+        let (check_status, detail) = match status {
+            RecoveryKeyReadinessStatus::Ready => (CheckStatus::Ok, "ready"),
+            RecoveryKeyReadinessStatus::Unprovisioned => (CheckStatus::Ok, "unprovisioned"),
+            RecoveryKeyReadinessStatus::SealedKeyMissing => {
+                (CheckStatus::Warning, "sealed_key_missing")
+            }
+            RecoveryKeyReadinessStatus::HubVerifierMissing => {
+                (CheckStatus::Warning, "hub_verifier_missing")
+            }
+            RecoveryKeyReadinessStatus::PublicKeyMismatch => {
+                (CheckStatus::Error, "public_key_mismatch")
+            }
+            RecoveryKeyReadinessStatus::HelperUnavailable => {
+                (CheckStatus::Warning, "helper_unavailable")
+            }
+            RecoveryKeyReadinessStatus::ReadinessUnknown => {
+                (CheckStatus::Warning, "readiness_unknown")
+            }
+            RecoveryKeyReadinessStatus::Unsupported => unreachable!(),
+        };
+        push(checks, "recovery_key_readiness", check_status, detail);
+        RecoveryKeyReadinessSummary { status }
+    }
 }
 
 fn inspect_hub(
@@ -2026,6 +2223,197 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_key_readiness_uses_only_verified_public_helper_without_user_presence() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ring::{
+            rand::SystemRandom,
+            signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _},
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_dir("recovery-readiness-public-only");
+        let hub = root.join("hub");
+        let bin = root.join("bin");
+        let recovery = root.join("recovery");
+        for directory in [&root, &hub, &bin, &recovery] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let public = key.public_key().as_ref();
+        std::fs::write(
+            hub.join(crate::v2_online_recovery::RECOVERY_PUBLIC_KEY_FILENAME),
+            public,
+        )
+        .unwrap();
+
+        let sealed = recovery.join("recovery-key.sealed");
+        std::fs::write(&sealed, b"sealed-key-fixture").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let helper = bin.join("v2_recovery_enclave_helper");
+        let marker_file = root.join("helper-operation");
+        let response = serde_json::json!({
+            "schema_version": 1,
+            "sealed_key_base64": null,
+            "public_key_base64": STANDARD.encode(public),
+            "signature_base64": null
+        });
+        let helper_body = format!(
+            "#!/bin/sh\n[ \"$1\" = \"public\" ] || exit 23\nprintf '%s\\n' \"$1\" > '{}'\ncat >/dev/null\nprintf '%s\\n' '{}'\n",
+            marker_file.display(),
+            response
+        );
+        std::fs::write(&helper, helper_body).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config = DoctorConfig {
+            hub_state_dir: hub,
+            agent_state_dir: root.join("agent"),
+            runtime_manifest: root.join("runtime-manifest.json"),
+            binary_dir: bin,
+            hub_launchd_label: "hub".into(),
+            agent_launchd_label: "agent".into(),
+            grant_signer_launchd_label: None,
+            grant_signer_socket: None,
+            tls_server_certificate: None,
+            tls_root_certificate: None,
+            cua_command: None,
+            expected_cua_version: None,
+            mutation_authority_dir: None,
+            handoff_control_socket: None,
+            maintenance_job_exclude_label: None,
+            recovery_key_file: Some(sealed),
+            recovery_helper: Some(helper),
+        };
+        let mut checks = Vec::new();
+        let summary = inspect_recovery_key_readiness(&config, true, &mut checks);
+        assert_eq!(summary.status, RecoveryKeyReadinessStatus::Ready);
+        assert_eq!(
+            std::fs::read_to_string(marker_file).unwrap().trim(),
+            "public"
+        );
+        assert_eq!(
+            checks,
+            vec![DoctorCheck {
+                name: "recovery_key_readiness".into(),
+                status: CheckStatus::Ok,
+                detail: "ready".into(),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_key_readiness_never_executes_unverified_helper() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = temp_dir("recovery-readiness-unverified-helper");
+        let bin = root.join("bin");
+        let recovery = root.join("recovery");
+        for directory in [&root, &bin, &recovery] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let sealed = recovery.join("recovery-key.sealed");
+        std::fs::write(&sealed, b"sealed-key-fixture").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let helper = bin.join("v2_recovery_enclave_helper");
+        let marker_file = root.join("executed");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = DoctorConfig {
+            hub_state_dir: root.join("hub"),
+            agent_state_dir: root.join("agent"),
+            runtime_manifest: root.join("runtime-manifest.json"),
+            binary_dir: bin,
+            hub_launchd_label: "hub".into(),
+            agent_launchd_label: "agent".into(),
+            grant_signer_launchd_label: None,
+            grant_signer_socket: None,
+            tls_server_certificate: None,
+            tls_root_certificate: None,
+            cua_command: None,
+            expected_cua_version: None,
+            mutation_authority_dir: None,
+            handoff_control_socket: None,
+            maintenance_job_exclude_label: None,
+            recovery_key_file: Some(sealed),
+            recovery_helper: Some(helper),
+        };
+        assert_eq!(
+            inspect_local_recovery_public_key(&config, false),
+            RecoveryPublicKeyInput::HelperUnavailable
+        );
+        assert!(!marker_file.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_key_readiness_distinguishes_ready_missing_mismatch_and_helper_failure() {
+        let a = [4_u8; 65];
+        let b = [5_u8; 65];
+        assert_eq!(
+            classify_recovery_key_readiness(
+                RecoveryPublicKeyInput::Available(a),
+                RecoveryPublicKeyInput::Available(a)
+            ),
+            RecoveryKeyReadinessStatus::Ready
+        );
+        assert_eq!(
+            classify_recovery_key_readiness(
+                RecoveryPublicKeyInput::Missing,
+                RecoveryPublicKeyInput::Missing
+            ),
+            RecoveryKeyReadinessStatus::Unprovisioned
+        );
+        assert_eq!(
+            classify_recovery_key_readiness(
+                RecoveryPublicKeyInput::Available(a),
+                RecoveryPublicKeyInput::Missing
+            ),
+            RecoveryKeyReadinessStatus::SealedKeyMissing
+        );
+        assert_eq!(
+            classify_recovery_key_readiness(
+                RecoveryPublicKeyInput::Missing,
+                RecoveryPublicKeyInput::Available(a)
+            ),
+            RecoveryKeyReadinessStatus::HubVerifierMissing
+        );
+        assert_eq!(
+            classify_recovery_key_readiness(
+                RecoveryPublicKeyInput::Available(a),
+                RecoveryPublicKeyInput::Available(b)
+            ),
+            RecoveryKeyReadinessStatus::PublicKeyMismatch
+        );
+        assert_eq!(
+            classify_recovery_key_readiness(
+                RecoveryPublicKeyInput::Available(a),
+                RecoveryPublicKeyInput::HelperUnavailable
+            ),
+            RecoveryKeyReadinessStatus::HelperUnavailable
+        );
+        assert_eq!(
+            classify_recovery_key_readiness(
+                RecoveryPublicKeyInput::Unknown,
+                RecoveryPublicKeyInput::Available(a)
+            ),
+            RecoveryKeyReadinessStatus::ReadinessUnknown
+        );
+    }
+
     #[test]
     fn runtime_manifest_verifies_exact_required_binary_hashes() {
         let root = temp_dir("manifest");
@@ -2076,6 +2464,8 @@ mod tests {
             mutation_authority_dir: None,
             handoff_control_socket: None,
             maintenance_job_exclude_label: None,
+            recovery_key_file: None,
+            recovery_helper: None,
         };
         let mut runtime = RuntimeSummary {
             package_version: env!("CARGO_PKG_VERSION").into(),
@@ -2149,6 +2539,8 @@ mod tests {
             mutation_authority_dir: None,
             handoff_control_socket: None,
             maintenance_job_exclude_label: None,
+            recovery_key_file: None,
+            recovery_helper: None,
         };
         let mut runtime = RuntimeSummary {
             package_version: env!("CARGO_PKG_VERSION").into(),
