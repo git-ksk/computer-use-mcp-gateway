@@ -568,6 +568,10 @@ impl fmt::Debug for VerifiedAccessToken {
 #[async_trait]
 pub trait AccessTokenVerifier: Send + Sync {
     async fn verify(&self, token: &str) -> Result<VerifiedAccessToken, TokenVerificationError>;
+
+    fn unavailable_error_code(&self) -> &'static str {
+        "oauth_introspection_unavailable"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -906,8 +910,8 @@ async fn oauth_resource_guard(
             warn!(
                 event = "v2_northbound_auth_unavailable",
                 outcome = "denied",
-                error_code = "oauth_introspection_unavailable",
-                "OAuth token validation unavailable"
+                error_code = state.verifier.unavailable_error_code(),
+                "Northbound token validation unavailable"
             );
             return oauth_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,

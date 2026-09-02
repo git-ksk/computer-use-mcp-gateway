@@ -43,7 +43,7 @@ Authentication infrastructure proves caller identity; CUMG consumes only the nor
 verified external identity -> AuthenticatedClientPrincipal { issuer, subject }
 ```
 
-`OAuthIntrospectionVerifier` remains the concrete token adapter behind `AccessTokenVerifier`; RFC 7662 is not a product-level requirement. The packaged trusted authenticated-proxy adapter now emits a configured fixed principal for an explicitly single-principal loopback deployment and ignores caller-supplied identity headers. A future generic OIDC/JWT adapter should verify signature and required claims against the configured issuer/audience and then emit the same principal for multi-principal deployments. This work is tracked by [issue #139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) and is deliberately sequenced after the `0.3.0` Production Hardening closeout rather than being folded into it.
+`AccessTokenVerifier` now has two concrete bearer-token adapters: `OAuthIntrospectionVerifier` for RFC 7662 and provider-neutral `OidcJwtVerifier` for locally verified signed tokens. The packaged trusted authenticated-proxy adapter remains a separate configured fixed-principal path for explicitly single-principal loopback deployments and ignores caller-supplied identity headers. `OidcJwtVerifier` pins configured issuer/audience/JWKS/asymmetric algorithms and emits the same principal type for multi-principal deployments. Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) owns physical signed-token dogfood acceptance before a provider-specific support claim is made.
 
 This seam owns no user/account database. Token issuance, login/session state, password/MFA handling, and identity lifecycle remain with the external IdP or authentication edge.
 

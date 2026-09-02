@@ -22,6 +22,7 @@ use computer_use_mcp_gateway::{
         OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp, build_northbound_router,
         build_trusted_proxy_router,
     },
+    v2_oidc_jwt::{OidcJwtAlgorithm, OidcJwtConfig, OidcJwtVerifier},
     v2_operator_handoff::UnixOperatorHandoffAuthority,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -122,6 +123,27 @@ struct Args {
     /// File containing the introspection client secret. The file is required to be private.
     #[arg(long, env = "CUMG_V2_OAUTH_INTROSPECTION_CLIENT_SECRET_FILE")]
     oauth_introspection_client_secret_file: Option<PathBuf>,
+    /// Exact OIDC/JWT audience accepted from the signed `aud` claim.
+    #[arg(long, env = "CUMG_V2_OIDC_AUDIENCE")]
+    oidc_audience: Option<String>,
+    /// Explicit HTTPS JWKS endpoint for provider-neutral signed OIDC/JWT verification.
+    #[arg(long, env = "CUMG_V2_OIDC_JWKS_URI")]
+    oidc_jwks_uri: Option<String>,
+    /// Comma-separated asymmetric JWT algorithms: RS*, PS*, ES256/384, or EdDSA.
+    #[arg(long, env = "CUMG_V2_OIDC_ALLOWED_ALGORITHMS")]
+    oidc_allowed_algorithms: Option<String>,
+    #[arg(long, env = "CUMG_V2_OIDC_CLOCK_SKEW_SECS", default_value_t = 30)]
+    oidc_clock_skew_secs: u64,
+    #[arg(long, env = "CUMG_V2_OIDC_JWKS_CACHE_SECS", default_value_t = 300)]
+    oidc_jwks_cache_secs: u64,
+    #[arg(
+        long,
+        env = "CUMG_V2_OIDC_UNKNOWN_KID_REFRESH_SECS",
+        default_value_t = 30
+    )]
+    oidc_unknown_kid_refresh_secs: u64,
+    #[arg(long, env = "CUMG_V2_OIDC_HTTP_TIMEOUT_SECS", default_value_t = 5)]
+    oidc_http_timeout_secs: u64,
     /// Space-separated OAuth scopes required to enter the MCP resource boundary.
     #[arg(long, env = "CUMG_V2_OAUTH_REQUIRED_SCOPES")]
     oauth_required_scopes: Option<String>,
@@ -552,26 +574,29 @@ fn build_northbound_runtime(
     device_id: &str,
     handoff_coordinator: Option<Arc<HandoffCoordinator>>,
 ) -> Result<Option<NorthboundRuntime>> {
-    let oauth_configured = [
-        args.oauth_authorization_server.is_some(),
-        args.oauth_introspection_endpoint.is_some(),
-        args.oauth_introspection_client_id.is_some(),
-        args.oauth_introspection_client_secret_file.is_some(),
-        args.oauth_required_scopes.is_some(),
-    ]
-    .into_iter()
-    .any(|value| value);
+    let shared_oauth_configured =
+        args.oauth_authorization_server.is_some() || args.oauth_required_scopes.is_some();
+    let introspection_configured = args.oauth_introspection_endpoint.is_some()
+        || args.oauth_introspection_client_id.is_some()
+        || args.oauth_introspection_client_secret_file.is_some();
+    let oidc_configured = args.oidc_audience.is_some()
+        || args.oidc_jwks_uri.is_some()
+        || args.oidc_allowed_algorithms.is_some();
     let trusted_proxy_configured = args.trusted_proxy_issuer.is_some()
         || args.trusted_proxy_subject.is_some()
         || args.trusted_proxy_secret_file.is_some();
-    ensure!(
-        !(oauth_configured && trusted_proxy_configured),
-        "OAuth introspection and trusted-proxy authentication modes are mutually exclusive"
-    );
+    validate_northbound_auth_mode_selection(
+        introspection_configured,
+        oidc_configured,
+        trusted_proxy_configured,
+        shared_oauth_configured,
+    )?;
     let configured = [
         args.mcp_resource.is_some(),
         args.northbound_policy_file.is_some(),
-        oauth_configured,
+        shared_oauth_configured,
+        introspection_configured,
+        oidc_configured,
         trusted_proxy_configured,
     ]
     .into_iter()
@@ -662,6 +687,56 @@ fn build_northbound_runtime(
                 computer_use_mcp_gateway::v2_limits::enforce_trusted_proxy_loopback,
             ));
         (router, resource, None, "trusted_proxy_fixed_principal")
+    } else if oidc_configured {
+        let authorization_server = required(
+            &args.oauth_authorization_server,
+            "CUMG_V2_OAUTH_AUTHORIZATION_SERVER",
+        )?;
+        let scopes = required(&args.oauth_required_scopes, "CUMG_V2_OAUTH_REQUIRED_SCOPES")?
+            .split_ascii_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let audience = required(&args.oidc_audience, "CUMG_V2_OIDC_AUDIENCE")?;
+        let jwks_uri = required(&args.oidc_jwks_uri, "CUMG_V2_OIDC_JWKS_URI")?;
+        let algorithms = parse_oidc_algorithms(required(
+            &args.oidc_allowed_algorithms,
+            "CUMG_V2_OIDC_ALLOWED_ALGORITHMS",
+        )?)?;
+        let mcp_config = NorthboundMcpConfig::new(resource, authorization_server, scopes)
+            .context("invalid V2 northbound OIDC/JWT Authorization configuration")?;
+        let policy = NorthboundPolicyDocument::from_json(&policy_text)
+            .context("failed to parse northbound authorization policy")?
+            .build_policy(mcp_config.authorization_server(), device_id)
+            .context("invalid northbound principal/device/capability policy")?;
+        let mut verifier_config = OidcJwtConfig::new(
+            mcp_config.authorization_server(),
+            audience,
+            jwks_uri,
+            algorithms,
+        );
+        verifier_config.clock_skew = Duration::from_secs(args.oidc_clock_skew_secs);
+        verifier_config.jwks_cache_ttl = Duration::from_secs(args.oidc_jwks_cache_secs);
+        verifier_config.unknown_kid_refresh_interval =
+            Duration::from_secs(args.oidc_unknown_kid_refresh_secs);
+        verifier_config.http_timeout = Duration::from_secs(args.oidc_http_timeout_secs);
+        let verifier = OidcJwtVerifier::new(verifier_config)
+            .context("invalid OIDC/JWT token verification configuration")?;
+        let metadata_url = mcp_config.metadata_url().to_owned();
+        let resource = mcp_config.resource().to_owned();
+        let mut service = V2NorthboundMcp::new(handle, policy);
+        if let Some(secret) = audit_fingerprint_secret.clone() {
+            service = service.with_request_fingerprint_secret(secret);
+        }
+        if let Some(coordinator) = handoff_coordinator.as_ref() {
+            service = service.with_handoff_coordinator(coordinator.clone());
+        }
+        let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
+            axum::middleware::from_fn_with_state(
+                overload,
+                computer_use_mcp_gateway::v2_limits::enforce_http_limits,
+            ),
+        );
+        (router, resource, Some(metadata_url), "oidc_jwt")
     } else {
         let authorization_server = required(
             &args.oauth_authorization_server,
@@ -728,6 +803,43 @@ fn build_northbound_runtime(
     }))
 }
 
+fn validate_northbound_auth_mode_selection(
+    introspection: bool,
+    oidc: bool,
+    trusted_proxy: bool,
+    shared_oauth: bool,
+) -> Result<()> {
+    let auth_mode_count =
+        usize::from(introspection) + usize::from(oidc) + usize::from(trusted_proxy);
+    ensure!(
+        auth_mode_count <= 1,
+        "OAuth introspection, OIDC/JWT, and trusted-proxy authentication modes are mutually exclusive"
+    );
+    ensure!(
+        !(trusted_proxy && shared_oauth),
+        "trusted-proxy mode must not configure OAuth/OIDC authorization-server or scope settings"
+    );
+    Ok(())
+}
+
+fn parse_oidc_algorithms(value: &str) -> Result<Vec<OidcJwtAlgorithm>> {
+    let algorithms = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<OidcJwtAlgorithm>()
+                .map_err(|_| anyhow::anyhow!("unsupported OIDC/JWT algorithm: {value}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !algorithms.is_empty(),
+        "CUMG_V2_OIDC_ALLOWED_ALGORITHMS must contain at least one asymmetric algorithm"
+    );
+    Ok(algorithms)
+}
+
 fn required<'a>(value: &'a Option<String>, name: &'static str) -> Result<&'a str> {
     value
         .as_deref()
@@ -769,5 +881,30 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
         if *shutdown.borrow() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod auth_mode_tests {
+    use super::*;
+
+    #[test]
+    fn authentication_modes_are_mutually_exclusive() {
+        assert!(validate_northbound_auth_mode_selection(true, false, false, true).is_ok());
+        assert!(validate_northbound_auth_mode_selection(false, true, false, true).is_ok());
+        assert!(validate_northbound_auth_mode_selection(false, false, true, false).is_ok());
+        assert!(validate_northbound_auth_mode_selection(true, true, false, true).is_err());
+        assert!(validate_northbound_auth_mode_selection(true, false, true, true).is_err());
+        assert!(validate_northbound_auth_mode_selection(false, true, true, true).is_err());
+        assert!(validate_northbound_auth_mode_selection(false, false, true, true).is_err());
+    }
+
+    #[test]
+    fn oidc_algorithm_parser_accepts_only_asymmetric_allowlist() {
+        let parsed = parse_oidc_algorithms("RS256, ES256,EdDSA").unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert!(parse_oidc_algorithms("HS256").is_err());
+        assert!(parse_oidc_algorithms("none").is_err());
+        assert!(parse_oidc_algorithms(" , ").is_err());
     }
 }
