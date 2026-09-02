@@ -95,7 +95,7 @@ CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 �
 
 - **`0.3.x` — Product Readiness & Stabilization:** #237 と #213 cross-cutting closeout は完了済みです。future release は恒久 [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gate を再利用します。#226/#233/#234/#235/#109/#236 の operator/recovery foundation と #224 release-candidate artifact boundary は完了済みで、#115 actionable indeterminate UX も完了済みです。#104 least-privilege filesystem-root separation は完了済みです。#111 reproducible performance benchmark は完了済みです。#215 Cloud Run Hub support-gate design は完了済みですが、durable-state/fencing/ingress implementation と acceptance は未完了です。#96 Unix containment の bounded 調査は完了済みです。stronger Linux implementation は managed-execution milestone の #267 へ分離しました。
 - **`0.4.0` — Recovery & Reconciliation:** #103 / #137 / #136 は完了済みです。shared WebAuthn/CTAP verifier は #256 / PR #258 で完了済みです。#227 Windows Hello は implementation / CI complete・physical Windows acceptance pending のまま、#228 / PR #259 Linux FIDO2 も implementation / CI complete・physical Linux acceptance pending です。#253 runtime/operator-tool skew detection と #254 recovery-key readiness は完了済み、#115 actionable indeterminate guidance と #255 Human historical-resolution guidance は完了済みで、bounded non-blocking recovery-dogfood hardening lane は完了し、released invariant failure の新 evidence が出た場合だけ blocker に昇格します。#217 は parity umbrella のままで、各 platform provider の support claim 前に physical acceptance を必須とします。
-- **`0.5.0` — Multi-principal Identity & Authorization:** #139 の provider-neutral OIDC/JWT caller identity と #221 の narrow-only typed semantic constraint を追加し、既存 exact `principal -> device -> capability` authorizer、single-principal / introspection adapter、独立した grant/recovery/Handoff authority を維持します。
+- **`0.5.0` — Multi-principal Identity & Authorization:** #139 provider-neutral OIDC/JWT caller identity は implementation complete・physical signed-token acceptance pending です。既存 exact `principal -> device -> capability` authorizer、single-principal / introspection adapter、独立した grant/recovery/Handoff authority を維持し、次に #221 narrow-only typed semantic constraint へ進みます。
 - **`0.6.0` — Least-privilege Workspace:** #83 の bounded retrievable output、#105 の ranged / deterministic filesystem observation、#107 の明示的 writable root 下での atomic workspace mutation により Dangerous shell authority への依存を減らす。
 - **`0.7.0` — Managed Developer Execution:** #106 の explicitly managed long-running job、#114 の separately sandboxed Playwright/E2E execution、#267 の optional Linux cgroup-v2 execution containment を追加。completed #96 Unix containment 調査を前提にし、background-shell escape compatibility は作らない。
 
@@ -169,7 +169,7 @@ repository の open issue は、work が roadmap の可視性から黙って抜�
 
 - **`0.3.x — Product Readiness & Stabilization`:** #213 final cross-cutting Product Readiness gate は完了済みで、今後は [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) が standing gate を引き継ぎます。#226/#233/#234/#235/#109/#236 の operator/recovery foundation と #115 actionable indeterminate UX は完了済みで、#224 も completed release-candidate artifact boundary を提供します。artifact-backed install/upgrade #237 と #213 cross-cutting closeout は完了済みで、blocking `0.3.x` implementation/gate は残っていません。#104 filesystem-root separation は完了済みです。#111 reproducible performance benchmark は完了済みです。#215 Cloud Run Hub support-gate design は完了済みですが implementation/acceptance はopenのままです。#96 Unix containment の bounded 調査は完了済みです。Linux cgroup-v2 hardening は `0.7.0` の #267 で別途継続します。
 - **`0.4.0 — Recovery & Reconciliation`:** #103/#137/#136 と shared verifier #256 は完了済みです。#227 Windows Hello/WebAuthn と #228 / PR #259 Linux FIDO2 UV は implementation/CI complete ですが、#217 配下で各platformのphysical acceptance gateを別途維持します。#253 runtime/operator skew と #254 recovery-key readiness は完了済みで、#115 actionable indeterminate guidance と #255 Human historical-resolution guidance は完了済みです。新しい evidence がない限り bounded recovery dogfood-hardening の残件はありません。
-- **`0.5.0 — Multi-principal Identity`:** #139 が既存 exact authorizer を維持した provider-neutral OIDC/JWT identity、#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
+- **`0.5.0 — Multi-principal Identity`:** #139 provider-neutral OIDC/JWT identity は existing exact authorizer を維持したまま implementation complete・physical acceptance pending です。#221 が CUMG を generic policy engine にせず narrow-only typed backend-neutral semantic constraints を追加します。
 - **`0.6.0 — Least-privilege Workspace`:** #83 が bounded retrievable process/shell output、#105 が ranged / deterministic filesystem observation、#107 が unrestricted shell authority を継承しない bounded atomic workspace mutation を追加します。
 - **`0.7.0 — Managed Developer Execution`:** #106 が explicit managed-job lifecycle、#114 が separately sandboxed Playwright/E2E execution、#267 が completed #96 investigation を受けた optional Linux cgroup-v2 execution containment を担当します。
 - **Upstream-blocked V1 compatibility:** #14（`get_screen_size` session/escalation）と #15（`list_apps` live-process discovery mismatch）は upstream Cua 待ちのまま、active post-v0.3 milestone を意図的に付けません。V1 を deliberate に retire する場合は no-longer-applicable になる可能性があります。
@@ -182,7 +182,7 @@ Cua authorization / product-boundary research #219 は [`v2/V2_AUTHORIZATION_CAP
 
 Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は `0.3.x` stabilization / `0.4.0` Recovery & Reconciliation contract には**意図的に含めません**。distinct authenticated principal が必要な deployment 向けの provider-neutral signed-token path として、現在の作業順では `0.5.0` northbound-authentication expansion に置きます。正確なrelease numberは上記admission/evidence ruleに従います。
 
-target architecture は次です。
+implemented #139 architecture は次です。
 
 ```text
 external OAuth/OIDC identity provider
@@ -198,11 +198,11 @@ DeviceCapabilityAuthorizer
 principal -> stable device -> exact DeviceCapability
 ```
 
-adapter は provider-neutral / fail-closed を維持します。signature、issuer、audience、time claim、subject、algorithm policy、bounded な JWKS/metadata rotation を検証した後にだけ既存 CUMG principal を生成します。caller-supplied identity header と MCP `clientInfo` は audit metadata のままで、authorization authority にはしません。
+adapter は provider-neutral / fail-closed を維持します。signature、issuer、audience、time claim、subject、algorithm policy、bounded な JWKS caching/rotation を検証した後にだけ既存 CUMG principal を生成します。caller-supplied identity header と MCP `clientInfo` は audit metadata のままで、authorization authority にはしません。
 
 この work により CUMG を identity provider、account database、session manager、token issuer にはしません。既存 RFC 7662 introspection と、明示的に single-principal とする trusted-proxy adapter は引き続き deployment option として維持します。signed-token deployment では、fixed-principal local proxy bridge が identity 確立だけのために存在する場合は取り除けます。一方、reverse proxy / tunnel は transport、origin hardening、rate limiting、defense in depth のために残して構いません。
 
-acceptance では少なくとも2つの verified subject が既存 `DeviceCapabilityAuthorizer` を通じて異なる exact device/capability decision を受けることを証明し、bad signature / issuer / audience / time / key / subject / algorithm は fail closed、既存 authentication adapter に regression がないことを要求します。
+automated acceptance では少なくとも2つの verified subject が既存 `DeviceCapabilityAuthorizer` を通じて異なる exact device/capability decision を受けることを証明済みで、bad signature / issuer / audience / time / key / subject / algorithm は fail closed、既存 authentication adapter に regression がないことを確認します。#139 close 前の最終 acceptance として physical signed-token dogfood が残ります。
 
 ### Remaining semantic parity decisions
 

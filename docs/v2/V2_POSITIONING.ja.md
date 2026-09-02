@@ -151,7 +151,7 @@ CUMG は MCP Authorization/OAuth、OIDC、IAM-like system、SINT-style capabilit
 
 CUMG authorization はその縮約後に始まります。`DeviceCapabilityAuthorizer` が答えるのは、認証済み principal が1つの stable desktop 上で1つの exact `DeviceCapability` を使用できるかどうかだけです。identity storage、password/session handling、token issuance、general-purpose account management は CUMG の外に置きます。そのため self-contained signed JWT で identity を確立するだけなら CUMG user database は不要で、authorization storage は別 concern です。
 
-runtime は RFC 7662 OAuth introspection と、意図的に single-principal とする deployment 向けの trusted authenticated-proxy fixed-principal adapter をサポートします。Firebase/Auth0/Cognito/Entra/Keycloak のような provider に対しては、OIDC/JWT が general signed-token direction として引き続き推奨です。trusted-proxy adapter は loopback origin を要求し、principal identity は operator configuration のみから取得し、client identity header を信頼しません。multi-principal policy には tamper-resistant authenticated identity が必要です。
+runtime は3つの明示的authentication adapterをサポートします。RFC 7662 OAuth introspection、multi-principal deployment向けprovider-neutral signed OIDC/JWT、意図的にsingle-principalとするdeployment向けtrusted authenticated-proxy fixed-principal adapterです。OIDC/JWTはoperator-configured issuer、exact audience、pinned HTTPS JWKS、asymmetric algorithm allowlist、time claim、stable subjectを検証して同じprincipal typeを生成し、provider-specific behaviorはadapterで終端します。trusted-proxy adapterはloopback originを要求し、principal identityはoperator configurationのみから取得し、client identity headerを信頼しません。
 
 northbound credential は Agent credential ではなく、device-scoped execution grant の代わりに southbound へ転送してはいけません。custom value は新たな generic authorization protocol を発明することではなく、authorized intent を上記 operation-ownership state machine に bind することです。
 

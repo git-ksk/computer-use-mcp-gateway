@@ -43,6 +43,7 @@ pub mod v2_linux_fido2_recovery;
 pub mod v2_maintenance;
 pub mod v2_multi_device;
 pub mod v2_observability;
+pub mod v2_oidc_jwt;
 pub mod v2_online_recovery;
 pub mod v2_operator_handoff;
 pub mod v2_operator_status;

@@ -52,7 +52,7 @@ external IdP / authenticated proxy
         -> principal -> stable desktop -> exact DeviceCapability
 ```
 
-RFC 7662 introspection is one packaged token-validation adapter, not the canonical identity protocol. The packaged trusted authenticated-proxy fixed-principal adapter is appropriate for explicitly single-principal deployments whose origin is loopback-only behind that reviewed proxy/tunnel. Generic OIDC/JWT validation remains the preferred multi-principal signed-token direction. Provider-specific logic must terminate before `AuthenticatedClientPrincipal`.
+RFC 7662 introspection is one packaged token-validation adapter, not the canonical identity protocol. The packaged trusted authenticated-proxy fixed-principal adapter is appropriate for explicitly single-principal deployments whose origin is loopback-only behind that reviewed proxy/tunnel. Provider-neutral OIDC/JWT validation is now implemented as the preferred multi-principal signed-token adapter, using an operator-pinned issuer/audience/JWKS/algorithm ceiling before normalization to the same principal type. Provider-specific logic must terminate before `AuthenticatedClientPrincipal`.
 
 The trusted-proxy runtime mode yields only its configured/fixed principal and is therefore suitable only for an explicitly single-principal deployment. It does not read arbitrary caller identity headers. Multi-principal authorization must receive a tamper-resistant authenticated identity from the authentication boundary.
 
