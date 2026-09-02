@@ -65,6 +65,19 @@ Do not weaken these tests by asserting raw payload text for diagnostics. If a ne
 
 The Linux thresholds remain enforced regression guards, not capacity or production-performance claims. A representative passing hosted-Linux sample measured 100 calls in 0.142 seconds, 0.000% idle gateway CPU, and 17.191 MiB gateway RSS. Exact numbers vary by runner; the configured Linux thresholds remain the pass/fail contract. The unsupported-platform skip does not weaken the Linux CI gate and does not skip the portable gateway/backend health or 100-call soak checks.
 
+### Informational V1 latency/concurrency benchmark
+
+`scripts/v1_perf_benchmark.py` complements the deterministic quality gate without changing its semantics or adding workstation-specific latency thresholds to CI. Build the real V1 gateway, then run the default 50-call warmup plus 1,000 measured calls at concurrency 1, 4, and 16:
+
+```bash
+cargo build --locked --bin v1_gateway
+python3 scripts/v1_perf_benchmark.py
+```
+
+Use `--json` for machine-readable output, or override `--calls`, `--warmup`, `--concurrency 1,4,16`, `--port`, and `--gateway-binary` for controlled experiments. Each profile reports elapsed time, throughput, mean latency, p50, p95, p99, and max latency. The final report also records Gateway health, backend CPU/RSS from the detailed health fixture, and Gateway CPU/RSS on Linux where `/proc` provides the same reliable counters used by the quality gate.
+
+The measurement boundary is explicit: each latency is a **local client HTTP round trip through the real Gateway and deterministic mock MCP backend**. It includes local HTTP serialization/transport, Gateway processing, Gateway↔mock-backend stdio, and the return path. It does **not** isolate Gateway-only processing time and does not include a remote network, real desktop, or real Cua latency. The JSON contract exposes these inclusions/exclusions directly. Results are informational regression evidence, not a production capacity claim and not a latency pass/fail gate. CI compiles the harness and runs its deterministic unit tests only.
+
 ### Official MCP conformance runner
 
 `scripts/v1_conformance.py` pins the official runner package to:
