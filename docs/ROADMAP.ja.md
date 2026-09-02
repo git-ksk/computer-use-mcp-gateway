@@ -50,29 +50,28 @@ completion provable?
 
 `v0.3.0` 後に merge された compatible fix は将来の `0.3.1` に含められますが、maintenance commit が存在するだけで release を必須にはしません。
 
-### 直近の Product Readiness 実行順
+### 直近の post-v0.3 実行順
 
-現在は、**追加 desktop platform の recovery parity より先に single-Mac の operator/product path を完成させる**ことを優先します。cross-platform recovery は重要ですが、新しい platform-backed recovery provider を追加しても、すでに supported な deployment に残る最大の usability gap は解消しません。
+`0.3.x` Product Readiness closeout は完了済みです。`0.4.0` Recovery & Reconciliation は、manual な physical acceptance gate が無関係な実装を直列化しないよう、**shared/provider implementation、physical platform acceptance、parallel dogfood hardening の3レーン**に分けて進めます。
 
-`0.3.x` Product Readiness closeout は完了済みです。以下の表は completed gate と、明示的に non-blocking な stabilization / future work を記録します。
-
-| Closeout track | Issues | Status | 現在の `0.3.x` closeout を block? |
+| `0.4.0` track | Issues / PR | Status | Release role |
 | --- | --- | --- | --- |
-| Operator/recovery foundation | #226, #233, #234, #235, #109 | Complete | No |
-| Guided quarantine recovery | #236 | Complete | No |
-| Artifact-backed install/upgrade | #237 | Complete | No — closeout evidence 実装済み |
-| Cross-cutting Product Readiness closeout | #213 | Complete | No — standing gate は [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) |
-| Compatible stabilization backlog | #215, #115, #104, #111, bounded #96 work | Parallel/deferred | released regression evidence が出ない限り No |
-| Cross-platform recovery parity | #217, #227, #228 | `0.4.0` planned | No |
+| Core recovery semantics | #103, #137, #136 | Complete | baseline 完了 |
+| Shared WebAuthn/CTAP verifier | #256 | Next / active | Windows/Linux parity の shared dependency。単独では platform support を claim しない |
+| Windows Hello provider | #227 / PR #252 | implementation + CI green、physical acceptance pending | Windows online-recovery support/parity closeout は block するが、無関係な実装は block しない |
+| Linux FIDO2 UV provider | #228 | shared verifier merge 後に進行可能。support claim 前に physical acceptance 必須 | Linux provider support を claim する場合の parity closeout gate |
+| Recovery dogfood hardening | #253, #254, #115, #255 | Parallel | implementation/evidence が released safety/recovery invariant failure を示さない限り non-blocking |
+| その他 compatible stabilization | #215, #104, #111, bounded #96 work | Parallel/deferred | released regression の新 evidence がない限り non-blocking |
 
 released safety regression を示す新しい evidence がない限り、次の順序を使います。
 
-1. **operator/recovery workflow 完了:** #226 lane-scoped readiness、#233 operator-ready incident brief、#234 durable / inspectable single-Mac upgrade transaction、#235 unified operator status、#109 exact durable online-recovery completion confirmation、#236 guided quarantine recovery は完了済みです。
-2. **product workflow を完了:** #237 は exact CUMG/Handoff pairing、fail-closed verification、one-shot upgrade、paired rollback、installed doctor/status verification を備えた reviewed single-Mac source-free artifact install/upgrade path を提供します。
-3. **横断 gate 完了:** #213 で single-Mac product path を end-to-end review し、恒久 per-release gate として [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) を確立しました。compatible stabilization backlog は、その evidence が release invariant を壊さない限り non-blocking のままです。
-4. **Recovery & Reconciliation を dependency 順に拡張:** #103 durable effectful operation identity/status、#137 reviewed local-Human current-state acceptance、#136 permanent replay tombstone / bounded detailed retirement history 分離は完了済みです。次に #217/#227/#228 の cross-platform user-presence recovery parity を進めます。
+1. **完了済み recovery core を固定:** #103 durable effectful operation identity/status、#137 reviewed local-Human current-state acceptance、#136 permanent replay tombstone / bounded detailed history 分離は完了済みで、`0.4.0` semantic baseline とします。
+2. **shared protocol work を manual Windows acceptance から分離:** #256 で PR #252 の provider-neutral WebAuthn/CTAP ES256 verifier を independently reviewable な変更として抽出します。shared verifier は Windows/Linux provider support を claim せず先に merge できます。
+3. **provider implementation と physical acceptance を別レーンで進行:** #227 / PR #252 は automated check green の実装を保持し、physical Windows Hello acceptance pending を明示します。#256 merge 後は #228 Linux FIDO2 UV provider を同じ verifier contract に対して進め、Windows 実機確認待ちにしません。ただし各 platform の support claim には、その platform の explicit physical acceptance が必要です。
+4. **physical-acceptance 待ち時間を bounded recovery hardening に使用:** #253 installed runtime/operator-tool skew detection と #254 recovery-key readiness を優先し、その後 #115 actionable `device_indeterminate` guidance と #255 Human historical-resolution guidance を進めます。これらは compatible な `0.4`-era dogfood improvement であり自動的な release blocker にはしません。既存 safety/recovery invariant が満たされていない evidence が出た場合だけ blocker へ昇格します。
+5. **cross-platform parity を意図的にclose:** #217 は、実際に supported と claim する platform provider が required implementation、user-presence proof、durable recovery/no-replay evidence、physical acceptance を満たした場合だけ close します。manual acceptance pending は「未実装」ではなく acceptance gate として明示します。
 
-これは Windows/Linux recovery の de-scope ではなく、実行順の決定です。`0.3.x` Product Readiness path は完了済みです。途中まで実装済みの #227 work は保持しますが、#103/#137/#136 の immediate dependency ではありません。platform-provider implementation は dedicated parity slot で再開し、concrete production evidence により Windows/Linux online recovery がより高い safety/operability priority になった場合だけ前倒しします。
+この sequencing により `0.4.0` を無制限な backlog-clearing exercise にせず、Windows/Linux の physical acceptance が面倒または実行不能な期間も開発を止めません。`0.5.0` authorization/identity work は分離したままとし、#221 は design review を先行してよいものの implementation を recovery milestone へ取り込みません。
 
 ### Legacy V1 retirement candidate
 
@@ -95,8 +94,8 @@ CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 �
 現在の作業順:
 
 - **`0.3.x` — Product Readiness & Stabilization:** #237 と #213 cross-cutting closeout は完了済みです。future release は恒久 [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gate を再利用します。#226/#233/#234/#235/#109/#236 の operator/recovery foundation と #224 release-candidate artifact boundary は完了済みです。#215、#115、#104、#111、#96 の bounded な調査/documentation は compatible non-blocking stabilization として並行可能で、milestone を無制限な backlog-clearing exercise にはしません。
-- **`0.4.0` — Recovery & Reconciliation:** #103 / #137 / #136 は完了済みです。permanent replay deny は bounded detailed retirement history から分離済みで、effectful Desktop/Browser work は caller-retained durable operation identity/status を持ち、reviewed `Scroll` / `MovePointer` ambiguity は exact local-user-presence authorization 後だけ `current_state_accepted` として retire できます。historical outcome は `Indeterminate` のまま、old ID は permanent non-replayable のままです。次に #217/#227/#228 の cross-platform user-presence recovery parity を進めます。
-- **`0.5.0` — Multi-principal Identity:** #139 で provider-neutral OIDC/JWT caller identity を追加し、既存の exact `principal -> device -> capability` authorizer と single-principal / introspection adapter を維持。
+- **`0.4.0` — Recovery & Reconciliation:** #103 / #137 / #136 は完了済みです。次に #256 で shared WebAuthn/CTAP verifier を抽出し、#227 Windows Hello / #228 Linux FIDO2 provider work が manual platform acceptance に直列化されないようにします。PR #252 は implementation / CI complete ですが physical Windows acceptance pending を明示します。並行して #253/#254/#115/#255 を bounded non-blocking recovery-dogfood hardening lane とし、released invariant failure の新 evidence が出た場合だけ blocker に昇格します。#217 は parity umbrella のままで、各 platform provider の support claim 前に physical acceptance を必須とします。
+- **`0.5.0` — Multi-principal Identity & Authorization:** #139 の provider-neutral OIDC/JWT caller identity と #221 の narrow-only typed semantic constraint を追加し、既存 exact `principal -> device -> capability` authorizer、single-principal / introspection adapter、独立した grant/recovery/Handoff authority を維持します。
 - **`0.6.0` — Least-privilege Workspace:** #83 の bounded retrievable output、#105 の ranged / deterministic filesystem observation、#107 の明示的 writable root 下での atomic workspace mutation により Dangerous shell authority への依存を減らす。
 - **`0.7.0` — Managed Developer Execution:** #106 の explicitly managed long-running job と #114 の separately sandboxed Playwright/E2E execution を追加。background-shell escape compatibility ではなく #96 の Unix containment 調査を前提にする。
 
