@@ -1,8 +1,14 @@
 #[cfg(not(target_os = "macos"))]
 use anyhow::bail;
 use anyhow::{Context, Result};
+#[path = "v2_recover/linux_fido2.rs"]
+mod linux_fido2;
+use linux_fido2::{
+    LinuxFido2ProviderArgs, accept_current_state_linux_fido2, init_linux_fido2, resolve_linux_fido2,
+};
+
 use clap::{Parser, Subcommand, ValueEnum};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use computer_use_mcp_gateway::v2_online_recovery::{
     RecoveryAuditAssessment, new_authorization, new_current_state_acceptance_authorization,
     recovery_decision_name, store_authorization,
@@ -24,7 +30,7 @@ use computer_use_mcp_gateway::{
     },
     v2_operator_status::OperatorOverallStatus,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::fs::OpenOptions;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -57,6 +63,57 @@ enum Command {
         secure_enclave_helper: PathBuf,
         #[arg(long)]
         public_key_out: PathBuf,
+    },
+    /// Create a dedicated Linux FIDO2 recovery credential with explicit user verification.
+    InitLinuxFido2 {
+        #[arg(long, env = "CUMG_V2_FIDO2_TOOL_DIR")]
+        tool_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_FIDO2_DEVICE")]
+        device: PathBuf,
+        #[arg(long, value_enum)]
+        uv_mode: LinuxFido2UvModeArg,
+        #[arg(long)]
+        verifier_out: PathBuf,
+    },
+    /// Approve an exact recovery decision with a provisioned Linux FIDO2 credential.
+    ResolveLinuxFido2 {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_FIDO2_TOOL_DIR")]
+        tool_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_FIDO2_DEVICE")]
+        device: PathBuf,
+        #[arg(long, value_enum)]
+        uv_mode: LinuxFido2UvModeArg,
+        #[arg(long, env = "CUMG_V2_RECOVERY_WEBAUTHN_VERIFIER_FILE")]
+        verifier_file: PathBuf,
+        #[arg(long, value_enum)]
+        decision: ResolutionDecisionArg,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
+    },
+    /// Accept the current desktop state with a provisioned Linux FIDO2 credential.
+    AcceptCurrentStateLinuxFido2 {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_FIDO2_TOOL_DIR")]
+        tool_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_FIDO2_DEVICE")]
+        device: PathBuf,
+        #[arg(long, value_enum)]
+        uv_mode: LinuxFido2UvModeArg,
+        #[arg(long, env = "CUMG_V2_RECOVERY_WEBAUTHN_VERIFIER_FILE")]
+        verifier_file: PathBuf,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
     },
     /// Guide a Human through authoritative quarantine review and durable recovery verification.
     Guide {
@@ -150,6 +207,23 @@ enum Command {
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
         wait_secs: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LinuxFido2UvModeArg {
+    Pin,
+    Builtin,
+}
+
+impl From<LinuxFido2UvModeArg>
+    for computer_use_mcp_gateway::v2_linux_fido2_recovery::LinuxFido2UvMode
+{
+    fn from(value: LinuxFido2UvModeArg) -> Self {
+        match value {
+            LinuxFido2UvModeArg::Pin => Self::Pin,
+            LinuxFido2UvModeArg::Builtin => Self::Builtin,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -281,6 +355,56 @@ fn main() -> Result<()> {
             secure_enclave_helper,
             public_key_out,
         } => export_public(key_file, secure_enclave_helper, public_key_out),
+        Command::InitLinuxFido2 {
+            tool_dir,
+            device,
+            uv_mode,
+            verifier_out,
+        } => init_linux_fido2(tool_dir, device, uv_mode.into(), verifier_out),
+        Command::ResolveLinuxFido2 {
+            state_dir,
+            hub_public_key_file,
+            tool_dir,
+            device,
+            uv_mode,
+            verifier_file,
+            decision,
+            evidence,
+            wait_secs,
+        } => resolve_linux_fido2(
+            state_dir,
+            hub_public_key_file,
+            LinuxFido2ProviderArgs {
+                tool_dir,
+                device,
+                uv_mode: uv_mode.into(),
+                verifier_file,
+            },
+            decision.into(),
+            evidence,
+            wait_secs,
+        ),
+        Command::AcceptCurrentStateLinuxFido2 {
+            state_dir,
+            hub_public_key_file,
+            tool_dir,
+            device,
+            uv_mode,
+            verifier_file,
+            evidence,
+            wait_secs,
+        } => accept_current_state_linux_fido2(
+            state_dir,
+            hub_public_key_file,
+            LinuxFido2ProviderArgs {
+                tool_dir,
+                device,
+                uv_mode: uv_mode.into(),
+                verifier_file,
+            },
+            evidence,
+            wait_secs,
+        ),
         Command::Guide {
             hub_state_dir,
             agent_state_dir,

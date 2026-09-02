@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](V2_ONLINE_RECOVERY.ja.md)
 
-Status: **implemented behind explicit recovery-key provisioning; trusted physical macOS Secure Enclave user-presence acceptance is complete and the same authority is reused by current-state acceptance.**
+Status: **implemented behind explicit recovery-key provisioning. Trusted physical macOS Secure Enclave user-presence acceptance is complete. The Linux FIDO2/CTAP2 provider is an implementation candidate with automated contract coverage, but Linux support is not claimed until separate physical UV-capable authenticator acceptance passes.**
 
 This document defines the online recovery path for a desktop that entered durable `Indeterminate` quarantine. It removes the normal operational need to stop the Hub and run offline maintenance, without weakening the existing no-auto-replay or persistence-gated recovery boundary.
 
@@ -12,9 +12,11 @@ The Agent device identity is **not** recovery authority. A compromised Agent may
 
 Online recovery therefore uses a separately provisioned endpoint recovery key. On macOS a small stable-signed CryptoKit helper creates a Secure Enclave P-256 key protected by `userPresence + privateKeyUsage`. Only the Secure Enclave sealed `dataRepresentation` is persisted, in an owner-private file managed by CUMG; the private key itself never leaves the Secure Enclave. The Hub stores only the P-256 public verifier. Initial provisioning uses create-new file semantics, and both the sealed-key file and Hub public-key file are validated with strict path/symlink/permission rules.
 
-The initial implementation is intentionally macOS-only for local approval. Windows and Linux do not gain a weaker software-key substitute; they continue to use the existing explicit offline maintenance path until an equivalent reviewed user-presence provider exists.
+The accepted production provider remains macOS Secure Enclave. Windows Hello remains implementation/CI-complete but physical-acceptance pending in #227. Linux now has an optional FIDO2/CTAP2 implementation candidate in #228. Neither pending platform gains a software-key substitute, and deployments that do not meet a provider's explicit prerequisites continue to use the existing offline maintenance path.
 
 The recovery core also contains a **provider-neutral WebAuthn/CTAP ES256 verifier contract**. It validates the bounded credential/public-key document, exact CUMG client-data challenge binding, RP ID hash, credential ID, ES256 signature, and both UP/UV flags. That verifier is shared cryptographic plumbing only: merging or testing it does **not** claim Windows Hello, Linux FIDO2, or any other platform provider as supported. Each platform provider must separately implement native provisioning/assertion behavior and pass its own physical user-presence acceptance before support is claimed.
+
+The Linux candidate deliberately uses the distro-installed libfido2 command-line tools as an optional runtime provider rather than making `libfido2-dev` a build dependency. CUMG requires an explicit root-owned tool directory, an explicit `/dev/...` authenticator path, libfido2 tools version 1.17.0 or newer, CTAP2/FIDO2 capability, ES256, signed user presence, and one explicit UV mode: `pin` for Client PIN / PIN-UV Auth or `builtin` for authenticator-integrated UV. CUMG never supplies a PIN through config, environment, argv, logs, or process stdin; PIN mode requires libfido2 to obtain it from the controlling tty. No `-u` U2F mode is used, and the shared Hub verifier independently rejects any assertion lacking signed UP and UV bits.
 
 ## Protocol
 
@@ -31,7 +33,7 @@ cumg-v2-recover status / local inspection
         |
         | exact Human choice:
         | historical resolution OR current-state acceptance
-        | Secure Enclave user-presence signature
+        | platform recovery-provider user-verification signature
         v
 Agent relays signed RecoveryAuthorization
         |
@@ -109,6 +111,37 @@ The Agent state directory contains only short-lived recovery handoff files:
 The files are bounded and private. Authorization publication is create/no-clobber so a second local decision cannot silently overwrite a pending one. The Agent verifies challenge consistency before relay and removes the handoff only after a valid Hub-signed resolution acknowledgement. A fresh authenticated generation clears stale handoff state.
 
 These files are not execution authority: the Hub's durable quarantine/checkpoint remains authoritative.
+
+## Linux FIDO2 implementation candidate
+
+This lane is implemented for review and automated CI, but remains **pre-support** until the #228 physical Linux acceptance is recorded. Install libfido2 1.17.0+ tools from a root-managed distro/package path and choose the exact authenticator device explicitly; CUMG does not auto-select or silently switch devices. `pin` mode requires configured Client PIN support. `builtin` mode requires authenticator-integrated `uv`; it does not silently fall back to a PIN.
+
+Provision a dedicated ES256 recovery credential:
+
+```bash
+v2_recover init-linux-fido2 \
+  --tool-dir /usr/bin \
+  --device /dev/hidraw0 \
+  --uv-mode pin \
+  --verifier-out "$HOME/.config/cumg/recovery-webauthn-verifier.json"
+```
+
+Transfer only that bounded verifier document through the authenticated administrative channel and install it as `<HUB_STATE_DIR>/recovery-webauthn-verifier.json`, then restart the Hub. The authenticator private key and PIN never become Hub/Agent state. For a fresh valid challenge, use the matching provider parameters:
+
+```bash
+v2_recover resolve-linux-fido2 \
+  --state-dir "$HOME/.local/state/cumg-v2-agent" \
+  --hub-public-key-file "$HOME/.config/cumg/hub.pub" \
+  --tool-dir /usr/bin \
+  --device /dev/hidraw0 \
+  --uv-mode pin \
+  --verifier-file "$HOME/.config/cumg/recovery-webauthn-verifier.json" \
+  --decision confirmed-completed \
+  --evidence "local user inspected the current desktop" \
+  --wait-secs 30
+```
+
+For the separately reviewed low-impact current-state path, use `accept-current-state-linux-fido2` with the same provider/verifier arguments. Missing tools/device, unsupported CTAP2/ES256/UP/UV capability, a cancelled/failed PIN or biometric gesture, malformed tool output, wrong credential/RP/challenge/signature, or missing signed UP/UV all fail closed before CUMG publishes authority. Unsupported Linux deployments continue to use offline `v2_maint`.
 
 ## macOS provisioning and use
 
