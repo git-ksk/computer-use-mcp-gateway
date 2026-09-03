@@ -2,7 +2,7 @@
 
 > English is canonical. [日本語版 / Japanese translation](V2_040_RELEASE_SCOPE.ja.md)
 
-Status: **released scope for `v0.4.0`**. This document remains the support-claim boundary for the immutable release snapshot.
+Status: **active `v0.4.0` release-candidate scope; no `v0.4.0` tag or GitHub Release has shipped yet**. This document is the candidate support-claim boundary.
 
 ## Purpose
 
@@ -17,7 +17,7 @@ A capability can therefore be present in the artifact while its support claim re
 
 ## Included baseline
 
-The immutable `0.4.0` release includes the compatible work below:
+The `0.4.0` candidate includes the compatible work below:
 
 - durable Recovery & Reconciliation semantics, permanent no-replay and reviewed current-state/Human recovery paths (#103, #137, #136, #115, #255);
 - recovery/operator hardening and readiness (#253, #254, #256);
@@ -36,15 +36,15 @@ The immutable `0.4.0` release includes the compatible work below:
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | Implementation + CI merged | Do not make the signed-token support claim until #139 physical/dogfood acceptance is recorded |
 | Typed semantic authorization | #221 / PR #271 merged, CI green | Included |
-| Windows Hello recovery | Implementation + CI present | Do not claim Windows online-recovery support until #227 physical acceptance passes |
-| Linux FIDO2 UV recovery | Implementation + CI present | Do not claim Linux online-recovery support until #228 physical acceptance passes |
+| Windows Hello recovery | Implementation + CI present; physical acceptance pending | **Remaining `v0.4.0` release gate:** #227 physical interactive-desktop acceptance must pass before tag/Release |
+| Linux FIDO2 UV recovery | Implementation + CI present; physical acceptance deferred | Does **not** block base `v0.4.0`; do not claim Linux online-recovery support until #228 physical Linux + real UV-capable authenticator acceptance passes |
 | Cross-platform recovery parity | #217 open | Close only for the platform set actually claimed as supported |
 | Cloud Run hosted Hub | Design only / NO-GO | Not a `0.4.0` support claim; #215 implementation/acceptance remains future work |
 | Second real computer-use backend | #222 future evidence | Not required for `0.4.0`; current backend-neutral claims remain bounded to existing evidence |
 
 ## Release closeout gate
 
-The `v0.4.0` release was admitted only after:
+Before creating the `v0.4.0` tag/Release:
 
 1. #221 / PR #271 merged with typed constraints, immutable final-command binding, durable bounded audit evidence, stale-decision fencing, full regression, and EN/JA normative docs.
 2. The standing [`../PRODUCT_READINESS.md`](../PRODUCT_READINESS.md) gate is rerun for the exact candidate commit.
@@ -54,12 +54,13 @@ The `v0.4.0` release was admitted only after:
 6. Recovery/no-auto-replay, dependency review, CodeQL, docs/link validation, conformance, and release packaging checks are green.
 7. Release notes state the support-claim matrix above explicitly. Optional platform/provider implementations with pending acceptance must not be described as supported.
 8. No new evidence demonstrates a released safety/reliability invariant failure that requires a blocker fix.
+9. **Record #227 physical Windows interactive-desktop Windows Hello acceptance.** Do not create the `v0.4.0` tag or GitHub Release until it passes.
 
 ## What does not block the base artifact
 
 The following may remain open if their associated support claim is withheld clearly:
 
-- #217/#227/#228 physical Windows/Linux recovery acceptance;
+- #217 cross-platform parity and #228 physical Linux FIDO2 acceptance;
 - #139 signed-token dogfood acceptance, if generic signed-token identity is explicitly marked not-yet-supported in that candidate;
 - #215 Cloud Run implementation/acceptance;
 - #222 second-backend proof.
