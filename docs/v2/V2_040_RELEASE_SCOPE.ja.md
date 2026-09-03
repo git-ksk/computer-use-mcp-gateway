@@ -2,7 +2,7 @@
 
 > この日本語版は [`V2_040_RELEASE_SCOPE.md`](V2_040_RELEASE_SCOPE.md) の翻訳です。**英語版をcanonicalとします。**
 
-Status: **`v0.4.0` released scope**。この文書はimmutable release snapshotのsupport-claim boundaryとして維持します。
+Status: **active `v0.4.0` release-candidate scope。`v0.4.0` tag / GitHub Release はまだshipしていません。** この文書をcandidateのsupport-claim boundaryとします。
 
 ## Purpose
 
@@ -17,7 +17,7 @@ Status: **`v0.4.0` released scope**。この文書はimmutable release snapshot�
 
 ## Included baseline
 
-immutable `0.4.0` releaseには以下のcompatible workを含みます。
+`0.4.0` candidateには以下のcompatible workを含みます。
 
 - durable Recovery & Reconciliation、permanent no-replay、reviewed current-state/Human recovery (#103, #137, #136, #115, #255);
 - recovery/operator hardening/readiness (#253, #254, #256);
@@ -36,8 +36,8 @@ immutable `0.4.0` releaseには以下のcompatible workを含みます。
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | implementation + CI merged | #139 physical/dogfood acceptance記録前はsigned-token supportをclaimしない |
 | Typed semantic authorization | #221 / PR #271 merged, CI green | Included |
-| Windows Hello recovery | implementation + CI present | #227 physical acceptance前はWindows online-recovery supportをclaimしない |
-| Linux FIDO2 UV recovery | implementation + CI present | #228 physical acceptance前はLinux online-recovery supportをclaimしない |
+| Windows Hello recovery | implementation + CI present、physical acceptance pending | **残る`v0.4.0` release gate:** tag/Release前に#227 physical interactive-desktop acceptanceを通す |
+| Linux FIDO2 UV recovery | implementation + CI present、physical acceptance deferred | base `v0.4.0`をblockしない。#228 physical Linux + real UV-capable authenticator acceptance前はLinux online-recovery supportをclaimしない |
 | Cross-platform recovery parity | #217 open | 実際にsupportedとclaimするplatform setだけを対象にcloseする |
 | Cloud Run hosted Hub | design only / NO-GO | `0.4.0` support claimではない。#215 implementation/acceptanceはfuture work |
 | Second real computer-use backend | #222 future evidence | `0.4.0`必須ではない。backend-neutral claimはexisting evidenceの範囲に限定 |
@@ -54,12 +54,13 @@ immutable `0.4.0` releaseには以下のcompatible workを含みます。
 6. recovery/no-auto-replay、Dependency Review、CodeQL、docs/link validation、conformance、release packagingをgreenにする。
 7. release noteで上記support-claim matrixを明示する。acceptance pendingのoptional platform/provider implementationをsupportedと書かない。
 8. released safety/reliability invariant failureを示す新evidenceがないことを確認する。
+9. **#227 physical Windows interactive-desktop Windows Hello acceptanceを記録する。** これが通るまで`v0.4.0` tag / GitHub Releaseを作成しない。
 
 ## Base artifactをblockしないもの
 
 関連support claimを明確に保留する場合、次はOPENのままでもbase artifactをblockしません。
 
-- #217/#227/#228 physical Windows/Linux recovery acceptance;
+- #217 cross-platform parityと#228 physical Linux FIDO2 acceptance;
 - #139 signed-token dogfood acceptance。ただしcandidateでgeneric signed-token identityをnot-yet-supportedと明示する場合のみ;
 - #215 Cloud Run implementation/acceptance;
 - #222 second-backend proof。

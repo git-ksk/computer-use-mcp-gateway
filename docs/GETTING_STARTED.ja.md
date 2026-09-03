@@ -213,7 +213,7 @@ cargo build --locked
 
 `Cargo.lock` は commit 済みで、normal build は `--locked` を使って dependency graph の reproducibility を保ちます。
 
-`v0.4.0` release は source-only です。CI では packaging review 用の verified **release-candidate** archive を公開する場合がありますが、unsigned / unnotarized artifact は official installer や broader platform-support claim ではありません。bounded manifest / checksum / fresh-extraction contract は [`VERSIONING.ja.md`](VERSIONING.ja.md#release-candidate-artifact) を参照してください。
+`v0.4.0` はまだshipしていません。CI では packaging review 用の verified **release-candidate** archive を公開する場合がありますが、unsigned / unnotarized artifact は official installer や broader platform-support claim ではありません。bounded manifest / checksum / fresh-extraction contract は [`VERSIONING.ja.md`](VERSIONING.ja.md#release-candidate-artifact) を参照してください。
 
 ## 6. V2 identity と TLS boundary を provision する
 
