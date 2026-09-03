@@ -24,6 +24,7 @@ use computer_use_mcp_gateway::{
     },
     v2_oidc_jwt::{OidcJwtAlgorithm, OidcJwtConfig, OidcJwtVerifier},
     v2_operator_handoff::UnixOperatorHandoffAuthority,
+    v2_semantic_constraints::SemanticConstraintPolicy,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch};
@@ -35,6 +36,7 @@ const MAX_TRUSTED_PROXY_SECRET_BYTES: u64 = 256;
 const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
 const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
+const MAX_SEMANTIC_CONSTRAINT_POLICY_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "v2_hub")]
@@ -150,6 +152,10 @@ struct Args {
     /// Integrity-protected JSON principal -> device -> exact-capability mapping.
     #[arg(long, env = "CUMG_V2_NORTHBOUND_POLICY_FILE")]
     northbound_policy_file: Option<PathBuf>,
+    /// Optional immutable operator semantic-constraint snapshot. It can only narrow
+    /// already-authorized exact capabilities and is loaded once at Hub startup.
+    #[arg(long, env = "CUMG_V2_SEMANTIC_CONSTRAINT_POLICY_FILE")]
+    semantic_constraint_policy_file: Option<PathBuf>,
     /// Compatibility-only local Unix socket for the acceptance/regression Handoff bridge.
     /// Mutually exclusive with the first-class managed Handoff runtime.
     #[arg(long, env = "CUMG_V2_OPERATOR_HANDOFF_SOCKET")]
@@ -594,6 +600,7 @@ fn build_northbound_runtime(
     let configured = [
         args.mcp_resource.is_some(),
         args.northbound_policy_file.is_some(),
+        args.semantic_constraint_policy_file.is_some(),
         shared_oauth_configured,
         introspection_configured,
         oidc_configured,
@@ -620,6 +627,15 @@ fn build_northbound_runtime(
         .context("CUMG_V2_NORTHBOUND_POLICY_FILE is required")?;
     let policy_text = load_trusted_text(policy_file, MAX_NORTHBOUND_POLICY_BYTES)
         .context("failed to load northbound authorization policy")?;
+    let semantic_constraints = args
+        .semantic_constraint_policy_file
+        .as_ref()
+        .map(|path| {
+            let text = load_trusted_text(path, MAX_SEMANTIC_CONSTRAINT_POLICY_BYTES)
+                .context("failed to load semantic constraint policy")?;
+            SemanticConstraintPolicy::from_json(&text).context("invalid semantic constraint policy")
+        })
+        .transpose()?;
     let overload = computer_use_mcp_gateway::v2_limits::HttpOverloadGuard::new(
         args.max_northbound_concurrency,
         args.max_northbound_requests_per_minute,
@@ -671,6 +687,11 @@ fn build_northbound_runtime(
             .context("invalid northbound principal/device/capability policy")?;
         let resource = proxy_config.resource().to_owned();
         let mut service = V2NorthboundMcp::new(handle, policy);
+        if let Some(constraints) = semantic_constraints.clone() {
+            service = service
+                .with_semantic_constraints(constraints)
+                .context("failed to install immutable semantic constraint revision")?;
+        }
         if let Some(secret) = audit_fingerprint_secret.clone() {
             service = service.with_request_fingerprint_secret(secret);
         }
@@ -724,6 +745,11 @@ fn build_northbound_runtime(
         let metadata_url = mcp_config.metadata_url().to_owned();
         let resource = mcp_config.resource().to_owned();
         let mut service = V2NorthboundMcp::new(handle, policy);
+        if let Some(constraints) = semantic_constraints.clone() {
+            service = service
+                .with_semantic_constraints(constraints)
+                .context("failed to install immutable semantic constraint revision")?;
+        }
         if let Some(secret) = audit_fingerprint_secret.clone() {
             service = service.with_request_fingerprint_secret(secret);
         }
@@ -779,6 +805,11 @@ fn build_northbound_runtime(
         let metadata_url = mcp_config.metadata_url().to_owned();
         let resource = mcp_config.resource().to_owned();
         let mut service = V2NorthboundMcp::new(handle, policy);
+        if let Some(constraints) = semantic_constraints.clone() {
+            service = service
+                .with_semantic_constraints(constraints)
+                .context("failed to install immutable semantic constraint revision")?;
+        }
         if let Some(secret) = audit_fingerprint_secret.clone() {
             service = service.with_request_fingerprint_secret(secret);
         }

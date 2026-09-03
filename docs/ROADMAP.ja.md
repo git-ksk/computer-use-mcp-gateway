@@ -50,7 +50,7 @@ completion provable?
 | Shared WebAuthn/CTAP verifier | #256 / PR #258 | Complete | Required shared recovery dependency。単独ではplatform support claimを意味しない |
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | implementation + CI complete、physical signed-token dogfood pending | implementation は含める。provider-specific support claim は acceptance 待ち |
-| Typed semantic authorization | #221 | Active implementation | **Required `0.4.0` implementation gate** |
+| Typed semantic authorization | #221 | candidate changeでimplementation complete | merge/CI後included |
 | Windows Hello recovery | #227 / PR #252 | implementation + CI green、physical acceptance pending | optional platform support gate。base `0.4.0` が Windows recovery support をclaimする必要はない |
 | Linux FIDO2 UV recovery | #228 / PR #259 | implementation + CI complete、physical acceptance pending | optional platform support gate。base `0.4.0` が Linux recovery support をclaimする必要はない |
 | Cross-platform recovery parity umbrella | #217 | physical acceptance dependent | 実際にsupport claimするplatform setのevidenceが揃うまでOPEN可 |
@@ -87,7 +87,7 @@ CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 �
 現在の作業順:
 
 - **`0.3.x` — released baseline / compatible maintenance:** #213 Product Readiness closeout、#237 artifact-backed install/upgrade、#104 filesystem-root separation、#111 reproducible benchmark、bounded #96 investigationは完了済み。#215 Cloud Run designも完了済みだが、hosted supportはopen-endedな`0.3.x` blockerではなくfuture NO-GO implementation trackとする。
-- **`0.4.0` — Recovery, Identity & Semantic Authorization:** 完了済みrecovery/reconciliation (#103/#137/#136/#253/#254/#115/#255/#256)、provider-neutral OIDC/JWT identity (#139)、typed backend-neutral semantic authorization (#221)を統合する。active implementation gateは#221 completion +通常release closeout。#139/#227/#228は必要なphysical/support-claim acceptanceを明示的に保持し、未accept platform providerをcodeがあるだけでsupportedとは表現しない。
+- **`0.4.0` — Recovery, Identity & Semantic Authorization:** 完了済みrecovery/reconciliation (#103/#137/#136/#253/#254/#115/#255/#256)、provider-neutral OIDC/JWT identity (#139)、typed backend-neutral semantic authorization (#221)を統合する。#221 implementationはcandidate changeでcompleteしており、残りはmerge/CI +通常release closeout。#139/#227/#228は必要なphysical/support-claim acceptanceを明示的に保持し、未accept platform providerをcodeがあるだけでsupportedとは表現しない。
 - **`0.5.0` — Least-privilege Workspace:** #83 bounded retrievable output、#105 ranged/deterministic filesystem observation、#107 explicit writable root配下のatomic workspace mutationでDangerous shell authorityへの依存を減らす。
 - **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
@@ -160,7 +160,7 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 open issue はrevised release sequenceで分類し、roadmap visibilityからsilentに落ちないようにします。milestoneはordering/admission guidanceです。optional support-claim acceptanceは、そのsupport claimを明示的に保留する限りbase artifact release後もOPENのままにできます。
 
 - **`0.3.x — released baseline / maintenance`:** blocking implementation gateは残っていません。#215はpatch-line milestoneから外し、design complete / Cloud Run unsupportedのfuture hosted-deployment concernとして扱います。
-- **`0.4.0 — Recovery, Identity & Semantic Authorization`:** active implementation gateは#221です。#139 implementationはmerge済みでphysical signed-token dogfood待ち、#227/#228もimplementation済みで#217配下のplatform-specific physical acceptance待ちです。これらは各support claimをgateしますが、無関係な`0.4.0` capabilityをblockしません。
+- **`0.4.0 — Recovery, Identity & Semantic Authorization`:** #221 implementationはcandidate changeでcompleteしており、残るfeature gateはmerge/CIです。#139 implementationはmerge済みでphysical signed-token dogfood待ち、#227/#228もimplementation済みで#217配下のplatform-specific physical acceptance待ちです。これらは各support claimをgateしますが、無関係な`0.4.0` capabilityをblockしません。
 - **`0.5.0 — Least-privilege Workspace`:** #83 bounded retrievable process/shell output、#105 ranged/deterministic filesystem observation、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation。
 - **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementationと#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。

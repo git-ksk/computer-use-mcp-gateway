@@ -50,7 +50,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -160,6 +160,7 @@ struct HubInner {
     persistent: Mutex<PersistentHubState>,
     live: Mutex<Option<LiveSession>>,
     draining: AtomicBool,
+    semantic_constraint_snapshot: OnceLock<SemanticConstraintSnapshotIdentity>,
     last_checkpoint_bytes: AtomicUsize,
     session_slots: Arc<Semaphore>,
     session_rate: crate::v2_limits::SlidingWindowRateLimit,
@@ -175,6 +176,30 @@ pub struct SingleDeviceHub {
 #[derive(Clone)]
 pub struct HubHandle {
     inner: Arc<HubInner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticConstraintSnapshotIdentity {
+    revision: u64,
+    digest: String,
+}
+
+impl SemanticConstraintSnapshotIdentity {
+    fn from_evidence(
+        evidence: &crate::v2_execution_safety::SemanticConstraintAdmissionEvidence,
+    ) -> Self {
+        Self {
+            revision: evidence.revision,
+            digest: evidence.snapshot_digest.clone(),
+        }
+    }
+}
+
+fn semantic_constraint_snapshot_is_current(
+    inner: &HubInner,
+    expected: Option<&SemanticConstraintSnapshotIdentity>,
+) -> bool {
+    expected.is_none_or(|expected| inner.semantic_constraint_snapshot.get() == Some(expected))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +305,7 @@ enum HubRequest {
 struct PendingOperation {
     owner: OperationOwner,
     command: DeviceCommand,
+    expected_semantic_constraint_snapshot: Option<SemanticConstraintSnapshotIdentity>,
     handoff: Option<RemoteHandoffAuthority>,
     envelope: Option<CommandEnvelope>,
     reply: oneshot::Sender<Result<HubCommandResult, HubCommandError>>,
@@ -396,6 +422,7 @@ impl SingleDeviceHub {
             }),
             live: Mutex::new(None),
             draining: AtomicBool::new(false),
+            semantic_constraint_snapshot: OnceLock::new(),
             last_checkpoint_bytes: AtomicUsize::new(0),
             session_slots,
             session_rate,
@@ -742,6 +769,10 @@ impl SingleDeviceHub {
                                 device_generation: generation,
                                 operation_id: operation_id.clone(),
                             };
+                            let expected_semantic_constraint_snapshot = metadata
+                                .semantic_constraint
+                                .as_ref()
+                                .map(SemanticConstraintSnapshotIdentity::from_evidence);
                             let decision = {
                                 let mut persistent = self.inner.persistent.lock().await;
                                 match persistent.execution.prepare_with_metadata(
@@ -799,6 +830,7 @@ impl SingleDeviceHub {
                             pending.insert(operation_id.clone(), PendingOperation {
                                 owner,
                                 command: *command,
+                                expected_semantic_constraint_snapshot,
                                 handoff,
                                 envelope: None,
                                 reply,
@@ -1075,13 +1107,14 @@ impl SingleDeviceHub {
         operation_id: &str,
         pending: &mut HashMap<String, PendingOperation>,
     ) -> Result<DispatchOutcome, HubServiceError> {
-        let (owner, device_command, handoff) = {
+        let (owner, device_command, expected_semantic_constraint_snapshot, handoff) = {
             let operation = pending
                 .get(operation_id)
                 .ok_or(HubServiceError::PendingOperationMissing)?;
             (
                 operation.owner.clone(),
                 operation.command.clone(),
+                operation.expected_semantic_constraint_snapshot.clone(),
                 operation.handoff.clone(),
             )
         };
@@ -1141,6 +1174,15 @@ impl SingleDeviceHub {
                 .await;
         }
 
+        if !semantic_constraint_snapshot_is_current(
+            &self.inner,
+            expected_semantic_constraint_snapshot.as_ref(),
+        ) {
+            return self
+                .reject_for_semantic_constraint_snapshot(operation_id, &owner, generation, pending)
+                .await;
+        }
+
         // Persist `Dispatched` before putting bytes on the network. A crash after
         // this point can conservatively restore as indeterminate, but can never
         // restore a command that may have executed as runnable.
@@ -1171,6 +1213,47 @@ impl SingleDeviceHub {
             "operation dispatched to Agent"
         );
         Ok(DispatchOutcome::Sent)
+    }
+
+    async fn reject_for_semantic_constraint_snapshot(
+        &self,
+        operation_id: &str,
+        owner: &OperationOwner,
+        generation: u64,
+        pending: &mut HashMap<String, PendingOperation>,
+    ) -> Result<DispatchOutcome, HubServiceError> {
+        let next = {
+            let mut persistent = self.inner.persistent.lock().await;
+            let decision = persistent.execution.request_cancel(
+                operation_id,
+                owner,
+                generation,
+                unix_time_ms()?,
+            )?;
+            persist_locked(&self.inner, &persistent)?;
+            match decision {
+                CancellationDecision::CancelledBeforeDispatch { next } => next,
+                CancellationDecision::AlreadyTerminal(_) => CompletionDecision::Idle,
+                CancellationDecision::SendCancellation(_) => {
+                    return Err(HubServiceError::StateBusy);
+                }
+            }
+        };
+        if let Some(operation) = pending.remove(operation_id) {
+            let _ = operation
+                .reply
+                .send(Err(HubCommandError::SemanticConstraintSnapshotStale));
+        }
+        tracing::warn!(
+            event = "v2_semantic_constraint_snapshot_stale",
+            operation_id,
+            device_id = %self.inner.device_id,
+            generation,
+            outcome = "cancelled_before_dispatch",
+            error_code = "semantic_constraint_snapshot_stale",
+            "semantic constraint snapshot changed before provider dispatch"
+        );
+        Ok(DispatchOutcome::Rejected(next))
     }
 
     async fn reject_for_grant_signer(
@@ -2297,6 +2380,42 @@ impl HubHandle {
             .await
     }
 
+    /// Installs one immutable semantic-constraint snapshot identity for this Hub runtime.
+    /// Re-installing the exact revision+digest is idempotent; any different snapshot
+    /// requires a reviewed Hub restart and cannot hot-widen the running authority.
+    pub fn install_semantic_constraint_snapshot(
+        &self,
+        revision: u64,
+        digest: &str,
+    ) -> Result<(), HubCommandError> {
+        if revision == 0
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(HubCommandError::Rejected);
+        }
+        let requested = SemanticConstraintSnapshotIdentity {
+            revision,
+            digest: digest.to_owned(),
+        };
+        if let Some(current) = self.inner.semantic_constraint_snapshot.get() {
+            return if current == &requested {
+                Ok(())
+            } else {
+                Err(HubCommandError::Rejected)
+            };
+        }
+        match self
+            .inner
+            .semantic_constraint_snapshot
+            .set(requested.clone())
+        {
+            Ok(()) => Ok(()),
+            Err(_) if self.inner.semantic_constraint_snapshot.get() == Some(&requested) => Ok(()),
+            Err(_) => Err(HubCommandError::Rejected),
+        }
+    }
+
     /// Allocates a CUMG logical operation identity before command admission.
     pub fn new_operation_id(&self) -> String {
         random_operation_id()
@@ -2891,6 +3010,7 @@ pub enum HubCommandError {
     SessionSuperseded,
     SessionClosed,
     CancelledBeforeDispatch,
+    SemanticConstraintSnapshotStale,
     OperationReplay,
     Busy,
     UnknownOperation,
@@ -2909,6 +3029,7 @@ impl SafeErrorCode for HubCommandError {
             Self::SessionSuperseded => "session_superseded",
             Self::SessionClosed => "session_closed",
             Self::CancelledBeforeDispatch => "cancelled_before_dispatch",
+            Self::SemanticConstraintSnapshotStale => "semantic_constraint_snapshot_stale",
             Self::OperationReplay => "operation_replay",
             Self::Busy => "busy",
             Self::UnknownOperation => "unknown_operation",
@@ -3097,6 +3218,170 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(base.state_dir);
+    }
+
+    #[tokio::test]
+    async fn semantic_constraint_snapshot_is_immutable_and_stale_admission_cancels_before_dispatch()
+    {
+        use crate::v2_execution_safety::{
+            OperationAdmissionMetadata, SemanticConstraintAdmissionEvidence,
+        };
+
+        let immutable_state = test_state_dir("semantic-snapshot-immutable");
+        let device = DeviceIdentity::generate();
+        let (_hub, immutable_handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: immutable_state.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let digest_a = "a".repeat(64);
+        let digest_b = "b".repeat(64);
+        immutable_handle
+            .install_semantic_constraint_snapshot(7, &digest_a)
+            .unwrap();
+        immutable_handle
+            .install_semantic_constraint_snapshot(7, &digest_a)
+            .unwrap();
+        assert_eq!(
+            immutable_handle.install_semantic_constraint_snapshot(7, &digest_b),
+            Err(HubCommandError::Rejected)
+        );
+        assert_eq!(
+            immutable_handle.install_semantic_constraint_snapshot(8, &digest_a),
+            Err(HubCommandError::Rejected)
+        );
+        drop(immutable_handle);
+        let _ = std::fs::remove_dir_all(immutable_state);
+
+        let state_dir = test_state_dir("semantic-snapshot-stale");
+        let device = DeviceIdentity::generate();
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+
+        let operation_id = "op-semantic-snapshot-stale".to_owned();
+        let owner = OperationOwner::local_hub();
+        let admitted = SemanticConstraintAdmissionEvidence {
+            revision: 7,
+            snapshot_digest: digest_a.clone(),
+            kind: "type_text_max_utf8_bytes".into(),
+            rule_id: "text-small".into(),
+        };
+        let expected = SemanticConstraintSnapshotIdentity::from_evidence(&admitted);
+        let metadata = OperationAdmissionMetadata {
+            audit: Default::default(),
+            request_fingerprint: None,
+            evidence_envelope: None,
+            semantic_constraint: Some(admitted),
+        };
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare_with_metadata(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::TypeText,
+                    metadata,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+        handle
+            .install_semantic_constraint_snapshot(8, &digest_b)
+            .unwrap();
+        assert!(!semantic_constraint_snapshot_is_current(
+            &hub.inner,
+            Some(&expected),
+        ));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            operation_id.clone(),
+            PendingOperation {
+                owner: owner.clone(),
+                command: DeviceCommand::TypeText {
+                    text: "approved".into(),
+                },
+                expected_semantic_constraint_snapshot: Some(expected),
+                handoff: None,
+                envelope: None,
+                reply: reply_tx,
+            },
+        )]);
+        let outcome = hub
+            .reject_for_semantic_constraint_snapshot(&operation_id, &owner, 1, &mut pending)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Rejected(_)));
+        assert!(pending.is_empty());
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            Err(HubCommandError::SemanticConstraintSnapshotStale)
+        );
+        let persistent = handle.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(&operation_id),
+            Some(HubOperationState::Cancelled)
+        );
+        assert!(
+            persistent
+                .execution
+                .quarantine(handle.device_id())
+                .is_none()
+        );
+        let snapshot = persistent.execution.snapshot_for_restart();
+        let record = snapshot
+            .operations
+            .iter()
+            .find(|record| record.operation.operation_id == operation_id)
+            .unwrap();
+        assert_eq!(record.dispatched_at_ms, None);
+        assert!(record.dispatch_binding.is_none());
+        assert_eq!(record.semantic_constraint.as_ref().unwrap().revision, 7);
+        assert_eq!(
+            record.semantic_constraint.as_ref().unwrap().snapshot_digest,
+            digest_a
+        );
+        drop(persistent);
+        drop(hub);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]

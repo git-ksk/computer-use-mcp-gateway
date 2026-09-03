@@ -48,6 +48,7 @@ pub mod v2_online_recovery;
 pub mod v2_operator_handoff;
 pub mod v2_operator_status;
 pub mod v2_reference_backend;
+pub mod v2_semantic_constraints;
 pub mod v2_state_lock;
 pub(crate) mod v2_terminal_pty;
 #[cfg(all(test, unix))]

@@ -26,7 +26,7 @@ Status: **active release candidate scope。`v0.4.0` tag / GitHub Release はま�
 - existing `AuthenticatedClientPrincipal` / exact authorizerを利用するprovider-neutral OIDC/JWT caller identity (#139 / PR #269);
 - bounded Unix containment investigation (#96)。stronger Linux containmentは#267へ分離済み。
 
-integrated candidateに残る**implementation gate**は#221 typed backend-neutral semantic constraintsです。exact capability authorization、grant signing、Handoff、recovery authority、quarantine、no-auto-replayを独立authorityのまま維持する必要があります。
+#221 typed backend-neutral semantic constraintsはcandidate changeでimplementation completeです。exact capability authorization、grant signing、Handoff、recovery authority、quarantine、no-auto-replayは独立authorityのまま維持します。残るbase `0.4.0` workは通常のrelease closeoutです。
 
 ## Support-claim matrix
 
@@ -35,7 +35,7 @@ integrated candidateに残る**implementation gate**は#221 typed backend-neutra
 | 既存accepted macOS/single-Mac V2 profile | Accepted baseline | normal release closeoutを満たせばsupported維持可 |
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | implementation + CI merged | #139 physical/dogfood acceptance記録前はsigned-token supportをclaimしない |
-| Typed semantic authorization | #221 active | release candidate closeout前にimplementation-complete / green必須 |
+| Typed semantic authorization | #221 implementation complete in candidate change | merge/CI後はbase candidateへincluded |
 | Windows Hello recovery | implementation + CI present | #227 physical acceptance前はWindows online-recovery supportをclaimしない |
 | Linux FIDO2 UV recovery | implementation + CI present | #228 physical acceptance前はLinux online-recovery supportをclaimしない |
 | Cross-platform recovery parity | #217 open | 実際にsupportedとclaimするplatform setだけを対象にcloseする |
@@ -46,7 +46,7 @@ integrated candidateに残る**implementation gate**は#221 typed backend-neutra
 
 `v0.4.0`作成前に次を満たします。
 
-1. #221をmergeし、typed constraint、immutable final-command binding、durable bounded audit evidence、stale-decision fencing、full regression、EN/JA normative docsを完了する。
+1. #221 candidate changeをmergeし、typed constraint、immutable final-command binding、durable bounded audit evidence、stale-decision fencing、full regression、EN/JA normative docsのCI evidenceを確定する。
 2. exact candidate commitに対してstanding [`../PRODUCT_READINESS.ja.md`](../PRODUCT_READINESS.ja.md) gateを再実行する。
 3. durable/wire schema変更をdocumentし、previous supported minorからのupgrade compatibilityを証明する。incompatible downgrade/rolling mixはfail closedを維持する。
 4. exact candidate identityからsource-free release-candidate artifactをbuildし、fresh extraction後verify、clean install/upgrade/paired rollback evidenceをgreenにする。

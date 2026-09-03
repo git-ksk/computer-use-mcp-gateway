@@ -26,7 +26,7 @@ The `0.4.0` candidate includes the already-completed compatible work on `main`, 
 - provider-neutral OIDC/JWT caller identity through the existing `AuthenticatedClientPrincipal` and exact authorizer (#139 / PR #269);
 - the completed bounded Unix containment investigation (#96), with stronger Linux containment split to #267.
 
-The remaining **implementation gate** for the integrated candidate is #221 typed backend-neutral semantic constraints. It must preserve exact capability authorization, grant signing, Handoff, recovery authority, quarantine, and no-auto-replay as separate authorities.
+#221 typed backend-neutral semantic constraints are implementation-complete in the candidate change. Exact capability authorization, grant signing, Handoff, recovery authority, quarantine, and no-auto-replay remain separate authorities. The remaining base `0.4.0` work is normal release closeout.
 
 ## Support-claim matrix
 
@@ -35,7 +35,7 @@ The remaining **implementation gate** for the integrated candidate is #221 typed
 | Existing accepted macOS/single-Mac V2 profile | Accepted baseline | May remain supported subject to normal release closeout |
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | Implementation + CI merged | Do not make the signed-token support claim until #139 physical/dogfood acceptance is recorded |
-| Typed semantic authorization | #221 active | Must be implementation-complete and green before release candidate closeout |
+| Typed semantic authorization | #221 implementation-complete in candidate change | Included after merge/CI |
 | Windows Hello recovery | Implementation + CI present | Do not claim Windows online-recovery support until #227 physical acceptance passes |
 | Linux FIDO2 UV recovery | Implementation + CI present | Do not claim Linux online-recovery support until #228 physical acceptance passes |
 | Cross-platform recovery parity | #217 open | Close only for the platform set actually claimed as supported |
@@ -46,7 +46,7 @@ The remaining **implementation gate** for the integrated candidate is #221 typed
 
 Before creating `v0.4.0`:
 
-1. #221 is merged with its required typed constraint, immutable final-command binding, durable bounded audit evidence, stale-decision fencing, full regression, and EN/JA normative docs.
+1. The #221 candidate change is merged and CI confirms its typed constraints, immutable final-command binding, durable bounded audit evidence, stale-decision fencing, full regression, and EN/JA normative docs.
 2. The standing [`../PRODUCT_READINESS.md`](../PRODUCT_READINESS.md) gate is rerun for the exact candidate commit.
 3. Durable/wire schema changes are documented and upgrade compatibility from the previous supported minor is proven; incompatible downgrade/rolling mixes continue to fail closed.
 4. Source-free release-candidate artifacts are built from the exact candidate identity, verified after fresh extraction, and clean install/upgrade/paired rollback evidence remains green.

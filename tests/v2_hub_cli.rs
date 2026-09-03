@@ -15,6 +15,8 @@ fn hub_help_exposes_oidc_jwt_authentication_settings() {
         "CUMG_V2_OIDC_AUDIENCE",
         "CUMG_V2_OIDC_JWKS_URI",
         "CUMG_V2_OIDC_ALLOWED_ALGORITHMS",
+        "--semantic-constraint-policy-file",
+        "CUMG_V2_SEMANTIC_CONSTRAINT_POLICY_FILE",
     ] {
         assert!(
             help.contains(expected),
