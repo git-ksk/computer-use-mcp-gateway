@@ -4,7 +4,7 @@
 
 CUMG は Semantic Versioning を採用し、pre-1.0 policy を明示します。
 
-現在の released line は **0.3.x** です。`v0.3.0` は V2 Production Hardening / Operational Readiness milestone を表し、`v0.2.0` は immutable な V2-complete historical tag として維持します。
+現在の released line は **0.4.x** です。`v0.4.0` は V2 Recovery, Identity & Semantic Authorization milestone を表し、`v0.3.0` は immutable な V2 Production Hardening / Operational Readiness historical tag として維持します。
 
 ## Version format
 
@@ -99,7 +99,7 @@ feature count は 1.0 gate ではありません。product boundary を先に変
 
 ## Release-candidate artifact
 
-現在公開済みの `v0.3.0` release は、将来の GitHub Release が reviewed binary asset を明示的に含めるまでは **source-only** のままです。CI artifact を supported distribution へ暗黙昇格させません。
+`v0.4.0` GitHub Release は、そのpublished release entryがreviewed binary assetを明示的に含めない限り **source-only** です。CI artifact を supported distribution へ暗黙昇格させません。
 
 `Release Candidate Artifacts` workflow は引き続き Linux / macOS / Windows の bounded native candidate を build します。manifest schema v2 は package version、exact CUMG source commit、Hub/Agent application-schema version、platform/architecture、exact allowlisted file、size、SHA-256 identity を記録します。Linux / Windows candidate は distribution evidence のままです。
 

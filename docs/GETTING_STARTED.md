@@ -214,7 +214,7 @@ cargo build --locked
 `Cargo.lock` is committed and normal builds use `--locked` so the dependency graph is reproducible.
 
 
-The currently published `v0.3.0` release is source-only. CI may expose verified **release-candidate** archives for packaging review, but those unsigned/unnotarized artifacts are not an official installer or a broader platform-support claim. See [`VERSIONING.md`](VERSIONING.md#release-candidate-artifacts) for the bounded manifest/checksum/fresh-extraction contract.
+The `v0.4.0` release is source-only. CI may expose verified **release-candidate** archives for packaging review, but those unsigned/unnotarized artifacts are not an official installer or a broader platform-support claim. See [`VERSIONING.md`](VERSIONING.md#release-candidate-artifacts) for the bounded manifest/checksum/fresh-extraction contract.
 
 ## 6. Provision the V2 identities and TLS boundary
 

@@ -2,7 +2,7 @@
 
 > この日本語版は [`V2_040_RELEASE_SCOPE.md`](V2_040_RELEASE_SCOPE.md) の翻訳です。**英語版をcanonicalとします。**
 
-Status: **active release candidate scope。`v0.4.0` tag / GitHub Release はまだ一度もshipしていません。**
+Status: **`v0.4.0` released scope**。この文書はimmutable release snapshotのsupport-claim boundaryとして維持します。
 
 ## Purpose
 
@@ -17,7 +17,7 @@ Status: **active release candidate scope。`v0.4.0` tag / GitHub Release はま�
 
 ## Included baseline
 
-`0.4.0` candidateには、すでに`main`で完了したcompatible workを含めます。
+immutable `0.4.0` releaseには以下のcompatible workを含みます。
 
 - durable Recovery & Reconciliation、permanent no-replay、reviewed current-state/Human recovery (#103, #137, #136, #115, #255);
 - recovery/operator hardening/readiness (#253, #254, #256);
@@ -26,16 +26,16 @@ Status: **active release candidate scope。`v0.4.0` tag / GitHub Release はま�
 - existing `AuthenticatedClientPrincipal` / exact authorizerを利用するprovider-neutral OIDC/JWT caller identity (#139 / PR #269);
 - bounded Unix containment investigation (#96)。stronger Linux containmentは#267へ分離済み。
 
-#221 typed backend-neutral semantic constraintsはcandidate changeでimplementation completeです。exact capability authorization、grant signing、Handoff、recovery authority、quarantine、no-auto-replayは独立authorityのまま維持します。残るbase `0.4.0` workは通常のrelease closeoutです。
+#221 typed backend-neutral semantic constraintsはPR #271でmerge済み・includedです。exact capability authorization、grant signing、Handoff、recovery authority、quarantine、no-auto-replayは独立authorityのまま維持します。base implementation gateはclose済みで、release closeout evidenceは#272で追跡します。
 
 ## Support-claim matrix
 
 | Surface | Candidate state | `0.4.0` support-claim rule |
 | --- | --- | --- |
-| 既存accepted macOS/single-Mac V2 profile | Accepted baseline | normal release closeoutを満たせばsupported維持可 |
+| 既存accepted macOS/single-Mac V2 profile | Accepted baseline | Supported reference profile |
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | implementation + CI merged | #139 physical/dogfood acceptance記録前はsigned-token supportをclaimしない |
-| Typed semantic authorization | #221 implementation complete in candidate change | merge/CI後はbase candidateへincluded |
+| Typed semantic authorization | #221 / PR #271 merged, CI green | Included |
 | Windows Hello recovery | implementation + CI present | #227 physical acceptance前はWindows online-recovery supportをclaimしない |
 | Linux FIDO2 UV recovery | implementation + CI present | #228 physical acceptance前はLinux online-recovery supportをclaimしない |
 | Cross-platform recovery parity | #217 open | 実際にsupportedとclaimするplatform setだけを対象にcloseする |
@@ -44,9 +44,9 @@ Status: **active release candidate scope。`v0.4.0` tag / GitHub Release はま�
 
 ## Release closeout gate
 
-`v0.4.0`作成前に次を満たします。
+`v0.4.0`は次を満たした場合のみadmitします。
 
-1. #221 candidate changeをmergeし、typed constraint、immutable final-command binding、durable bounded audit evidence、stale-decision fencing、full regression、EN/JA normative docsのCI evidenceを確定する。
+1. #221 / PR #271をmergeし、typed constraint、immutable final-command binding、durable bounded audit evidence、stale-decision fencing、full regression、EN/JA normative docsのCI evidenceを確定。
 2. exact candidate commitに対してstanding [`../PRODUCT_READINESS.ja.md`](../PRODUCT_READINESS.ja.md) gateを再実行する。
 3. durable/wire schema変更をdocumentし、previous supported minorからのupgrade compatibilityを証明する。incompatible downgrade/rolling mixはfail closedを維持する。
 4. exact candidate identityからsource-free release-candidate artifactをbuildし、fresh extraction後verify、clean install/upgrade/paired rollback evidenceをgreenにする。

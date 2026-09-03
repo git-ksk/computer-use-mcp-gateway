@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-08-27 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、current released version は `v0.3.0` です。**
+2026-09-03 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、current released version は `v0.4.0` です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,15 +34,15 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Released baseline: `0.3.x`; active candidate: `0.4.0`
+## Released baseline: `0.4.x`; next planned minor: `0.5.0`
 
-`v0.3.0` は released V2 Production Hardening / Operational Readiness baseline のままです。互換修正は patch candidate になり得ますが、現在の feature release candidate は **`v0.4.0`** です。
+`v0.4.0` は released Recovery, Identity & Semantic Authorization baseline です。互換修正は `0.4.x` patch candidate になり得ます。次のplanned feature minorは **`v0.5.0` — Least-privilege Workspace** です。
 
-`0.4.0` candidate は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を意図的に統合します。まだ `v0.4.0` release/tag は一度も出していないため、すでに統合が進んだ機能を人工的な minor 境界で分けても meaningful な compatibility boundary にはなりません。
+`0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合した released baseline です。future feature work はこの historical split を再開せず `0.5.0` から進めます。
 
-### `0.4.0` integrated release plan
+### `0.4.0` integrated released baseline
 
-`0.4.0` は working **Recovery, Identity & Semantic Authorization** release とします。 canonical candidate scope / support-claim matrix は [`v2/V2_040_RELEASE_SCOPE.ja.md`](v2/V2_040_RELEASE_SCOPE.ja.md) に固定します。recovery/reconciliation foundation、provider-neutral multi-principal identity、typed semantic authorization boundary をまとめつつ、optional platform/hosted support claim は artifact 本体より狭く保ちます。
+`0.4.0` は released **Recovery, Identity & Semantic Authorization** baseline です。 canonical candidate scope / support-claim matrix は [`v2/V2_040_RELEASE_SCOPE.ja.md`](v2/V2_040_RELEASE_SCOPE.ja.md) に固定します。recovery/reconciliation foundation、provider-neutral multi-principal identity、typed semantic authorization boundary をまとめつつ、optional platform/hosted support claim は artifact 本体より狭く保ちます。
 
 | `0.4.0` track | Issues / PR | Status | Release role |
 | --- | --- | --- | --- |
@@ -50,15 +50,15 @@ completion provable?
 | Shared WebAuthn/CTAP verifier | #256 / PR #258 | Complete | Required shared recovery dependency。単独ではplatform support claimを意味しない |
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | implementation + CI complete、physical signed-token dogfood pending | implementation は含める。provider-specific support claim は acceptance 待ち |
-| Typed semantic authorization | #221 | candidate changeでimplementation complete | merge/CI後included |
+| Typed semantic authorization | #221 / PR #271 | Complete / merged / CI green | Included |
 | Windows Hello recovery | #227 / PR #252 | implementation + CI green、physical acceptance pending | optional platform support gate。base `0.4.0` が Windows recovery support をclaimする必要はない |
 | Linux FIDO2 UV recovery | #228 / PR #259 | implementation + CI complete、physical acceptance pending | optional platform support gate。base `0.4.0` が Linux recovery support をclaimする必要はない |
 | Cross-platform recovery parity umbrella | #217 | physical acceptance dependent | 実際にsupport claimするplatform setのevidenceが揃うまでOPEN可 |
 | Hosted Cloud Run Hub | #215 | design complete、implementation/acceptance pending | **`0.4.0` support claimではない**。future hosted-deployment track |
 
-release candidate は次の順で進めます。
+release closeout は次の順で完了しました。
 
-1. **#221を完了**し、typed backend-neutral semantic constraint boundary、full regression/CI、EN/JA normative docsをmergeする。
+1. **#221 / PR #271をmerge/verify済み**。typed backend-neutral semantic constraint boundary、full regression/CI、EN/JA normative docsを完了。
 2. standing [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateで **`0.4.0` release closeout** を行う。version/durable-schema compatibility、source-free candidate artifact、clean install/upgrade/rollback、doctor/status、recovery/no-replay、dependency/CodeQL、docs、release noteを対象にする。
 3. generic signed-token identityをrelease-supportedと表現する前に **#139 signed-token dogfood** を完了する。artifactにimplementationが入っていても、acceptance前はsupport claimを保留できる。
 4. **#227/#228 physical gateを正直に維持**する。codeはcandidateへ含められるが、各physical acceptanceが通るまでWindows Hello/Linux FIDO2 online recoveryをsupportedとは表現しない。#217はclaimed platform setが実証された後にcloseする。
@@ -80,14 +80,13 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 これらを満たすまでは V1 を narrow / regression-only に保ち、新しい capability は追加しません。
 
-## Post-v0.3 の製品化シーケンス
+## Post-v0.4 の製品化シーケンス
 
-CUMG は初期 V2 production-hardening release を終えました。Post-v0.3 では execution-safety boundary を弱めず、security-focused な source release から install / operate しやすい product へ段階的に進めます。以下の minor number は現在の作業順であり日程の約束ではありません。minor release は admitted public-contract scope と evidence が揃った場合だけ切ります。
+CUMG は `v0.4.0` Recovery, Identity & Semantic Authorization release を終えました。Post-v0.4 では execution-safety boundary を弱めず、security-focused な source release から install / operate しやすい product への移行を継続します。以下の minor number は現在の作業順であり日程の約束ではありません。minor release は admitted public-contract scope と evidence が揃った場合だけ切ります。
 
 現在の作業順:
 
-- **`0.3.x` — released baseline / compatible maintenance:** #213 Product Readiness closeout、#237 artifact-backed install/upgrade、#104 filesystem-root separation、#111 reproducible benchmark、bounded #96 investigationは完了済み。#215 Cloud Run designも完了済みだが、hosted supportはopen-endedな`0.3.x` blockerではなくfuture NO-GO implementation trackとする。
-- **`0.4.0` — Recovery, Identity & Semantic Authorization:** 完了済みrecovery/reconciliation (#103/#137/#136/#253/#254/#115/#255/#256)、provider-neutral OIDC/JWT identity (#139)、typed backend-neutral semantic authorization (#221)を統合する。#221 implementationはcandidate changeでcompleteしており、残りはmerge/CI +通常release closeout。#139/#227/#228は必要なphysical/support-claim acceptanceを明示的に保持し、未accept platform providerをcodeがあるだけでsupportedとは表現しない。
+- **`0.4.x` — released Recovery, Identity & Semantic Authorization baseline / compatible maintenance:** recovery/reconciliation (#103/#137/#136/#253/#254/#115/#255/#256)、provider-neutral OIDC/JWT identity (#139)、typed backend-neutral semantic authorization (#221)をincluded。#139/#227/#228は必要なphysical/support-claim acceptanceを明示的に保持し、未accept platform providerをcodeがあるだけでsupportedとは表現しない。
 - **`0.5.0` — Least-privilege Workspace:** #83 bounded retrievable output、#105 ranged/deterministic filesystem observation、#107 explicit writable root配下のatomic workspace mutationでDangerous shell authorityへの依存を減らす。
 - **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
@@ -97,7 +96,7 @@ minor numberはworking release boundaryでありcalendar promiseではありま�
 
 初回 umbrella [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213) は完了済みです。future release preparation は恒久 [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) checklist を使い、gate が actionable gap を見つけた場合は narrower issue に分割します。
 
-source-tree dogfood で capability が動くだけでは製品化完了とはしません。Post-v0.3 の各 milestone は次の product-level foundation を改善または維持します。
+source-tree dogfood で capability が動くだけでは製品化完了とはしません。Post-v0.4 の各 milestone は次の product-level foundation を改善または維持します。
 
 1. **Distribution / release integrity.** Source release は引き続き有効ですが、installable product path は最終的に reviewed な platform 別 artifact、deterministic checksum、provenance / attestation、SBOM と third-party license / notice inventory、適用可能な platform signing / notarization を提供します。release artifact に credential / private endpoint を含めません。source checkout だけでなく clean-machine artifact install smoke で user が受け取る実物を検証します。
 2. **Install / upgrade / rollback.** 初回 install、Hub / Agent / maintenance / helper の coordinated upgrade、durable-state migration、rollback の supported path を明示します。version-paired component と checkpoint compatibility を明確にし、incompatible mixed version は silent rolling compatibility を試さず fail closed します。durable / wire state を変更する release は previous supported minor からの upgrade と safe rollback boundary を証明します。
@@ -153,14 +152,13 @@ Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) で
 - diagnostics / host reliability: `#141` privacy-safe structured execution error、`#143` privacy-safe browser staging startup stage/I/O diagnostics、`#112` disk/temp exhaustion の fail-closed 診断・回復、`#194` `v2_doctor` self-observation;
 - 各 issue は独立した severity、compatibility、test、acceptance boundary を維持する。follow-up は PATCH-compatible、将来 minor への admission、または defer のいずれもあり得るが、backlog を減らすために quarantine/no-replay semantics を弱めない。
 
-この queue は、#100 が既知の `0.3.0` blocker だった期間にも Handoff integration / physical dogfood を進めた結果です。各 follow-up の evidence が released invariant を無効化しない限り、completed v0.3.0 runtime gate の外で追跡します。
+この queue は初期 `0.3.0` gate 後も Handoff integration / physical dogfood を継続した結果です。historical follow-up は現在、`0.4.0` included、explicit support-claim gate、またはlater roadmap trackのいずれかへ整理済みです。
 
 ### 現在の open issue inventory
 
 open issue はrevised release sequenceで分類し、roadmap visibilityからsilentに落ちないようにします。milestoneはordering/admission guidanceです。optional support-claim acceptanceは、そのsupport claimを明示的に保留する限りbase artifact release後もOPENのままにできます。
 
-- **`0.3.x — released baseline / maintenance`:** blocking implementation gateは残っていません。#215はpatch-line milestoneから外し、design complete / Cloud Run unsupportedのfuture hosted-deployment concernとして扱います。
-- **`0.4.0 — Recovery, Identity & Semantic Authorization`:** #221 implementationはcandidate changeでcompleteしており、残るfeature gateはmerge/CIです。#139 implementationはmerge済みでphysical signed-token dogfood待ち、#227/#228もimplementation済みで#217配下のplatform-specific physical acceptance待ちです。これらは各support claimをgateしますが、無関係な`0.4.0` capabilityをblockしません。
+- **`0.4.x — released baseline / compatible maintenance`:** #221 / PR #271はmerge済み・greenです。#139 implementationはmerge済みでphysical signed-token dogfood待ち、#227/#228もimplementation済みで#217配下のplatform-specific physical acceptance待ちです。これらのOPEN項目は各support claimだけをgateします。
 - **`0.5.0 — Least-privilege Workspace`:** #83 bounded retrievable process/shell output、#105 ranged/deterministic filesystem observation、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation。
 - **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementationと#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
