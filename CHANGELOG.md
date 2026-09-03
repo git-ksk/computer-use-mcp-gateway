@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.4.0 — 2026-09-03
+
+V2 Recovery, Identity & Semantic Authorization release. This release consolidates the post-v0.3 recovery/reconciliation hardening, provider-neutral multi-principal identity, and narrow typed semantic authorization into one reviewed minor release without widening unaccepted platform/provider support claims.
+
+### Recovery and execution safety
+
+- durable recovery/reconciliation and operator guidance were tightened across current-state acceptance, historical Human resolution, runtime/tool skew detection, recovery-key readiness, and replay-tombstone handling (#103/#115/#136/#137/#253/#254/#255/#256);
+- execution-safety durable schema v12 records only bounded semantic-authorization admission evidence (snapshot revision/digest plus constraint kind/rule ID); v11 and earlier supported state remains readable, while a downgrade that would discard v12 semantic evidence fails closed;
+- permanent no-auto-replay, `Indeterminate` quarantine, exact operation ownership, and pre-dispatch cancellation semantics remain authoritative.
+
+### Identity and authorization
+
+- provider-neutral signed OIDC/JWT caller identity verifies exact issuer/audience, asymmetric algorithm allowlists, pinned HTTPS JWKS, bounded cache/unknown-`kid` refresh, and maps only verified `issuer + subject` into the existing exact principal/device/capability authorizer (#139 / PR #269);
+- typed semantic authorization adds narrow-only constraints at the finalized command boundary: a UTF-8 byte ceiling for `TypeText` and normalized requested-origin allowlists for `BrowserNavigate` (#221 / PR #271);
+- semantic decisions are bound to an immutable revision+digest snapshot, recorded without raw text/URL/policy payloads, and fenced again before provider dispatch; stale snapshot identity cancels before dispatch rather than becoming indeterminate;
+- no generic expression language, regex policy escape hatch, caller-controlled hot reload, or backend-private authorization namespace is introduced.
+
+### Product and operability
+
+- filesystem observation roots are separated from process working-directory roots (#104);
+- reproducible V1 latency/concurrency benchmarking is available as informational product evidence (#111);
+- the Unix explicit-session-detachment investigation is closed with the portable process-group guarantee documented; stronger optional Linux cgroup-v2 containment remains future #267 work (#96);
+- the `0.4.0` roadmap now treats Cloud Run #215 as design-complete but unsupported future hosted work rather than a release claim.
+
+### Compatibility and support claims
+
+- `v0.4.0` is a pre-1.0 minor compatibility boundary and must be deployed as a version-paired Hub/Agent/maintenance/recovery/Handoff set; mixed/incompatible schema or durable-state representations continue to fail closed;
+- the GitHub Release remains source-only unless reviewed binary assets, SBOM/license inventory, and provenance/attestation are explicitly attached; CI release-candidate artifacts are evidence, not automatically supported installers;
+- generic signed-token support remains withheld until #139 physical/dogfood acceptance is recorded; Windows Hello recovery (#227), Linux FIDO2 UV recovery (#228), and cross-platform parity (#217) remain support-claim acceptance work only;
+- Cloud Run remains unsupported, and Linux/Windows CI artifacts do not become official binary-installer claims.
+
+### Acceptance evidence
+
+- #221 merged after local full regression (`530 passed / 0 failed`, six existing physical-only tests ignored), warning-free all-target clippy, synchronized EN/JA docs, and all 15 GitHub checks green;
+- the standing Product Readiness gate is rerun by the dedicated `release/v0.4.0` PR and tracked in #272 before the immutable tag/GitHub Release is created.
+
 ## v0.3.0 — 2026-08-27
 
 V2 Production Hardening / Operational Readiness release. The final #100 trusted physical-macOS Secure Enclave/user-presence acceptance passed on merged release-candidate code: a real ambiguous desktop operation was resolved through local-user-authorized online recovery, the durable quarantine cleared only after verified authorization, Hub restart preserved the resolution, and the old operation was never replayed. The stale release PR #99 was superseded by a fresh release snapshot from current `main`.

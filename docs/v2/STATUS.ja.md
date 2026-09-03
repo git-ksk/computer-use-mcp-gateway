@@ -4,7 +4,7 @@
 
 2026-09-03 時点の状況:
 
-- **Release sequencing:** released baselineは`v0.3.0`、active candidateはRecovery & Reconciliation、provider-neutral multi-principal OIDC/JWT identity、typed semantic authorizationを統合した`v0.4.0`です。#221 implementationはcandidate changeでcompleteしており、残るfeature gateはmerge/CIです。#139/#227/#228は各signed-token/platform support claim前のexplicit acceptanceを維持します。future workspace / managed-executionは`0.5.0` / `0.6.0`へ繰り上げ、Cloud Run #215はunsupportedな別hosted trackのままです。
+- **Release sequencing:** released baselineはRecovery & Reconciliation、provider-neutral multi-principal OIDC/JWT identity、typed semantic authorizationを統合した`v0.4.0`です。#221はmerge/close済みで、base artifactに残るimplementation gateはありません。#139/#227/#228は各signed-token/platform support claim前のexplicit acceptanceを維持します。future workspace / managed-executionは`0.5.0` / `0.6.0`へ繰り上げ、Cloud Run #215はunsupportedな別hosted trackのままです。
 - **Desktop semantic path:** complete / accepted。same-context の native element click/type/key targeting と、real-Cua による background AX element-action evidence を含みます。
 - **Browser core semantic path:** prepare、bind、inspect、navigate、click、type、dialog、pointer semantics まで complete / accepted です。
 - **Browser transfer:** complete / accepted。upload/download は scoped CUMG ref と Agent-private の bounded staging を使用し、任意の host path を northbound に公開しません。private staging を確立できない場合も privacy を保ったまま、Agent startup が失敗した正確な bounded stage / I/O class を host-local に記録します。

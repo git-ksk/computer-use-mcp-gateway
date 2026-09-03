@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-08-31: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.3.0`.**
+Status as of 2026-09-03: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.4.0`.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -34,15 +34,15 @@ An ambiguous state-changing operation is never automatically retried or replayed
 
 The completed V1/V2 implementation history and acceptance evidence remain available through [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), [`v2/STATUS.md`](v2/STATUS.md), [`v2/acceptance/`](v2/acceptance/), and [`archive/`](archive/). This file intentionally focuses on work that is still relevant after the V2 closeout.
 
-## Released baseline: `0.3.x`; active candidate: `0.4.0`
+## Released baseline: `0.4.x`; next planned minor: `0.5.0`
 
-`v0.3.0` remains the released V2 Production Hardening / Operational Readiness baseline. Compatible fixes may still qualify for a patch release, but the active feature candidate is now **`v0.4.0`**.
+`v0.4.0` is the released Recovery, Identity & Semantic Authorization baseline. Compatible fixes may qualify for a `0.4.x` patch release; the next planned feature minor is **`v0.5.0` — Least-privilege Workspace**.
 
-The `0.4.0` candidate intentionally consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. No `v0.4.0` release/tag has shipped yet, so keeping those already-integrated changes behind an artificial minor-version boundary would add release overhead without creating a meaningful compatibility boundary.
+The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. The consolidation is now the released baseline; future feature work starts at `0.5.0` rather than reopening that historical split.
 
-### `0.4.0` integrated release plan
+### `0.4.0` integrated released baseline
 
-`0.4.0` is the working **Recovery, Identity & Semantic Authorization** release. The canonical candidate scope and support-claim matrix are maintained in [`v2/V2_040_RELEASE_SCOPE.md`](v2/V2_040_RELEASE_SCOPE.md). It combines the completed recovery/reconciliation foundation with provider-neutral multi-principal identity and the typed semantic authorization boundary, while keeping optional platform/hosted support claims narrower than the artifact itself.
+`0.4.0` is the released **Recovery, Identity & Semantic Authorization** baseline. The canonical candidate scope and support-claim matrix are maintained in [`v2/V2_040_RELEASE_SCOPE.md`](v2/V2_040_RELEASE_SCOPE.md). It combines the completed recovery/reconciliation foundation with provider-neutral multi-principal identity and the typed semantic authorization boundary, while keeping optional platform/hosted support claims narrower than the artifact itself.
 
 | `0.4.0` track | Issues / PR | Status | Release role |
 | --- | --- | --- | --- |
@@ -50,15 +50,15 @@ The `0.4.0` candidate intentionally consolidates the work that had previously be
 | Shared WebAuthn/CTAP verifier | #256 / PR #258 | Complete | Required shared recovery dependency; no platform support claim by itself |
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | Implementation + CI complete; physical signed-token dogfood pending | Included implementation; provider-specific support claim waits for acceptance |
-| Typed semantic authorization | #221 | Implementation complete in candidate change | Included after merge/CI |
+| Typed semantic authorization | #221 / PR #271 | Complete / merged / CI green | Included |
 | Windows Hello recovery | #227 / PR #252 | Implementation + CI green; physical acceptance pending | Optional platform support gate; base `0.4.0` release need not claim Windows recovery support |
 | Linux FIDO2 UV recovery | #228 / PR #259 | Implementation + CI complete; physical acceptance pending | Optional platform support gate; base `0.4.0` release need not claim Linux recovery support |
 | Cross-platform recovery parity umbrella | #217 | Physical acceptance dependent | May remain open until each platform actually advertised as supported has evidence |
 | Hosted Cloud Run Hub | #215 | Design complete; implementation/acceptance pending | **Not a `0.4.0` support claim**; future hosted-deployment track |
 
-Use this order for the release candidate:
+The release closeout followed this order:
 
-1. **Merge/verify #221**: implementation is complete in the candidate change; require full regression/CI and EN/JA normative documentation before treating the gate as closed.
+1. **#221 merged/verified** via PR #271 with full regression/CI and EN/JA normative documentation.
 2. **Run the `0.4.0` release closeout** against the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate: version/durable-schema compatibility, source-free candidate artifacts, clean install/upgrade/rollback, doctor/status, recovery/no-replay, dependency/CodeQL, docs, and release notes.
 3. **Complete #139 signed-token dogfood before advertising generic signed-token identity as release-supported.** The implementation may be present in the artifact while that explicit support claim remains acceptance-gated.
 4. **Keep #227/#228 physical gates honest.** Their code can ship in the candidate, but Windows Hello or Linux FIDO2 online recovery is not advertised as supported until its own physical acceptance passes. #217 closes only after the claimed platform set is actually proven.
@@ -80,14 +80,13 @@ Retiring V1 is now a valid future simplification candidate, but removal must be 
 
 Until those conditions are met, keep V1 narrow and regression-only; do not expand it with new capabilities.
 
-## Post-v0.3 productization sequence
+## Post-v0.4 productization sequence
 
-CUMG is now past the initial V2 production-hardening release. Post-v0.3 work should move the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
+CUMG is now past the initial V2 production-hardening release. Post-v0.4 work should continue moving the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
 
 The working sequence is:
 
-- **`0.3.x` — released baseline / compatible maintenance:** #213 Product Readiness closeout, #237 artifact-backed install/upgrade, #104 filesystem-root separation, #111 reproducible benchmark, and bounded #96 investigation are complete. #215 Cloud Run design is complete but hosted support remains a future NO-GO implementation track rather than an open-ended `0.3.x` release blocker.
-- **`0.4.0` — Recovery, Identity & Semantic Authorization:** consolidate the completed recovery/reconciliation work (#103/#137/#136/#253/#254/#115/#255/#256), provider-neutral OIDC/JWT identity (#139), and typed backend-neutral semantic authorization (#221). #221 implementation is complete in the candidate change; merge/CI plus normal release closeout remain. #139/#227/#228 retain explicit physical/support-claim acceptance where applicable; unaccepted platform providers are not advertised as supported merely because their code is present.
+- **`0.4.x` — released Recovery, Identity & Semantic Authorization baseline / compatible maintenance:** recovery/reconciliation (#103/#137/#136/#253/#254/#115/#255/#256), provider-neutral OIDC/JWT identity (#139), and typed backend-neutral semantic authorization (#221) are included. #139/#227/#228 retain explicit physical/support-claim acceptance where applicable; unaccepted platform providers are not advertised as supported merely because their code is present.
 - **`0.5.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through bounded retrievable output (#83), ranged/deterministic filesystem observation (#105), and atomic workspace mutation under explicitly separate writable roots (#107).
 - **`0.6.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106), separately sandboxed Playwright/E2E execution (#114), and optional Linux cgroup-v2 execution containment (#267), informed by completed #96 rather than by background-shell escape compatibility.
 
@@ -153,14 +152,13 @@ Sustained CUMG + Handoff dogfood after the original production-hardening baselin
 - diagnostics and host reliability: `#141` privacy-safe structured execution errors, `#143` privacy-safe browser-staging startup stage/I/O diagnostics, `#112` disk/temp-exhaustion fail-closed diagnostics and recovery, and `#194` `v2_doctor` self-observation;
 - each issue keeps its own severity, compatibility, tests, and acceptance boundary. A follow-up may be PATCH-compatible, admitted to a later minor, or deferred; none weakens quarantine/no-replay semantics to reduce backlog.
 
-This queue records the practical result of continuing Handoff integration and physical dogfood while #100 was the known `0.3.0` blocker. Those follow-ups remain outside the completed v0.3.0 runtime gate unless their own evidence invalidates a released invariant.
+This queue records the practical result of continued Handoff integration and physical dogfood after the original `0.3.0` gate. Those historical follow-ups are now either included in `0.4.0`, explicitly support-claim-gated, or assigned to a later roadmap track.
 
 ### Current open issue inventory
 
 The repository's open issues are classified by the revised release sequence so work cannot silently fall out of roadmap visibility. Milestones are ordering/admission guidance; an optional support-claim acceptance issue may remain open after the base artifact is released if that support claim is explicitly withheld.
 
-- **`0.3.x — released baseline / maintenance`:** no blocking implementation gate remains. #215 is removed from the patch-line milestone: its design is complete, Cloud Run remains unsupported, and future implementation is tracked as a separate hosted-deployment concern rather than keeping `0.3.x` artificially open.
-- **`0.4.0 — Recovery, Identity & Semantic Authorization`:** #221 implementation is complete in the candidate change; merge/CI is the remaining feature gate. #139 implementation is merged and physical signed-token dogfood remains; #227/#228 implementation is present with platform-specific physical acceptance pending under #217. Those acceptance items gate their respective support claims, not unrelated `0.4.0` capabilities.
+- **`0.4.x — released baseline / compatible maintenance`:** #221 / PR #271 is merged and green. #139 implementation is merged with physical signed-token dogfood still pending; #227/#228 implementation is present with platform-specific physical acceptance pending under #217. Those open items gate only their respective support claims.
 - **`0.5.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
 - **`0.6.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle, #114 adds separately sandboxed Playwright/E2E execution, and #267 owns optional Linux cgroup-v2 containment.
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.

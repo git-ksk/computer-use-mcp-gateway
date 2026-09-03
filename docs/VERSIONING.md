@@ -4,7 +4,7 @@
 
 CUMG uses Semantic Versioning with an explicit pre-1.0 policy.
 
-Current released line: **0.3.x**. `v0.3.0` represents the V2 Production Hardening / Operational Readiness milestone; `v0.2.0` remains the immutable V2-complete historical tag.
+Current released line: **0.4.x**. `v0.4.0` represents the V2 Recovery, Identity & Semantic Authorization milestone; `v0.3.0` remains the immutable V2 Production Hardening / Operational Readiness historical tag.
 
 ## Version shape
 
@@ -99,7 +99,7 @@ Before 1.0, only the **latest released minor line** is actively supported. Older
 
 ## Release-candidate artifacts
 
-The currently published `v0.3.0` release remains **source-only** unless a later GitHub Release explicitly contains reviewed binary assets. CI artifacts are never silently promoted into a supported distribution.
+The `v0.4.0` GitHub Release is **source-only** unless its published release entry explicitly contains reviewed binary assets. CI artifacts are never silently promoted into a supported distribution.
 
 The `Release Candidate Artifacts` workflow still builds bounded native candidates on Linux, macOS, and Windows. Manifest schema v2 records the package version, exact CUMG source commit, Hub/Agent application-schema version, platform/architecture, exact allowlisted files, sizes, and SHA-256 identities. Linux and Windows candidates remain distribution evidence only.
 
