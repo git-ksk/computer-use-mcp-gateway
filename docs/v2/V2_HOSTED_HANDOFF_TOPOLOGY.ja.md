@@ -254,7 +254,7 @@ single-host/VM profile は引き続き有効で、hosted operator adapter の採
 
 ## Upstream Handoff adoption
 
-現在の CUMG artifact manifest は Handoff commit `9a621d12524632fd717e5f8d84a42c29946ab662` を pin し、packaged dependency を `0.3.0` と記録しています。
+Issue #276 candidate は CUMG artifact manifest の Handoff pin を v0.4.1 release commit `19692aba691249dbff6e09c39da0e8cde4b803b6` / package `0.4.1` へ更新し、workflow checkout identity と package version の両方を exact match で検証します。
 
 upstream v0.4.1 は Desktop Session / Display Backend boundary を追加し、その後の roadmap では provider-neutral connectivity (#19) と hosted worker topology (#12) を分離しています。CUMG は current Windows #227 / CUMG `0.4.0` closeout と分離した lane で reviewed upstream release boundary を採用します。
 

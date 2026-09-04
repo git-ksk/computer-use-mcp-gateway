@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  HANDOFF_SOURCE_COMMIT: 9a621d12524632fd717e5f8d84a42c29946ab662
+  HANDOFF_SOURCE_COMMIT: 19692aba691249dbff6e09c39da0e8cde4b803b6
 
 jobs:
   bundle:
@@ -95,8 +95,11 @@ jobs:
           )"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             pinned="$(python3 -c 'import json; print(json.load(open("packaging/release/single-mac-handoff.json"))["source_commit"])')"
+            pinned_version="$(python3 -c 'import json; print(json.load(open("packaging/release/single-mac-handoff.json"))["package_version"])')"
+            handoff_version="$(node -p 'require("./handoff-src/package.json").version')"
             [[ "$pinned" == "$HANDOFF_SOURCE_COMMIT" ]] || { echo "Handoff workflow pin differs from reviewed package pin" >&2; exit 1; }
             [[ "$(git -C handoff-src rev-parse HEAD)" == "$HANDOFF_SOURCE_COMMIT" ]] || { echo "Handoff checkout identity mismatch" >&2; exit 1; }
+            [[ "$handoff_version" == "$pinned_version" ]] || { echo "Handoff package version differs from reviewed package manifest" >&2; exit 1; }
           fi
           printf 'PACKAGE_VERSION=%s\n' "$package_version" >> "$GITHUB_ENV"
           printf 'SOURCE_COMMIT=%s\n' "$source_commit" >> "$GITHUB_ENV"
