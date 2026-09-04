@@ -131,7 +131,9 @@ CUMG が upstream Handoff pin を更新した後、この model は v0.4.1 Deskt
 
 現在の `CUMG_V2_HANDOFF_CONTROL_SOCKET` は single-host/VM では適切な operator boundary ですが、hosted profile は Hub instance の filesystem access に依存できません。
 
-したがって hosted profile では、local CLI と同じ narrow lifecycle intent を持つ closed authenticated operator-control surface が必要です。exact HTTP shape はここでは固定しません。`/operator/v1/handoff/*` のような path family は例示にすぎません。
+したがって hosted profile では、local CLI と同じ narrow lifecycle intent を持つ closed authenticated operator-control surface が必要です。#277 adapter では review 対象の HTTP resource family を、short-lived context 発行用 `/operator/v1/handoff/context` と lifecycle command 用 `/operator/v1/handoff/control` に固定します。この router は OAuth 保護された operator resource であり、MCP tool は登録しません。
+
+context handle 自体を target authority として扱いません。process-memory-only で bounded CUMG selection lifetime 内に失効し、発行 operator principal / action に bind したうえで、exact fresh CUMG selection + Agent generation/capability revision に再照合します。fresh selection では handle を rotate し、stale / cross-principal / cross-action / expired / generation-mismatch は fail closed します。hosted caller から raw PID/window identity は一切受け付けません。
 
 必須条件:
 
@@ -276,8 +278,8 @@ consumer update に必要な evidence:
 1. **この architecture を固定 (#275)。** Agent-owned canonical Handoff authority と non-authoritative hosted routing を維持する。
 2. **#276 で review 済み newer Handoff pin を別laneで採用。** v0.4.1-or-newer boundary を CUMG integration/acceptance evidence 付きでconsumeする。
 3. **upstream provider-neutral connectivity (#19) をconsume。** consumer-visible provider-specific relay assumption を除去する。
-4. **#277 で hosted operator/routing adapter を実装。** hosted profile では Hub-local Unix-socket access を置換しつつ同じ typed lifecycle command を維持する。
-5. **#215 durable Hub/writer fencing + one-port hosted ingress を実装。** commit-before-dispatch boundary に Handoff check を合成する。
+4. **#277 で hosted operator/routing adapter を実装。** PR #281 で transport-neutral authorization core、principal/action-bound opaque context handle、MCP tool surface を持たない separate OAuth HTTP router まで実装済み。temporary な追加public portは作らず、production `v2_hub` listener composition は意図的に次段へ残す。
+5. **#215 durable Hub/writer fencing + one-port hosted ingress を実装。** review 済み #277 router を one-port ingress にcomposeし、commit-before-dispatch boundary に Handoff check を合成する。
 6. **hosted failure / physical acceptance。** Hub replacement、stale writer、Agent reconnect/restart、viewer reconnect、WSS/WebRTC fallback、Human Done/verification/resume lifecycle を含める。
 
 interface が固定できている範囲では step 2-4 を並行実装できます。ただし hosted support claim が #215 durable-state/fencing gate を迂回することはできません。

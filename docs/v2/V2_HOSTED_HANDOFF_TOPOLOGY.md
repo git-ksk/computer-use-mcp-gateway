@@ -131,7 +131,9 @@ This model consumes the upstream v0.4.1 Desktop Session / Display Backend separa
 
 The current `CUMG_V2_HANDOFF_CONTROL_SOCKET` remains a good single-host/VM operator boundary, but hosted operation cannot depend on filesystem access to the Hub instance.
 
-A hosted profile therefore needs a closed authenticated operator-control surface with the same narrow lifecycle intent as the local CLI. The exact HTTP shape is not frozen here; a family such as `/operator/v1/handoff/*` is only an example.
+A hosted profile therefore needs a closed authenticated operator-control surface with the same narrow lifecycle intent as the local CLI. The #277 adapter now fixes the reviewed HTTP resource family as `/operator/v1/handoff/context` for short-lived context issuance and `/operator/v1/handoff/control` for lifecycle commands. This router is an OAuth-protected operator resource and does not register MCP tools.
+
+The context handle is not target authority by itself. It is process-memory-only, expires within the bounded CUMG selection lifetime, binds the issuing operator principal and action, and is checked again against the exact fresh CUMG selection plus Agent generation/capability revision. Fresh selection rotates the handle; stale, cross-principal, cross-action, expired, or generation-mismatched handles fail closed. Raw PID/window identity is never accepted from the hosted caller.
 
 Required properties:
 
@@ -276,8 +278,8 @@ The preferred sequencing is:
 1. **Freeze this architecture (#275).** Keep Agent-owned canonical Handoff authority and hosted routing non-authoritative.
 2. **Adopt a reviewed newer Handoff pin separately in #276.** Consume v0.4.1-or-newer boundaries with CUMG integration/acceptance evidence.
 3. **Consume upstream provider-neutral connectivity (#19).** Remove any consumer-visible provider-specific relay assumptions.
-4. **Implement the hosted operator/routing adapter in #277.** Preserve the same typed lifecycle commands while replacing Hub-local Unix-socket access for the hosted profile.
-5. **Implement #215 durable Hub/writer fencing and one-port hosted ingress.** Compose Handoff checks into the commit-before-dispatch boundary.
+4. **Implement the hosted operator/routing adapter in #277.** PR #281 now provides the transport-neutral authorization core, principal/action-bound opaque context handles, and a separate OAuth HTTP router with no MCP tool surface. Production `v2_hub` listener composition remains intentionally deferred rather than creating a temporary extra public port.
+5. **Implement #215 durable Hub/writer fencing and one-port hosted ingress.** Compose the reviewed #277 router into that one-port ingress and Handoff checks into the commit-before-dispatch boundary.
 6. **Run hosted failure/physical acceptance.** Include Hub replacement, stale writer, Agent reconnect/restart, viewer reconnect, WSS/WebRTC fallback and the complete Human Done/verification/resume lifecycle.
 
 Steps 2-4 may develop in parallel where their interfaces are already fixed, but no hosted support claim may bypass #215's durable-state/fencing gate.
