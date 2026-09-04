@@ -107,13 +107,19 @@ supported Cloud Run Hub は Cloud Run `PORT` 上の reviewed ingress service 1�
 
 Cloud Run が public TLS を terminate するため、hosted ingress は現在の private `v2_hub` TLS listener shape に依存できません。ただし Agent identity は弱まりません。Agent application-level Ed25519 identity/enrollment は transport TLS と独立したままです。hosted profile は Google frontend trust、service内 h2c、northbound HTTPS resource identity を明示します。
 
-### 6. Instance count / concurrency は authority ではない
+### 6. Hosted Handoff composition
+
+Handoff-enabled hosted profile は [`V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](V2_HOSTED_HANDOFF_TOPOLOGY.ja.md) の Agent-owned composition も満たす必要があります。Hub-local Unix operator socket は single-host/VM deployment では引き続き有効ですが、hosted operator interface にはしません。hosted lifecycle control は normal MCP tool discovery と別に authentication/authorization し、caller に PID/window authority を生成させず、bounded かつ fenced な control だけを Agent-owned canonical Handoff runtime へrelayします。
+
+Human media/input と STUN/TURN/provider credential は CUMG authoritative state の外側に維持します。viewer/transport generation は Agent generation / Handoff epoch と分離し、Hub replacement が hosted routing metadata から Human/Agent authority を復元することはありません。old Agent stream や stale permissive Handoff cache を保持する stale hosted instance も、上記と同じ writer-epoch/revision fence により effect dispatch 前に拒否します。
+
+### 7. Instance count / concurrency は authority ではない
 
 initial operational profile は cost/predictability のため `min-instances=1` / `max-instances=1` を使用しても構いませんが、acceptance は rollout/replacement が作り得る **2つの同時live Hub revision/instance** で安全性を意図的に証明します。
 
 exact Cloud Run concurrency value は acceptance artifact に記録します。これは capacity/latency setting であり security boundary ではありません。値を変更しても single-writer fencing / no-replay behavior が変わってはいけません。
 
-### 7. Secret / observability / recovery
+### 8. Secret / observability / recovery
 
 supported profile は以下も document / accept します。
 
@@ -140,6 +146,7 @@ supported profile は以下も document / accept します。
 | concurrent old/new revision fencing test | Pending |
 | replacement後 durable quarantine/replay-barrier restore | Pending |
 | hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
+| Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation・acceptance pending |
 | physical Agent + real Cua interrupted-effect acceptance | Pending |
 
 これらがopenの間、既存 VM/single-host deployment は unchanged / supported のままです。
@@ -158,5 +165,6 @@ supported profile は以下も document / accept します。
 8. single hosted ingressでAgent gRPC / northbound MCPをrouteし、双方が相手側credential/routeを拒否することを証明;
 9. durable backend backup/restoreでexact quarantine/replay barrierが維持されることを証明;
 10. physical Agent + real Cuaでdeliberately interrupted effectを再実施。
+11. hosted operator/routing path で Handoff を有効化し、Hub replacement / viewer reconnect / transport fallback が Agent/Human authority を復元できないことを証明したうえで、physical Agent 上で Human active -> Agent deny -> Done -> fresh verification -> explicit resume を完了する。
 
 hosted availability 改善を理由に commit-before-authority-change、`Indeterminate`、quarantine、no-auto-replay contract を弱めてはいけません。
