@@ -107,13 +107,19 @@ There must be no generic pass-through route.
 
 Cloud Run terminates public TLS. The hosted ingress therefore cannot depend on the current private `v2_hub` TLS listener shape. This does **not** weaken Agent identity: Agent application-level Ed25519 identity/enrollment remains independent of transport TLS. The hosted profile must explicitly document Google frontend trust, h2c inside the service boundary, and northbound HTTPS resource identity.
 
-### 6. Instance count and concurrency are not authority
+### 6. Hosted Handoff composition
+
+A Handoff-enabled hosted profile must also satisfy the Agent-owned composition in [`V2_HOSTED_HANDOFF_TOPOLOGY.md`](V2_HOSTED_HANDOFF_TOPOLOGY.md). The Hub-local Unix operator socket remains valid for single-host/VM deployment, but it is not the hosted operator interface. Hosted lifecycle control must be separately authenticated/authorized from normal MCP tool discovery, must not let callers manufacture PID/window authority, and must relay only bounded fenced control to the Agent-owned canonical Handoff runtime.
+
+Human media/input and STUN/TURN/provider credentials remain outside CUMG authoritative state. Viewer/transport generations are separate from Agent generation and Handoff epoch, and Hub replacement never restores Human/Agent authority from hosted routing metadata. The same writer-epoch/revision fence required above must deny stale hosted instances before they can dispatch an effect even if they retain an old Agent stream or stale permissive Handoff cache.
+
+### 7. Instance count and concurrency are not authority
 
 The initial operational profile may use `min-instances=1` and `max-instances=1` for cost/predictability, but acceptance must deliberately prove safety with **two concurrently alive Hub revisions/instances** because rollout and replacement can create that condition.
 
 The exact tested Cloud Run concurrency value must be recorded in the acceptance artifact. It is a capacity/latency setting, not a security boundary. Changing it must not alter single-writer fencing or no-replay behavior.
 
-### 7. Secrets, observability, and recovery
+### 8. Secrets, observability, and recovery
 
 A supported profile must also document and accept:
 
@@ -140,6 +146,7 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 | Concurrent old/new revision fencing test | Pending |
 | Durable quarantine/replay-barrier restore after replacement | Pending |
 | Hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
+| Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation/acceptance pending |
 | Physical Agent + real Cua interrupted-effect acceptance | Pending |
 
 The existing VM/single-host deployment remains unchanged and supported while these hosted gates are open.
@@ -158,5 +165,6 @@ Before #215 can close, acceptance must include at least:
 8. route Agent gRPC and northbound MCP through the single hosted ingress and prove each authentication boundary rejects the other's credentials/routes;
 9. backup/restore the durable backend and prove exact quarantine and replay barriers survive;
 10. repeat the deliberately interrupted effect with a physical Agent and real Cua.
+11. enable Handoff through the hosted operator/routing path and prove Hub replacement, viewer reconnect, and transport fallback cannot restore Agent/Human authority; then complete Human active -> Agent deny -> Done -> fresh verification -> explicit resume on a physical Agent.
 
 No hosted availability improvement may weaken the existing commit-before-authority-change, `Indeterminate`, quarantine, or no-auto-replay contracts.

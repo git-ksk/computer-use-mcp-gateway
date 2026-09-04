@@ -55,6 +55,7 @@ The `0.4.0` candidate consolidates the work that had previously been split acros
 | Linux FIDO2 UV recovery | #228 / PR #259 | Implementation + CI complete; physical acceptance deferred | Non-blocking support-claim gate; Linux online recovery remains unsupported until physical Linux + real UV-capable FIDO2 acceptance |
 | Cross-platform recovery parity umbrella | #217 | Physical acceptance dependent | May remain open until each platform actually advertised as supported has evidence |
 | Hosted Cloud Run Hub | #215 | Design complete; implementation/acceptance pending | **Not a `0.4.0` support claim**; future hosted-deployment track |
+| Hosted Handoff composition | #275 / #276 / #277 | Architecture documented; pin adoption and hosted operator/routing implementation remain pending | Future hosted-deployment dependency of #215; Agent keeps canonical Handoff authority |
 
 The release closeout followed this order:
 
@@ -132,6 +133,9 @@ Physical CUMG + `mcp-execution-handoff` acceptance has proven the bounded OS-win
 
 Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) completed this integration and its merged-main physical OS-window acceptance. The topology is intentionally **first-class but optional**: ordinary CUMG capabilities do not require Handoff, but a deployment that enables Handoff must treat its authority decision as part of the execution boundary rather than as a best-effort sidecar. The controlled Agent owns the canonical Handoff FSM/checkpoint, WebRTC/TURN, capture, Human input, and local verification; the Hub retains CUMG authorization/ledger/quarantine and only a conservative pre-dispatch fence plus signed operator-control relay. Hub and Agent therefore do not run duplicate Handoff state machines. Live generation rollover uses an explicit same-surface `rebind_live`, and the final Agent gate re-validates the signed authority binding against the actual command immediately before Cua. Runtime/transport unavailability after Handoff is enabled must fail closed rather than silently bypass the coordinator. The legacy Unix bridge stays compatibility/regression-only.
 
+
+The hosted extension is defined in [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.md`](v2/V2_HOSTED_HANDOFF_TOPOLOGY.md): Cloud/hosted routing may issue and route Human sessions, but canonical physical mutation authority/checkpoint stays on the controlled Agent, while CUMG authoritative operation/quarantine/replay state stays in the Hub. Hosted routing state is never a second Handoff FSM or replay authority.
+
 The original dependency sequence has completed through component migration:
 
 1. `#152` — first-class CUMG HandoffCoordinator and OS-window regression acceptance — **closed**;
@@ -161,7 +165,7 @@ The repository's open issues are classified by the revised release sequence so w
 - **`0.4.0 — active release candidate`:** #221 / PR #271 is merged and green. #227 physical Windows Hello acceptance is the remaining release gate. #139 signed-token dogfood and #228 physical Linux FIDO2 acceptance are deferred support-claim gates; #217 remains open for parity.
 - **`0.5.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
 - **`0.6.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle, #114 adds separately sandboxed Playwright/E2E execution, and #267 owns optional Linux cgroup-v2 containment.
-- **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.
+- **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation, #275 hosted Handoff architecture with #276 pin adoption / #277 hosted operator-routing implementation, and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.
 - **Upstream-blocked V1 compatibility:** #14 and #15 remain blocked on upstream Cua and are not active CUMG release blockers.
 
 If an open issue is not represented here or in another explicit roadmap section, treat the roadmap as stale and correct it before declaring release closeout.
