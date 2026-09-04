@@ -440,12 +440,7 @@ impl HostedHandoffControlService {
             self.coordinator.operator_control(command, session).await
         };
         match result {
-            Ok(mut status) => {
-                if !action.may_return_locator() {
-                    status.locator = None;
-                }
-                HostedHandoffControlResponse::success(status)
-            }
+            Ok(status) => HostedHandoffControlResponse::success_for_action(action, status),
             Err(error) => HostedHandoffControlResponse::error(error.into()),
         }
     }
@@ -500,6 +495,13 @@ impl HostedHandoffControlResponse {
             status: Some(status),
             error_code: None,
         }
+    }
+
+    fn success_for_action(action: HostedHandoffAction, mut status: HandoffRuntimeStatus) -> Self {
+        if !action.may_return_locator() {
+            status.locator = None;
+        }
+        Self::success(status)
     }
 
     fn error(error: HostedHandoffControlError) -> Self {
@@ -682,11 +684,30 @@ mod tests {
 
     #[test]
     fn status_and_non_issuance_actions_never_return_locator_capability() {
-        assert!(!HostedHandoffAction::Status.may_return_locator());
-        assert!(!HostedHandoffAction::RequestResume.may_return_locator());
-        assert!(!HostedHandoffAction::CancelBeforeHuman.may_return_locator());
-        assert!(HostedHandoffAction::Begin.may_return_locator());
-        assert!(HostedHandoffAction::RecoverRebind.may_return_locator());
+        let status = HandoffRuntimeStatus {
+            active: None,
+            recovery_required: false,
+            recovery_status: None,
+            recovery_epoch: None,
+            recovery_expired: false,
+            resume_requested: false,
+            faulted: false,
+            human_surface: None,
+            locator: Some("https://handoff.example/secret-capability".to_owned()),
+        };
+        let observational = HostedHandoffControlResponse::success_for_action(
+            HostedHandoffAction::Status,
+            status.clone(),
+        );
+        assert!(observational.status.unwrap().locator.is_none());
+        let resume = HostedHandoffControlResponse::success_for_action(
+            HostedHandoffAction::RequestResume,
+            status.clone(),
+        );
+        assert!(resume.status.unwrap().locator.is_none());
+        let issuance =
+            HostedHandoffControlResponse::success_for_action(HostedHandoffAction::Begin, status);
+        assert!(issuance.status.unwrap().locator.is_some());
     }
 
     #[test]
