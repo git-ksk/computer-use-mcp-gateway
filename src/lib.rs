@@ -36,6 +36,7 @@ pub mod v2_grant_signer;
 pub mod v2_guided_recovery;
 pub mod v2_handoff_control;
 pub mod v2_handoff_coordinator;
+pub mod v2_hosted_handoff_control;
 pub mod v2_incident_brief;
 pub mod v2_interaction_context;
 pub mod v2_limits;
