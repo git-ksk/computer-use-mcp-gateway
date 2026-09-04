@@ -406,6 +406,7 @@ impl HandoffCoordinator {
         });
     }
 
+    #[cfg(test)]
     fn selected_authority(
         &self,
         admitted: bool,
