@@ -98,7 +98,7 @@ A public routing plane may own only hosted-session concerns such as:
 - bounded readiness/revocation state;
 - signaling or WSS routing required by the selected Handoff transport.
 
-This state is **routing/session state, not execution authority**. It must never be used to restore Agent or Human mutation authority after a process restart.
+This state is **routing/session state, not execution authority**. It must never be used to restore Agent or Human mutation authority after a process restart. The #277 routing-fence core is intentionally process-memory-only and provider-blind: route creation binds device + Agent generation + intervention/epoch, viewer attachment advances an independent viewer generation, and each concrete transport attachment advances an independent transport generation. There is no durable restore API and no field for Human input, frames, ICE/SDP, TURN credentials, or mutation authority.
 
 ## Three durable-state meanings
 
@@ -131,7 +131,7 @@ This model consumes the upstream v0.4.1 Desktop Session / Display Backend separa
 
 The current `CUMG_V2_HANDOFF_CONTROL_SOCKET` remains a good single-host/VM operator boundary, but hosted operation cannot depend on filesystem access to the Hub instance.
 
-A hosted profile therefore needs a closed authenticated operator-control surface with the same narrow lifecycle intent as the local CLI. The #277 adapter now fixes the reviewed HTTP resource family as `/operator/v1/handoff/context` for short-lived context issuance and `/operator/v1/handoff/control` for lifecycle commands. This router is an OAuth-protected operator resource and does not register MCP tools.
+A hosted profile therefore needs a closed authenticated operator-control surface with the same narrow lifecycle intent as the local CLI. The #277 adapter now fixes the reviewed HTTP resource family as `/operator/v1/handoff/context` for short-lived context issuance and `/operator/v1/handoff/control` for lifecycle commands. This router is an OAuth-protected operator resource and does not register MCP tools. Locator capability material is returned only by lifecycle actions that explicitly issue/reissue a Human route; observational `status` and non-issuance actions strip it.
 
 The context handle is not target authority by itself. It is process-memory-only, expires within the bounded CUMG selection lifetime, binds the issuing operator principal and action, and is checked again against the exact fresh CUMG selection plus Agent generation/capability revision. Fresh selection rotates the handle; stale, cross-principal, cross-action, expired, or generation-mismatched handles fail closed. Raw PID/window identity is never accepted from the hosted caller.
 
@@ -222,7 +222,8 @@ A Hub-side Handoff cache is fail-closed only: stale/unknown status may deny work
 - viewer disconnect is not Done;
 - Desktop/application continuity may remain local when its supported boundary survives;
 - a reconnect/fallback gets a fresh viewer/transport generation;
-- no Human input is replayed across generations.
+- no Human input is replayed across generations;
+- a routing-process restart starts with zero route leases, so every surviving old route/viewer/transport capability fails closed and must be freshly issued.
 
 ## Privacy and secret boundary
 
@@ -278,7 +279,7 @@ The preferred sequencing is:
 1. **Freeze this architecture (#275).** Keep Agent-owned canonical Handoff authority and hosted routing non-authoritative.
 2. **Adopt a reviewed newer Handoff pin separately in #276.** Consume v0.4.1-or-newer boundaries with CUMG integration/acceptance evidence.
 3. **Consume upstream provider-neutral connectivity (#19).** Remove any consumer-visible provider-specific relay assumptions.
-4. **Implement the hosted operator/routing adapter in #277.** PR #281 now provides the transport-neutral authorization core, principal/action-bound opaque context handles, and a separate OAuth HTTP router with no MCP tool surface. Production `v2_hub` listener composition remains intentionally deferred rather than creating a temporary extra public port.
+4. **Implement the hosted operator/routing adapter in #277.** PR #281 now provides the transport-neutral authorization core, principal/action-bound opaque context handles, a separate OAuth HTTP router with no MCP tool surface, and a process-memory-only provider-blind routing fence with independent Agent/intervention/viewer/transport generations and zero-route restart semantics. Production `v2_hub` listener composition remains intentionally deferred to #215 one-port ingress rather than creating a temporary extra public port.
 5. **Implement #215 durable Hub/writer fencing and one-port hosted ingress.** Compose the reviewed #277 router into that one-port ingress and Handoff checks into the commit-before-dispatch boundary.
 6. **Run hosted failure/physical acceptance.** Include Hub replacement, stale writer, Agent reconnect/restart, viewer reconnect, WSS/WebRTC fallback and the complete Human Done/verification/resume lifecycle.
 
