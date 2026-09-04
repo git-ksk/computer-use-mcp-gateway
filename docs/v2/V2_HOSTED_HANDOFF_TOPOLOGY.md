@@ -254,7 +254,7 @@ The single-host/VM profile remains valid and does not need to adopt the hosted o
 
 ## Upstream Handoff adoption
 
-The current CUMG artifact manifest pins Handoff commit `9a621d12524632fd717e5f8d84a42c29946ab662` and labels the packaged dependency `0.3.0`.
+Issue #276 updates the CUMG artifact manifest candidate to the v0.4.1 release commit `19692aba691249dbff6e09c39da0e8cde4b803b6` / package `0.4.1`, with exact workflow checkout identity and package-version matching.
 
 Upstream v0.4.1 adds the Desktop Session / Display Backend boundary and later roadmap work separates provider-neutral connectivity (#19) from hosted worker topology (#12). CUMG should adopt a reviewed upstream release boundary separately from the current Windows #227 / CUMG `0.4.0` closeout.
 
