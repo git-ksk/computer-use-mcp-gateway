@@ -8,7 +8,6 @@
 use crate::{
     v2_hosted_handoff_control::{
         HostedHandoffContextRequest, HostedHandoffControlApi, HostedHandoffControlRequest,
-        HostedHandoffControlResponse,
     },
     v2_m0_trust::AuthenticatedClientPrincipal,
     v2_m1_northbound::{AccessTokenVerifier, TokenVerificationError},
@@ -428,7 +427,9 @@ fn oauth_error_response(
 mod tests {
     use super::*;
     use crate::{
-        v2_hosted_handoff_control::{HostedHandoffAction, HostedHandoffContextResponse},
+        v2_hosted_handoff_control::{
+            HostedHandoffAction, HostedHandoffContextResponse, HostedHandoffControlResponse,
+        },
         v2_m1_northbound::VerifiedAccessToken,
     };
     use async_trait::async_trait;
