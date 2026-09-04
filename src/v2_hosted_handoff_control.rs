@@ -39,6 +39,13 @@ pub enum HostedHandoffAction {
 }
 
 impl HostedHandoffAction {
+    pub const fn may_return_locator(self) -> bool {
+        matches!(
+            self,
+            Self::Begin | Self::RecoverReissue | Self::RecoverRebind | Self::RebindLive
+        )
+    }
+
     pub const fn requires_surface_context(self) -> bool {
         matches!(
             self,
@@ -433,7 +440,12 @@ impl HostedHandoffControlService {
             self.coordinator.operator_control(command, session).await
         };
         match result {
-            Ok(status) => HostedHandoffControlResponse::success(status),
+            Ok(mut status) => {
+                if !action.may_return_locator() {
+                    status.locator = None;
+                }
+                HostedHandoffControlResponse::success(status)
+            }
             Err(error) => HostedHandoffControlResponse::error(error.into()),
         }
     }
@@ -666,6 +678,15 @@ mod tests {
         let debug = format!("{response:?}");
         assert!(debug.contains("context_handle_present: true"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn status_and_non_issuance_actions_never_return_locator_capability() {
+        assert!(!HostedHandoffAction::Status.may_return_locator());
+        assert!(!HostedHandoffAction::RequestResume.may_return_locator());
+        assert!(!HostedHandoffAction::CancelBeforeHuman.may_return_locator());
+        assert!(HostedHandoffAction::Begin.may_return_locator());
+        assert!(HostedHandoffAction::RecoverRebind.may_return_locator());
     }
 
     #[test]

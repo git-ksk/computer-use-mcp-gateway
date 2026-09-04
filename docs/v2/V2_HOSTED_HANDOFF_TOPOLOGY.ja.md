@@ -98,7 +98,7 @@ public routing plane が所有できるのは hosted-session concern に限定�
 - bounded readiness / revocation state;
 - selected Handoff transport に必要な signaling / WSS routing。
 
-これは **routing/session state であり execution authority ではありません**。process restart 後に Agent/Human mutation authority を復元する根拠として使ってはいけません。
+これは **routing/session state であり execution authority ではありません**。process restart 後に Agent/Human mutation authority を復元する根拠として使ってはいけません。#277 の routing-fence core は意図的に process-memory-only / provider-blind とし、route 作成時に device + Agent generation + intervention/epoch を bind し、viewer attach ごとに独立 viewer generation、concrete transport attach ごとに独立 transport generation を進めます。durable restore API は持たず、Human input、frame、ICE/SDP、TURN credential、mutation authority を表す field も持ちません。
 
 ## 3種類の durable-state meaning
 
@@ -131,7 +131,7 @@ CUMG が upstream Handoff pin を更新した後、この model は v0.4.1 Deskt
 
 現在の `CUMG_V2_HANDOFF_CONTROL_SOCKET` は single-host/VM では適切な operator boundary ですが、hosted profile は Hub instance の filesystem access に依存できません。
 
-したがって hosted profile では、local CLI と同じ narrow lifecycle intent を持つ closed authenticated operator-control surface が必要です。#277 adapter では review 対象の HTTP resource family を、short-lived context 発行用 `/operator/v1/handoff/context` と lifecycle command 用 `/operator/v1/handoff/control` に固定します。この router は OAuth 保護された operator resource であり、MCP tool は登録しません。
+したがって hosted profile では、local CLI と同じ narrow lifecycle intent を持つ closed authenticated operator-control surface が必要です。#277 adapter では review 対象の HTTP resource family を、short-lived context 発行用 `/operator/v1/handoff/context` と lifecycle command 用 `/operator/v1/handoff/control` に固定します。この router は OAuth 保護された operator resource であり、MCP tool は登録しません。locator capability material は Human route を明示的に issue/reissue する lifecycle action の response だけで返し、observational `status` と non-issuance action では除去します。
 
 context handle 自体を target authority として扱いません。process-memory-only で bounded CUMG selection lifetime 内に失効し、発行 operator principal / action に bind したうえで、exact fresh CUMG selection + Agent generation/capability revision に再照合します。fresh selection では handle を rotate し、stale / cross-principal / cross-action / expired / generation-mismatch は fail closed します。hosted caller から raw PID/window identity は一切受け付けません。
 
@@ -222,7 +222,8 @@ Hub-side Handoff cache は fail-closed 専用です。stale/unknown status は w
 - viewer disconnect は Done ではない;
 - supported boundary が維持されるなら Desktop/application continuity は local に残せる;
 - reconnect/fallback は fresh viewer/transport generation を取得する;
-- generation を跨いで Human input を replay しない。
+- generation を跨いで Human input を replay しない;
+- routing process restart 後は route lease 0件から開始し、surviving old route/viewer/transport capability はすべて fail closed し、fresh issue を必須とする。
 
 ## Privacy / secret boundary
 
@@ -278,7 +279,7 @@ consumer update に必要な evidence:
 1. **この architecture を固定 (#275)。** Agent-owned canonical Handoff authority と non-authoritative hosted routing を維持する。
 2. **#276 で review 済み newer Handoff pin を別laneで採用。** v0.4.1-or-newer boundary を CUMG integration/acceptance evidence 付きでconsumeする。
 3. **upstream provider-neutral connectivity (#19) をconsume。** consumer-visible provider-specific relay assumption を除去する。
-4. **#277 で hosted operator/routing adapter を実装。** PR #281 で transport-neutral authorization core、principal/action-bound opaque context handle、MCP tool surface を持たない separate OAuth HTTP router まで実装済み。temporary な追加public portは作らず、production `v2_hub` listener composition は意図的に次段へ残す。
+4. **#277 で hosted operator/routing adapter を実装。** PR #281 で transport-neutral authorization core、principal/action-bound opaque context handle、MCP tool surface を持たない separate OAuth HTTP router、process-memory-only provider-blind routing fence（Agent/intervention/viewer/transport generation 分離、restart時 route 0件）まで実装済み。temporary な追加public portは作らず、production `v2_hub` listener composition は意図的に #215 one-port ingress へ残す。
 5. **#215 durable Hub/writer fencing + one-port hosted ingress を実装。** review 済み #277 router を one-port ingress にcomposeし、commit-before-dispatch boundary に Handoff check を合成する。
 6. **hosted failure / physical acceptance。** Hub replacement、stale writer、Agent reconnect/restart、viewer reconnect、WSS/WebRTC fallback、Human Done/verification/resume lifecycle を含める。
 
