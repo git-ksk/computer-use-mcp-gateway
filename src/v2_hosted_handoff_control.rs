@@ -8,18 +8,22 @@
 use crate::{
     v2_handoff_coordinator::{
         HandoffCoordinator, HandoffOperatorCommand, HandoffOperatorControlError,
-        HandoffSessionFence,
+        HandoffSessionFence, valid_operator_context_handle,
     },
     v2_m0_trust::AuthenticatedClientPrincipal,
     v2_m1_hub::HubHandle,
     v2_operator_handoff::HandoffRuntimeStatus,
 };
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+
+const HOSTED_CONTEXT_BINDING_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,10 +38,25 @@ pub enum HostedHandoffAction {
     CancelBeforeHuman,
 }
 
+impl HostedHandoffAction {
+    pub const fn requires_surface_context(self) -> bool {
+        matches!(
+            self,
+            Self::Begin | Self::RecoverReissue | Self::RecoverRebind | Self::RebindLive
+        )
+    }
+
+    const fn uses_admitted_surface(self) -> bool {
+        matches!(self, Self::Begin)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostedHandoffControlRequest {
     pub action: HostedHandoffAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_context_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,6 +71,7 @@ impl fmt::Debug for HostedHandoffControlRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HostedHandoffControlRequest")
             .field("action", &self.action)
+            .field("has_context_handle", &self.context_handle.is_some())
             .field("has_prior_context", &self.prior_context_id.is_some())
             .field("has_prior_generation", &self.prior_generation.is_some())
             .field(
@@ -68,12 +88,20 @@ impl HostedHandoffControlRequest {
         self.action
     }
 
-    fn into_operator_command(self) -> Result<HandoffOperatorCommand, HostedHandoffControlError> {
+    fn into_operator_command(
+        self,
+    ) -> Result<(HandoffOperatorCommand, Option<String>), HostedHandoffControlError> {
         let has_prior = self.prior_context_id.is_some()
             || self.prior_generation.is_some()
             || self.prior_capability_revision.is_some();
         let has_expected_epoch = self.expected_epoch.is_some();
-        match self.action {
+        let context_handle = match (self.action.requires_surface_context(), self.context_handle) {
+            (true, Some(handle)) if valid_operator_context_handle(&handle) => Some(handle),
+            (true, _) => return Err(HostedHandoffControlError::InvalidRequest),
+            (false, None) => None,
+            (false, Some(_)) => return Err(HostedHandoffControlError::InvalidRequest),
+        };
+        let command = match self.action {
             HostedHandoffAction::Status
             | HostedHandoffAction::Begin
             | HostedHandoffAction::RecoverReissue
@@ -82,7 +110,7 @@ impl HostedHandoffControlRequest {
             | HostedHandoffAction::CancelBeforeHuman
                 if !has_prior && !has_expected_epoch =>
             {
-                Ok(match self.action {
+                match self.action {
                     HostedHandoffAction::Status => HandoffOperatorCommand::Status,
                     HostedHandoffAction::Begin => HandoffOperatorCommand::Begin,
                     HostedHandoffAction::RecoverReissue => HandoffOperatorCommand::RecoverReissue,
@@ -92,25 +120,69 @@ impl HostedHandoffControlRequest {
                         HandoffOperatorCommand::CancelBeforeHuman
                     }
                     _ => unreachable!(),
-                })
+                }
             }
             HostedHandoffAction::RecoverRebind if !has_expected_epoch => {
                 let prior_context_id = self
                     .prior_context_id
                     .ok_or(HostedHandoffControlError::InvalidRequest)?;
-                Ok(HandoffOperatorCommand::RecoverRebind {
+                HandoffOperatorCommand::RecoverRebind {
                     prior_context_id,
                     prior_generation: self.prior_generation,
                     prior_capability_revision: self.prior_capability_revision,
-                })
+                }
             }
             HostedHandoffAction::AbandonExpiredRecovery if !has_prior => {
                 let expected_epoch = self
                     .expected_epoch
                     .ok_or(HostedHandoffControlError::InvalidRequest)?;
-                Ok(HandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch })
+                HandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch }
             }
-            _ => Err(HostedHandoffControlError::InvalidRequest),
+            _ => return Err(HostedHandoffControlError::InvalidRequest),
+        };
+        Ok((command, context_handle))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedHandoffContextRequest {
+    pub action: HostedHandoffAction,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedHandoffContextResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+impl fmt::Debug for HostedHandoffContextResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedHandoffContextResponse")
+            .field("ok", &self.ok)
+            .field("context_handle_present", &self.context_handle.is_some())
+            .field("error_code", &self.error_code)
+            .finish()
+    }
+}
+
+impl HostedHandoffContextResponse {
+    fn success(context_handle: String) -> Self {
+        Self {
+            ok: true,
+            context_handle: Some(context_handle),
+            error_code: None,
+        }
+    }
+
+    fn error(error: HostedHandoffControlError) -> Self {
+        Self {
+            ok: false,
+            context_handle: None,
+            error_code: Some(error.safe_code().to_owned()),
         }
     }
 }
@@ -168,11 +240,98 @@ impl HostedHandoffAuthorizationPolicy {
 }
 
 #[derive(Clone)]
+struct IssuedHostedContext {
+    issuer: String,
+    subject: String,
+    action: HostedHandoffAction,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct IssuedHostedContexts {
+    bindings: Mutex<HashMap<String, IssuedHostedContext>>,
+}
+
+impl IssuedHostedContexts {
+    fn remember(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        action: HostedHandoffAction,
+        handle: &str,
+    ) {
+        let now = Instant::now();
+        let mut issued = self
+            .bindings
+            .lock()
+            .expect("hosted Handoff context lock poisoned");
+        issued.retain(|_, binding| binding.expires_at > now);
+        issued.insert(
+            handle.to_owned(),
+            IssuedHostedContext {
+                issuer: principal.issuer.clone(),
+                subject: principal.subject.clone(),
+                action,
+                expires_at: now + HOSTED_CONTEXT_BINDING_TTL,
+            },
+        );
+    }
+
+    fn validate(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        action: HostedHandoffAction,
+        handle: &str,
+    ) -> Result<(), HostedHandoffControlError> {
+        self.validate_at(principal, action, handle, Instant::now())
+    }
+
+    fn validate_at(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        action: HostedHandoffAction,
+        handle: &str,
+        now: Instant,
+    ) -> Result<(), HostedHandoffControlError> {
+        let mut issued = self
+            .bindings
+            .lock()
+            .expect("hosted Handoff context lock poisoned");
+        issued.retain(|_, binding| binding.expires_at > now);
+        let binding = issued
+            .get(handle)
+            .ok_or(HostedHandoffControlError::ContextInvalid)?;
+        if binding.issuer != principal.issuer || binding.subject != principal.subject {
+            return Err(HostedHandoffControlError::Unauthorized);
+        }
+        if binding.action != action {
+            return Err(HostedHandoffControlError::ContextInvalid);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait HostedHandoffControlApi: Send + Sync {
+    async fn issue_context(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        request: HostedHandoffContextRequest,
+    ) -> HostedHandoffContextResponse;
+
+    async fn execute(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        request: HostedHandoffControlRequest,
+    ) -> HostedHandoffControlResponse;
+}
+
+#[derive(Clone)]
 pub struct HostedHandoffControlService {
     device_id: Arc<str>,
     policy: Arc<HostedHandoffAuthorizationPolicy>,
     coordinator: Arc<HandoffCoordinator>,
     hub: HubHandle,
+    issued_contexts: Arc<IssuedHostedContexts>,
 }
 
 impl HostedHandoffControlService {
@@ -191,7 +350,43 @@ impl HostedHandoffControlService {
             policy,
             coordinator,
             hub,
+            issued_contexts: Arc::new(IssuedHostedContexts::default()),
         })
+    }
+
+    pub async fn issue_context(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        request: HostedHandoffContextRequest,
+    ) -> HostedHandoffContextResponse {
+        if let Err(error) = self
+            .policy
+            .authorize(principal, &self.device_id, request.action)
+        {
+            return HostedHandoffContextResponse::error(error);
+        }
+        if !request.action.requires_surface_context() {
+            return HostedHandoffContextResponse::error(HostedHandoffControlError::InvalidRequest);
+        }
+        let session = self
+            .hub
+            .current_session_binding()
+            .await
+            .map(|(generation, capabilities)| HandoffSessionFence {
+                generation,
+                capability_revision: capabilities.revision,
+            });
+        match self
+            .coordinator
+            .issue_operator_context_handle(request.action.uses_admitted_surface(), session)
+        {
+            Ok(handle) => {
+                self.issued_contexts
+                    .remember(principal, request.action, &handle);
+                HostedHandoffContextResponse::success(handle)
+            }
+            Err(error) => HostedHandoffContextResponse::error(error.into()),
+        }
     }
 
     /// Execute one already-authenticated operator request.
@@ -211,6 +406,7 @@ impl HostedHandoffControlService {
         {
             return HostedHandoffControlResponse::error(error);
         }
+        let action = request.action();
         let session = self
             .hub
             .current_session_binding()
@@ -219,14 +415,46 @@ impl HostedHandoffControlService {
                 generation,
                 capability_revision: capabilities.revision,
             });
-        let command = match request.into_operator_command() {
+        let (command, context_handle) = match request.into_operator_command() {
             Ok(command) => command,
             Err(error) => return HostedHandoffControlResponse::error(error),
         };
-        match self.coordinator.operator_control(command, session).await {
+        let result = if let Some(context_handle) = context_handle.as_deref() {
+            if let Err(error) = self
+                .issued_contexts
+                .validate(principal, action, context_handle)
+            {
+                return HostedHandoffControlResponse::error(error);
+            }
+            self.coordinator
+                .operator_control_for_context(command, session, context_handle)
+                .await
+        } else {
+            self.coordinator.operator_control(command, session).await
+        };
+        match result {
             Ok(status) => HostedHandoffControlResponse::success(status),
             Err(error) => HostedHandoffControlResponse::error(error.into()),
         }
+    }
+}
+
+#[async_trait]
+impl HostedHandoffControlApi for HostedHandoffControlService {
+    async fn issue_context(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        request: HostedHandoffContextRequest,
+    ) -> HostedHandoffContextResponse {
+        HostedHandoffControlService::issue_context(self, principal, request).await
+    }
+
+    async fn execute(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+        request: HostedHandoffControlRequest,
+    ) -> HostedHandoffControlResponse {
+        HostedHandoffControlService::execute(self, principal, request).await
     }
 }
 
@@ -276,6 +504,7 @@ pub enum HostedHandoffControlError {
     InvalidConfiguration,
     Unauthorized,
     InvalidRequest,
+    ContextInvalid,
     Control(HandoffOperatorControlError),
 }
 
@@ -285,6 +514,7 @@ impl HostedHandoffControlError {
             Self::InvalidConfiguration => "hosted_handoff_invalid_configuration",
             Self::Unauthorized => "hosted_handoff_unauthorized",
             Self::InvalidRequest => "hosted_handoff_request_invalid",
+            Self::ContextInvalid => "hosted_handoff_context_invalid",
             Self::Control(error) => error.safe_code(),
         }
     }
@@ -323,7 +553,7 @@ mod tests {
 
     #[test]
     fn hosted_recovery_request_carries_only_bounded_prior_proof_fields() {
-        let raw = r#"{"action":"recover_rebind","prior_context_id":"ctx_0123456789abcdef0123456789abcdef","prior_generation":7,"prior_capability_revision":8}"#;
+        let raw = r#"{"action":"recover_rebind","context_handle":"hctx_0123456789abcdef0123456789abcdef","prior_context_id":"ctx_0123456789abcdef0123456789abcdef","prior_generation":7,"prior_capability_revision":8}"#;
         let parsed: HostedHandoffControlRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.action(), HostedHandoffAction::RecoverRebind);
         assert!(parsed.clone().into_operator_command().is_ok());
@@ -332,7 +562,7 @@ mod tests {
 
     #[test]
     fn hosted_request_rejects_action_field_mismatch() {
-        let raw = r#"{"action":"begin","expected_epoch":7}"#;
+        let raw = r#"{"action":"begin","context_handle":"hctx_0123456789abcdef0123456789abcdef","expected_epoch":7}"#;
         let parsed: HostedHandoffControlRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(
             parsed.into_operator_command(),
@@ -371,6 +601,71 @@ mod tests {
             policy.authorize(&beta, "device-a", HostedHandoffAction::Begin),
             Err(HostedHandoffControlError::Unauthorized)
         );
+    }
+
+    #[test]
+    fn target_actions_require_valid_opaque_context_handle() {
+        let raw = r#"{"action":"begin"}"#;
+        let parsed: HostedHandoffControlRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            parsed.into_operator_command(),
+            Err(HostedHandoffControlError::InvalidRequest)
+        );
+
+        let raw = r#"{"action":"begin","context_handle":"hctx_NOT_SECRET"}"#;
+        let parsed: HostedHandoffControlRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            parsed.into_operator_command(),
+            Err(HostedHandoffControlError::InvalidRequest)
+        );
+
+        let raw = r#"{"action":"status","context_handle":"hctx_0123456789abcdef0123456789abcdef"}"#;
+        let parsed: HostedHandoffControlRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            parsed.into_operator_command(),
+            Err(HostedHandoffControlError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn issued_context_is_bound_to_exact_principal_action_and_expiry() {
+        let alpha = principal("alpha");
+        let beta = principal("beta");
+        let registry = IssuedHostedContexts::default();
+        let handle = "hctx_0123456789abcdef0123456789abcdef";
+        registry.remember(&alpha, HostedHandoffAction::Begin, handle);
+        assert!(
+            registry
+                .validate(&alpha, HostedHandoffAction::Begin, handle)
+                .is_ok()
+        );
+        assert_eq!(
+            registry.validate(&beta, HostedHandoffAction::Begin, handle),
+            Err(HostedHandoffControlError::Unauthorized)
+        );
+        assert_eq!(
+            registry.validate(&alpha, HostedHandoffAction::RebindLive, handle),
+            Err(HostedHandoffControlError::ContextInvalid)
+        );
+        assert_eq!(
+            registry.validate_at(
+                &alpha,
+                HostedHandoffAction::Begin,
+                handle,
+                Instant::now() + HOSTED_CONTEXT_BINDING_TTL + Duration::from_secs(1),
+            ),
+            Err(HostedHandoffControlError::ContextInvalid)
+        );
+    }
+
+    #[test]
+    fn hosted_context_response_debug_redacts_handle() {
+        let response = HostedHandoffContextResponse::success(
+            "hctx_0123456789abcdef0123456789abcdef".to_owned(),
+        );
+        let debug = format!("{response:?}");
+        assert!(debug.contains("context_handle_present: true"));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 
     #[test]
