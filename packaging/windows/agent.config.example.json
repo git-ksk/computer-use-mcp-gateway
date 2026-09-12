@@ -4,6 +4,8 @@
   "workingDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway",
   "logDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\logs",
   "restartDelaySeconds": 2,
+  "restartBackoffMaxSeconds": 60,
+  "rapidExitThresholdSeconds": 30,
   "waitForTcp": "127.0.0.1:7443",
   "arguments": [
     "--hub-endpoint", "https://127.0.0.1:7443",

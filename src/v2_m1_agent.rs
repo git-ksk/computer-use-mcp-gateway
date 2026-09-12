@@ -2253,6 +2253,22 @@ pub enum AgentServiceError {
     CheckpointGrantTrustMismatch,
 }
 
+fn grpc_status_safe_error_code(status: &tonic::Status) -> &'static str {
+    match status.code() {
+        Code::FailedPrecondition
+            if status.message() == crate::v2_m1_grpc::HUB_AGENT_SCHEMA_INCOMPATIBLE_MESSAGE =>
+        {
+            "hub_agent_schema_incompatible"
+        }
+        Code::PermissionDenied => "hub_agent_identity_rejected",
+        Code::Unauthenticated => "hub_authentication_rejected",
+        Code::ResourceExhausted => "hub_session_resource_exhausted",
+        Code::Unavailable => "hub_transport_unavailable",
+        Code::Cancelled => "hub_transport_cancelled",
+        Code::DeadlineExceeded => "hub_transport_deadline_exceeded",
+        _ => "grpc_status",
+    }
+}
 impl AgentServiceError {
     fn reconnectable(&self) -> bool {
         match self {
@@ -2271,7 +2287,7 @@ impl SafeErrorCode for AgentServiceError {
         match self {
             Self::InvalidConfig(_) => "invalid_config",
             Self::Transport(_) => "hub_transport_connect_failed",
-            Self::Status(_) => "grpc_status",
+            Self::Status(status) => grpc_status_safe_error_code(status),
             Self::Carrier(_) => "carrier_error",
             Self::Protocol(_) => "protocol_error",
             Self::Trust(_) => "trust_error",
@@ -2382,6 +2398,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
+    #[test]
+    fn grpc_status_classification_is_bounded_and_distinguishes_schema_skew() {
+        let mismatch = AgentServiceError::Status(tonic::Status::failed_precondition(
+            crate::v2_m1_grpc::HUB_AGENT_SCHEMA_INCOMPATIBLE_MESSAGE,
+        ));
+        assert_eq!(mismatch.safe_error_code(), "hub_agent_schema_incompatible");
+        assert!(!mismatch.reconnectable());
+
+        let identity = AgentServiceError::Status(tonic::Status::permission_denied(
+            "remote detail must not be copied",
+        ));
+        assert_eq!(identity.safe_error_code(), "hub_agent_identity_rejected");
+        assert!(!format!("{identity:?}").contains("remote detail"));
+
+        let unknown_marker = "REMOTE_SECRET_DO_NOT_LOG";
+        let unknown = AgentServiceError::Status(tonic::Status::failed_precondition(unknown_marker));
+        assert_eq!(unknown.safe_error_code(), "grpc_status");
+        assert!(!format!("{unknown:?}").contains(unknown_marker));
+    }
     #[test]
     fn storage_full_persistence_failure_is_bounded_and_forces_fail_closed_exit() {
         let error = AgentServiceError::Persistence(PersistenceError::Io(std::io::Error::from(
