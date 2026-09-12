@@ -18,6 +18,7 @@ pub mod proto {
 
 use proto::{AgentFrame, HubFrame};
 
+pub const HUB_AGENT_SCHEMA_INCOMPATIBLE_MESSAGE: &str = "Hub-Agent schema incompatible";
 pub const MAX_GRPC_APPLICATION_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_GRPC_LARGE_RESULT_APPLICATION_MESSAGE_BYTES: usize = 28 * 1024 * 1024;
 // Tonic limits the encoded Protobuf message, which includes the bytes-field tag

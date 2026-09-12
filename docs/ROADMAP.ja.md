@@ -55,6 +55,7 @@ completion provable?
 | Linux FIDO2 UV recovery | #228 / PR #259 | implementation + CI complete、physical acceptance deferred | non-blocking support-claim gate。physical Linux + real UV-capable FIDO2 acceptanceまでLinux online recoveryはunsupported |
 | Cross-platform recovery parity umbrella | #217 | physical acceptance dependent | 実際にsupport claimするplatform setのevidenceが揃うまでOPEN可 |
 | Hosted Cloud Run Hub | #215 | design complete、implementation/acceptance pending | **`0.4.0` support claimではない**。future hosted-deployment track |
+| Hosted Handoff composition | #275 / #276 / #277 | architecture documented、pin adoption / hosted operator-routing implementation pending | #215 の future hosted-deployment dependency。canonical Handoff authority は Agent に維持 |
 
 release closeout は次の順で完了しました。
 
@@ -132,6 +133,9 @@ physical CUMG + `mcp-execution-handoff` では、exact macOS Window に対する
 
 Issue [#152](https://github.com/git-ksk/computer-use-mcp-gateway/issues/152) でこの integration と merged-main physical OS-window acceptance は完了しました。構成原則は **first-class だが optional** です。通常の CUMG capability は Handoff を必須としませんが、Handoff を有効化した deployment では authority decision を best-effort な外付け判定ではなく execution boundary の一部として扱います。操作対象 Agent が canonical Handoff FSM/checkpoint、WebRTC/TURN、capture、Human input、local verification を所有し、Hub は CUMG authorization / ledger / quarantine と conservative な pre-dispatch fence、signed operator-control relay のみを保持します。Hub/Agent に二重の Handoff state machine は作りません。generation rollover は fresh same-surface observation を伴う explicit `rebind_live` とし、Agent は Cua 直前に signed authority binding と実 command surface を再検証します。有効化後に runtime/transport が unavailable になった場合は coordinator を迂回せず fail closed します。
 
+
+Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md) で定義します。Cloud/hosted routing は Human session の発行・routingを担当できますが、canonical physical mutation authority/checkpoint は controlled Agent に残し、CUMG authoritative operation/quarantine/replay state は Hub に残します。hosted routing state を2つ目のHandoff FSMやreplay authorityとして扱いません。
+
 当初の依存順はcomponent migrationまで完了しました。
 
 1. `#152` — first-class CUMG HandoffCoordinator / OS-window regression acceptance — **closed**
@@ -161,7 +165,7 @@ open issue はrevised release sequenceで分類し、roadmap visibilityからsil
 - **`0.4.0 — active release candidate`:** #221 / PR #271はmerge済み・green。#227 physical Windows Hello acceptanceが残るrelease gateです。#139 signed-token dogfoodと#228 physical Linux FIDO2 acceptanceはdeferred support-claim gateで、#217はparity用にOPEN維持します。
 - **`0.5.0 — Least-privilege Workspace`:** #83 bounded retrievable process/shell output、#105 ranged/deterministic filesystem observation、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation。
 - **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
-- **Future / evidence-driven:** #215 hosted Cloud Run Hub implementationと#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
+- **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation、#275 hosted Handoff architecture（#276 pin adoption / #277 hosted operator-routing implementation）、#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
 - **Upstream-blocked V1 compatibility:** #14/#15はupstream Cua blockedのままでactive CUMG release blockerではない。
 
 open issueがこのinventoryまたは別のexplicit roadmap sectionに現れない場合はroadmap staleとして、release closeout前に修正します。

@@ -377,3 +377,9 @@ local vs remote connection
 ```
 
 Never attach real screenshots, credentials, Access tokens, private hostnames, or raw desktop contents to a public issue.
+
+### Agent exits with `hub_agent_schema_incompatible`
+
+This bounded error means the Hub rejected the Agent because their signed Hub-Agent application schema versions differ. Treat it as runtime pairing skew, not as a transient network/TLS failure. Restore a version-paired Hub + Agent set from one reviewed candidate identity, then use `v2_status` / `v2_doctor` runtime-pairing diagnostics where available. Do not keep retrying a mixed pair and do not copy arbitrary newer operator binaries into an older deployed runtime.
+
+On the reviewed Windows supervisor profile, repeated rapid exits back off exponentially (bounded by `restartBackoffMaxSeconds`) instead of retrying every two seconds indefinitely. Authentication rejection, transport unavailability, and unknown remote gRPC failures remain separate bounded error codes; arbitrary remote status text is not copied into the safe local error surface.

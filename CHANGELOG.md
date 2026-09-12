@@ -20,6 +20,8 @@ V2 Recovery, Identity & Semantic Authorization release. This release consolidate
 ### Product and operability
 
 - filesystem observation roots are separated from process working-directory roots (#104);
+- Windows v0.4.0 dogfood gains a fail-closed version-paired upgrade path with release-manifest verification, candidate config preflight, bounded Hub/Agent health gates, and pair rollback (#293/#294);
+- Windows candidate operation now surfaces bounded Hub-Agent schema incompatibility separately from transport/auth failures and exponentially backs off repeated rapid child exits instead of creating a tight restart storm (#294);
 - reproducible V1 latency/concurrency benchmarking is available as informational product evidence (#111);
 - the Unix explicit-session-detachment investigation is closed with the portable process-group guarantee documented; stronger optional Linux cgroup-v2 containment remains future #267 work (#96);
 - the `0.4.0` roadmap now treats Cloud Run #215 as design-complete but unsupported future hosted work rather than a release claim.
