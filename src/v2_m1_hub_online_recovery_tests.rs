@@ -13,7 +13,11 @@ use ring::{
     rand::SystemRandom,
     signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _},
 };
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::Command;
 
 fn temp_dir(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -27,7 +31,39 @@ fn temp_dir(name: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+    #[cfg(windows)]
+    lock_down_windows_path(&path, true);
     path
+}
+
+#[cfg(windows)]
+fn windows_identity() -> String {
+    let output = Command::new("whoami").output().expect("run whoami");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[cfg(windows)]
+fn lock_down_windows_path(path: &Path, directory: bool) {
+    let current = windows_identity();
+    let suffix = if directory { "(OI)(CI)F" } else { "F" };
+    let output = Command::new("icacls.exe")
+        .arg(path)
+        .args([
+            "/inheritance:r".to_string(),
+            "/grant:r".to_string(),
+            format!("{current}:{suffix}"),
+            format!("*S-1-5-18:{suffix}"),
+            format!("*S-1-5-32-544:{suffix}"),
+            "/Q".to_string(),
+        ])
+        .output()
+        .expect("run icacls");
+    assert!(
+        output.status.success(),
+        "icacls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn recovery_key() -> (EcdsaKeyPair, [u8; 65]) {
@@ -92,6 +128,8 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
     let (recovery_key, recovery_public) = recovery_key();
     let recovery_public_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
     std::fs::write(&recovery_public_path, recovery_public).unwrap();
+    #[cfg(windows)]
+    lock_down_windows_path(&recovery_public_path, false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -268,6 +306,8 @@ async fn signed_current_state_acceptance_is_persistence_gated_restart_safe_and_n
     let (recovery_key, recovery_public) = recovery_key();
     let recovery_public_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
     std::fs::write(&recovery_public_path, recovery_public).unwrap();
+    #[cfg(windows)]
+    lock_down_windows_path(&recovery_public_path, false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -510,6 +550,8 @@ async fn signed_current_state_acceptance_fails_closed_for_shell_and_equal_genera
         let (recovery_key, recovery_public) = recovery_key();
         let recovery_public_path = state_dir.join(RECOVERY_PUBLIC_KEY_FILENAME);
         std::fs::write(&recovery_public_path, recovery_public).unwrap();
+        #[cfg(windows)]
+        lock_down_windows_path(&recovery_public_path, false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
