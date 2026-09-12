@@ -195,7 +195,7 @@ pub struct ProcessExecutor {
 struct ProcessLaunch<'a> {
     program: &'a str,
     args: &'a [String],
-    windows_raw_arg: Option<&'a str>,
+    _windows_raw_arg: Option<&'a str>,
 }
 
 impl ProcessExecutor {
@@ -213,7 +213,7 @@ impl ProcessExecutor {
             ProcessLaunch {
                 program: &request.program,
                 args: &request.args,
-                windows_raw_arg: None,
+                _windows_raw_arg: None,
             },
             &validated.cwd,
             &request.env,
@@ -248,7 +248,7 @@ impl ProcessExecutor {
             ProcessLaunch {
                 program: &program,
                 args: &args,
-                windows_raw_arg,
+                _windows_raw_arg: windows_raw_arg,
             },
             &cwd,
             &request.env,
@@ -281,7 +281,7 @@ impl ProcessExecutor {
         let mut command = Command::new(launch.program);
         command.args(launch.args);
         #[cfg(windows)]
-        if let Some(raw_arg) = launch.windows_raw_arg {
+        if let Some(raw_arg) = launch._windows_raw_arg {
             // cmd.exe owns parsing for the explicitly-authorized free-form shell surface.
             // Passing the command through std::process::Command::arg would quote embedded
             // Windows command syntax and corrupt nested quotes (for example tasklist /FI
