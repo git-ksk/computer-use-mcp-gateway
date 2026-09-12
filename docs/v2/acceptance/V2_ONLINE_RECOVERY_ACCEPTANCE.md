@@ -27,6 +27,20 @@ The permanent automated suite must prove:
 
 The ordinary project gates (`fmt`, `check --locked --all-targets`, tests, clippy `-D warnings`, documentation/link checks, passthrough contract) remain required because online recovery changes the Hub-Agent application schema.
 
+## Windows Hello physical acceptance checkpoint (#227)
+
+Status as of 2026-09-12: **physical acceptance remains pending; this checkpoint is non-terminal evidence only and must not be used to claim Windows support or create the `v0.4.0` tag/Release.** The exact PR #252 head exercised here was `db82a255798d9604a85dbfd12444f282e64dbe94` with Cua 0.19.3.
+
+A trusted physical Windows interactive-desktop run established the following bounded facts without recording PIN/biometric data, raw desktop payloads, recovery evidence bodies, or recovery private material:
+
+- the real-Cua physical harness reached `ONLINE_RECOVERY_PHYSICAL_READY` after an ambiguous `PointerDrag`, with the exact operation still `Indeterminate`, quarantined on its historical generation, and a newer authenticated Agent generation active;
+- a real Windows Hello prompt was cancelled by the local user; `v2_recover resolve-windows-hello` returned the stable `recovery_user_presence_denied` class, while the same quarantine remained present and the Hub still had zero resolution records;
+- a second real Windows Hello prompt was approved by the local user; `v2_recover` completed WebAuthn user verification and reported `authorization=published` for the exact quarantined operation;
+- that run did **not** reach `ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false`: after publication, the harness continued to observe the quarantine and no durable Hub resolution record appeared before the run was stopped;
+- the local authorization handoff file was subsequently absent while the Hub-signed recovery challenge was refreshed, so the next investigation should distinguish Agent-side authorization relay/consumption from Hub-side recovery handling/challenge refresh sequencing. Do not repeat Windows Hello approval until that path is understood well enough to run one clean cancel -> approve acceptance sequence.
+
+Resume from the Agent recovery loop around authorization polling/relay and incoming `RecoveryChallenge` handling (`src/v2_m1_agent.rs`), then the Hub `RecoveryAuthorization` handler. The acceptance gate remains open until a fresh run proves exact durable resolution, unrelated `ScreenGeometry` success, restart persistence, permanent no-replay of the old operation, and the final `ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false` marker.
+
 ## Trusted physical Linux FIDO2 acceptance (#228)
 
 This gate is deliberately separate from implementation/CI and from Windows Hello acceptance. Until it passes, the Linux provider is an implementation candidate only and documentation/release notes must not claim Linux online-recovery support. Use an operator-controlled Linux desktop, a real UV-capable CTAP2 authenticator, and root-managed libfido2 1.17.0+ tools. Record the exact authenticator model/firmware, Linux distribution/kernel, libfido2 version, Cua version, and CUMG commit without recording PINs, credential private material, raw desktop payloads, or recovery evidence text.

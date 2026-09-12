@@ -274,3 +274,7 @@ threat model は deployment に引き続き次の external responsibility を要
 - `indeterminate` operation は persistence-gated な settlement が存在するまで quarantined のままにする。network recovery、backend reconnect、service restart だけでは settlement ではなく、replay permission にもならない。automatic な例外は同じ prior dispatch binding に対する exact signed terminal evidence だけで、missing/mismatch evidence は operator-required / fail-closed のまま。
 
 これらは deployment assumption / residual risk であり、missing V2-M1 protocol feature ではありません。multi-machine identity、fleet attestation、additional native GUI backend は later milestone に意図的に defer されています。
+
+### Windows Hello recovery authority
+
+Windows provider は Windows account/process identity を recovery authority にしません。signing は native WebAuthn platform authenticator の dedicated exact credential に限定し、User Present と User Verified の両 flag を必須にします。Task Scheduler、Agent device key、ordinary process identity、external security key、software private key ではこの provider を満たせません。Hub は persistence transition 前に fresh CUMG recovery challenge、quarantine fingerprint、generation、exact credential/public key、RP ID hash、client-data binding、UP+UV flags、ES256 signature を引き続き検証します。cancel/deny/platform failure では quarantine を維持します。

@@ -1,6 +1,4 @@
-#[cfg(not(target_os = "macos"))]
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 #[path = "v2_recover/linux_fido2.rs"]
 mod linux_fido2;
 use linux_fido2::{
@@ -8,7 +6,7 @@ use linux_fido2::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use computer_use_mcp_gateway::v2_online_recovery::{
     RecoveryAuditAssessment, new_authorization, new_current_state_acceptance_authorization,
     recovery_decision_name, store_authorization,
@@ -31,7 +29,7 @@ use computer_use_mcp_gateway::{
     },
     v2_operator_status::OperatorOverallStatus,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::fs::OpenOptions;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -64,6 +62,39 @@ enum Command {
         secure_enclave_helper: PathBuf,
         #[arg(long)]
         public_key_out: PathBuf,
+    },
+    /// Create a dedicated Windows Hello recovery credential and export only its public verifier.
+    InitWindowsHello {
+        #[arg(long)]
+        verifier_out: PathBuf,
+    },
+    /// Approve an exact recovery decision with the provisioned Windows Hello credential.
+    ResolveWindowsHello {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_WEBAUTHN_VERIFIER_FILE")]
+        verifier_file: PathBuf,
+        #[arg(long, value_enum)]
+        decision: ResolutionDecisionArg,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
+    },
+    /// Accept the current desktop state using Windows Hello user verification.
+    AcceptCurrentStateWindowsHello {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_WEBAUTHN_VERIFIER_FILE")]
+        verifier_file: PathBuf,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
     },
     /// Create a dedicated Linux FIDO2 recovery credential with explicit user verification.
     InitLinuxFido2 {
@@ -381,6 +412,35 @@ fn main() -> Result<()> {
             secure_enclave_helper,
             public_key_out,
         } => export_public(key_file, secure_enclave_helper, public_key_out),
+        Command::InitWindowsHello { verifier_out } => init_windows_hello(verifier_out),
+        Command::ResolveWindowsHello {
+            state_dir,
+            hub_public_key_file,
+            verifier_file,
+            decision,
+            evidence,
+            wait_secs,
+        } => resolve_windows_hello(
+            state_dir,
+            hub_public_key_file,
+            verifier_file,
+            decision.into(),
+            evidence,
+            wait_secs,
+        ),
+        Command::AcceptCurrentStateWindowsHello {
+            state_dir,
+            hub_public_key_file,
+            verifier_file,
+            evidence,
+            wait_secs,
+        } => accept_current_state_windows_hello(
+            state_dir,
+            hub_public_key_file,
+            verifier_file,
+            evidence,
+            wait_secs,
+        ),
         Command::InitLinuxFido2 {
             tool_dir,
             device,
@@ -887,6 +947,172 @@ fn publish_guided_authorization(
     _selected: GuidedRecoverySelection,
 ) -> Result<ExpectedRecoveryCompletion> {
     bail!("local user-presence recovery approval is supported only on macOS")
+}
+
+#[cfg(windows)]
+fn init_windows_hello(verifier_out: PathBuf) -> Result<()> {
+    use computer_use_mcp_gateway::v2_online_recovery::windows::WindowsHelloRecovery;
+    if std::fs::symlink_metadata(&verifier_out).is_ok() {
+        anyhow::bail!("refusing to overwrite {}", verifier_out.display());
+    }
+    let (_credential, verifier) = WindowsHelloRecovery::create_new()
+        .context("Windows Hello recovery credential provisioning was not completed")?;
+    let encoded = serde_json::to_vec_pretty(&verifier)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&verifier_out)
+        .with_context(|| format!("refusing to overwrite {}", verifier_out.display()))?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    println!("windows_hello_recovery=provisioned");
+    println!("user_verification=required");
+    println!("recovery_verifier={}", verifier_out.display());
+    println!("hub_filename=recovery-webauthn-verifier.json");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn init_windows_hello(_verifier_out: PathBuf) -> Result<()> {
+    bail!("Windows Hello recovery provisioning is supported only on Windows")
+}
+
+#[cfg(windows)]
+fn load_windows_hello(
+    verifier_file: &Path,
+) -> Result<computer_use_mcp_gateway::v2_online_recovery::windows::WindowsHelloRecovery> {
+    use computer_use_mcp_gateway::v2_online_recovery::windows::WindowsHelloRecovery;
+    let metadata = std::fs::symlink_metadata(verifier_file)
+        .context("failed to inspect Windows Hello recovery verifier")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > 4096
+    {
+        anyhow::bail!("Windows Hello recovery verifier is unsafe or invalid");
+    }
+    let bytes =
+        std::fs::read(verifier_file).context("failed to read Windows Hello recovery verifier")?;
+    WindowsHelloRecovery::from_verifier_document(&bytes)
+        .context("Windows Hello recovery verifier is invalid")
+}
+
+#[cfg(windows)]
+fn resolve_windows_hello(
+    state_dir: PathBuf,
+    hub_public_key_file: PathBuf,
+    verifier_file: PathBuf,
+    decision: IndeterminateResolution,
+    evidence: String,
+    wait_secs: u64,
+) -> Result<()> {
+    let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
+    let authorization = new_authorization(
+        &challenge,
+        RecoveryAuditAssessment::Inconclusive,
+        decision,
+        evidence,
+    )
+    .context("invalid recovery decision")?;
+    println!("approving_windows_hello_recovery");
+    println!("device_id={}", authorization.device_id);
+    println!("operation_id={}", authorization.operation_id);
+    println!("current_generation={}", authorization.current_generation);
+    println!(
+        "decision={}",
+        recovery_decision_name(authorization.decision)
+    );
+    println!("windows_hello_user_verification=required");
+    let credential = load_windows_hello(&verifier_file)?;
+    let authorization = credential
+        .sign_authorization(authorization)
+        .context("Windows Hello user verification was not completed")?;
+    store_authorization(&state_dir, &authorization)
+        .context("failed to publish Windows Hello recovery authorization")?;
+    finish_published_authorization(&state_dir, &hub_public_key_file, &authorization, wait_secs)
+}
+
+#[cfg(not(windows))]
+fn resolve_windows_hello(
+    _state_dir: PathBuf,
+    _hub_public_key_file: PathBuf,
+    _verifier_file: PathBuf,
+    _decision: IndeterminateResolution,
+    _evidence: String,
+    _wait_secs: u64,
+) -> Result<()> {
+    bail!("Windows Hello recovery approval is supported only on Windows")
+}
+
+#[cfg(windows)]
+fn accept_current_state_windows_hello(
+    state_dir: PathBuf,
+    hub_public_key_file: PathBuf,
+    verifier_file: PathBuf,
+    evidence: String,
+    wait_secs: u64,
+) -> Result<()> {
+    let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
+    let authorization = new_current_state_acceptance_authorization(
+        &challenge,
+        RetirementPolicy::TransientUiInteractionV1,
+        evidence,
+    )
+    .context("current-state acceptance is not valid for this recovery schema")?;
+    println!("accepting_current_state_windows_hello");
+    println!("device_id={}", authorization.device_id);
+    println!("operation_id={}", authorization.operation_id);
+    println!("historical_execution_outcome=indeterminate");
+    println!("operator_observation=current_state_accepted");
+    println!("old_operation_replayed=false");
+    println!("windows_hello_user_verification=required");
+    let credential = load_windows_hello(&verifier_file)?;
+    let authorization = credential
+        .sign_authorization(authorization)
+        .context("Windows Hello user verification was not completed")?;
+    store_authorization(&state_dir, &authorization)
+        .context("failed to publish Windows Hello current-state authorization")?;
+    finish_published_authorization(&state_dir, &hub_public_key_file, &authorization, wait_secs)
+}
+
+#[cfg(not(windows))]
+fn accept_current_state_windows_hello(
+    _state_dir: PathBuf,
+    _hub_public_key_file: PathBuf,
+    _verifier_file: PathBuf,
+    _evidence: String,
+    _wait_secs: u64,
+) -> Result<()> {
+    bail!("Windows Hello current-state acceptance is supported only on Windows")
+}
+
+#[cfg(windows)]
+fn finish_published_authorization(
+    state_dir: &Path,
+    hub_public_key_file: &Path,
+    authorization: &computer_use_mcp_gateway::v2_online_recovery::RecoveryAuthorization,
+    wait_secs: u64,
+) -> Result<()> {
+    println!("request_id={}", authorization.request_id);
+    println!("authorization=published");
+    if wait_secs > 0 {
+        wait_for_completion(
+            state_dir,
+            hub_public_key_file,
+            &ExpectedRecoveryCompletion {
+                request_id: authorization.request_id.clone(),
+                device_id: authorization.device_id.clone(),
+                operation_id: authorization.operation_id.clone(),
+                current_generation: authorization.current_generation,
+                decision: authorization.decision,
+                current_state_policy: authorization.current_state_policy,
+            },
+            wait_secs,
+        )?;
+    } else {
+        println!("durable_completion=not_checked");
+    }
+    Ok(())
 }
 
 fn exact_quarantine_cleared(
