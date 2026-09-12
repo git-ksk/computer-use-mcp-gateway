@@ -111,3 +111,7 @@ CI unit-tests the bounded restart-delay policy without relying on a hosted runne
 7. Re-check the unrelated WindowsMCP listener.
 
 Do not use `reset`, `clean`, forced checkout, or broad process-kill commands during acceptance.
+
+## Version-paired upgrades
+
+Use [UPGRADE.md](UPGRADE.md) for the reviewed Windows fail-closed paired-upgrade procedure. Japanese guidance is available in [UPGRADE.ja.md](UPGRADE.ja.md).
