@@ -928,9 +928,7 @@ fn atomic_write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<(),
         file.flush().map_err(|_| RecoveryError::Io)?;
         file.sync_all().map_err(|_| RecoveryError::Io)?;
         fs::rename(&pending, path).map_err(|_| RecoveryError::Io)?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| RecoveryError::Io)?;
+        sync_directory(parent)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -987,13 +985,25 @@ fn atomic_write_json_private_no_replace<T: Serialize>(
         // execution authority; reporting failure here would invite a second,
         // conflicting local decision while the first authorization is visible.
         let _ = fs::remove_file(&pending);
-        let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        let _ = sync_directory(parent);
         Ok(())
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&pending);
     }
     write_result
+}
+
+fn sync_directory(directory: &Path) -> Result<(), RecoveryError> {
+    #[cfg(unix)]
+    {
+        File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| RecoveryError::Io)?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 fn read_json_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, RecoveryError> {

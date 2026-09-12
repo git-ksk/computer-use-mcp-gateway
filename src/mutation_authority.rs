@@ -6,6 +6,8 @@
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -13,6 +15,8 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 
 const LOCK_FILE: &str = "mutation-authority.lock";
 const OWNER_FILE: &str = "mutation-authority.json";
@@ -85,6 +89,7 @@ impl MutationAuthorityGate {
     pub fn try_acquire(&self) -> Result<MutationAuthorityPermit, MutationAuthorityError> {
         validate_private_directory(&self.directory)?;
         let lock = open_existing_private_file(&self.directory.join(LOCK_FILE), true)?;
+        let process_lock = ProcessLockReservation::acquire(&self.directory)?;
         match lock.try_lock_exclusive() {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -108,6 +113,7 @@ impl MutationAuthorityGate {
         }
         Ok(MutationAuthorityPermit {
             lock,
+            _process_lock: process_lock,
             owner: status.owner,
             epoch: status.epoch,
         })
@@ -117,6 +123,7 @@ impl MutationAuthorityGate {
 #[derive(Debug)]
 pub struct MutationAuthorityPermit {
     lock: File,
+    _process_lock: ProcessLockReservation,
     owner: MutationAuthorityRole,
     epoch: u64,
 }
@@ -217,6 +224,7 @@ where
     }
     validate_private_directory(directory)?;
     let lock = open_existing_private_file(&directory.join(LOCK_FILE), true)?;
+    let _process_lock = ProcessLockReservation::acquire(directory)?;
     match lock.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -255,6 +263,49 @@ where
     result?;
     Ok(next)
 }
+
+#[derive(Debug)]
+struct ProcessLockReservation {
+    #[cfg(windows)]
+    key: PathBuf,
+}
+
+impl ProcessLockReservation {
+    fn acquire(directory: &Path) -> Result<Self, MutationAuthorityError> {
+        #[cfg(windows)]
+        {
+            let key = fs::canonicalize(directory).map_err(|_| MutationAuthorityError::Io)?;
+            let locks = PROCESS_LOCKS.get_or_init(|| Mutex::new(HashSet::new()));
+            let mut locks = locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !locks.insert(key.clone()) {
+                return Err(MutationAuthorityError::Busy);
+            }
+            return Ok(Self { key });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = directory;
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for ProcessLockReservation {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(locks) = PROCESS_LOCKS.get() {
+            let mut locks = locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locks.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(windows)]
+static PROCESS_LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationAuthorityError {

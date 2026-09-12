@@ -2896,7 +2896,7 @@ mod tests {
 
     #[test]
     fn terminal_proof_is_persisted_before_remote_result_delivery() {
-        let source = include_str!("v2_m1_agent.rs");
+        let source = include_str!("v2_m1_agent.rs").replace("\r\n", "\n");
         let start = source
             .find("record_terminal_evidence(\n                                &mut self.terminal_evidence")
             .unwrap();
