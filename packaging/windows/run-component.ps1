@@ -30,6 +30,8 @@ function Test-Loopback([string]$endpoint) {
   finally { $c.Dispose() }
 }
 
+. (Join-Path $PSScriptRoot 'supervisor-backoff.ps1')
+
 $config=Get-Content -LiteralPath (Resolve-Path -LiteralPath $ConfigPath) -Raw -Encoding UTF8|ConvertFrom-Json
 foreach($n in 'component','executable','workingDirectory','logDirectory') {
   if(-not $config.PSObject.Properties.Name.Contains($n) -or [string]::IsNullOrWhiteSpace([string]$config.$n)) { throw "missing config field: $n" }
@@ -46,15 +48,21 @@ $archive=Join-Path $logs 'archive'; New-Item -ItemType Directory -Path $archive 
 $pidFile=if($config.PSObject.Properties.Name.Contains('pidFile') -and -not [string]::IsNullOrWhiteSpace([string]$config.pidFile)){[Environment]::ExpandEnvironmentVariables([string]$config.pidFile)}else{Join-Path $logs "$component.pid"}
 if(-not [IO.Path]::IsPathRooted($pidFile)){throw 'pidFile must be absolute'}
 $restart=if($config.PSObject.Properties.Name.Contains('restartDelaySeconds')){[int]$config.restartDelaySeconds}else{2}
+$restartMax=if($config.PSObject.Properties.Name.Contains('restartBackoffMaxSeconds')){[int]$config.restartBackoffMaxSeconds}else{60}
+$rapidExitThreshold=if($config.PSObject.Properties.Name.Contains('rapidExitThresholdSeconds')){[int]$config.rapidExitThresholdSeconds}else{30}
 $startup=if($config.PSObject.Properties.Name.Contains('startupDelaySeconds')){[int]$config.startupDelaySeconds}else{0}
 if($restart -lt 1 -or $restart -gt 300){throw 'restartDelaySeconds must be 1..300'}
+if($restartMax -lt $restart -or $restartMax -gt 300){throw 'restartBackoffMaxSeconds must be restartDelaySeconds..300'}
+if($rapidExitThreshold -lt 1 -or $rapidExitThreshold -gt 3600){throw 'rapidExitThresholdSeconds must be 1..3600'}
 if($startup -lt 0 -or $startup -gt 300){throw 'startupDelaySeconds must be 0..300'}
 $wait=if($config.PSObject.Properties.Name.Contains('waitForTcp')){[string]$config.waitForTcp}else{''}
 $args=@(); if($config.PSObject.Properties.Name.Contains('arguments') -and $null -ne $config.arguments){$args=@($config.arguments|ForEach-Object{[Environment]::ExpandEnvironmentVariables([string]$_)})}
 $argLine=($args|ForEach-Object{Quote-Arg $_}) -join ' '
 if($startup){Log "component=$component event=startup_delay seconds=$startup"; Start-Sleep -Seconds $startup}
 $waiting=$false
+$rapidExitStreak=0
 while($true){
+  $nextRestart=$restart
   try {
     if(-not [string]::IsNullOrWhiteSpace($wait)){
       while(-not(Test-Loopback $wait)){
@@ -68,6 +76,7 @@ while($true){
     $stderr=Join-Path $archive "$component.$runStamp.stderr.log"
     $sp=@{FilePath=$exe;WorkingDirectory=$work;RedirectStandardOutput=$stdout;RedirectStandardError=$stderr;PassThru=$true;WindowStyle='Hidden'}
     if(-not [string]::IsNullOrWhiteSpace($argLine)){$sp.ArgumentList=$argLine}
+    $startedAt=[DateTimeOffset]::UtcNow
     $p=Start-Process @sp
     $childPid=$p.Id
     Set-Content -LiteralPath $pidFile -Value $childPid -Encoding ASCII
@@ -78,10 +87,15 @@ while($true){
       $p.Dispose()
     }
     Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
-    Log "component=$component event=child_exit pid=$childPid exit_code=$code restart_in_seconds=$restart"
+    $runtimeSeconds=[Math]::Max(0,[int][Math]::Floor(([DateTimeOffset]::UtcNow-$startedAt).TotalSeconds))
+    if($runtimeSeconds -lt $rapidExitThreshold){$rapidExitStreak++}else{$rapidExitStreak=0}
+    $nextRestart=Get-CumgRestartDelay $rapidExitStreak $restart $restartMax
+    Log "component=$component event=child_exit pid=$childPid exit_code=$code runtime_seconds=$runtimeSeconds rapid_exit_streak=$rapidExitStreak restart_in_seconds=$nextRestart"
   } catch {
     Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
-    Log "component=$component event=supervisor_error type=$($_.Exception.GetType().Name) restart_in_seconds=$restart"
+    $rapidExitStreak++
+    $nextRestart=Get-CumgRestartDelay $rapidExitStreak $restart $restartMax
+    Log "component=$component event=supervisor_error type=$($_.Exception.GetType().Name) rapid_exit_streak=$rapidExitStreak restart_in_seconds=$nextRestart"
   }
-  Start-Sleep -Seconds $restart
+  Start-Sleep -Seconds $nextRestart
 }

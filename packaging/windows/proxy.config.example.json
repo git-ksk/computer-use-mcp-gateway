@@ -4,6 +4,8 @@
   "workingDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway",
   "logDirectory": "%LOCALAPPDATA%\\computer-use-mcp-gateway\\logs",
   "restartDelaySeconds": 2,
+  "restartBackoffMaxSeconds": 60,
+  "rapidExitThresholdSeconds": 30,
   "waitForTcp": "127.0.0.1:8102",
   "arguments": [
     "run", "--config", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\run\\Caddyfile",

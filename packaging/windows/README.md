@@ -72,7 +72,7 @@ The stable paths are under the configured `logDirectory`:
 - `archive\<component>.<UTC timestamp>.stderr.log` — one file per child run.
 - `<component>.pid`
 
-A child exit should produce `event=child_exit`, followed by a new `event=child_start` after `restartDelaySeconds`. Each child run writes to a fresh timestamped stdout/stderr file so restart does not depend on renaming a recently closed Windows log handle.
+A child exit produces `event=child_exit`, followed by a new `event=child_start`. Rapid exits use bounded exponential backoff from `restartDelaySeconds` up to `restartBackoffMaxSeconds` (default 60 seconds); a child that remains alive for at least `rapidExitThresholdSeconds` (default 30 seconds) resets the rapid-exit streak. The supervisor log records `runtime_seconds`, `rapid_exit_streak`, and `restart_in_seconds` without copying child stderr or argv. This keeps transient Hub recovery automatic while preventing a deterministic configuration/protocol failure from creating a tight 2-second restart storm. Each child run writes to a fresh timestamped stdout/stderr file so restart does not depend on renaming a recently closed Windows log handle.
 
 ## Disable or uninstall
 
@@ -98,6 +98,8 @@ cargo test --locked
 ```
 
 Windows also keeps a process-local reservation alongside the OS file lock for the Hub state directory. This preserves the single-owner invariant when Windows permits a second lock attempt from the same process.
+
+CI unit-tests the bounded restart-delay policy without relying on a hosted runner interactive desktop. Physical Windows acceptance must exercise the complete `run-component.ps1` child lifecycle; the v0.4.0 dogfood verified rapid-exit delays increase rather than remaining at a tight fixed retry interval.
 ## Physical Windows acceptance
 
 1. Confirm the unrelated WindowsMCP listener remains healthy before and after every step.

@@ -3111,6 +3111,12 @@ impl HubServiceError {
             Self::WrongDevice | Self::CheckpointDeviceTrustMismatch => {
                 Status::permission_denied("Agent identity rejected")
             }
+            Self::Transport(crate::v2_m0_transport::TransportError::UnsupportedSchema {
+                ..
+            }) => Status::failed_precondition(
+                crate::v2_m1_grpc::HUB_AGENT_SCHEMA_INCOMPATIBLE_MESSAGE,
+            ),
+            Self::Transport(_) => Status::failed_precondition("Agent protocol rejected"),
             _ => Status::failed_precondition("Agent session rejected"),
         }
     }
@@ -3126,6 +3132,9 @@ impl SafeErrorCode for HubServiceError {
             Self::StateDirectoryLock(_) => "state_directory_lock_error",
             Self::Control(_) => "control_error",
             Self::Execution(_) => "execution_error",
+            Self::Transport(crate::v2_m0_transport::TransportError::UnsupportedSchema {
+                ..
+            }) => "hub_agent_schema_incompatible",
             Self::Transport(_) => "protocol_error",
             Self::Trust(_) => "trust_error",
             Self::Carrier(_) => "carrier_error",
@@ -3174,6 +3183,20 @@ mod tests {
     use crate::v2_m0_transport::RemoteHandoffOperatorCommand;
     use crate::v2_m0_trust::build_device_key_rotation;
 
+    #[test]
+    fn unsupported_hub_agent_schema_has_bounded_specific_grpc_status() {
+        let error =
+            HubServiceError::Transport(crate::v2_m0_transport::TransportError::UnsupportedSchema {
+                got: 4,
+            });
+        let status = error.grpc_status();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            crate::v2_m1_grpc::HUB_AGENT_SCHEMA_INCOMPATIBLE_MESSAGE
+        );
+        assert_eq!(error.safe_error_code(), "hub_agent_schema_incompatible");
+    }
     fn test_state_dir(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "cumg-v2-hub-{name}-{}-{}",
