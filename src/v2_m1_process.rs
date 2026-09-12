@@ -192,6 +192,12 @@ pub struct ProcessExecutor {
     policy: ProcessPolicy,
 }
 
+struct ProcessLaunch<'a> {
+    program: &'a str,
+    args: &'a [String],
+    windows_raw_arg: Option<&'a str>,
+}
+
 impl ProcessExecutor {
     pub fn new(policy: ProcessPolicy) -> Self {
         Self { policy }
@@ -204,9 +210,11 @@ impl ProcessExecutor {
     ) -> Result<ProcessOutput, ProcessError> {
         let validated = self.validate_request(request)?;
         self.execute_validated(
-            &request.program,
-            &request.args,
-            None,
+            ProcessLaunch {
+                program: &request.program,
+                args: &request.args,
+                windows_raw_arg: None,
+            },
             &validated.cwd,
             &request.env,
             request.timeout_ms,
@@ -237,9 +245,11 @@ impl ProcessExecutor {
 
         #[cfg(any(unix, windows))]
         self.execute_validated(
-            &program,
-            &args,
-            windows_raw_arg,
+            ProcessLaunch {
+                program: &program,
+                args: &args,
+                windows_raw_arg,
+            },
             &cwd,
             &request.env,
             request.timeout_ms,
@@ -249,9 +259,7 @@ impl ProcessExecutor {
 
     fn execute_validated(
         &self,
-        program: &str,
-        args: &[String],
-        _windows_raw_arg: Option<&str>,
+        launch: ProcessLaunch<'_>,
         cwd: &Path,
         env: &[ProcessEnvVar],
         timeout_ms: u64,
@@ -270,10 +278,10 @@ impl ProcessExecutor {
             });
         }
 
-        let mut command = Command::new(program);
-        command.args(args);
+        let mut command = Command::new(launch.program);
+        command.args(launch.args);
         #[cfg(windows)]
-        if let Some(raw_arg) = _windows_raw_arg {
+        if let Some(raw_arg) = launch.windows_raw_arg {
             // cmd.exe owns parsing for the explicitly-authorized free-form shell surface.
             // Passing the command through std::process::Command::arg would quote embedded
             // Windows command syntax and corrupt nested quotes (for example tasklist /FI
