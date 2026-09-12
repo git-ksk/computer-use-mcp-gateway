@@ -19,6 +19,8 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -68,6 +70,12 @@ impl ProcessPolicy {
             // than widening the cleared child environment to APPDATA/LOCALAPPDATA.
             #[cfg(windows)]
             "USERPROFILE",
+            // Windows cryptographic/runtime initialization can fail after env_clear()
+            // when SystemRoot is absent (notably Node/OpenSSL CSPRNG startup and some
+            // inbox Windows utilities). Preserve only this OS locator rather than the
+            // broader user profile/application environment.
+            #[cfg(windows)]
+            "SystemRoot",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -198,6 +206,7 @@ impl ProcessExecutor {
         self.execute_validated(
             &request.program,
             &request.args,
+            None,
             &validated.cwd,
             &request.env,
             request.timeout_ms,
@@ -212,19 +221,16 @@ impl ProcessExecutor {
     ) -> Result<ProcessOutput, ProcessError> {
         let cwd = self.validate_common(&request.cwd, &request.env, request.timeout_ms)?;
         #[cfg(unix)]
-        let (program, args) = (
+        let (program, args, windows_raw_arg) = (
             "/bin/sh".to_owned(),
             vec!["-c".to_owned(), request.command.clone()],
+            None,
         );
         #[cfg(windows)]
-        let (program, args) = (
+        let (program, args, windows_raw_arg) = (
             "cmd.exe".to_owned(),
-            vec![
-                "/D".to_owned(),
-                "/S".to_owned(),
-                "/C".to_owned(),
-                request.command.clone(),
-            ],
+            vec!["/D".to_owned(), "/S".to_owned(), "/C".to_owned()],
+            Some(request.command.as_str()),
         );
         #[cfg(not(any(unix, windows)))]
         return Err(ProcessError::ShellUnsupportedPlatform);
@@ -233,6 +239,7 @@ impl ProcessExecutor {
         self.execute_validated(
             &program,
             &args,
+            windows_raw_arg,
             &cwd,
             &request.env,
             request.timeout_ms,
@@ -244,6 +251,7 @@ impl ProcessExecutor {
         &self,
         program: &str,
         args: &[String],
+        _windows_raw_arg: Option<&str>,
         cwd: &Path,
         env: &[ProcessEnvVar],
         timeout_ms: u64,
@@ -263,8 +271,16 @@ impl ProcessExecutor {
         }
 
         let mut command = Command::new(program);
+        command.args(args);
+        #[cfg(windows)]
+        if let Some(raw_arg) = _windows_raw_arg {
+            // cmd.exe owns parsing for the explicitly-authorized free-form shell surface.
+            // Passing the command through std::process::Command::arg would quote embedded
+            // Windows command syntax and corrupt nested quotes (for example tasklist /FI
+            // and node -e). raw_arg preserves the exact shell command after /C.
+            command.raw_arg(raw_arg);
+        }
         command
-            .args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -381,8 +397,8 @@ impl ProcessExecutor {
             .map_err(|_| ProcessError::ReaderPanicked)??;
         Ok(ProcessOutput {
             exit_code: status.code(),
-            stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+            stdout: decode_process_output(&stdout.bytes),
+            stderr: decode_process_output(&stderr.bytes),
             stdout_truncated: stdout.truncated,
             stderr_truncated: stderr.truncated,
             timed_out,
@@ -523,6 +539,54 @@ fn prove_process_domain_terminal(
             Err(ProcessError::OutcomeUnproven(failure_stage))
         }
     }
+}
+
+fn decode_process_output(bytes: &[u8]) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(decoded) = decode_windows_utf16(bytes) {
+            return decoded;
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn decode_windows_utf16(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let (little_endian, payload) = if bytes.starts_with(&[0xff, 0xfe]) {
+        (true, &bytes[2..])
+    } else if bytes.starts_with(&[0xfe, 0xff]) {
+        (false, &bytes[2..])
+    } else {
+        let pairs = bytes.len() / 2;
+        let odd_zeroes = bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|byte| **byte == 0)
+            .count();
+        let even_zeroes = bytes.iter().step_by(2).filter(|byte| **byte == 0).count();
+        let looks_utf16le =
+            odd_zeroes >= 2 && odd_zeroes * 8 >= pairs && odd_zeroes > even_zeroes * 2;
+        if !looks_utf16le {
+            return None;
+        }
+        (true, bytes)
+    };
+    if payload.len() % 2 != 0 {
+        return None;
+    }
+    let units = payload.chunks_exact(2).map(|pair| {
+        if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        }
+    });
+    Some(String::from_utf16_lossy(&units.collect::<Vec<_>>()))
 }
 
 fn drain_bounded<R: Read>(mut reader: R, max: usize) -> Result<BoundedBytes, ProcessError> {
@@ -775,6 +839,7 @@ mod tests {
         let root = temp_root("windows-userprofile");
         let policy = ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap();
         assert!(policy.inherited_env_keys.contains("USERPROFILE"));
+        assert!(policy.inherited_env_keys.contains("SystemRoot"));
         assert!(!policy.inherited_env_keys.contains("APPDATA"));
         assert!(!policy.inherited_env_keys.contains("LOCALAPPDATA"));
 
@@ -792,6 +857,102 @@ mod tests {
         assert!(!output.stdout.trim().is_empty());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_cmd_contract_handles_env_quotes_compound_and_inbox_tools() {
+        let root = temp_root("windows-cmd-contract");
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+        for (command, expected) in [
+            ("hostname", None),
+            ("echo %USERPROFILE%", None),
+            (
+                "for %I in (\"hello world\") do @echo %~I",
+                Some("hello world"),
+            ),
+            ("echo A&&echo B", Some("A\r\nB")),
+            ("tasklist /FI \"IMAGENAME eq cmd.exe\"", None),
+        ] {
+            let output = executor
+                .execute_shell(
+                    &ShellRequest {
+                        command: command.into(),
+                        cwd: root.to_string_lossy().into_owned(),
+                        env: vec![],
+                        timeout_ms: 10_000,
+                    },
+                    &ProcessCancellation::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                output.exit_code,
+                Some(0),
+                "command failed: {command}: {}",
+                output.stderr
+            );
+            assert!(!output.stdout.trim().is_empty(), "empty stdout: {command}");
+            if let Some(expected) = expected {
+                assert!(
+                    output.stdout.contains(expected),
+                    "stdout mismatch for {command}: {}",
+                    output.stdout
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_node_crypto_initializes_with_minimal_systemroot_inheritance() {
+        if Command::new("node.exe").arg("--version").output().is_err() {
+            return;
+        }
+        let root = temp_root("windows-node-crypto");
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+        let output = executor
+            .execute_shell(
+                &ShellRequest {
+                    command:
+                        "node -e \"console.log(require('crypto').randomBytes(4).toString('hex'))\""
+                            .into(),
+                    cwd: root.to_string_lossy().into_owned(),
+                    env: vec![],
+                    timeout_ms: 10_000,
+                },
+                &ProcessCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            output.exit_code,
+            Some(0),
+            "node crypto failed: {}",
+            output.stderr
+        );
+        assert_eq!(output.stdout.trim().len(), 8);
+        assert!(
+            output
+                .stdout
+                .trim()
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utf16le_stderr_is_decoded_without_nul_garbling() {
+        let encoded: Vec<u8> = "Windows PowerShell 日本語\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let decoded = decode_process_output(&encoded);
+        assert_eq!(decoded, "Windows PowerShell 日本語\r\n");
+        assert!(!decoded.contains('\0'));
     }
 
     #[cfg(unix)]

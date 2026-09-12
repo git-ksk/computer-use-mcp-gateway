@@ -1959,7 +1959,6 @@ done
         (config, root)
     }
 
-    #[cfg(unix)]
     fn fixture_authority_request() -> AgentAuthorityRequest {
         AgentAuthorityRequest {
             principal_binding: "a".repeat(64),
