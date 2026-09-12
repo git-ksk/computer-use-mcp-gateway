@@ -4382,7 +4382,7 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_SHELL,
-            "Execute a bounded free-form shell command. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; nohup/backgrounding is not a supported persistence mechanism. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the shell command.",
+            "Execute a bounded free-form shell command. On Windows the dialect is exactly cmd.exe /D /S /C (use %NAME% for available environment variables; do not wrap the entire command in an extra quote pair); on Unix it is /bin/sh -c. The child environment is intentionally allowlisted rather than a full login shell environment. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; nohup/backgrounding is not a supported persistence mechanism. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the shell command.",
             object_schema(
                 vec![
                     ("operation_id", operation_id_schema()),
@@ -7316,6 +7316,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shell_tool_description_pins_platform_dialects() {
+        let tool = all_tools()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == TOOL_SHELL)
+            .unwrap();
+        let value = serde_json::to_value(tool).unwrap();
+        let description = value["description"].as_str().unwrap();
+        assert!(description.contains("cmd.exe /D /S /C"));
+        assert!(description.contains("%NAME%"));
+        assert!(description.contains("/bin/sh -c"));
+        assert!(description.contains("do not wrap the entire command"));
+    }
     #[test]
     fn effectful_tool_schemas_accept_bounded_audit_labels_but_observe_tools_do_not() {
         let tools = all_tools();
