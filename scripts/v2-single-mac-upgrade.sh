@@ -163,7 +163,8 @@ CARGO_BUILD_JOBS="${CUMG_V2_CARGO_BUILD_JOBS:-2}"
 MIN_BUILD_FREE_MIB="${CUMG_V2_MIN_BUILD_FREE_MIB:-6144}"
 UPGRADE_TRANSACTION_HELPER="$SUPPORT_ROOT/v2_upgrade_transaction.py"
 if [[ "$RECOVERY_UPGRADE_MODE" == "1" ]]; then
-  UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/quarantine-recovery-upgrade.json"
+  RECOVERY_UPGRADE_ATTEMPT_ID="$(date '+%s')-$$"
+  UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/quarantine-recovery-upgrade-$RECOVERY_UPGRADE_ATTEMPT_ID.json"
 else
   UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/upgrade-transaction.json"
 fi
@@ -620,13 +621,23 @@ upgrade_transaction_exit() {
 }
 trap upgrade_transaction_exit EXIT
 tx_advance() {
-  python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" advance "$@" >/dev/null || {
-    UPGRADE_FAILURE_STATUS="operator_action_required"
-    UPGRADE_FAILURE_REASON="transaction_update_failed"
-    UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
-    echo "REFUSED reason=upgrade_transaction_update_failed" >&2
+  local tx_error tx_detail
+  tx_error="$(mktemp /private/tmp/cumg-v2-tx-error.XXXXXX)"
+  if ! python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" advance "$@" >/dev/null 2>"$tx_error"; then
+    tx_detail="$(head -c 512 "$tx_error" | tr '\n\r' '  ' | sed 's/[^A-Za-z0-9_.:= -]/_/g')"
+    rm -f "$tx_error"
+    if [[ "$UPGRADE_FAILURE_STATUS" == "failed_before_install" ]]; then
+      UPGRADE_FAILURE_REASON="transaction_update_failed"
+      UPGRADE_OPERATOR_ACTION="restore_capacity_and_retry"
+    else
+      UPGRADE_FAILURE_STATUS="operator_action_required"
+      UPGRADE_FAILURE_REASON="transaction_update_failed"
+      UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+    fi
+    echo "REFUSED reason=upgrade_transaction_update_failed detail=$tx_detail" >&2
     exit 2
-  }
+  fi
+  rm -f "$tx_error"
 }
 
 if [[ "$ARTIFACT_MODE" == "0" ]]; then

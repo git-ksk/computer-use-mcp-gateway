@@ -173,7 +173,7 @@ fn quarantine_recovery_upgrade_preserves_exact_unknown_pointer_click_without_wea
 
     assert!(upgrade.contains("--preserve-quarantine-operation-id"));
     assert!(upgrade.contains("quarantine_recovery_requires_artifact_mode"));
-    assert!(upgrade.contains("quarantine-recovery-upgrade.json"));
+    assert!(upgrade.contains("quarantine-recovery-upgrade-$RECOVERY_UPGRADE_ATTEMPT_ID.json"));
     assert!(upgrade.contains("preserved_quarantine_not_exact_pointer_click"));
     assert!(upgrade.contains("\"capability\": \"pointer_click\""));
     assert!(upgrade.contains("\"execution_outcome\": \"indeterminate\""));
