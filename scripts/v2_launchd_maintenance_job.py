@@ -393,6 +393,7 @@ def run_upgrade_one_shot(
     *,
     repo_root: pathlib.Path | None,
     artifact_bundle: pathlib.Path | None = None,
+    preserve_quarantine_operation_id: str | None = None,
     domain: str,
     launchctl: str,
     job_dir: pathlib.Path,
@@ -414,12 +415,20 @@ def run_upgrade_one_shot(
         program_arguments = [
             "/bin/bash", str(upgrade), "--artifact-bundle", str(artifact_bundle)
         ]
+        if preserve_quarantine_operation_id is not None:
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,180}", preserve_quarantine_operation_id):
+                raise MaintenanceError("invalid_preserved_quarantine_operation_id")
+            program_arguments.extend(
+                ["--preserve-quarantine-operation-id", preserve_quarantine_operation_id]
+            )
     else:
         if repo_root is None:
             raise MaintenanceError("upgrade_source_required")
         repo_root = repo_root.resolve(strict=True)
         upgrade = repo_root / "scripts/v2-single-mac-upgrade.sh"
         working_directory = repo_root
+        if preserve_quarantine_operation_id is not None:
+            raise MaintenanceError("quarantine_recovery_requires_artifact_mode")
         program_arguments = ["/bin/bash", str(upgrade)]
     if not upgrade.is_file() or upgrade.is_symlink():
         raise MaintenanceError("upgrade_helper_missing_or_unsafe")
@@ -513,6 +522,10 @@ def _parser() -> argparse.ArgumentParser:
         type=pathlib.Path,
         help="verified extracted single-Mac artifact bundle (normal operator path)",
     )
+    run.add_argument(
+        "--preserve-quarantine-operation-id",
+        help="artifact-only exact PointerClick quarantine to preserve across a recovery runtime upgrade",
+    )
     run.add_argument("--timeout-secs", type=float, default=DEFAULT_TIMEOUT_SECS)
     return parser
 
@@ -560,6 +573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             exit_code = run_upgrade_one_shot(
                 repo_root=repo_root,
                 artifact_bundle=args.artifact_bundle,
+                preserve_quarantine_operation_id=args.preserve_quarantine_operation_id,
                 domain=args.domain,
                 launchctl=args.launchctl,
                 job_dir=args.job_dir,
