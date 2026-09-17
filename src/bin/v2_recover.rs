@@ -341,7 +341,6 @@ const GUIDED_RECOVERY_EVIDENCE: &str = "guided_recovery_authoritative_incident_r
 const GUIDED_HUMAN_HISTORICAL_EVIDENCE: &str = "guided_recovery_human_historical_assertion_v1";
 #[cfg(target_os = "macos")]
 const GUIDED_CURRENT_STATE_EVIDENCE: &str = "guided_recovery_current_state_accepted_v1";
-#[cfg(target_os = "macos")]
 const GUIDED_MUTATION_RESUME_EVIDENCE: &str = "guided_recovery_mutation_resume_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
