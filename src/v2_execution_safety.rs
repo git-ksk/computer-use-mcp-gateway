@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 12;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 13;
+const SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 12;
 const REPLAY_TOMBSTONE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 11;
 const CURRENT_STATE_ACCEPTANCE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 10;
 const EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 9;
@@ -48,6 +49,7 @@ pub const MAX_RETIREMENT_REASON_BYTES: usize = 1024;
 pub const MAX_RETIREMENT_RECORDS: usize = 64;
 pub const REQUEST_FINGERPRINT_ALGORITHM: &str = "hmac-sha256:cumg-v2-shell-process-v1";
 pub const TEXT_INPUT_FINGERPRINT_ALGORITHM: &str = "hmac-sha256:cumg-v2-text-input-v1";
+pub const POINTER_CLICK_FINGERPRINT_ALGORITHM: &str = "hmac-sha256:cumg-v2-pointer-click-v1";
 pub const OPERATION_EVIDENCE_ENVELOPE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +161,7 @@ pub enum RetirementOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum RetirementPolicy {
     TransientUiInteractionV1,
+    AcknowledgedUnknownPointerClickV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -185,7 +188,7 @@ struct RetirementTransition {
     now_ms: u64,
 }
 
-pub const fn retirement_policy_for_capability(
+pub const fn offline_retirement_policy_for_capability(
     capability: DeviceCapability,
 ) -> Option<RetirementPolicy> {
     match capability {
@@ -194,6 +197,26 @@ pub const fn retirement_policy_for_capability(
         }
         _ => None,
     }
+}
+
+pub const fn current_state_acceptance_policy_for_capability(
+    capability: DeviceCapability,
+) -> Option<RetirementPolicy> {
+    match capability {
+        DeviceCapability::Scroll | DeviceCapability::MovePointer => {
+            Some(RetirementPolicy::TransientUiInteractionV1)
+        }
+        DeviceCapability::PointerClick => Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1),
+        _ => None,
+    }
+}
+
+/// Backward-compatible helper used by offline-maintenance inspection. New
+/// current-state acceptance code must use the disposition-specific helper above.
+pub const fn retirement_policy_for_capability(
+    capability: DeviceCapability,
+) -> Option<RetirementPolicy> {
+    offline_retirement_policy_for_capability(capability)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,7 +474,9 @@ impl OperationRequestFingerprint {
     pub fn validate(&self) -> Result<(), ExecutionError> {
         if !matches!(
             self.algorithm.as_str(),
-            REQUEST_FINGERPRINT_ALGORITHM | TEXT_INPUT_FINGERPRINT_ALGORITHM
+            REQUEST_FINGERPRINT_ALGORITHM
+                | TEXT_INPUT_FINGERPRINT_ALGORITHM
+                | POINTER_CLICK_FINGERPRINT_ALGORITHM
         ) || self.key_id.len() != 16
             || !self
                 .key_id
@@ -760,6 +785,42 @@ pub fn fingerprint_shell_request(
     fingerprint_canonical_contract(secret, REQUEST_FINGERPRINT_ALGORITHM, &contract)
 }
 
+pub fn fingerprint_pointer_click_request(
+    secret: &[u8],
+    command: &DeviceCommand,
+) -> Result<OperationRequestFingerprint, ExecutionError> {
+    let contract = match command {
+        DeviceCommand::PointerClick { x, y, button } => json!({
+            "contract": "pointer_click",
+            "kind": "legacy_desktop_coordinate",
+            "x": x,
+            "y": y,
+            "button": button,
+        }),
+        DeviceCommand::PointerClickAdvanced {
+            context_id,
+            target,
+            button,
+            click_count,
+            action,
+            modifiers,
+            delivery,
+        } => json!({
+            "contract": "pointer_click",
+            "kind": "advanced",
+            "context_id": context_id,
+            "target": target,
+            "button": button,
+            "click_count": click_count,
+            "action": action,
+            "modifiers": modifiers,
+            "delivery": delivery,
+        }),
+        _ => return Err(ExecutionError::InvalidOperation),
+    };
+    fingerprint_canonical_contract(secret, POINTER_CLICK_FINGERPRINT_ALGORITHM, &contract)
+}
+
 pub fn compare_request_fingerprint(
     stored: Option<&OperationRequestFingerprint>,
     candidate: Option<&OperationRequestFingerprint>,
@@ -842,7 +903,15 @@ impl RetirementRecord {
                 ReconciliationStatus::OperatorRequired
                     | ReconciliationStatus::UnrecoverableEvidenceGap
             )
-            && retirement_policy_for_capability(self.capability) == Some(self.policy)
+            && match self.disposition {
+                RetirementDisposition::Retired => {
+                    offline_retirement_policy_for_capability(self.capability) == Some(self.policy)
+                }
+                RetirementDisposition::CurrentStateAccepted => {
+                    current_state_acceptance_policy_for_capability(self.capability)
+                        == Some(self.policy)
+                }
+            }
             && matches!(
                 (self.disposition, self.authority),
                 (
@@ -857,6 +926,57 @@ impl RetirementRecord {
             && self.reason.len() <= MAX_RETIREMENT_REASON_BYTES
             && self.authorized_device_generation > self.operation.device_generation
             && !self.replayed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationResumeBarrier {
+    pub device_id: String,
+    pub source_operation_id: String,
+    pub source_device_generation: u64,
+    pub accepted_generation: u64,
+    pub policy: RetirementPolicy,
+    pub created_at_ms: u64,
+}
+
+impl MutationResumeBarrier {
+    fn is_valid(&self) -> bool {
+        !self.device_id.trim().is_empty()
+            && self.device_id.len() <= MAX_RECONCILIATION_DEVICE_ID_BYTES
+            && !self.source_operation_id.trim().is_empty()
+            && self.source_operation_id.len() <= MAX_RECONCILIATION_OPERATION_ID_BYTES
+            && self.source_device_generation > 0
+            && self.accepted_generation > self.source_device_generation
+            && self.policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1
+            && self.created_at_ms > 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationResumeRecord {
+    pub device_id: String,
+    pub source_operation_id: String,
+    pub accepted_generation: u64,
+    pub resumed_generation: u64,
+    pub policy: RetirementPolicy,
+    pub authority: RetirementAuthority,
+    pub reason: String,
+    pub resumed_at_ms: u64,
+}
+
+impl MutationResumeRecord {
+    fn is_valid(&self) -> bool {
+        !self.device_id.trim().is_empty()
+            && self.device_id.len() <= MAX_RECONCILIATION_DEVICE_ID_BYTES
+            && !self.source_operation_id.trim().is_empty()
+            && self.source_operation_id.len() <= MAX_RECONCILIATION_OPERATION_ID_BYTES
+            && self.accepted_generation > 0
+            && self.resumed_generation > self.accepted_generation
+            && self.policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1
+            && self.authority == RetirementAuthority::LocalUserPresence
+            && !self.reason.trim().is_empty()
+            && self.reason.len() <= MAX_RETIREMENT_REASON_BYTES
+            && self.resumed_at_ms > 0
     }
 }
 
@@ -1066,6 +1186,10 @@ pub struct AuthoritativeSafetySnapshot {
     pub auto_resolutions: Vec<AutoResolutionRecord>,
     #[serde(default)]
     pub retirements: Vec<RetirementRecord>,
+    #[serde(default)]
+    pub mutation_resume_barriers: Vec<MutationResumeBarrier>,
+    #[serde(default)]
+    pub mutation_resumes: Vec<MutationResumeRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -1104,6 +1228,8 @@ pub struct AuthoritativeOperationController {
     resolutions: Vec<ResolutionRecord>,
     auto_resolutions: Vec<AutoResolutionRecord>,
     retirements: Vec<RetirementRecord>,
+    mutation_resume_barriers: HashMap<String, MutationResumeBarrier>,
+    mutation_resumes: Vec<MutationResumeRecord>,
 }
 
 impl AuthoritativeOperationController {
@@ -1116,6 +1242,8 @@ impl AuthoritativeOperationController {
             resolutions: Vec::new(),
             auto_resolutions: Vec::new(),
             retirements: Vec::new(),
+            mutation_resume_barriers: HashMap::new(),
+            mutation_resumes: Vec::new(),
         })
     }
 
@@ -1159,6 +1287,13 @@ impl AuthoritativeOperationController {
             evidence_envelope,
             semantic_constraint,
         } = metadata;
+        if !matches!(capability.class(), crate::v2_m0::CapabilityClass::Observe)
+            && let Some(barrier) = self.mutation_resume_barriers.get(&operation.device_id)
+        {
+            return Err(ExecutionError::MutationResumeRequired {
+                operation_id: barrier.source_operation_id.clone(),
+            });
+        }
         let execution_lane = if self.quarantines.contains_key(&operation.device_id) {
             if !capability.is_recovery_evidence_read_only() {
                 let blocking_operation_id = self
@@ -1752,8 +1887,15 @@ impl AuthoritativeOperationController {
         ) {
             return Err(ExecutionError::InvalidTransition);
         }
-        let policy = retirement_policy_for_capability(record.capability)
-            .ok_or(ExecutionError::InvalidTransition)?;
+        let policy = match disposition {
+            RetirementDisposition::Retired => {
+                offline_retirement_policy_for_capability(record.capability)
+            }
+            RetirementDisposition::CurrentStateAccepted => {
+                current_state_acceptance_policy_for_capability(record.capability)
+            }
+        }
+        .ok_or(ExecutionError::InvalidTransition)?;
         if policy != requested_policy {
             return Err(ExecutionError::InvalidTransition);
         }
@@ -1788,7 +1930,49 @@ impl AuthoritativeOperationController {
             return Err(ExecutionError::InvalidTransition);
         }
 
-        let next = self.admission.retire_indeterminate(operation_id)?;
+        let requires_mutation_barrier = disposition == RetirementDisposition::CurrentStateAccepted
+            && policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1;
+        let next = if requires_mutation_barrier {
+            if self
+                .mutation_resume_barriers
+                .contains_key(&retirement.operation.device_id)
+            {
+                return Err(ExecutionError::InvalidTransition);
+            }
+            let cancelled = self
+                .admission
+                .retire_indeterminate_and_cancel_queued(operation_id)?;
+            for queued in cancelled {
+                let record = self
+                    .operations
+                    .get_mut(&queued.operation_id)
+                    .ok_or(ExecutionError::InvalidTransition)?;
+                if record.state != HubOperationState::Queued {
+                    return Err(ExecutionError::InvalidTransition);
+                }
+                record.state = HubOperationState::Cancelled;
+                record.receipt = Some(Self::receipt_for(
+                    record,
+                    HubOperationState::Cancelled,
+                    ExecutionEvidence::CancelledBeforeDispatch,
+                    now_ms,
+                ));
+            }
+            self.mutation_resume_barriers.insert(
+                retirement.operation.device_id.clone(),
+                MutationResumeBarrier {
+                    device_id: retirement.operation.device_id.clone(),
+                    source_operation_id: retirement.operation.operation_id.clone(),
+                    source_device_generation: retirement.operation.device_generation,
+                    accepted_generation: authorized_device_generation,
+                    policy,
+                    created_at_ms: now_ms,
+                },
+            );
+            CompletionDecision::Idle
+        } else {
+            self.admission.retire_indeterminate(operation_id)?
+        };
         self.quarantines.remove(&retirement.operation.device_id);
         self.retirements.push(retirement.clone());
         self.rotate_retirement_history()?;
@@ -1796,12 +1980,76 @@ impl AuthoritativeOperationController {
         Ok((next, retirement))
     }
 
+    pub fn mutation_resume_barrier(&self, device_id: &str) -> Option<&MutationResumeBarrier> {
+        self.mutation_resume_barriers.get(device_id)
+    }
+
+    pub fn mutation_resume_records(&self) -> &[MutationResumeRecord] {
+        &self.mutation_resumes
+    }
+
+    pub fn resume_mutations(
+        &mut self,
+        device_id: &str,
+        source_operation_id: &str,
+        authority: RetirementAuthority,
+        authorized_device_generation: u64,
+        reason: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<MutationResumeRecord, ExecutionError> {
+        let reason = reason.into();
+        if authority != RetirementAuthority::LocalUserPresence
+            || reason.trim().is_empty()
+            || reason.len() > MAX_RETIREMENT_REASON_BYTES
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        let barrier = self
+            .mutation_resume_barriers
+            .get(device_id)
+            .cloned()
+            .ok_or(ExecutionError::InvalidTransition)?;
+        if barrier.source_operation_id != source_operation_id
+            || authorized_device_generation <= barrier.accepted_generation
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        let record = MutationResumeRecord {
+            device_id: barrier.device_id.clone(),
+            source_operation_id: barrier.source_operation_id.clone(),
+            accepted_generation: barrier.accepted_generation,
+            resumed_generation: authorized_device_generation,
+            policy: barrier.policy,
+            authority,
+            reason,
+            resumed_at_ms: now_ms,
+        };
+        if !record.is_valid() || self.mutation_resumes.len() >= MAX_RETIREMENT_RECORDS {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        self.mutation_resume_barriers.remove(device_id);
+        self.mutation_resumes.push(record.clone());
+        // Resume audit is retained/rotated in lockstep with the detailed
+        // retirement record that proves how the barrier originated. Rotating it
+        // independently can leave a still-retained PointerClick retirement with
+        // neither an active barrier nor durable resume proof.
+        Ok(record)
+    }
+
     fn rotate_retirement_history(&mut self) -> Result<(), ExecutionError> {
         while self.retirements.len() > MAX_RETIREMENT_RECORDS {
+            // An active post-recovery barrier is authority-bearing state. Its
+            // source retirement must stay detailed until the Human has explicitly
+            // resumed mutations. Other retirement details may rotate normally.
             let oldest_index = self
                 .retirements
                 .iter()
                 .enumerate()
+                .filter(|(_, retirement)| {
+                    !self.mutation_resume_barriers.values().any(|barrier| {
+                        barrier.source_operation_id == retirement.operation.operation_id
+                    })
+                })
                 .min_by(|(_, left), (_, right)| {
                     left.retired_at_ms.cmp(&right.retired_at_ms).then_with(|| {
                         left.operation
@@ -1812,6 +2060,25 @@ impl AuthoritativeOperationController {
                 .map(|(index, _)| index)
                 .ok_or(ExecutionError::InvalidTransition)?;
             let retired = self.retirements.remove(oldest_index);
+
+            if retired.policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1 {
+                // Once the active barrier is gone, a PointerClick retirement is
+                // safe to compact only if the separate Human resume is durably
+                // recorded. Rotate that audit record atomically with its source
+                // retirement so every persisted checkpoint remains self-consistent.
+                let resume_index = self
+                    .mutation_resumes
+                    .iter()
+                    .position(|resume| {
+                        resume.source_operation_id == retired.operation.operation_id
+                            && resume.device_id == retired.operation.device_id
+                            && resume.accepted_generation == retired.authorized_device_generation
+                            && resume.policy == retired.policy
+                    })
+                    .ok_or(ExecutionError::InvalidTransition)?;
+                self.mutation_resumes.remove(resume_index);
+            }
+
             self.admission
                 .compact_retired_indeterminate_detail(&retired.operation.operation_id)?;
             if self
@@ -2197,6 +2464,15 @@ impl AuthoritativeOperationController {
         recoveries.sort_by(|a, b| a.operation.operation_id.cmp(&b.operation.operation_id));
         let mut quarantines: Vec<_> = quarantines.into_values().collect();
         quarantines.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let mut mutation_resume_barriers: Vec<_> =
+            self.mutation_resume_barriers.values().cloned().collect();
+        mutation_resume_barriers.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let mut mutation_resumes = self.mutation_resumes.clone();
+        mutation_resumes.sort_by(|a, b| {
+            a.resumed_at_ms
+                .cmp(&b.resumed_at_ms)
+                .then_with(|| a.source_operation_id.cmp(&b.source_operation_id))
+        });
         AuthoritativeSafetySnapshot {
             schema_version: EXECUTION_SAFETY_SCHEMA_VERSION,
             admission,
@@ -2206,6 +2482,8 @@ impl AuthoritativeOperationController {
             resolutions: self.resolutions.clone(),
             auto_resolutions: self.auto_resolutions.clone(),
             retirements: self.retirements.clone(),
+            mutation_resume_barriers,
+            mutation_resumes,
         }
     }
 
@@ -2244,6 +2522,20 @@ impl AuthoritativeOperationController {
                 .recoveries
                 .iter()
                 .any(|record| record.semantic_constraint.is_some());
+        let has_v13_mutation_resume_state = !snapshot.mutation_resume_barriers.is_empty()
+            || !snapshot.mutation_resumes.is_empty()
+            || snapshot
+                .retirements
+                .iter()
+                .any(|record| record.policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1)
+            || snapshot.operations.iter().any(|record| {
+                record
+                    .request_fingerprint
+                    .as_ref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.algorithm == POINTER_CLICK_FINGERPRINT_ALGORITHM
+                    })
+            });
         let has_v6_state = snapshot.resolutions.iter().any(|resolution| {
             resolution.decision == IndeterminateResolution::ConfirmedEffectAppliedUncommitted
         });
@@ -2272,8 +2564,25 @@ impl AuthoritativeOperationController {
         });
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v13_mutation_resume_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version =
+                            SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version =
+                        SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             REPLAY_TOMBSTONE_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v12_semantic_constraint_state {
+                if has_v13_mutation_resume_state || has_v12_semantic_constraint_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2289,7 +2598,10 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             CURRENT_STATE_ACCEPTANCE_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v11_compacted_state || has_v12_semantic_constraint_state {
+                if has_v13_mutation_resume_state
+                    || has_v11_compacted_state
+                    || has_v12_semantic_constraint_state
+                {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.admission = self.admission.snapshot_for_restart_legacy_retired_ids();
@@ -2307,7 +2619,11 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v10_state || has_v11_compacted_state || has_v12_semantic_constraint_state {
+                if has_v13_mutation_resume_state
+                    || has_v10_state
+                    || has_v11_compacted_state
+                    || has_v12_semantic_constraint_state
+                {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 snapshot.admission = self.admission.snapshot_for_restart_legacy_retired_ids();
@@ -2324,7 +2640,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RECOVERY_EVIDENCE_READ_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v9_state
+                if has_v13_mutation_resume_state
+                    || has_v9_state
                     || has_v10_state
                     || has_v11_compacted_state
                     || has_v12_semantic_constraint_state
@@ -2346,7 +2663,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             EVIDENCE_ENVELOPE_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v8_state
+                if has_v13_mutation_resume_state
+                    || has_v8_state
                     || has_v9_state
                     || has_v10_state
                     || has_v11_compacted_state
@@ -2368,7 +2686,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             PARTIAL_INPUT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v7_state
+                if has_v13_mutation_resume_state
+                    || has_v7_state
                     || has_v8_state
                     || has_v9_state
                     || has_v10_state
@@ -2390,7 +2709,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RETIREMENT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v6_state
+                if has_v13_mutation_resume_state
+                    || has_v6_state
                     || has_v7_state
                     || has_v8_state
                     || has_v9_state
@@ -2413,7 +2733,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RECONCILIATION_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v5_state
+                if has_v13_mutation_resume_state
+                    || has_v5_state
                     || has_v6_state
                     || has_v7_state
                     || has_v8_state
@@ -2442,7 +2763,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             AUDIT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v4_state
+                if has_v13_mutation_resume_state
+                    || has_v4_state
                     || has_v5_state
                     || has_v6_state
                     || has_v7_state
@@ -2474,7 +2796,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v4_state
+                if has_v13_mutation_resume_state
+                    || has_v4_state
                     || has_v5_state
                     || has_v6_state
                     || has_v7_state
@@ -2507,7 +2830,8 @@ impl AuthoritativeOperationController {
                 Ok(snapshot)
             }
             LEGACY_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v4_state
+                if has_v13_mutation_resume_state
+                    || has_v4_state
                     || has_v5_state
                     || has_v6_state
                     || has_v7_state
@@ -2560,6 +2884,7 @@ impl AuthoritativeOperationController {
                 | EFFECTFUL_RECOVERY_EXECUTION_SAFETY_SCHEMA_VERSION
                 | CURRENT_STATE_ACCEPTANCE_EXECUTION_SAFETY_SCHEMA_VERSION
                 | REPLAY_TOMBSTONE_EXECUTION_SAFETY_SCHEMA_VERSION
+                | SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -2604,7 +2929,7 @@ impl AuthoritativeOperationController {
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION
             && (snapshot
                 .operations
                 .iter()
@@ -2613,6 +2938,23 @@ impl AuthoritativeOperationController {
                     .recoveries
                     .iter()
                     .any(|record| record.semantic_constraint.is_some()))
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && (!snapshot.mutation_resume_barriers.is_empty()
+                || !snapshot.mutation_resumes.is_empty()
+                || snapshot.retirements.iter().any(|record| {
+                    record.policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1
+                })
+                || snapshot.operations.iter().any(|record| {
+                    record
+                        .request_fingerprint
+                        .as_ref()
+                        .is_some_and(|fingerprint| {
+                            fingerprint.algorithm == POINTER_CLICK_FINGERPRINT_ALGORITHM
+                        })
+                }))
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -2836,7 +3178,7 @@ impl AuthoritativeOperationController {
             }
         }
         if !retirement_ids.is_subset(&admission_retired_ids)
-            || (snapshot_schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            || (snapshot_schema_version < SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION
                 && admission_retired_ids != retirement_ids)
         {
             return Err(ExecutionError::InvalidSnapshot);
@@ -2859,6 +3201,59 @@ impl AuthoritativeOperationController {
         }
         if snapshot.retirements.len() > MAX_RETIREMENT_RECORDS {
             return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.mutation_resumes.len() > MAX_RETIREMENT_RECORDS {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        let mut mutation_resume_barriers = HashMap::new();
+        let mut barrier_sources = std::collections::HashSet::new();
+        for barrier in snapshot.mutation_resume_barriers {
+            let matching_retirement = snapshot.retirements.iter().find(|retirement| {
+                retirement.operation.operation_id == barrier.source_operation_id
+                    && retirement.operation.device_id == barrier.device_id
+                    && retirement.operation.device_generation == barrier.source_device_generation
+                    && retirement.authorized_device_generation == barrier.accepted_generation
+                    && retirement.policy == barrier.policy
+                    && retirement.disposition == RetirementDisposition::CurrentStateAccepted
+                    && retirement.authority == RetirementAuthority::LocalUserPresence
+            });
+            if !barrier.is_valid()
+                || matching_retirement.is_none()
+                || quarantines.contains_key(&barrier.device_id)
+                || !barrier_sources.insert(barrier.source_operation_id.clone())
+                || mutation_resume_barriers
+                    .insert(barrier.device_id.clone(), barrier)
+                    .is_some()
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+        }
+        let mut mutation_resume_sources = std::collections::HashSet::new();
+        for resume in &snapshot.mutation_resumes {
+            let matching_retirement = snapshot.retirements.iter().find(|retirement| {
+                retirement.operation.operation_id == resume.source_operation_id
+                    && retirement.operation.device_id == resume.device_id
+                    && retirement.authorized_device_generation == resume.accepted_generation
+                    && retirement.policy == resume.policy
+                    && retirement.disposition == RetirementDisposition::CurrentStateAccepted
+                    && retirement.authority == RetirementAuthority::LocalUserPresence
+            });
+            if !resume.is_valid()
+                || matching_retirement.is_none()
+                || !mutation_resume_sources.insert(resume.source_operation_id.clone())
+                || barrier_sources.contains(&resume.source_operation_id)
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
+        }
+        for retirement in snapshot.retirements.iter().filter(|retirement| {
+            retirement.policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1
+        }) {
+            if !barrier_sources.contains(&retirement.operation.operation_id)
+                && !mutation_resume_sources.contains(&retirement.operation.operation_id)
+            {
+                return Err(ExecutionError::InvalidSnapshot);
+            }
         }
         if snapshot.auto_resolutions.len() > MAX_AUTO_RESOLUTION_RECORDS
             || snapshot
@@ -2919,6 +3314,8 @@ impl AuthoritativeOperationController {
             resolutions: snapshot.resolutions,
             auto_resolutions: snapshot.auto_resolutions,
             retirements: snapshot.retirements,
+            mutation_resume_barriers,
+            mutation_resumes: snapshot.mutation_resumes,
         })
     }
 
@@ -4350,6 +4747,383 @@ mod tests {
         );
         assert!(restored.quarantine("desktop-a").is_none());
         assert_eq!(restored.retirements(), &[retirement]);
+    }
+
+    #[test]
+    fn pointer_click_current_state_acceptance_requires_fresh_human_resume_barrier() {
+        let mut ledger = controller();
+        assert!(matches!(
+            ledger
+                .prepare(
+                    op("op-click-unknown", 4),
+                    alice(),
+                    DeviceCapability::PointerClick,
+                    100,
+                )
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        assert!(matches!(
+            ledger
+                .prepare(
+                    op("op-pre-quarantine-queued", 4),
+                    alice(),
+                    DeviceCapability::Shell,
+                    101,
+                )
+                .unwrap(),
+            AdmissionDecision::Queued { .. }
+        ));
+        ledger
+            .mark_dispatched("op-click-unknown", &alice(), 4, 110)
+            .unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-click-unknown",
+                &alice(),
+                4,
+                IndeterminateReason::BackendOutcomeUnproven,
+                120,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.state("op-pre-quarantine-queued"),
+            Some(HubOperationState::Cancelled)
+        );
+        assert_eq!(
+            ledger.retire_indeterminate(
+                "op-click-unknown",
+                RetirementAuthority::LocalMaintenanceOperator,
+                RetirementPolicy::AcknowledgedUnknownPointerClickV1,
+                "offline maintenance must not authorize an unknown click",
+                5,
+                125,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+        assert!(ledger.quarantine("desktop-a").is_some());
+
+        let (next, retirement) = ledger
+            .accept_current_state(
+                "op-click-unknown",
+                RetirementPolicy::AcknowledgedUnknownPointerClickV1,
+                "local human accepts the current state while the prior click remains unknown",
+                5,
+                130,
+            )
+            .unwrap();
+        assert_eq!(next, CompletionDecision::Idle);
+        assert_eq!(retirement.outcome, RetirementOutcome::Unknown);
+        assert_eq!(
+            retirement.disposition,
+            RetirementDisposition::CurrentStateAccepted
+        );
+        assert_eq!(retirement.authority, RetirementAuthority::LocalUserPresence);
+        assert_eq!(
+            retirement.policy,
+            RetirementPolicy::AcknowledgedUnknownPointerClickV1
+        );
+        assert_eq!(
+            ledger.state("op-click-unknown"),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(ledger.receipt("op-click-unknown").is_none());
+        assert!(ledger.quarantine("desktop-a").is_none());
+        let barrier = ledger.mutation_resume_barrier("desktop-a").unwrap();
+        assert_eq!(barrier.source_operation_id, "op-click-unknown");
+        assert_eq!(barrier.accepted_generation, 5);
+
+        assert_eq!(
+            ledger.prepare(
+                op("op-effectful-before-resume", 5),
+                alice(),
+                DeviceCapability::PointerClick,
+                131,
+            ),
+            Err(ExecutionError::MutationResumeRequired {
+                operation_id: "op-click-unknown".into(),
+            })
+        );
+        assert!(matches!(
+            ledger
+                .prepare(
+                    op("op-read-after-accept", 5),
+                    alice(),
+                    DeviceCapability::ListApplications,
+                    132,
+                )
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+        ledger
+            .request_cancel("op-read-after-accept", &alice(), 5, 133)
+            .unwrap();
+
+        assert_eq!(
+            ledger.resume_mutations(
+                "desktop-a",
+                "op-click-unknown",
+                RetirementAuthority::LocalUserPresence,
+                5,
+                "same generation must not re-arm mutation",
+                134,
+            ),
+            Err(ExecutionError::InvalidTransition)
+        );
+
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.schema_version, EXECUTION_SAFETY_SCHEMA_VERSION);
+        assert_eq!(
+            ledger.snapshot_for_restart_compatible_with(
+                SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        );
+        let mut restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        assert!(restored.mutation_resume_barrier("desktop-a").is_some());
+        assert_eq!(
+            restored.prepare(
+                op("op-effectful-after-restart-before-resume", 6),
+                alice(),
+                DeviceCapability::Shell,
+                140,
+            ),
+            Err(ExecutionError::MutationResumeRequired {
+                operation_id: "op-click-unknown".into(),
+            })
+        );
+
+        let resumed = restored
+            .resume_mutations(
+                "desktop-a",
+                "op-click-unknown",
+                RetirementAuthority::LocalUserPresence,
+                6,
+                "local human explicitly re-arms fresh mutations after generation rollover",
+                141,
+            )
+            .unwrap();
+        assert_eq!(resumed.accepted_generation, 5);
+        assert_eq!(resumed.resumed_generation, 6);
+        assert!(restored.mutation_resume_barrier("desktop-a").is_none());
+        assert_eq!(restored.mutation_resume_records(), &[resumed]);
+        assert_eq!(
+            restored.prepare(
+                op("op-click-unknown", 6),
+                alice(),
+                DeviceCapability::PointerClick,
+                142,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+        assert!(matches!(
+            restored
+                .prepare(
+                    op("op-fresh-mutation-after-resume", 6),
+                    alice(),
+                    DeviceCapability::PointerClick,
+                    143,
+                )
+                .unwrap(),
+            AdmissionDecision::StartNow(_)
+        ));
+
+        let restored_again = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            restored.snapshot_for_restart(),
+        )
+        .unwrap();
+        assert!(
+            restored_again
+                .mutation_resume_barrier("desktop-a")
+                .is_none()
+        );
+        assert_eq!(restored_again.mutation_resume_records().len(), 1);
+        assert_eq!(
+            restored_again.state("op-click-unknown"),
+            Some(HubOperationState::Indeterminate)
+        );
+    }
+
+    #[test]
+    fn pointer_click_resume_audit_rotates_atomically_with_source_retirement() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 8,
+        };
+        let mut ledger = AuthoritativeOperationController::new(limits).unwrap();
+        ledger
+            .prepare(
+                op("op-click-rotated", 1),
+                alice(),
+                DeviceCapability::PointerClick,
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-click-rotated", &alice(), 1, 2)
+            .unwrap();
+        ledger
+            .mark_indeterminate(
+                "op-click-rotated",
+                &alice(),
+                1,
+                IndeterminateReason::BackendOutcomeUnproven,
+                3,
+            )
+            .unwrap();
+        ledger
+            .accept_current_state(
+                "op-click-rotated",
+                RetirementPolicy::AcknowledgedUnknownPointerClickV1,
+                "human accepted current state before explicit mutation resume",
+                2,
+                4,
+            )
+            .unwrap();
+        ledger
+            .resume_mutations(
+                "desktop-a",
+                "op-click-rotated",
+                RetirementAuthority::LocalUserPresence,
+                3,
+                "human re-armed fresh mutations after generation rollover",
+                5,
+            )
+            .unwrap();
+        assert_eq!(ledger.retirements().len(), 1);
+        assert_eq!(ledger.mutation_resume_records().len(), 1);
+
+        for index in 0..MAX_RETIREMENT_RECORDS {
+            let operation_id = format!("op-scroll-rotate-{index:03}");
+            let generation = 10 + (index as u64 * 2);
+            ledger
+                .prepare(
+                    op(&operation_id, generation),
+                    alice(),
+                    DeviceCapability::Scroll,
+                    100 + index as u64 * 4,
+                )
+                .unwrap();
+            ledger
+                .mark_dispatched(&operation_id, &alice(), generation, 101 + index as u64 * 4)
+                .unwrap();
+            ledger
+                .mark_indeterminate(
+                    &operation_id,
+                    &alice(),
+                    generation,
+                    IndeterminateReason::BackendOutcomeUnproven,
+                    102 + index as u64 * 4,
+                )
+                .unwrap();
+            ledger
+                .retire_indeterminate(
+                    &operation_id,
+                    RetirementAuthority::LocalMaintenanceOperator,
+                    RetirementPolicy::TransientUiInteractionV1,
+                    "bounded transient scroll retirement for rotation coverage",
+                    generation + 1,
+                    103 + index as u64 * 4,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(ledger.retirements().len(), MAX_RETIREMENT_RECORDS);
+        assert!(
+            ledger
+                .retirements()
+                .iter()
+                .all(|record| record.operation.operation_id != "op-click-rotated")
+        );
+        assert!(ledger.mutation_resume_records().is_empty());
+        assert_eq!(ledger.state("op-click-rotated"), None);
+        assert_eq!(
+            ledger.prepare(
+                op("op-click-rotated", 200),
+                alice(),
+                DeviceCapability::PointerClick,
+                999,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+
+        let mut restored = AuthoritativeOperationController::restore_after_restart(
+            limits,
+            ledger.snapshot_for_restart(),
+        )
+        .unwrap();
+        assert!(restored.mutation_resume_records().is_empty());
+        assert_eq!(
+            restored.prepare(
+                op("op-click-rotated", 201),
+                alice(),
+                DeviceCapability::PointerClick,
+                1_000,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+    }
+
+    #[test]
+    fn pointer_click_fingerprint_is_keyed_exact_and_payload_free() {
+        let secret = [7_u8; 32];
+        let first = DeviceCommand::PointerClickAdvanced {
+            context_id: Some("ctx-one".into()),
+            target: crate::v2_m0::PointerTarget::WindowPhysical {
+                process_id: 42,
+                window_id: 99,
+                x: 12,
+                y: 34,
+            },
+            button: crate::v2_m0::PointerButton::Left,
+            click_count: 1,
+            action: None,
+            modifiers: Vec::new(),
+            delivery: InputDeliveryMode::Foreground,
+        };
+        let same = first.clone();
+        let changed = DeviceCommand::PointerClickAdvanced {
+            context_id: Some("ctx-one".into()),
+            target: crate::v2_m0::PointerTarget::WindowPhysical {
+                process_id: 42,
+                window_id: 99,
+                x: 12,
+                y: 35,
+            },
+            button: crate::v2_m0::PointerButton::Left,
+            click_count: 1,
+            action: None,
+            modifiers: Vec::new(),
+            delivery: InputDeliveryMode::Foreground,
+        };
+        let first = fingerprint_pointer_click_request(&secret, &first).unwrap();
+        let same = fingerprint_pointer_click_request(&secret, &same).unwrap();
+        let changed = fingerprint_pointer_click_request(&secret, &changed).unwrap();
+        assert_eq!(
+            compare_request_fingerprint(Some(&first), Some(&same)),
+            RequestFingerprintComparison::SameRequest
+        );
+        assert_eq!(
+            compare_request_fingerprint(Some(&first), Some(&changed)),
+            RequestFingerprintComparison::DifferentRequest
+        );
+        assert_eq!(first.algorithm, POINTER_CLICK_FINGERPRINT_ALGORITHM);
+        let serialized = serde_json::to_string(&first).unwrap();
+        assert!(!serialized.contains("ctx-one"));
+        assert!(!serialized.contains("window_id"));
+        assert!(!serialized.contains("process_id"));
     }
 
     #[test]

@@ -7,7 +7,9 @@
 //! macOS that key is intended to live in the Secure Enclave with user-presence
 //! access control; the Agent only relays the resulting authorization.
 
-use crate::v2_execution_safety::{DesktopQuarantine, IndeterminateReason, RetirementPolicy};
+use crate::v2_execution_safety::{
+    DesktopQuarantine, IndeterminateReason, MutationResumeBarrier, RetirementPolicy,
+};
 use crate::v2_m0_execution::IndeterminateResolution;
 use crate::v2_m0_transport::HubIdentity;
 use crate::v2_m1_keys::{KeyMaterialError, load_public_trust_bytes};
@@ -21,7 +23,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 2;
+pub const ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 3;
+const CURRENT_STATE_ACCEPTANCE_ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 2;
 const LEGACY_ONLINE_RECOVERY_SCHEMA_VERSION: u16 = 1;
 pub const RECOVERY_CHALLENGE_TTL_MS: u64 = 300_000;
 pub const MAX_RECOVERY_EVIDENCE_BYTES: usize = 1024;
@@ -38,6 +41,7 @@ const CHALLENGE_DOMAIN: &[u8] = b"cumg-v2-online-recovery-challenge-v1";
 const AUTHORIZATION_DOMAIN: &[u8] = b"cumg-v2-online-recovery-authorization-v1";
 const RESULT_DOMAIN: &[u8] = b"cumg-v2-online-recovery-result-v1";
 const FINGERPRINT_DOMAIN: &[u8] = b"cumg-v2-quarantine-fingerprint-v1";
+const MUTATION_RESUME_FINGERPRINT_DOMAIN: &[u8] = b"cumg-v2-mutation-resume-fingerprint-v1";
 const WEBAUTHN_PROOF_SCHEMA_VERSION: u16 = 1;
 const WEBAUTHN_VERIFIER_SCHEMA_VERSION: u16 = 1;
 const MAX_WEBAUTHN_VERIFIER_BYTES: usize = 4096;
@@ -61,11 +65,22 @@ pub enum RecoveryDecision {
     ConfirmedCompleted,
     ConfirmedNotExecuted,
     CurrentStateAccepted,
+    MutationsResumed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhase {
+    #[default]
+    QuarantineResolution,
+    MutationResume,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryChallenge {
     pub schema_version: u16,
+    #[serde(default)]
+    pub phase: RecoveryPhase,
     pub device_id: String,
     pub operation_id: String,
     /// Historical generation in which the ambiguous operation was dispatched.
@@ -82,6 +97,8 @@ pub struct RecoveryChallenge {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryAuthorization {
     pub schema_version: u16,
+    #[serde(default)]
+    pub phase: RecoveryPhase,
     pub request_id: String,
     pub device_id: String,
     pub operation_id: String,
@@ -104,6 +121,8 @@ pub struct RecoveryAuthorization {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryResolved {
     pub schema_version: u16,
+    #[serde(default)]
+    pub phase: RecoveryPhase,
     pub request_id: String,
     pub device_id: String,
     pub operation_id: String,
@@ -441,11 +460,44 @@ pub fn build_recovery_challenge(
     OsRng.fill_bytes(&mut nonce);
     let mut challenge = RecoveryChallenge {
         schema_version: ONLINE_RECOVERY_SCHEMA_VERSION,
+        phase: RecoveryPhase::QuarantineResolution,
         device_id: quarantine.device_id.clone(),
         operation_id: quarantine.operation_id.clone(),
         quarantine_generation: quarantine.device_generation,
         current_generation,
         quarantine_fingerprint: quarantine_fingerprint(quarantine),
+        nonce,
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(RECOVERY_CHALLENGE_TTL_MS),
+        signature: Vec::new(),
+    };
+    let bytes = challenge_signing_bytes(&challenge)?;
+    challenge.signature = hub_identity.sign_message(&bytes);
+    Ok(challenge)
+}
+
+pub fn build_mutation_resume_challenge(
+    hub_identity: &HubIdentity,
+    barrier: &MutationResumeBarrier,
+    current_generation: u64,
+    now_ms: u64,
+) -> Result<RecoveryChallenge, RecoveryError> {
+    if current_generation <= barrier.accepted_generation
+        || barrier.device_id.trim().is_empty()
+        || barrier.source_operation_id.trim().is_empty()
+    {
+        return Err(RecoveryError::InvalidMessage);
+    }
+    let mut nonce = [0_u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let mut challenge = RecoveryChallenge {
+        schema_version: ONLINE_RECOVERY_SCHEMA_VERSION,
+        phase: RecoveryPhase::MutationResume,
+        device_id: barrier.device_id.clone(),
+        operation_id: barrier.source_operation_id.clone(),
+        quarantine_generation: barrier.source_device_generation,
+        current_generation,
+        quarantine_fingerprint: mutation_resume_barrier_fingerprint(barrier),
         nonce,
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(RECOVERY_CHALLENGE_TTL_MS),
@@ -506,7 +558,15 @@ pub fn new_current_state_acceptance_authorization(
     policy: RetirementPolicy,
     evidence: impl Into<String>,
 ) -> Result<RecoveryAuthorization, RecoveryError> {
-    if challenge.schema_version < ONLINE_RECOVERY_SCHEMA_VERSION {
+    let minimum_schema = match policy {
+        RetirementPolicy::TransientUiInteractionV1 => {
+            CURRENT_STATE_ACCEPTANCE_ONLINE_RECOVERY_SCHEMA_VERSION
+        }
+        RetirementPolicy::AcknowledgedUnknownPointerClickV1 => ONLINE_RECOVERY_SCHEMA_VERSION,
+    };
+    if challenge.schema_version < minimum_schema
+        || challenge.phase != RecoveryPhase::QuarantineResolution
+    {
         return Err(RecoveryError::UnsupportedSchema);
     }
     new_authorization_with_decision(
@@ -514,6 +574,24 @@ pub fn new_current_state_acceptance_authorization(
         RecoveryAuditAssessment::Inconclusive,
         RecoveryDecision::CurrentStateAccepted,
         Some(policy),
+        evidence,
+    )
+}
+
+pub fn new_mutation_resume_authorization(
+    challenge: &RecoveryChallenge,
+    evidence: impl Into<String>,
+) -> Result<RecoveryAuthorization, RecoveryError> {
+    if challenge.schema_version < ONLINE_RECOVERY_SCHEMA_VERSION
+        || challenge.phase != RecoveryPhase::MutationResume
+    {
+        return Err(RecoveryError::UnsupportedSchema);
+    }
+    new_authorization_with_decision(
+        challenge,
+        RecoveryAuditAssessment::Inconclusive,
+        RecoveryDecision::MutationsResumed,
+        None,
         evidence,
     )
 }
@@ -530,6 +608,7 @@ fn new_authorization_with_decision(
     validate_evidence(&evidence)?;
     validate_recovery_decision(
         challenge.schema_version,
+        challenge.phase,
         audit_assessment,
         decision,
         current_state_policy,
@@ -543,6 +622,7 @@ fn new_authorization_with_decision(
     }
     Ok(RecoveryAuthorization {
         schema_version: challenge.schema_version,
+        phase: challenge.phase,
         request_id,
         device_id: challenge.device_id.clone(),
         operation_id: challenge.operation_id.clone(),
@@ -569,6 +649,7 @@ pub fn validate_authorization_against_challenge(
     validate_evidence(&authorization.evidence)?;
     validate_recovery_decision(
         authorization.schema_version,
+        authorization.phase,
         authorization.audit_assessment,
         authorization.decision,
         authorization.current_state_policy,
@@ -585,6 +666,7 @@ pub fn validate_authorization_against_challenge(
         return Err(RecoveryError::ExpiredChallenge);
     }
     if authorization.schema_version != challenge.schema_version
+        || authorization.phase != challenge.phase
         || authorization.device_id != challenge.device_id
         || authorization.operation_id != challenge.operation_id
         || authorization.quarantine_generation != challenge.quarantine_generation
@@ -605,6 +687,7 @@ pub fn build_recovery_resolved(
 ) -> Result<RecoveryResolved, RecoveryError> {
     let mut resolved = RecoveryResolved {
         schema_version: authorization.schema_version,
+        phase: authorization.phase,
         request_id: authorization.request_id.clone(),
         device_id: authorization.device_id.clone(),
         operation_id: authorization.operation_id.clone(),
@@ -653,7 +736,8 @@ pub fn verify_recovery_resolved_for_authorization(
         &authorization.device_id,
         authorization.current_generation,
     )?;
-    if resolved.operation_id != authorization.operation_id
+    if resolved.phase != authorization.phase
+        || resolved.operation_id != authorization.operation_id
         || resolved.decision != authorization.decision
         || resolved.current_state_policy != authorization.current_state_policy
     {
@@ -672,6 +756,19 @@ pub fn quarantine_fingerprint(quarantine: &DesktopQuarantine) -> [u8; 32] {
     push_str(&mut bytes, &quarantine.owner.subject);
     push_str(&mut bytes, indeterminate_reason_name(quarantine.reason));
     bytes.extend_from_slice(&quarantine.since_ms.to_be_bytes());
+    let digest = digest::digest(&digest::SHA256, &bytes);
+    digest.as_ref().try_into().expect("SHA-256 digest length")
+}
+
+pub fn mutation_resume_barrier_fingerprint(barrier: &MutationResumeBarrier) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    push_bytes(&mut bytes, MUTATION_RESUME_FINGERPRINT_DOMAIN);
+    push_str(&mut bytes, &barrier.device_id);
+    push_str(&mut bytes, &barrier.source_operation_id);
+    bytes.extend_from_slice(&barrier.source_device_generation.to_be_bytes());
+    bytes.extend_from_slice(&barrier.accepted_generation.to_be_bytes());
+    push_str(&mut bytes, current_state_policy_name(Some(barrier.policy)));
+    bytes.extend_from_slice(&barrier.created_at_ms.to_be_bytes());
     let digest = digest::digest(&digest::SHA256, &bytes);
     digest.as_ref().try_into().expect("SHA-256 digest length")
 }
@@ -744,6 +841,7 @@ pub fn authorization_signing_bytes(
     validate_evidence(&authorization.evidence)?;
     validate_recovery_decision(
         authorization.schema_version,
+        authorization.phase,
         authorization.audit_assessment,
         authorization.decision,
         authorization.current_state_policy,
@@ -751,6 +849,9 @@ pub fn authorization_signing_bytes(
     let mut bytes = Vec::new();
     push_bytes(&mut bytes, AUTHORIZATION_DOMAIN);
     bytes.extend_from_slice(&authorization.schema_version.to_be_bytes());
+    if authorization.schema_version >= ONLINE_RECOVERY_SCHEMA_VERSION {
+        push_str(&mut bytes, recovery_phase_name(authorization.phase));
+    }
     push_str(&mut bytes, &authorization.request_id);
     push_str(&mut bytes, &authorization.device_id);
     push_str(&mut bytes, &authorization.operation_id);
@@ -779,6 +880,9 @@ fn challenge_signing_bytes(challenge: &RecoveryChallenge) -> Result<Vec<u8>, Rec
     let mut bytes = Vec::new();
     push_bytes(&mut bytes, CHALLENGE_DOMAIN);
     bytes.extend_from_slice(&challenge.schema_version.to_be_bytes());
+    if challenge.schema_version >= ONLINE_RECOVERY_SCHEMA_VERSION {
+        push_str(&mut bytes, recovery_phase_name(challenge.phase));
+    }
     push_str(&mut bytes, &challenge.device_id);
     push_str(&mut bytes, &challenge.operation_id);
     bytes.extend_from_slice(&challenge.quarantine_generation.to_be_bytes());
@@ -795,6 +899,9 @@ fn resolved_signing_bytes(resolved: &RecoveryResolved) -> Result<Vec<u8>, Recove
     let mut bytes = Vec::new();
     push_bytes(&mut bytes, RESULT_DOMAIN);
     bytes.extend_from_slice(&resolved.schema_version.to_be_bytes());
+    if resolved.schema_version >= ONLINE_RECOVERY_SCHEMA_VERSION {
+        push_str(&mut bytes, recovery_phase_name(resolved.phase));
+    }
     push_str(&mut bytes, &resolved.request_id);
     push_str(&mut bytes, &resolved.device_id);
     push_str(&mut bytes, &resolved.operation_id);
@@ -813,7 +920,9 @@ fn resolved_signing_bytes(resolved: &RecoveryResolved) -> Result<Vec<u8>, Recove
 fn validate_schema(version: u16) -> Result<(), RecoveryError> {
     if matches!(
         version,
-        LEGACY_ONLINE_RECOVERY_SCHEMA_VERSION | ONLINE_RECOVERY_SCHEMA_VERSION
+        LEGACY_ONLINE_RECOVERY_SCHEMA_VERSION
+            | CURRENT_STATE_ACCEPTANCE_ONLINE_RECOVERY_SCHEMA_VERSION
+            | ONLINE_RECOVERY_SCHEMA_VERSION
     ) {
         Ok(())
     } else {
@@ -840,24 +949,45 @@ fn push_str(output: &mut Vec<u8>, value: &str) {
 
 fn validate_recovery_decision(
     schema_version: u16,
+    phase: RecoveryPhase,
     audit_assessment: RecoveryAuditAssessment,
     decision: RecoveryDecision,
     current_state_policy: Option<RetirementPolicy>,
 ) -> Result<(), RecoveryError> {
-    match decision {
-        RecoveryDecision::ConfirmedCompleted | RecoveryDecision::ConfirmedNotExecuted => {
+    match (phase, decision) {
+        (
+            RecoveryPhase::QuarantineResolution,
+            RecoveryDecision::ConfirmedCompleted | RecoveryDecision::ConfirmedNotExecuted,
+        ) => {
             if current_state_policy.is_some() {
                 return Err(RecoveryError::InvalidMessage);
             }
         }
-        RecoveryDecision::CurrentStateAccepted => {
-            if schema_version < ONLINE_RECOVERY_SCHEMA_VERSION
+        (RecoveryPhase::QuarantineResolution, RecoveryDecision::CurrentStateAccepted) => {
+            let minimum_schema = match current_state_policy {
+                Some(RetirementPolicy::TransientUiInteractionV1) => {
+                    CURRENT_STATE_ACCEPTANCE_ONLINE_RECOVERY_SCHEMA_VERSION
+                }
+                Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1) => {
+                    ONLINE_RECOVERY_SCHEMA_VERSION
+                }
+                None => return Err(RecoveryError::InvalidMessage),
+            };
+            if schema_version < minimum_schema
                 || audit_assessment != RecoveryAuditAssessment::Inconclusive
-                || current_state_policy != Some(RetirementPolicy::TransientUiInteractionV1)
             {
                 return Err(RecoveryError::InvalidMessage);
             }
         }
+        (RecoveryPhase::MutationResume, RecoveryDecision::MutationsResumed) => {
+            if schema_version < ONLINE_RECOVERY_SCHEMA_VERSION
+                || audit_assessment != RecoveryAuditAssessment::Inconclusive
+                || current_state_policy.is_some()
+            {
+                return Err(RecoveryError::InvalidMessage);
+            }
+        }
+        _ => return Err(RecoveryError::InvalidMessage),
     }
     Ok(())
 }
@@ -867,6 +997,14 @@ pub const fn recovery_decision_name(value: RecoveryDecision) -> &'static str {
         RecoveryDecision::ConfirmedCompleted => "confirmed_completed",
         RecoveryDecision::ConfirmedNotExecuted => "confirmed_not_executed",
         RecoveryDecision::CurrentStateAccepted => "current_state_accepted",
+        RecoveryDecision::MutationsResumed => "mutations_resumed",
+    }
+}
+
+pub const fn recovery_phase_name(value: RecoveryPhase) -> &'static str {
+    match value {
+        RecoveryPhase::QuarantineResolution => "quarantine_resolution",
+        RecoveryPhase::MutationResume => "mutation_resume",
     }
 }
 
@@ -874,6 +1012,9 @@ fn current_state_policy_name(value: Option<RetirementPolicy>) -> &'static str {
     match value {
         None => "none",
         Some(RetirementPolicy::TransientUiInteractionV1) => "transient_ui_interaction_v1",
+        Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1) => {
+            "acknowledged_unknown_pointer_click_v1"
+        }
     }
 }
 

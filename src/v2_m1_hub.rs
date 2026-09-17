@@ -9,7 +9,7 @@ use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
     OperationAdmissionMetadata, OperationDispatchBinding, OperationExecutionLane, OperationOwner,
     OperationRecoverySnapshot, ReconciliationStatus, RecoverableOperationResult, ResolutionRecord,
-    RetirementRecord, terminal_evidence_for_device_result,
+    RetirementAuthority, RetirementPolicy, RetirementRecord, terminal_evidence_for_device_result,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -40,8 +40,10 @@ use crate::v2_m1_persistence::{
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryAuditAssessment, RecoveryAuthorization, RecoveryChallenge, RecoveryDecision,
-    RecoveryError, RecoveryResolved, RecoveryVerifier, build_recovery_challenge,
-    build_recovery_resolved, quarantine_fingerprint, recovery_decision_name,
+    RecoveryError, RecoveryPhase, RecoveryResolved, RecoveryVerifier,
+    build_mutation_resume_challenge, build_recovery_challenge, build_recovery_resolved,
+    mutation_resume_barrier_fingerprint, quarantine_fingerprint, recovery_decision_name,
+    recovery_phase_name,
 };
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use ed25519_dalek::VerifyingKey;
@@ -149,6 +151,13 @@ struct LiveSession {
 struct RecoveryRuntimeState {
     pending: Option<RecoveryChallenge>,
     last_resolved: Option<(RecoveryAuthorization, RecoveryResolved)>,
+    last_warned_subject: Option<(RecoveryPhase, [u8; 32])>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverySessionDisposition {
+    Continue,
+    Reconnect,
 }
 
 struct HubInner {
@@ -1046,13 +1055,24 @@ impl SingleDeviceHub {
                             let _ = reply.send(Ok(ack.ended));
                         }
                         AgentToHub::RecoveryAuthorization(authorization) => {
-                            self.handle_recovery_authorization(
-                                authorization,
-                                &outbound,
-                                generation,
-                                session_clock,
-                            )
-                            .await?;
+                            let disposition = self
+                                .handle_recovery_authorization(
+                                    authorization,
+                                    &outbound,
+                                    generation,
+                                    session_clock,
+                                )
+                                .await?;
+                            if disposition == RecoverySessionDisposition::Reconnect {
+                                tracing::info!(
+                                    event = "v2_recovery_generation_rollover_requested",
+                                    device_id = %self.inner.device_id,
+                                    generation,
+                                    outcome = "reconnect",
+                                    "current-state acceptance requires a fresh Agent generation before mutation resume"
+                                );
+                                return Ok(());
+                            }
                         }
                         AgentToHub::HandoffResponse(response) => {
                             {
@@ -1931,50 +1951,110 @@ impl SingleDeviceHub {
         if self.inner.recovery_verifier.is_none() {
             return Ok(());
         }
-        let quarantine = {
+        let subject = {
             let persistent = self.inner.persistent.lock().await;
-            persistent
+            if let Some(quarantine) = persistent
                 .execution
                 .quarantine(&self.inner.device_id)
                 .cloned()
+            {
+                Some((RecoveryPhase::QuarantineResolution, quarantine, None))
+            } else if let Some(barrier) = persistent
+                .execution
+                .mutation_resume_barrier(&self.inner.device_id)
+                .cloned()
+            {
+                if generation <= barrier.accepted_generation {
+                    None
+                } else {
+                    Some((
+                        RecoveryPhase::MutationResume,
+                        DesktopQuarantine {
+                            device_id: barrier.device_id.clone(),
+                            operation_id: barrier.source_operation_id.clone(),
+                            device_generation: barrier.source_device_generation,
+                            owner: OperationOwner::local_hub(),
+                            reason: IndeterminateReason::BackendOutcomeUnproven,
+                            since_ms: barrier.created_at_ms,
+                        },
+                        Some(barrier),
+                    ))
+                }
+            } else {
+                None
+            }
         };
-        let Some(quarantine) = quarantine else {
+        let Some((phase, quarantine_like, barrier)) = subject else {
             return Ok(());
         };
         let now_ms = session_clock.now_ms();
-        let fingerprint = quarantine_fingerprint(&quarantine);
+        let fingerprint = match barrier.as_ref() {
+            Some(barrier) => mutation_resume_barrier_fingerprint(barrier),
+            None => quarantine_fingerprint(&quarantine_like),
+        };
         {
             let runtime = self.inner.recovery_runtime.lock().await;
             if runtime.pending.as_ref().is_some_and(|pending| {
-                pending.current_generation == generation
+                pending.phase == phase
+                    && pending.current_generation == generation
                     && pending.quarantine_fingerprint == fingerprint
                     && now_ms <= pending.expires_at_ms
             }) {
                 return Ok(());
             }
         }
-        let challenge = build_recovery_challenge(
-            &self.inner.material.hub_identity,
-            &quarantine,
-            generation,
-            now_ms,
-        )
+        let challenge = match barrier.as_ref() {
+            Some(barrier) => build_mutation_resume_challenge(
+                &self.inner.material.hub_identity,
+                barrier,
+                generation,
+                now_ms,
+            ),
+            None => build_recovery_challenge(
+                &self.inner.material.hub_identity,
+                &quarantine_like,
+                generation,
+                now_ms,
+            ),
+        }
         .map_err(HubServiceError::OnlineRecovery)?;
-        {
+        let first_warning = {
             let mut runtime = self.inner.recovery_runtime.lock().await;
+            let first_warning = runtime.last_warned_subject != Some((phase, fingerprint));
             runtime.pending = Some(challenge.clone());
             runtime.last_resolved = None;
-        }
+            if first_warning {
+                runtime.last_warned_subject = Some((phase, fingerprint));
+            }
+            first_warning
+        };
         send_hub(outbound, HubToAgent::RecoveryChallenge(challenge.clone())).await?;
-        tracing::warn!(
-            event = "v2_recovery_challenge_issued",
-            operation_id = %challenge.operation_id,
-            device_id = %challenge.device_id,
-            generation,
-            quarantine_generation = challenge.quarantine_generation,
-            outcome = "local_user_action_required",
-            "online recovery challenge issued for quarantined desktop"
-        );
+        if first_warning {
+            tracing::warn!(
+                event = "v2_recovery_challenge_issued",
+                operation_id = %challenge.operation_id,
+                device_id = %challenge.device_id,
+                generation,
+                quarantine_generation = challenge.quarantine_generation,
+                recovery_phase = recovery_phase_name(challenge.phase),
+                outcome = if challenge.phase == RecoveryPhase::MutationResume {
+                    "mutation_resume_required"
+                } else {
+                    "local_user_action_required"
+                },
+                "online recovery challenge issued for local-user action"
+            );
+        } else {
+            tracing::debug!(
+                event = "v2_recovery_challenge_reissued",
+                operation_id = %challenge.operation_id,
+                device_id = %challenge.device_id,
+                generation,
+                recovery_phase = recovery_phase_name(challenge.phase),
+                outcome = "unchanged_challenge_refreshed",
+                "unchanged online recovery challenge refreshed without repeated operator warning"
+            );
+        }
         Ok(())
     }
 
@@ -1984,7 +2064,7 @@ impl SingleDeviceHub {
         outbound: &mpsc::Sender<Result<HubFrame, Status>>,
         generation: u64,
         session_clock: &TrustedSessionClock,
-    ) -> Result<(), HubServiceError> {
+    ) -> Result<RecoverySessionDisposition, HubServiceError> {
         let verifier =
             self.inner
                 .recovery_verifier
@@ -2009,7 +2089,17 @@ impl SingleDeviceHub {
                 ));
             }
             send_hub(outbound, HubToAgent::RecoveryResolved(ack)).await?;
-            return Ok(());
+            return Ok(
+                if accepted.phase == RecoveryPhase::QuarantineResolution
+                    && accepted.decision == RecoveryDecision::CurrentStateAccepted
+                    && accepted.current_state_policy
+                        == Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1)
+                {
+                    RecoverySessionDisposition::Reconnect
+                } else {
+                    RecoverySessionDisposition::Continue
+                },
+            );
         }
         let pending = pending.ok_or(HubServiceError::OnlineRecovery(
             RecoveryError::ChallengeMismatch,
@@ -2023,83 +2113,135 @@ impl SingleDeviceHub {
 
         let resolved_at_ms = session_clock.now_ms();
         let mut retirement_capacity = None;
+        let mut force_reconnect = false;
         {
             let mut persistent = self.inner.persistent.lock().await;
-            let quarantine = persistent
-                .execution
-                .quarantine(&self.inner.device_id)
-                .cloned()
-                .ok_or(HubServiceError::OnlineRecovery(
-                    RecoveryError::ChallengeMismatch,
-                ))?;
-            if quarantine.operation_id != authorization.operation_id
-                || quarantine.device_generation != authorization.quarantine_generation
-                || quarantine_fingerprint(&quarantine) != authorization.quarantine_fingerprint
-            {
-                return Err(HubServiceError::OnlineRecovery(
-                    RecoveryError::ChallengeMismatch,
-                ));
-            }
             let rollback = persistent.execution.snapshot_for_restart();
-            match authorization.decision {
-                RecoveryDecision::ConfirmedCompleted => {
-                    let resolver =
-                        OperationOwner::new("cumg://local-user-recovery", verifier.key_id())?;
-                    persistent.execution.resolve_indeterminate(
-                        &authorization.operation_id,
-                        resolver,
-                        IndeterminateResolution::ConfirmedCompleted,
-                        authorization.evidence.clone(),
-                        resolved_at_ms,
-                    )?;
-                }
-                RecoveryDecision::ConfirmedNotExecuted => {
-                    let resolver =
-                        OperationOwner::new("cumg://local-user-recovery", verifier.key_id())?;
-                    persistent.execution.resolve_indeterminate(
-                        &authorization.operation_id,
-                        resolver,
-                        IndeterminateResolution::ConfirmedNotExecuted,
-                        authorization.evidence.clone(),
-                        resolved_at_ms,
-                    )?;
-                }
-                RecoveryDecision::CurrentStateAccepted => {
-                    let current_session = persistent
-                        .registry
-                        .current_session(&self.inner.device_id)
-                        .map_err(HubServiceError::Control)?;
-                    if current_session.generation != authorization.current_generation {
-                        return Err(HubServiceError::StaleSession);
+            match authorization.phase {
+                RecoveryPhase::QuarantineResolution => {
+                    let quarantine = persistent
+                        .execution
+                        .quarantine(&self.inner.device_id)
+                        .cloned()
+                        .ok_or(HubServiceError::OnlineRecovery(
+                            RecoveryError::ChallengeMismatch,
+                        ))?;
+                    if quarantine.operation_id != authorization.operation_id
+                        || quarantine.device_generation != authorization.quarantine_generation
+                        || quarantine_fingerprint(&quarantine)
+                            != authorization.quarantine_fingerprint
+                    {
+                        return Err(HubServiceError::OnlineRecovery(
+                            RecoveryError::ChallengeMismatch,
+                        ));
                     }
-                    let policy = authorization.current_state_policy.ok_or(
-                        HubServiceError::OnlineRecovery(RecoveryError::ChallengeMismatch),
-                    )?;
-                    match persistent.execution.accept_current_state(
-                        &authorization.operation_id,
-                        policy,
-                        authorization.evidence.clone(),
-                        authorization.current_generation,
-                        resolved_at_ms,
-                    ) {
-                        Ok(_) => {
-                            retirement_capacity = Some(persistent.execution.retirement_capacity());
+                    match authorization.decision {
+                        RecoveryDecision::ConfirmedCompleted => {
+                            let resolver = OperationOwner::new(
+                                "cumg://local-user-recovery",
+                                verifier.key_id(),
+                            )?;
+                            persistent.execution.resolve_indeterminate(
+                                &authorization.operation_id,
+                                resolver,
+                                IndeterminateResolution::ConfirmedCompleted,
+                                authorization.evidence.clone(),
+                                resolved_at_ms,
+                            )?;
                         }
-                        Err(
-                            crate::v2_m0_execution::ExecutionError::RetirementCapacityExhausted,
-                        ) => {
-                            crate::v2_observability::retirement_capacity_exhausted();
-                            tracing::warn!(
-                                event = "v2_retirement_capacity_exhausted",
-                                outcome = "rejected",
-                                "current-state acceptance refused because permanent replay tombstone capacity is exhausted"
-                            );
-                            return Err(HubServiceError::Execution(
-                                crate::v2_m0_execution::ExecutionError::RetirementCapacityExhausted,
+                        RecoveryDecision::ConfirmedNotExecuted => {
+                            let resolver = OperationOwner::new(
+                                "cumg://local-user-recovery",
+                                verifier.key_id(),
+                            )?;
+                            persistent.execution.resolve_indeterminate(
+                                &authorization.operation_id,
+                                resolver,
+                                IndeterminateResolution::ConfirmedNotExecuted,
+                                authorization.evidence.clone(),
+                                resolved_at_ms,
+                            )?;
+                        }
+                        RecoveryDecision::CurrentStateAccepted => {
+                            let current_session = persistent
+                                .registry
+                                .current_session(&self.inner.device_id)
+                                .map_err(HubServiceError::Control)?;
+                            if current_session.generation != authorization.current_generation {
+                                return Err(HubServiceError::StaleSession);
+                            }
+                            let policy = authorization.current_state_policy.ok_or(
+                                HubServiceError::OnlineRecovery(RecoveryError::ChallengeMismatch),
+                            )?;
+                            match persistent.execution.accept_current_state(
+                                &authorization.operation_id,
+                                policy,
+                                authorization.evidence.clone(),
+                                authorization.current_generation,
+                                resolved_at_ms,
+                            ) {
+                                Ok(_) => {
+                                    retirement_capacity =
+                                        Some(persistent.execution.retirement_capacity());
+                                    force_reconnect = policy
+                                        == RetirementPolicy::AcknowledgedUnknownPointerClickV1;
+                                }
+                                Err(
+                                    crate::v2_m0_execution::ExecutionError::RetirementCapacityExhausted,
+                                ) => {
+                                    crate::v2_observability::retirement_capacity_exhausted();
+                                    tracing::warn!(
+                                        event = "v2_retirement_capacity_exhausted",
+                                        outcome = "rejected",
+                                        "current-state acceptance refused because permanent replay tombstone capacity is exhausted"
+                                    );
+                                    return Err(HubServiceError::Execution(
+                                        crate::v2_m0_execution::ExecutionError::RetirementCapacityExhausted,
+                                    ));
+                                }
+                                Err(error) => return Err(HubServiceError::Execution(error)),
+                            }
+                        }
+                        RecoveryDecision::MutationsResumed => {
+                            return Err(HubServiceError::OnlineRecovery(
+                                RecoveryError::ChallengeMismatch,
                             ));
                         }
-                        Err(error) => return Err(HubServiceError::Execution(error)),
                     }
+                }
+                RecoveryPhase::MutationResume => {
+                    if authorization.decision != RecoveryDecision::MutationsResumed
+                        || authorization.current_state_policy.is_some()
+                    {
+                        return Err(HubServiceError::OnlineRecovery(
+                            RecoveryError::ChallengeMismatch,
+                        ));
+                    }
+                    let barrier = persistent
+                        .execution
+                        .mutation_resume_barrier(&self.inner.device_id)
+                        .cloned()
+                        .ok_or(HubServiceError::OnlineRecovery(
+                            RecoveryError::ChallengeMismatch,
+                        ))?;
+                    if barrier.source_operation_id != authorization.operation_id
+                        || barrier.source_device_generation != authorization.quarantine_generation
+                        || mutation_resume_barrier_fingerprint(&barrier)
+                            != authorization.quarantine_fingerprint
+                        || authorization.current_generation <= barrier.accepted_generation
+                    {
+                        return Err(HubServiceError::OnlineRecovery(
+                            RecoveryError::ChallengeMismatch,
+                        ));
+                    }
+                    persistent.execution.resume_mutations(
+                        &self.inner.device_id,
+                        &authorization.operation_id,
+                        RetirementAuthority::LocalUserPresence,
+                        authorization.current_generation,
+                        authorization.evidence.clone(),
+                        resolved_at_ms,
+                    )?;
                 }
             }
             if let Err(error) = persist_locked(&self.inner, &persistent) {
@@ -2125,23 +2267,46 @@ impl SingleDeviceHub {
         if let Some(capacity) = retirement_capacity {
             crate::v2_observability::retirement_capacity_observed(capacity);
         }
-        crate::v2_observability::quarantine_resolved();
-        tracing::info!(
-            event = "v2_quarantine_resolved_online",
-            operation_id = %authorization.operation_id,
-            device_id = %authorization.device_id,
-            generation,
-            quarantine_generation = authorization.quarantine_generation,
-            recovery_key_id = %verifier.key_id(),
-            audit_assessment = match authorization.audit_assessment {
-                RecoveryAuditAssessment::Completed => "completed",
-                RecoveryAuditAssessment::NotExecuted => "not_executed",
-                RecoveryAuditAssessment::Inconclusive => "inconclusive",
-            },
-            outcome = recovery_decision_name(authorization.decision),
-            "local-user-authorized online recovery durably cleared desktop quarantine without replay"
-        );
-        send_hub(outbound, HubToAgent::RecoveryResolved(ack)).await
+        match authorization.phase {
+            RecoveryPhase::QuarantineResolution => {
+                crate::v2_observability::quarantine_resolved();
+                tracing::info!(
+                    event = "v2_quarantine_resolved_online",
+                    operation_id = %authorization.operation_id,
+                    device_id = %authorization.device_id,
+                    generation,
+                    quarantine_generation = authorization.quarantine_generation,
+                    recovery_key_id = %verifier.key_id(),
+                    recovery_phase = recovery_phase_name(authorization.phase),
+                    audit_assessment = match authorization.audit_assessment {
+                        RecoveryAuditAssessment::Completed => "completed",
+                        RecoveryAuditAssessment::NotExecuted => "not_executed",
+                        RecoveryAuditAssessment::Inconclusive => "inconclusive",
+                    },
+                    outcome = recovery_decision_name(authorization.decision),
+                    mutation_resume_required = force_reconnect,
+                    "local-user-authorized online recovery durably cleared desktop quarantine without replay"
+                );
+            }
+            RecoveryPhase::MutationResume => {
+                tracing::info!(
+                    event = "v2_mutation_resume_authorized",
+                    operation_id = %authorization.operation_id,
+                    device_id = %authorization.device_id,
+                    generation,
+                    recovery_key_id = %verifier.key_id(),
+                    recovery_phase = recovery_phase_name(authorization.phase),
+                    outcome = recovery_decision_name(authorization.decision),
+                    "local-user-authorized mutation resume durably re-armed fresh effectful admission"
+                );
+            }
+        }
+        send_hub(outbound, HubToAgent::RecoveryResolved(ack)).await?;
+        Ok(if force_reconnect {
+            RecoverySessionDisposition::Reconnect
+        } else {
+            RecoverySessionDisposition::Continue
+        })
     }
 
     async fn ensure_current_generation(&self, generation: u64) -> Result<(), HubServiceError> {
@@ -2505,6 +2670,15 @@ impl HubHandle {
             {
                 return Err(HubCommandError::DeviceIndeterminate {
                     operation_id: quarantine.operation_id.clone(),
+                });
+            }
+            if request.starts_human_control()
+                && let Some(barrier) = persistent
+                    .execution
+                    .mutation_resume_barrier(&self.inner.device_id)
+            {
+                return Err(HubCommandError::MutationResumeRequired {
+                    operation_id: barrier.source_operation_id.clone(),
                 });
             }
             if persistent
@@ -2967,6 +3141,9 @@ fn command_error_from_execution(error: crate::v2_m0_execution::ExecutionError) -
         ExecutionError::DeviceIndeterminate { operation_id } => {
             HubCommandError::DeviceIndeterminate { operation_id }
         }
+        ExecutionError::MutationResumeRequired { operation_id } => {
+            HubCommandError::MutationResumeRequired { operation_id }
+        }
         ExecutionError::UnknownOperation => HubCommandError::UnknownOperation,
         _ => HubCommandError::Rejected,
     }
@@ -3015,6 +3192,7 @@ pub enum HubCommandError {
     Busy,
     UnknownOperation,
     DeviceIndeterminate { operation_id: String },
+    MutationResumeRequired { operation_id: String },
     Rejected,
     GrantSigningUnavailable,
     Remote(DeviceErrorCode),
@@ -3034,6 +3212,7 @@ impl SafeErrorCode for HubCommandError {
             Self::Busy => "busy",
             Self::UnknownOperation => "unknown_operation",
             Self::DeviceIndeterminate { .. } | Self::Indeterminate => "device_indeterminate",
+            Self::MutationResumeRequired { .. } => "mutation_resume_required",
             Self::Rejected => "rejected",
             Self::GrantSigningUnavailable => "grant_signing_unavailable",
             Self::Remote(_) => "remote_error",
