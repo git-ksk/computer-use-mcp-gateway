@@ -187,6 +187,8 @@ fn quarantine_recovery_upgrade_preserves_exact_unknown_pointer_click_without_wea
     assert!(upgrade.contains("local_user_presence"));
     assert!(upgrade.contains("RECOVERY_UPGRADE_OK"));
     assert!(upgrade.contains("--reason quarantine_recovery_required"));
+    assert!(upgrade.contains("date -u '+%Y%m%dT%H%M%SZ'"));
+    assert!(!upgrade.contains("date '+%Y%m%dT%H%M%S%z'"));
     assert!(upgrade.contains("--operator-action complete_recovery"));
 
     // Normal upgrade still requires quarantine=0 and still records its ordinary

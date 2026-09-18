@@ -873,7 +873,7 @@ fi
 tx_advance --flag handoff_runtime_paired
 
 MUTATION_AUTHORITY_CREATED=0
-STAMP="$(date '+%Y%m%dT%H%M%S%z')"
+STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
 ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
 tx_advance --phase backup --rollback-asset "$(basename "$ROLLBACK")"
 umask 077
