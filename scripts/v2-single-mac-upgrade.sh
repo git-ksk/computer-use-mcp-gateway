@@ -310,6 +310,22 @@ if [[ "$MUTATION_AUTHORITY_PREFLIGHT_OUTPUT" == *"migration=required"* ]]; then
   }
 fi
 printf '%s\n' "$MUTATION_AUTHORITY_PREFLIGHT_OUTPUT"
+CURRENT_ALLOWED_FILE_ROOTS="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_ALLOWED_FILE_ROOTS' "$AGENT_PLIST" 2>/dev/null || true)"
+ALLOWED_FILE_ROOTS_MIGRATION=0
+if [[ -z "$CURRENT_ALLOWED_FILE_ROOTS" ]]; then
+  ALLOWED_FILE_ROOTS_MIGRATION=1
+else
+  python3 - "$CURRENT_ALLOWED_FILE_ROOTS" <<'PYFILEROOTS' || {
+import pathlib, sys
+for raw in sys.argv[1].split(","):
+    value = raw.strip()
+    if not value or not pathlib.Path(value).is_absolute():
+        raise SystemExit(2)
+PYFILEROOTS
+    echo "REFUSED reason=agent_allowed_file_roots_invalid" >&2
+    exit 2
+  }
+fi
 HANDOFF_ENV_FILE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_ENV_FILE' "$AGENT_PLIST" 2>/dev/null || true)"
 [[ "$HANDOFF_ENV_FILE" == /* && -f "$HANDOFF_ENV_FILE" && ! -L "$HANDOFF_ENV_FILE" ]] || {
   echo "REFUSED reason=agent_handoff_runtime_env_missing_or_unsafe" >&2; exit 2;
@@ -1125,6 +1141,13 @@ if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
   if ! plutil -insert EnvironmentVariables.CUMG_MUTATION_AUTHORITY_DIR -string "$MUTATION_AUTHORITY_DIR" "$AGENT_PLIST"; then
     restore_preinstall_profile
     echo "REFUSED reason=agent_mutation_authority_update_failed rollback=$ROLLBACK" >&2
+    exit 2
+  fi
+fi
+if [[ "$ALLOWED_FILE_ROOTS_MIGRATION" == "1" ]]; then
+  if ! plutil -insert EnvironmentVariables.CUMG_V2_ALLOWED_FILE_ROOTS -string "$HOME" "$AGENT_PLIST"; then
+    restore_preinstall_profile
+    echo "REFUSED reason=agent_allowed_file_roots_update_failed rollback=$ROLLBACK" >&2
     exit 2
   fi
 fi

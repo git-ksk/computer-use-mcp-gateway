@@ -136,6 +136,9 @@ fn single_mac_upgrade_enforces_cross_control_plane_mutation_authority() {
     assert!(upgrade.contains("mutation-authority-init"));
     assert!(upgrade.contains("--owner v2"));
     assert!(upgrade.contains("CUMG_MUTATION_AUTHORITY_DIR"));
+    assert!(upgrade.contains("CUMG_V2_ALLOWED_FILE_ROOTS"));
+    assert!(upgrade.contains("ALLOWED_FILE_ROOTS_MIGRATION"));
+    assert!(upgrade.contains("agent_allowed_file_roots_update_failed"));
     assert!(upgrade.contains(r#"--mutation-authority-dir "$MUTATION_AUTHORITY_DIR""#));
     assert!(upgrade.contains(r#"fail_poststart "mutation_authority_preflight""#));
     assert!(preflight.contains("shared_mutation_authority_missing"));
