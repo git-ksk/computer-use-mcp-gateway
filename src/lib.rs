@@ -31,6 +31,7 @@ pub mod v2_m1_hub;
 pub mod v2_m1_northbound;
 
 pub mod v2_enrollment;
+pub mod v2_ephemeral_data_refs;
 pub mod v2_execution_safety;
 pub mod v2_grant_signer;
 pub mod v2_guided_recovery;
