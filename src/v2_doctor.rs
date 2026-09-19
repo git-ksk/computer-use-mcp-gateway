@@ -2302,7 +2302,6 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn default_recovery_key_path_prefers_packaged_layout_and_falls_back_to_legacy() {
         let root = temp_dir("recovery-key-default");
@@ -2329,6 +2328,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn recovery_key_readiness_uses_only_verified_public_helper_without_user_presence() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
