@@ -108,6 +108,7 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
             allowed_file_roots: vec![cwd.clone()],
             allowed_cwd_roots: vec![cwd.clone()],
             state_dir: temp_dir("v2-real-cua-agent-state"),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_millis(100),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(50),

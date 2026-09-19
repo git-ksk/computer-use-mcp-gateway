@@ -8,7 +8,7 @@ use computer_use_mcp_gateway::{
     },
     v2_m0::{
         DeviceCapability, DeviceCommand, DeviceIdentity, DeviceRegistry, GrantAuthority,
-        ProcessRequest, ShellRequest,
+        ProcessOutputStream, ProcessRequest, ShellRequest,
     },
     v2_m0_execution::HubOperationState,
     v2_m0_transport::HubIdentity,
@@ -89,6 +89,7 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     let grant_authority = GrantAuthority::generate();
     let hub_state = temp_dir("hub-runtime-state");
     let agent_state = temp_dir("agent-runtime-state");
+    let agent_ephemeral = temp_dir("agent-runtime-ephemeral");
 
     let (hub, handle) = SingleDeviceHub::new(
         HubServiceConfig {
@@ -135,6 +136,7 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
+            ephemeral_data_parent: Some(agent_ephemeral.clone()),
             heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(5),
@@ -212,6 +214,72 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     assert_eq!(shell.output.exit_code, Some(0));
     assert_eq!(shell.output.stdout, "SHELL\n");
     assert!(!shell.output.cancelled && !shell.output.timed_out);
+
+    // Extended output keeps the existing 16 KiB inline contract while retaining
+    // a bounded raw-byte prefix in the dedicated non-authoritative Agent store.
+    let extended = handle
+        .execute_shell(ShellRequest {
+            command: "i=0; while [ $i -lt 20000 ]; do printf 'AB'; i=$((i+1)); done".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 10_000,
+        })
+        .await
+        .map_err(|error| anyhow!("Hub extended-output shell failed: {error:?}"))?;
+    assert_eq!(extended.output.exit_code, Some(0));
+    assert_eq!(extended.output.stdout.len(), 16 * 1024);
+    assert!(extended.output.stdout_truncated);
+    assert!(!extended.output.stderr_truncated);
+    let stdout_ref = extended
+        .output_refs
+        .as_ref()
+        .and_then(|refs| refs.stdout.as_ref())
+        .ok_or_else(|| anyhow!("truncated stdout did not mint an output_ref"))?;
+    assert_eq!(stdout_ref.retained_bytes, 40_000);
+    assert!(stdout_ref.complete);
+
+    let omitted = handle
+        .read_process_output_ref_as(
+            OperationOwner::local_hub(),
+            &stdout_ref.output_ref,
+            16 * 1024,
+            Some(4096),
+        )
+        .await
+        .map_err(|error| anyhow!("extended stdout retrieval failed: {error:?}"))?;
+    assert_eq!(omitted.stream, ProcessOutputStream::Stdout);
+    assert_eq!(omitted.source_operation_id, extended.operation_id);
+    assert_eq!(omitted.offset, 16 * 1024);
+    assert_eq!(omitted.next_offset, 20 * 1024);
+    assert_eq!(omitted.total_bytes, 40_000);
+    assert!(!omitted.eof);
+    assert_eq!(omitted.bytes, b"AB".repeat(2048));
+
+    let other_owner = OperationOwner::new("https://issuer.example", "other-owner").unwrap();
+    assert!(matches!(
+        handle
+            .read_process_output_ref_as(other_owner, &stdout_ref.output_ref, 16 * 1024, Some(64),)
+            .await,
+        Err(HubCommandError::EphemeralRef(_))
+    ));
+
+    // The Hub durable checkpoint never stores the live public ref and the Agent
+    // authoritative checkpoint never stores retained process bytes.
+    for entry in std::fs::read_dir(&hub_state)? {
+        let path = entry?.path();
+        if path.is_file() {
+            let bytes = std::fs::read(path)?;
+            assert!(!String::from_utf8_lossy(&bytes).contains(&stdout_ref.output_ref));
+        }
+    }
+    for entry in std::fs::read_dir(&agent_state)? {
+        let path = entry?.path();
+        if path.is_file() {
+            let bytes = std::fs::read(path)?;
+            assert!(!String::from_utf8_lossy(&bytes).contains("ABABABABABABABABABABABAB"));
+        }
+    }
+    assert!(agent_ephemeral.join("workspace-ephemeral-data").is_dir());
 
     let note_path = fs_root.join("note.txt").to_string_lossy().into_owned();
     let (bytes, truncated) = handle.read_file(note_path.clone()).await?;
@@ -571,6 +639,7 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
             allowed_cwd_roots: vec![cwd, fs_root.clone()],
             state_dir: agent_state.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(5),
@@ -730,6 +799,7 @@ async fn checkpoint_high_water_rolls_generation_without_quarantine() -> Result<(
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(5),
@@ -896,6 +966,7 @@ async fn session_lifetime_reauthenticates_cleanly_without_quarantine() -> Result
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_millis(200),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(5),
@@ -1016,6 +1087,7 @@ async fn hard_session_lifetime_cuts_off_unsettled_work_fail_closed() -> Result<(
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_millis(200),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(5),
@@ -1210,6 +1282,7 @@ async fn external_grant_signer_executes_without_hub_key_custody_and_has_no_fallb
             allowed_file_roots: vec![cwd.clone()],
             allowed_cwd_roots: vec![cwd.clone()],
             state_dir: agent_state.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(5),

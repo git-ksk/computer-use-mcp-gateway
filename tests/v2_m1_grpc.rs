@@ -194,7 +194,7 @@ impl AgentControl for TestHub {
                 }
                 validate_command_result(&command, &remote_result.result)?;
                 let stdout_len = match remote_result.result.result {
-                    DeviceResult::Process { output } => {
+                    DeviceResult::Process { output, .. } => {
                         if output.exit_code != Some(0) || output.timed_out || output.cancelled {
                             bail!("git did not complete normally");
                         }
@@ -367,7 +367,11 @@ async fn grpc_bidi_tls_preserves_v2_security_and_executes_agent_native_git() -> 
         device_generation: remote.command.device_generation,
         capability_revision: remote.command.capability_revision,
         operation_id: remote.command.operation_id,
-        result: DeviceResult::Process { output },
+        result: DeviceResult::Process {
+            output,
+            output_refs: None,
+            agent_output_locators: None,
+        },
     };
     let signed = build_remote_result(&identity, &hello, &hub_challenge, result)?;
     tx.send(encode_agent_frame(&AgentToHub::Result(signed))?)

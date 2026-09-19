@@ -119,6 +119,7 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
             allowed_file_roots: vec![cwd.clone(), state_root.clone()],
             allowed_cwd_roots: vec![cwd.clone(), state_root.clone()],
             state_dir: agent_state,
+            ephemeral_data_parent: None,
             heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),

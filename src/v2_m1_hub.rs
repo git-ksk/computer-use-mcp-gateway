@@ -5,6 +5,10 @@
 //! state before risky transitions, and exposes a small in-process handle that a
 //! future authenticated northbound MCP layer can call without depending on gRPC.
 
+use crate::v2_ephemeral_data_refs::{
+    DEFAULT_MAX_AGENT_EPHEMERAL_READ_BYTES, EphemeralDataKind, HubEphemeralRefError,
+    HubEphemeralRefLimits, HubEphemeralRefRegistry,
+};
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
     OperationAdmissionMetadata, OperationDispatchBinding, OperationExecutionLane, OperationOwner,
@@ -15,7 +19,8 @@ use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
     CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CommandEnvelope, DeviceCapability,
     DeviceCommand, DeviceErrorCode, DeviceRegistry, DeviceResult, DirectoryEntry, ProcessOutput,
-    ProcessRequest, ShellRequest, validate_command_result,
+    ProcessOutputRef, ProcessOutputRefs, ProcessOutputStream, ProcessRequest, ShellRequest,
+    validate_command_result,
 };
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision,
@@ -37,6 +42,7 @@ use crate::v2_m1_grpc::{
 use crate::v2_m1_persistence::{
     CheckpointStore, HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError,
 };
+use crate::v2_m1_process::DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM;
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryAuditAssessment, RecoveryAuthorization, RecoveryChallenge, RecoveryDecision,
@@ -175,6 +181,7 @@ struct HubInner {
     session_rate: crate::v2_limits::SlidingWindowRateLimit,
     recovery_verifier: Option<RecoveryVerifier>,
     recovery_runtime: Mutex<RecoveryRuntimeState>,
+    ephemeral_refs: Mutex<HubEphemeralRefRegistry>,
 }
 
 #[derive(Clone)]
@@ -222,6 +229,7 @@ pub struct HubCommandResult {
 pub struct HubProcessResult {
     pub operation_id: String,
     pub output: ProcessOutput,
+    pub output_refs: Option<ProcessOutputRefs>,
     pub receipt: ExecutionReceipt,
 }
 
@@ -229,7 +237,19 @@ pub struct HubProcessResult {
 pub struct HubShellResult {
     pub operation_id: String,
     pub output: ProcessOutput,
+    pub output_refs: Option<ProcessOutputRefs>,
     pub receipt: ExecutionReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubProcessOutputRange {
+    pub bytes: Vec<u8>,
+    pub stream: ProcessOutputStream,
+    pub source_operation_id: String,
+    pub offset: u64,
+    pub next_offset: u64,
+    pub total_bytes: u64,
+    pub eof: bool,
 }
 
 pub struct HubPendingCommand {
@@ -254,9 +274,14 @@ impl HubPendingProcess {
     pub async fn wait(self) -> Result<HubProcessResult, HubCommandError> {
         let result = self.pending.wait().await?;
         match result.result {
-            DeviceResult::Process { output } => Ok(HubProcessResult {
+            DeviceResult::Process {
+                output,
+                output_refs,
+                ..
+            } => Ok(HubProcessResult {
                 operation_id: result.operation_id,
                 output,
+                output_refs: output_refs.map(|refs| *refs),
                 receipt: result.receipt,
             }),
             DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
@@ -274,9 +299,14 @@ impl HubPendingShell {
     pub async fn wait(self) -> Result<HubShellResult, HubCommandError> {
         let result = self.pending.wait().await?;
         match result.result {
-            DeviceResult::Shell { output } => Ok(HubShellResult {
+            DeviceResult::Shell {
+                output,
+                output_refs,
+                ..
+            } => Ok(HubShellResult {
                 operation_id: result.operation_id,
                 output,
+                output_refs: output_refs.map(|refs| *refs),
                 receipt: result.receipt,
             }),
             DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
@@ -413,6 +443,8 @@ impl SingleDeviceHub {
             Err(error) => return Err(HubServiceError::Persistence(error)),
         };
 
+        let ephemeral_refs = HubEphemeralRefRegistry::new(HubEphemeralRefLimits::default())
+            .map_err(|_| HubServiceError::InvalidConfig("invalid ephemeral ref registry limits"))?;
         let session_slots = Arc::new(Semaphore::new(config.max_agent_sessions));
         let session_rate = crate::v2_limits::SlidingWindowRateLimit::new(
             config.max_agent_session_starts_per_minute,
@@ -437,6 +469,7 @@ impl SingleDeviceHub {
             session_rate,
             recovery_verifier,
             recovery_runtime: Mutex::new(RecoveryRuntimeState::default()),
+            ephemeral_refs: Mutex::new(ephemeral_refs),
         });
         let service = Self {
             inner: inner.clone(),
@@ -448,6 +481,128 @@ impl SingleDeviceHub {
 
     pub fn device_id(&self) -> &str {
         &self.inner.device_id
+    }
+
+    async fn publicize_process_output_refs(
+        &self,
+        owner: &OperationOwner,
+        operation_id: &str,
+        generation: u64,
+        capability_revision: u64,
+        result: DeviceResult,
+    ) -> Result<DeviceResult, HubServiceError> {
+        let (output, incoming_public_refs, locators, shell) = match result {
+            DeviceResult::Process {
+                output,
+                output_refs,
+                agent_output_locators,
+            } => (output, output_refs, agent_output_locators, false),
+            DeviceResult::Shell {
+                output,
+                output_refs,
+                agent_output_locators,
+            } => (output, output_refs, agent_output_locators, true),
+            other => return Ok(other),
+        };
+
+        // Public refs are Hub authority. An Agent may only return its private
+        // locator metadata; accepting an Agent-supplied public ref would turn
+        // an opaque identifier into forged northbound authority.
+        if incoming_public_refs.is_some() {
+            return Err(HubServiceError::UnexpectedResultType);
+        }
+
+        let mut public_refs = ProcessOutputRefs {
+            stdout: None,
+            stderr: None,
+        };
+        if let Some(locators) = locators {
+            if locators.stdout.is_some() && !output.stdout_truncated
+                || locators.stderr.is_some() && !output.stderr_truncated
+            {
+                return Err(HubServiceError::UnexpectedResultType);
+            }
+            let now_ms = unix_time_ms()?;
+            let mut registry = self.inner.ephemeral_refs.lock().await;
+            for (stream, locator) in [
+                (ProcessOutputStream::Stdout, locators.stdout),
+                (ProcessOutputStream::Stderr, locators.stderr),
+            ] {
+                let Some(locator) = locator else {
+                    continue;
+                };
+                let kind = match stream {
+                    ProcessOutputStream::Stdout => EphemeralDataKind::ProcessStdout,
+                    ProcessOutputStream::Stderr => EphemeralDataKind::ProcessStderr,
+                };
+                if locator.retained_bytes == 0
+                    || locator.retained_bytes
+                        > u64::try_from(DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM)
+                            .map_err(|_| HubServiceError::UnexpectedResultType)?
+                {
+                    return Err(HubServiceError::UnexpectedResultType);
+                }
+                let minted = registry.mint(
+                    owner.clone(),
+                    &self.inner.device_id,
+                    generation,
+                    capability_revision,
+                    Some(operation_id),
+                    kind,
+                    &locator.locator,
+                    locator.retained_bytes,
+                    now_ms,
+                );
+                let public_ref = match minted {
+                    Ok(public_ref) => Some(ProcessOutputRef {
+                        output_ref: public_ref,
+                        retained_bytes: locator.retained_bytes,
+                        complete: locator.complete,
+                    }),
+                    Err(
+                        HubEphemeralRefError::RefLimitExceeded
+                        | HubEphemeralRefError::OwnerRefLimitExceeded
+                        | HubEphemeralRefError::OwnerByteLimitExceeded
+                        | HubEphemeralRefError::IdentifierCollision,
+                    ) => {
+                        tracing::warn!(
+                            event = "v2_process_output_ref_refused",
+                            operation_id,
+                            device_id = %self.inner.device_id,
+                            generation,
+                            stream = match stream {
+                                ProcessOutputStream::Stdout => "stdout",
+                                ProcessOutputStream::Stderr => "stderr",
+                            },
+                            outcome = "inline_only",
+                            error_code = minted.err().map(HubEphemeralRefError::safe_error_code).unwrap_or("ephemeral_ref_limit"),
+                            "extended output public ref could not be minted; inline result remains authoritative"
+                        );
+                        None
+                    }
+                    Err(_) => return Err(HubServiceError::UnexpectedResultType),
+                };
+                match stream {
+                    ProcessOutputStream::Stdout => public_refs.stdout = public_ref,
+                    ProcessOutputStream::Stderr => public_refs.stderr = public_ref,
+                }
+            }
+        }
+        let public_refs = (public_refs.stdout.is_some() || public_refs.stderr.is_some())
+            .then_some(Box::new(public_refs));
+        Ok(if shell {
+            DeviceResult::Shell {
+                output,
+                output_refs: public_refs,
+                agent_output_locators: None,
+            }
+        } else {
+            DeviceResult::Process {
+                output,
+                output_refs: public_refs,
+                agent_output_locators: None,
+            }
+        })
     }
 
     fn persist_blocking(&self) -> Result<(), HubServiceError> {
@@ -1536,8 +1691,16 @@ impl SingleDeviceHub {
             .ok_or(HubServiceError::PendingOperationMissing)?;
         validate_command_result(command, &result.result)?;
         let owner = operation.owner.clone();
-        let device_result = result.result.result.clone();
         let capability = operation.command.capability();
+        let device_result = self
+            .publicize_process_output_refs(
+                &owner,
+                &operation_id,
+                generation,
+                capability_revision,
+                result.result.result.clone(),
+            )
+            .await?;
 
         if matches!(
             device_result,
@@ -2789,6 +2952,113 @@ impl HubHandle {
         self.start_shell(request).await?.wait().await
     }
 
+    pub async fn read_process_output_ref_as(
+        &self,
+        owner: OperationOwner,
+        output_ref: &str,
+        offset: u64,
+        max_bytes: Option<u64>,
+    ) -> Result<HubProcessOutputRange, HubCommandError> {
+        if output_ref.is_empty() {
+            return Err(HubCommandError::Rejected);
+        }
+        let max_bytes = max_bytes.unwrap_or(8 * 1024);
+        if max_bytes == 0
+            || max_bytes
+                > u64::try_from(DEFAULT_MAX_AGENT_EPHEMERAL_READ_BYTES)
+                    .map_err(|_| HubCommandError::Rejected)?
+        {
+            return Err(HubCommandError::Rejected);
+        }
+
+        let (generation, capability_revision) = {
+            let live = self.inner.live.lock().await;
+            let session = live.as_ref().ok_or(HubCommandError::AgentOffline)?;
+            (session.generation, session.capability_revision)
+        };
+        let resolved = {
+            let mut refs = self.inner.ephemeral_refs.lock().await;
+            refs.resolve_owned(
+                output_ref,
+                &owner,
+                &self.inner.device_id,
+                generation,
+                capability_revision,
+                unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
+            )
+            .map_err(HubCommandError::EphemeralRef)?
+        };
+        let source_operation_id = resolved
+            .operation_id
+            .clone()
+            .ok_or(HubCommandError::Rejected)?;
+        if offset > resolved.bytes {
+            return Err(HubCommandError::Rejected);
+        }
+        let expected_retained_bytes = resolved.bytes;
+        let stream = match resolved.kind {
+            EphemeralDataKind::ProcessStdout => ProcessOutputStream::Stdout,
+            EphemeralDataKind::ProcessStderr => ProcessOutputStream::Stderr,
+            EphemeralDataKind::DirectoryContinuation => return Err(HubCommandError::Rejected),
+        };
+
+        {
+            let persistent = self.inner.persistent.lock().await;
+            if let Some(quarantine) = persistent.execution.quarantine(&self.inner.device_id)
+                && quarantine.operation_id != source_operation_id
+            {
+                return Err(HubCommandError::DeviceIndeterminate {
+                    operation_id: quarantine.operation_id.clone(),
+                });
+            }
+        }
+
+        let command = DeviceCommand::ReadProcessOutput {
+            locator: resolved.agent_locator().to_owned(),
+            source_operation_id: source_operation_id.clone(),
+            stream,
+            offset,
+            max_bytes,
+        };
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                random_operation_id(),
+                command,
+                OperationAdmissionMetadata::empty(),
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::ProcessOutputRange {
+                bytes,
+                stream,
+                source_operation_id,
+                offset,
+                next_offset,
+                total_bytes,
+                eof,
+            } if total_bytes == expected_retained_bytes
+                && next_offset <= expected_retained_bytes =>
+            {
+                Ok(HubProcessOutputRange {
+                    bytes,
+                    stream,
+                    source_operation_id,
+                    offset,
+                    next_offset,
+                    total_bytes,
+                    eof,
+                })
+            }
+            DeviceResult::ProcessOutputRange { .. } => Err(HubCommandError::UnexpectedResult),
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
     pub async fn read_file(
         &self,
         path: impl Into<String>,
@@ -3146,12 +3416,12 @@ fn recoverable_result_for(
     result: &DeviceResult,
 ) -> Option<RecoverableOperationResult> {
     match (capability, result) {
-        (DeviceCapability::ExecuteProcess, DeviceResult::Process { output }) => {
+        (DeviceCapability::ExecuteProcess, DeviceResult::Process { output, .. }) => {
             Some(RecoverableOperationResult::Process {
                 output: output.clone(),
             })
         }
-        (DeviceCapability::Shell, DeviceResult::Shell { output }) => {
+        (DeviceCapability::Shell, DeviceResult::Shell { output, .. }) => {
             Some(RecoverableOperationResult::Shell {
                 output: output.clone(),
             })
@@ -3231,6 +3501,7 @@ pub enum HubCommandError {
     MutationResumeRequired { operation_id: String },
     Rejected,
     GrantSigningUnavailable,
+    EphemeralRef(HubEphemeralRefError),
     Remote(DeviceErrorCode),
     UnexpectedResult,
     Indeterminate,
@@ -3251,6 +3522,7 @@ impl SafeErrorCode for HubCommandError {
             Self::MutationResumeRequired { .. } => "mutation_resume_required",
             Self::Rejected => "rejected",
             Self::GrantSigningUnavailable => "grant_signing_unavailable",
+            Self::EphemeralRef(error) => error.safe_error_code(),
             Self::Remote(_) => "remote_error",
             Self::UnexpectedResult => "unexpected_result",
         }
@@ -4031,6 +4303,8 @@ mod tests {
                         cancelled: false,
                         duration_ms: 1,
                     },
+                    output_refs: None,
+                    agent_output_locators: None,
                 },
             },
             signature: b"RAW_SIGNATURE_SECRET_DO_NOT_LOG".to_vec(),

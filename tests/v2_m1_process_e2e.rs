@@ -179,7 +179,7 @@ fn encrypted_agent_executes_structured_git_without_cua_or_terminal_gui() -> Resu
         verify_remote_result(&registry, &hello, &challenge, &result)?;
         validate_command_result(&command, &result.result)?;
         let output = match result.result.result {
-            DeviceResult::Process { output } => output,
+            DeviceResult::Process { output, .. } => output,
             other => bail!("expected process output, got {other:?}"),
         };
         if output.exit_code != Some(0) || output.timed_out || output.cancelled {
@@ -265,7 +265,11 @@ fn encrypted_agent_executes_structured_git_without_cua_or_terminal_gui() -> Resu
         device_generation: remote.command.device_generation,
         capability_revision: remote.command.capability_revision,
         operation_id: remote.command.operation_id,
-        result: DeviceResult::Process { output },
+        result: DeviceResult::Process {
+            output,
+            output_refs: None,
+            agent_output_locators: None,
+        },
     };
     let signed = build_remote_result(&device_identity, &hello, &challenge, result)?;
     write_frame(&mut tls, &AgentToHub::Result(signed))?;

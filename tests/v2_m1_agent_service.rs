@@ -283,7 +283,7 @@ impl AgentControl for LifecycleHub {
                             verify_remote_result(&registry, &hello, &challenge, &result)?;
                             validate_command_result(&command, &result.result)?;
                             match result.result.result {
-                                DeviceResult::Process { output }
+                                DeviceResult::Process { output, .. }
                                     if output.cancelled && !output.timed_out => {}
                                 other => bail!("unexpected cancelled process result: {other:?}"),
                             }
@@ -394,6 +394,7 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
         allowed_file_roots: vec![cwd.clone()],
         allowed_cwd_roots: vec![cwd],
         state_dir: state_dir.clone(),
+        ephemeral_data_parent: None,
         heartbeat_interval: Duration::from_millis(50),
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(5),

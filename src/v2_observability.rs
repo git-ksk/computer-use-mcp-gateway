@@ -287,6 +287,7 @@ pub const fn capability_name(capability: DeviceCapability) -> &'static str {
         DeviceCapability::TypeText => "type_text",
         DeviceCapability::ExecuteProcess => "execute_process",
         DeviceCapability::Shell => "shell",
+        DeviceCapability::ReadProcessOutput => "read_process_output",
         DeviceCapability::ReadFile => "read_file",
         DeviceCapability::ListDirectory => "list_directory",
         DeviceCapability::ListWindows => "list_windows",

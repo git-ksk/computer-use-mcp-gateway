@@ -56,6 +56,7 @@ pub enum DeviceCapability {
     TypeText,
     ExecuteProcess,
     Shell,
+    ReadProcessOutput,
     ReadFile,
     ListDirectory,
     ListWindows,
@@ -93,6 +94,7 @@ impl DeviceCapability {
             Self::ListApplications
                 | Self::ScreenGeometry
                 | Self::Screenshot
+                | Self::ReadProcessOutput
                 | Self::ReadFile
                 | Self::ListDirectory
                 | Self::ListWindows
@@ -110,6 +112,7 @@ impl DeviceCapability {
             Self::ListApplications
             | Self::ScreenGeometry
             | Self::Screenshot
+            | Self::ReadProcessOutput
             | Self::ReadFile
             | Self::ListDirectory
             | Self::ListWindows
@@ -295,6 +298,63 @@ pub struct ProcessOutput {
     pub timed_out: bool,
     pub cancelled: bool,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessOutputRef {
+    pub output_ref: String,
+    pub retained_bytes: u64,
+    pub complete: bool,
+}
+
+impl fmt::Debug for ProcessOutputRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessOutputRef")
+            .field("output_ref", &"[redacted]")
+            .field("retained_bytes", &self.retained_bytes)
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessOutputRefs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<ProcessOutputRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<ProcessOutputRef>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProcessOutputLocator {
+    pub locator: String,
+    pub retained_bytes: u64,
+    pub complete: bool,
+}
+
+impl fmt::Debug for AgentProcessOutputLocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentProcessOutputLocator")
+            .field("locator", &"[redacted]")
+            .field("retained_bytes", &self.retained_bytes)
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProcessOutputLocators {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<AgentProcessOutputLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<AgentProcessOutputLocator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,6 +554,13 @@ pub enum DeviceCommand {
     Shell {
         request: ShellRequest,
     },
+    ReadProcessOutput {
+        locator: String,
+        source_operation_id: String,
+        stream: ProcessOutputStream,
+        offset: u64,
+        max_bytes: u64,
+    },
     ReadFile {
         path: String,
         #[serde(default)]
@@ -643,6 +710,7 @@ impl DeviceCommand {
             Self::TypeText { .. } | Self::TypeTextAdvanced { .. } => DeviceCapability::TypeText,
             Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
             Self::Shell { .. } => DeviceCapability::Shell,
+            Self::ReadProcessOutput { .. } => DeviceCapability::ReadProcessOutput,
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
             Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
             Self::ListWindows { .. } => DeviceCapability::ListWindows,
@@ -686,6 +754,7 @@ impl DeviceCommand {
                 | Self::ScreenGeometry
                 | Self::Screenshot
                 | Self::ScreenshotContextual { .. }
+                | Self::ReadProcessOutput { .. }
                 | Self::ReadFile { .. }
                 | Self::ListDirectory { .. }
                 | Self::ListWindows { .. }
@@ -1652,9 +1721,26 @@ pub enum DeviceResult {
     InteractionScopeExpanded,
     Process {
         output: ProcessOutput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_refs: Option<Box<ProcessOutputRefs>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_output_locators: Option<Box<AgentProcessOutputLocators>>,
     },
     Shell {
         output: ProcessOutput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_refs: Option<Box<ProcessOutputRefs>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_output_locators: Option<Box<AgentProcessOutputLocators>>,
+    },
+    ProcessOutputRange {
+        bytes: Vec<u8>,
+        stream: ProcessOutputStream,
+        source_operation_id: String,
+        offset: u64,
+        next_offset: u64,
+        total_bytes: u64,
+        eof: bool,
     },
     FileContents {
         bytes: Vec<u8>,
@@ -1712,6 +1798,41 @@ impl DeviceResult {
     pub(crate) fn matches_command(&self, command: &DeviceCommand) -> bool {
         if let (Self::Browser { result }, DeviceCommand::Browser { command }) = (self, command) {
             return result.matches_command(command);
+        }
+        if let (
+            Self::ProcessOutputRange {
+                bytes,
+                stream: result_stream,
+                source_operation_id: result_source_operation_id,
+                offset: result_offset,
+                next_offset,
+                total_bytes,
+                eof,
+            },
+            DeviceCommand::ReadProcessOutput {
+                source_operation_id,
+                stream,
+                offset,
+                max_bytes,
+                ..
+            },
+        ) = (self, command)
+        {
+            let len = match u64::try_from(bytes.len()) {
+                Ok(len) => len,
+                Err(_) => return false,
+            };
+            let expected_next = match result_offset.checked_add(len) {
+                Some(next) => next,
+                None => return false,
+            };
+            return result_stream == stream
+                && result_source_operation_id == source_operation_id
+                && result_offset == offset
+                && len <= *max_bytes
+                && *next_offset == expected_next
+                && *next_offset <= *total_bytes
+                && *eof == (*next_offset >= *total_bytes);
         }
         if let (
             Self::FileContents {
@@ -1788,6 +1909,10 @@ impl DeviceResult {
                 )
                 | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
                 | (Self::Shell { .. }, DeviceCommand::Shell { .. })
+                | (
+                    Self::ProcessOutputRange { .. },
+                    DeviceCommand::ReadProcessOutput { .. }
+                )
                 | (Self::Windows { .. }, DeviceCommand::ListWindows { .. })
                 | (
                     Self::ApplicationLaunched { .. },

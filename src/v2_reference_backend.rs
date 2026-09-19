@@ -143,6 +143,8 @@ fn shell_result(cancelled: bool, duration: Duration) -> DeviceResult {
             cancelled,
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         },
+        output_refs: None,
+        agent_output_locators: None,
     }
 }
 
