@@ -1354,6 +1354,7 @@ fn finish_published_authorization(
             state_dir,
             hub_public_key_file,
             &ExpectedRecoveryCompletion {
+                phase: authorization.phase,
                 request_id: authorization.request_id.clone(),
                 device_id: authorization.device_id.clone(),
                 operation_id: authorization.operation_id.clone(),
