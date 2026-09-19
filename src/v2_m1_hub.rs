@@ -42,6 +42,7 @@ use crate::v2_m1_grpc::{
 use crate::v2_m1_persistence::{
     CheckpointStore, HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError,
 };
+use crate::v2_m1_process::DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM;
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryAuditAssessment, RecoveryAuthorization, RecoveryChallenge, RecoveryDecision,
@@ -534,6 +535,13 @@ impl SingleDeviceHub {
                     ProcessOutputStream::Stdout => EphemeralDataKind::ProcessStdout,
                     ProcessOutputStream::Stderr => EphemeralDataKind::ProcessStderr,
                 };
+                if locator.retained_bytes == 0
+                    || locator.retained_bytes
+                        > u64::try_from(DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM)
+                            .map_err(|_| HubServiceError::UnexpectedResultType)?
+                {
+                    return Err(HubServiceError::UnexpectedResultType);
+                }
                 let minted = registry.mint(
                     owner.clone(),
                     &self.inner.device_id,
@@ -2984,6 +2992,10 @@ impl HubHandle {
             .operation_id
             .clone()
             .ok_or(HubCommandError::Rejected)?;
+        if offset > resolved.bytes {
+            return Err(HubCommandError::Rejected);
+        }
+        let expected_retained_bytes = resolved.bytes;
         let stream = match resolved.kind {
             EphemeralDataKind::ProcessStdout => ProcessOutputStream::Stdout,
             EphemeralDataKind::ProcessStderr => ProcessOutputStream::Stderr,
@@ -3028,15 +3040,20 @@ impl HubHandle {
                 next_offset,
                 total_bytes,
                 eof,
-            } => Ok(HubProcessOutputRange {
-                bytes,
-                stream,
-                source_operation_id,
-                offset,
-                next_offset,
-                total_bytes,
-                eof,
-            }),
+            } if total_bytes == expected_retained_bytes
+                && next_offset <= expected_retained_bytes =>
+            {
+                Ok(HubProcessOutputRange {
+                    bytes,
+                    stream,
+                    source_operation_id,
+                    offset,
+                    next_offset,
+                    total_bytes,
+                    eof,
+                })
+            }
+            DeviceResult::ProcessOutputRange { .. } => Err(HubCommandError::UnexpectedResult),
             DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
             _ => Err(HubCommandError::UnexpectedResult),
         }
