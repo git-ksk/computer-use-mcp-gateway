@@ -36,7 +36,7 @@ Status: **active `v0.4.0` release-candidate scope。`v0.4.0` tag / GitHub Releas
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | implementation + CI merged | #139 physical/dogfood acceptance記録前はsigned-token supportをclaimしない |
 | Typed semantic authorization | #221 / PR #271 merged, CI green | Included |
-| Windows Hello recovery | implementation + CI present、physical acceptance pending | **残る`v0.4.0` release gate:** tag/Release前に#227 physical interactive-desktop acceptanceを通す |
+| Windows Hello recovery | implementation + CI green、physical interactive-desktop acceptance PASS（2026-09-19） | release gateは解消済み。通常の`v0.4.0` closeout / publicationへ進む |
 | Linux FIDO2 UV recovery | implementation + CI present、physical acceptance deferred | base `v0.4.0`をblockしない。#228 physical Linux + real UV-capable authenticator acceptance前はLinux online-recovery supportをclaimしない |
 | Cross-platform recovery parity | #217 open | 実際にsupportedとclaimするplatform setだけを対象にcloseする |
 | Cloud Run hosted Hub | design only / NO-GO | `0.4.0` support claimではない。#215 implementation/acceptanceはfuture work |
@@ -54,7 +54,7 @@ Status: **active `v0.4.0` release-candidate scope。`v0.4.0` tag / GitHub Releas
 6. recovery/no-auto-replay、Dependency Review、CodeQL、docs/link validation、conformance、release packagingをgreenにする。
 7. release noteで上記support-claim matrixを明示する。acceptance pendingのoptional platform/provider implementationをsupportedと書かない。
 8. released safety/reliability invariant failureを示す新evidenceがないことを確認する。
-9. **#227 physical Windows interactive-desktop Windows Hello acceptanceを記録する。** これが通るまで`v0.4.0` tag / GitHub Releaseを作成しない。
+9. **#227 physical Windows interactive-desktop Windows Hello acceptance: PASS（2026-09-19）。** 通常の`v0.4.0` tag / GitHub Release closeout gateへ進む。
 
 ## Base artifactをblockしないもの
 

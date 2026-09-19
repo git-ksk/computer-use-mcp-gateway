@@ -36,7 +36,7 @@ The `0.4.0` candidate includes the compatible work below:
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | Implementation + CI merged | Do not make the signed-token support claim until #139 physical/dogfood acceptance is recorded |
 | Typed semantic authorization | #221 / PR #271 merged, CI green | Included |
-| Windows Hello recovery | Implementation + CI present; physical acceptance pending | **Remaining `v0.4.0` release gate:** #227 physical interactive-desktop acceptance must pass before tag/Release |
+| Windows Hello recovery | Implementation + CI green; physical interactive-desktop acceptance PASS (2026-09-19) | Release gate cleared; include the accepted provider in ordinary `v0.4.0` closeout/publication |
 | Linux FIDO2 UV recovery | Implementation + CI present; physical acceptance deferred | Does **not** block base `v0.4.0`; do not claim Linux online-recovery support until #228 physical Linux + real UV-capable authenticator acceptance passes |
 | Cross-platform recovery parity | #217 open | Close only for the platform set actually claimed as supported |
 | Cloud Run hosted Hub | Design only / NO-GO | Not a `0.4.0` support claim; #215 implementation/acceptance remains future work |
@@ -54,7 +54,7 @@ Before creating the `v0.4.0` tag/Release:
 6. Recovery/no-auto-replay, dependency review, CodeQL, docs/link validation, conformance, and release packaging checks are green.
 7. Release notes state the support-claim matrix above explicitly. Optional platform/provider implementations with pending acceptance must not be described as supported.
 8. No new evidence demonstrates a released safety/reliability invariant failure that requires a blocker fix.
-9. **Record #227 physical Windows interactive-desktop Windows Hello acceptance.** Do not create the `v0.4.0` tag or GitHub Release until it passes.
+9. **#227 physical Windows interactive-desktop Windows Hello acceptance: PASS (2026-09-19).** Continue with the ordinary `v0.4.0` tag/Release closeout gates.
 
 ## What does not block the base artifact
 

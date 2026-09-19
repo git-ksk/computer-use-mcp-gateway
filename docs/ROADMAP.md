@@ -36,7 +36,7 @@ The completed V1/V2 implementation history and acceptance evidence remain availa
 
 ## Released baseline: `0.3.x`; active candidate: `0.4.0`
 
-`v0.3.0` remains the released baseline. `v0.4.0` is the final Recovery, Identity & Semantic Authorization candidate; #227 physical Windows Hello acceptance is the remaining release gate. The planned feature minor after release is **`v0.5.0` — Least-privilege Workspace**.
+`v0.3.0` remains the released baseline. `v0.4.0` is the final Recovery, Identity & Semantic Authorization candidate; #227 physical Windows Hello acceptance passed on 2026-09-19, so the remaining work is ordinary release closeout/publication. The planned feature minor after release is **`v0.5.0` — Least-privilege Workspace**.
 
 The `0.4.0` candidate consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Implementation is complete; the release remains untagged until the selected Windows physical acceptance passes.
 
@@ -51,7 +51,7 @@ The `0.4.0` candidate consolidates the work that had previously been split acros
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | Implementation + CI complete; physical signed-token dogfood pending | Included implementation; provider-specific support claim waits for acceptance |
 | Typed semantic authorization | #221 / PR #271 | Complete / merged / CI green | Included |
-| Windows Hello recovery | #227 / PR #252 | Implementation + CI green; physical acceptance pending | **Remaining release gate:** complete physical Windows interactive-desktop acceptance before tag/Release |
+| Windows Hello recovery | #227 / PR #252 | Implementation + CI green; physical Windows interactive-desktop acceptance PASS (2026-09-19) | Release gate cleared; carry the accepted provider through ordinary `v0.4.0` closeout/publication |
 | Linux FIDO2 UV recovery | #228 / PR #259 | Implementation + CI complete; physical acceptance deferred | Non-blocking support-claim gate; Linux online recovery remains unsupported until physical Linux + real UV-capable FIDO2 acceptance |
 | Cross-platform recovery parity umbrella | #217 | Physical acceptance dependent | May remain open until each platform actually advertised as supported has evidence |
 | Hosted Cloud Run Hub | #215 | Design complete; implementation/acceptance pending | **Not a `0.4.0` support claim**; future hosted-deployment track |
@@ -62,7 +62,7 @@ The release closeout followed this order:
 1. **#221 merged/verified** via PR #271 with full regression/CI and EN/JA normative documentation.
 2. **Run the `0.4.0` release closeout** against the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate: version/durable-schema compatibility, source-free candidate artifacts, clean install/upgrade/rollback, doctor/status, recovery/no-replay, dependency/CodeQL, docs, and release notes.
 3. **Complete #139 signed-token dogfood before advertising generic signed-token identity as release-supported.** The implementation may be present in the artifact while that explicit support claim remains acceptance-gated.
-4. **Complete #227 before release.** Record physical Windows interactive-desktop Windows Hello acceptance before creating the `v0.4.0` tag/Release. **Defer #228 support**, keeping Linux online recovery explicitly unsupported until physical Linux + real UV-capable FIDO2 acceptance exists. #217 remains open for parity.
+4. **#227 physical Windows acceptance is complete.** The 2026-09-19 trusted interactive-desktop run passed cancel -> approve -> exact durable resolution -> restart/no-replay. Proceed with ordinary `v0.4.0` closeout/publication. **Defer #228 support**, keeping Linux online recovery explicitly unsupported until physical Linux + real UV-capable FIDO2 acceptance exists. #217 remains open for parity.
 5. **Do not pull #215 implementation into the release gate.** The Cloud Run design is useful evidence already on `main`, but hosted Hub support remains NO-GO until its separate durable-state/fencing/ingress/acceptance contract is implemented.
 
 This is a release-scope consolidation, not a weakening of acceptance. The artifact may contain implementation whose **support claim is narrower than its compiled surface**; release notes and status docs must state those boundaries explicitly.
@@ -83,11 +83,11 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 
 ## Post-v0.4 productization sequence
 
-CUMG is finishing the `v0.4.0` Recovery, Identity & Semantic Authorization release candidate. After the remaining #227 physical gate and release publication, post-v0.4 work should continue moving the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
+CUMG is finishing the `v0.4.0` Recovery, Identity & Semantic Authorization release candidate. The #227 physical Windows gate passed on 2026-09-19; after ordinary release closeout/publication, post-v0.4 work should continue moving the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
 
 The working sequence is:
 
-- **`0.4.0` — active Recovery, Identity & Semantic Authorization candidate:** implementation is complete; #227 physical Windows Hello acceptance remains before release. #139 and #228 stay non-blocking support-claim gates, with signed-token and Linux online-recovery claims withheld until their evidence exists.
+- **`0.4.0` — active Recovery, Identity & Semantic Authorization candidate:** implementation is complete and #227 physical Windows Hello acceptance passed on 2026-09-19. Ordinary release closeout/publication remains. #139 and #228 stay non-blocking support-claim gates, with signed-token and Linux online-recovery claims withheld until their evidence exists.
 - **`0.5.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through bounded retrievable output (#83), ranged/deterministic filesystem observation (#105), and atomic workspace mutation under explicitly separate writable roots (#107).
 - **`0.6.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106), separately sandboxed Playwright/E2E execution (#114), and optional Linux cgroup-v2 execution containment (#267), informed by completed #96 rather than by background-shell escape compatibility.
 
@@ -162,7 +162,7 @@ This queue records the practical result of continued Handoff integration and phy
 
 The repository's open issues are classified by the revised release sequence so work cannot silently fall out of roadmap visibility. Milestones are ordering/admission guidance; an optional support-claim acceptance issue may remain open after the base artifact is released if that support claim is explicitly withheld.
 
-- **`0.4.0 — active release candidate`:** #221 / PR #271 is merged and green. #227 physical Windows Hello acceptance is the remaining release gate. #139 signed-token dogfood and #228 physical Linux FIDO2 acceptance are deferred support-claim gates; #217 remains open for parity.
+- **`0.4.0 — active release candidate`:** #221 / PR #271 is merged and green; #227 physical Windows Hello acceptance passed on 2026-09-19. Ordinary release closeout/publication remains. #139 signed-token dogfood and #228 physical Linux FIDO2 acceptance are deferred support-claim gates; #217 remains open for parity.
 - **`0.5.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
 - **`0.6.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle, #114 adds separately sandboxed Playwright/E2E execution, and #267 owns optional Linux cgroup-v2 containment.
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation, #275 hosted Handoff architecture with #276 pin adoption / #277 hosted operator-routing implementation, and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.

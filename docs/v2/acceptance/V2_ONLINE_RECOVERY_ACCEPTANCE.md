@@ -27,6 +27,22 @@ The permanent automated suite must prove:
 
 The ordinary project gates (`fmt`, `check --locked --all-targets`, tests, clippy `-D warnings`, documentation/link checks, passthrough contract) remain required because online recovery changes the Hub-Agent application schema.
 
+## Windows Hello physical acceptance checkpoint (#227)
+
+Status as of 2026-09-19: **PASS.** Trusted physical Windows interactive-desktop acceptance completed on PR #252 head `f2924c748eef12ef35b7489937ab697112a5182b` with Cua 0.19.3. This clears the Windows Hello physical release gate for `v0.4.0`; the release itself still requires the ordinary release closeout and publication steps.
+
+The terminal run recorded only bounded recovery metadata and did not record PIN/biometric data, raw desktop payloads, recovery evidence bodies, credential private material, or raw challenge JSON:
+
+- the real-Cua harness reached `ONLINE_RECOVERY_PHYSICAL_READY` after an ambiguous same-point `PointerDrag`, with operation `op_bf349158c1e5346a1f7f3d6012ec94e1` remaining `Indeterminate`, quarantined on generation 1, and authenticated Agent generation 2 active;
+- the first real Windows Hello prompt was cancelled by the local user; `v2_recover resolve-windows-hello` returned `recovery_user_presence_denied`, published no authorization, and the exact recovery challenge remained present for the same operation/generation;
+- the second real Windows Hello prompt was approved by the local user; `v2_recover` completed WebAuthn user verification, published request `rec_303ddf7862501b3faa759811a9480d4f`, and reported `durable_completion=verified`;
+- the Hub durably resolved only that exact quarantined operation as `confirmed_not_executed`; the old operation was not replayed;
+- the harness then admitted an unrelated fresh `ScreenGeometry` operation successfully;
+- the Hub was shut down and reopened from the same durable state; quarantine remained clear and the old operation remained terminal;
+- the harness emitted `ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false` and completed with `1 passed; 0 failed`.
+
+The same PR head passed all required GitHub checks, including Windows Cua smoke and Windows bundle. A merge-follow-up compile gap in the Windows-only completion waiter was found before the physical run and fixed in `f2924c748eef12ef35b7489937ab697112a5182b` by binding the expected recovery phase to the published authorization.
+
 ## Trusted physical Linux FIDO2 acceptance (#228)
 
 This gate is deliberately separate from implementation/CI and from Windows Hello acceptance. Until it passes, the Linux provider is an implementation candidate only and documentation/release notes must not claim Linux online-recovery support. Use an operator-controlled Linux desktop, a real UV-capable CTAP2 authenticator, and root-managed libfido2 1.17.0+ tools. Record the exact authenticator model/firmware, Linux distribution/kernel, libfido2 version, Cua version, and CUMG commit without recording PINs, credential private material, raw desktop payloads, or recovery evidence text.
