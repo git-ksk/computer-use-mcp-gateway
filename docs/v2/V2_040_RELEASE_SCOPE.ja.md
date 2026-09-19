@@ -36,7 +36,7 @@ Status: **released `v0.4.0` scope（2026-09-19）。** この文書は release a
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | implementation + CI merged | #139 physical/dogfood acceptance記録前はsigned-token supportをclaimしない |
 | Typed semantic authorization | #221 / PR #271 merged, CI green | Included |
-| Windows Hello recovery | implementation + CI green、physical interactive-desktop acceptance PASS（2026-09-19） | release gateは解消済み。通常の`v0.4.0` closeout / publicationへ進む |
+| Windows Hello recovery | implementation + CI green、physical Windows interactive-desktop acceptance PASS（2026-09-19） | `v0.4.0`でrelease済み・support acceptance済み |
 | Linux FIDO2 UV recovery | implementation + CI present、physical acceptance deferred | base `v0.4.0`をblockしない。#228 physical Linux + real UV-capable authenticator acceptance前はLinux online-recovery supportをclaimしない |
 | Cross-platform recovery parity | #217 open | 実際にsupportedとclaimするplatform setだけを対象にcloseする |
 | Cloud Run hosted Hub | design only / NO-GO | `0.4.0` support claimではない。#215 implementation/acceptanceはfuture work |
@@ -47,14 +47,14 @@ Status: **released `v0.4.0` scope（2026-09-19）。** この文書は release a
 `v0.4.0` tag / Release は以下を満たした場合にのみ admit しました。
 
 1. #221 / PR #271をmergeし、typed constraint、immutable final-command binding、durable bounded audit evidence、stale-decision fencing、full regression、EN/JA normative docsのCI evidenceを確定。
-2. exact candidate commitに対してstanding [`../PRODUCT_READINESS.ja.md`](../PRODUCT_READINESS.ja.md) gateを再実行する。
-3. durable/wire schema変更をdocumentし、previous supported minorからのupgrade compatibilityを証明する。incompatible downgrade/rolling mixはfail closedを維持する。
-4. exact candidate identityからsource-free release-candidate artifactをbuildし、fresh extraction後verify、clean install/upgrade/paired rollback evidenceをgreenにする。
-5. reviewed reference deploymentで`v2_doctor` / `v2_status`をhealthyにし、unresolved quarantine / incompatible runtime-tool stateはfail closedを維持する。
-6. recovery/no-auto-replay、Dependency Review、CodeQL、docs/link validation、conformance、release packagingをgreenにする。
-7. release noteで上記support-claim matrixを明示する。acceptance pendingのoptional platform/provider implementationをsupportedと書かない。
-8. released safety/reliability invariant failureを示す新evidenceがないことを確認する。
-9. **#227 physical Windows interactive-desktop Windows Hello acceptance: PASS（2026-09-19）。** 通常の`v0.4.0` tag / GitHub Release closeout gateへ進む。
+2. exact release commitに対してstanding [`../PRODUCT_READINESS.ja.md`](../PRODUCT_READINESS.ja.md) gateを再実行済み。
+3. durable/wire schema変更をdocumentし、previous supported minorからのupgrade compatibilityを証明済み。incompatible downgrade/rolling mixはfail closedを維持する。
+4. exact release identityからsource-free release-candidate artifactをbuildし、fresh extraction後verify、clean install/upgrade/paired rollback evidenceをgreenで確認済み。
+5. reviewed reference deploymentで`v2_doctor` / `v2_status`のhealthyを確認済み。unresolved quarantine / incompatible runtime-tool stateはfail closedを維持する。
+6. recovery/no-auto-replay、Dependency Review、CodeQL、docs/link validation、conformance、release packagingをgreenで確認済み。
+7. release noteで上記support-claim matrixを明示済み。acceptance pendingのoptional platform/provider implementationはsupportedと表現しない。
+8. released safety/reliability invariant failureを示す新evidenceがないことを確認済み。
+9. **#227 physical Windows interactive-desktop Windows Hello acceptance: PASS（2026-09-19）。** published `v0.4.0` release boundaryへ反映済み。
 
 ## Base artifactをblockしないもの
 

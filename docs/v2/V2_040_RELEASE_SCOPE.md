@@ -36,7 +36,7 @@ The `0.4.0` release includes the compatible work below:
 | Recovery/reconciliation core | Implemented/accepted | Included |
 | Generic OIDC/JWT identity | Implementation + CI merged | Do not make the signed-token support claim until #139 physical/dogfood acceptance is recorded |
 | Typed semantic authorization | #221 / PR #271 merged, CI green | Included |
-| Windows Hello recovery | Implementation + CI green; physical interactive-desktop acceptance PASS (2026-09-19) | Release gate cleared; include the accepted provider in ordinary `v0.4.0` closeout/publication |
+| Windows Hello recovery | Implementation + CI green; physical Windows interactive-desktop acceptance PASS (2026-09-19) | Released and support-accepted in `v0.4.0` |
 | Linux FIDO2 UV recovery | Implementation + CI present; physical acceptance deferred | Does **not** block base `v0.4.0`; do not claim Linux online-recovery support until #228 physical Linux + real UV-capable authenticator acceptance passes |
 | Cross-platform recovery parity | #217 open | Close only for the platform set actually claimed as supported |
 | Cloud Run hosted Hub | Design only / NO-GO | Not a `0.4.0` support claim; #215 implementation/acceptance remains future work |
@@ -47,14 +47,14 @@ The `0.4.0` release includes the compatible work below:
 The `v0.4.0` tag/Release was admitted only after:
 
 1. #221 / PR #271 merged with typed constraints, immutable final-command binding, durable bounded audit evidence, stale-decision fencing, full regression, and EN/JA normative docs.
-2. The standing [`../PRODUCT_READINESS.md`](../PRODUCT_READINESS.md) gate is rerun for the exact candidate commit.
-3. Durable/wire schema changes are documented and upgrade compatibility from the previous supported minor is proven; incompatible downgrade/rolling mixes continue to fail closed.
-4. Source-free release-candidate artifacts are built from the exact candidate identity, verified after fresh extraction, and clean install/upgrade/paired rollback evidence remains green.
-5. `v2_doctor` and `v2_status` show the reviewed reference deployment healthy, while unresolved quarantine or incompatible runtime/tool state still fails closed.
-6. Recovery/no-auto-replay, dependency review, CodeQL, docs/link validation, conformance, and release packaging checks are green.
-7. Release notes state the support-claim matrix above explicitly. Optional platform/provider implementations with pending acceptance must not be described as supported.
-8. No new evidence demonstrates a released safety/reliability invariant failure that requires a blocker fix.
-9. **#227 physical Windows interactive-desktop Windows Hello acceptance: PASS (2026-09-19).** Continue with the ordinary `v0.4.0` tag/Release closeout gates.
+2. The standing [`../PRODUCT_READINESS.md`](../PRODUCT_READINESS.md) gate was rerun for the exact release commit.
+3. Durable/wire schema changes were documented and upgrade compatibility from the previous supported minor was proven; incompatible downgrade/rolling mixes continue to fail closed.
+4. Source-free release-candidate artifacts were built from the exact release identity, verified after fresh extraction, and clean install/upgrade/paired rollback evidence was green.
+5. `v2_doctor` and `v2_status` showed the reviewed reference deployment healthy, while unresolved quarantine or incompatible runtime/tool state still fails closed.
+6. Recovery/no-auto-replay, dependency review, CodeQL, docs/link validation, conformance, and release packaging checks were green.
+7. Release notes stated the support-claim matrix above explicitly. Optional platform/provider implementations with pending acceptance remain excluded from support claims.
+8. No new evidence demonstrated a released safety/reliability invariant failure requiring a blocker fix.
+9. **#227 physical Windows interactive-desktop Windows Hello acceptance: PASS (2026-09-19).** This gate was included in the published `v0.4.0` release boundary.
 
 ## What does not block the base artifact
 
