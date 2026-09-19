@@ -29,17 +29,19 @@ The ordinary project gates (`fmt`, `check --locked --all-targets`, tests, clippy
 
 ## Windows Hello physical acceptance checkpoint (#227)
 
-Status as of 2026-09-12: **physical acceptance remains pending; this checkpoint is non-terminal evidence only and must not be used to claim Windows support or create the `v0.4.0` tag/Release.** The exact PR #252 head exercised here was `db82a255798d9604a85dbfd12444f282e64dbe94` with Cua 0.19.3.
+Status as of 2026-09-19: **PASS.** Trusted physical Windows interactive-desktop acceptance completed on PR #252 head `f2924c748eef12ef35b7489937ab697112a5182b` with Cua 0.19.3. This clears the Windows Hello physical release gate for `v0.4.0`; the release itself still requires the ordinary release closeout and publication steps.
 
-A trusted physical Windows interactive-desktop run established the following bounded facts without recording PIN/biometric data, raw desktop payloads, recovery evidence bodies, or recovery private material:
+The terminal run recorded only bounded recovery metadata and did not record PIN/biometric data, raw desktop payloads, recovery evidence bodies, credential private material, or raw challenge JSON:
 
-- the real-Cua physical harness reached `ONLINE_RECOVERY_PHYSICAL_READY` after an ambiguous `PointerDrag`, with the exact operation still `Indeterminate`, quarantined on its historical generation, and a newer authenticated Agent generation active;
-- a real Windows Hello prompt was cancelled by the local user; `v2_recover resolve-windows-hello` returned the stable `recovery_user_presence_denied` class, while the same quarantine remained present and the Hub still had zero resolution records;
-- a second real Windows Hello prompt was approved by the local user; `v2_recover` completed WebAuthn user verification and reported `authorization=published` for the exact quarantined operation;
-- that run did **not** reach `ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false`: after publication, the harness continued to observe the quarantine and no durable Hub resolution record appeared before the run was stopped;
-- the local authorization handoff file was subsequently absent while the Hub-signed recovery challenge was refreshed, so the next investigation should distinguish Agent-side authorization relay/consumption from Hub-side recovery handling/challenge refresh sequencing. Do not repeat Windows Hello approval until that path is understood well enough to run one clean cancel -> approve acceptance sequence.
+- the real-Cua harness reached `ONLINE_RECOVERY_PHYSICAL_READY` after an ambiguous same-point `PointerDrag`, with operation `op_bf349158c1e5346a1f7f3d6012ec94e1` remaining `Indeterminate`, quarantined on generation 1, and authenticated Agent generation 2 active;
+- the first real Windows Hello prompt was cancelled by the local user; `v2_recover resolve-windows-hello` returned `recovery_user_presence_denied`, published no authorization, and the exact recovery challenge remained present for the same operation/generation;
+- the second real Windows Hello prompt was approved by the local user; `v2_recover` completed WebAuthn user verification, published request `rec_303ddf7862501b3faa759811a9480d4f`, and reported `durable_completion=verified`;
+- the Hub durably resolved only that exact quarantined operation as `confirmed_not_executed`; the old operation was not replayed;
+- the harness then admitted an unrelated fresh `ScreenGeometry` operation successfully;
+- the Hub was shut down and reopened from the same durable state; quarantine remained clear and the old operation remained terminal;
+- the harness emitted `ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false` and completed with `1 passed; 0 failed`.
 
-Resume from the Agent recovery loop around authorization polling/relay and incoming `RecoveryChallenge` handling (`src/v2_m1_agent.rs`), then the Hub `RecoveryAuthorization` handler. The acceptance gate remains open until a fresh run proves exact durable resolution, unrelated `ScreenGeometry` success, restart persistence, permanent no-replay of the old operation, and the final `ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false` marker.
+The same PR head passed all required GitHub checks, including Windows Cua smoke and Windows bundle. A merge-follow-up compile gap in the Windows-only completion waiter was found before the physical run and fixed in `f2924c748eef12ef35b7489937ab697112a5182b` by binding the expected recovery phase to the published authorization.
 
 ## Trusted physical Linux FIDO2 acceptance (#228)
 

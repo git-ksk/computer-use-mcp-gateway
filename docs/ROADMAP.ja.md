@@ -36,7 +36,7 @@ completion provable?
 
 ## Released baseline: `0.3.x`; active candidate: `0.4.0`
 
-`v0.3.0` はreleased baselineのままです。`v0.4.0` はfinal Recovery, Identity & Semantic Authorization candidateで、残るrelease gateは#227 physical Windows Hello acceptanceです。release後のplanned feature minorは **`v0.5.0` — Least-privilege Workspace** です。
+`v0.3.0` はreleased baselineのままです。`v0.4.0` はfinal Recovery, Identity & Semantic Authorization candidateで、#227 physical Windows Hello acceptanceは2026-09-19にPASSしました。残るのは通常のrelease closeout / publicationです。release後のplanned feature minorは **`v0.5.0` — Least-privilege Workspace** です。
 
 `0.4.0` candidate は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていたworkを統合します。implementationはcompleteで、選択したWindows physical acceptanceを通すまでrelease/tagは作りません。
 
@@ -51,7 +51,7 @@ completion provable?
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | implementation + CI complete、physical signed-token dogfood pending | implementation は含める。provider-specific support claim は acceptance 待ち |
 | Typed semantic authorization | #221 / PR #271 | Complete / merged / CI green | Included |
-| Windows Hello recovery | #227 / PR #252 | implementation + CI green、physical acceptance pending | **残るrelease gate:** tag/Release前にphysical Windows interactive-desktop acceptanceを完了する |
+| Windows Hello recovery | #227 / PR #252 | implementation + CI green、physical Windows interactive-desktop acceptance PASS（2026-09-19） | release gateは解消済み。通常の`v0.4.0` closeout / publicationへ進む |
 | Linux FIDO2 UV recovery | #228 / PR #259 | implementation + CI complete、physical acceptance deferred | non-blocking support-claim gate。physical Linux + real UV-capable FIDO2 acceptanceまでLinux online recoveryはunsupported |
 | Cross-platform recovery parity umbrella | #217 | physical acceptance dependent | 実際にsupport claimするplatform setのevidenceが揃うまでOPEN可 |
 | Hosted Cloud Run Hub | #215 | design complete、implementation/acceptance pending | **`0.4.0` support claimではない**。future hosted-deployment track |

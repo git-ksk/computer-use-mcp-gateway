@@ -12,7 +12,7 @@ Agent device identity は recovery authority ではありません。侵害さ�
 
 そこでmacOSでは、Agent keyとは別にP-256 recovery keyを小さなstable-signed CryptoKit helperでSecure Enclaveへ生成し、`userPresence + privateKeyUsage` 制約を付けます。永続化するのはSecure Enclaveのsealed `dataRepresentation`だけで、private key本体はSecure Enclave外へ出ません。sealed fileはCUMGがowner-privateに管理し、Hubには公開鍵だけをpinします。初回provisioningは既存sealed-key pathを再利用せず拒否し、sealed fileとHub側public-key fileの両方でpath/symlink/permissionをfail-closedに検証します。
 
-accepted production provider は引き続き macOS Secure Enclave です。Windows Hello は #227 で implementation / CI complete・physical acceptance pending、Linux は #228 で optional FIDO2/CTAP2 実装候補を持ちます。pending platform に弱い software-key fallback は追加せず、provider の明示 prerequisite を満たさない deployment は既存 offline maintenance を使用します。
+accepted production provider は macOS Secure Enclave と Windows Hello です。Windows Hello は #227 で2026-09-19にphysical interactive-desktop acceptanceをPASSし、Linux は #228 で optional FIDO2/CTAP2 実装候補を持ちます。pendingのLinux platformに弱い software-key fallback は追加せず、provider の明示 prerequisite を満たさない deployment は既存 offline maintenance を使用します。
 
 recovery core には **provider-neutral な WebAuthn/CTAP ES256 verifier contract** も含まれます。これは bounded な credential/public-key document、CUMG client-data への exact challenge binding、RP ID hash、credential ID、ES256 signature、UP/UV 両flagを検証する共有暗号部品です。この verifier の merge/test だけでは Windows Hello、Linux FIDO2、その他platform providerのsupportを**主張しません**。各platform providerはnative provisioning/assertionを別途実装し、supportをclaimする前にそれぞれphysical user-presence acceptanceをpassする必要があります。
 
@@ -210,7 +210,7 @@ Online recoveryは現在の `HUB_AGENT_SCHEMA_VERSION = 5` application protocol�
 
 Recovery challengeは300秒（5分）で期限切れになります。desktopがquarantineのままなら、通常のauthenticated Agent heartbeatを契機にHubがpending challengeを再確認し、期限切れ後はfresh nonceを持つchallengeを再発行します。承認時間切れだけを理由にHub/Agentを再起動する必要はありません。fresh challenge受信時は以前のlocal authorization handoffを無効化します。
 
-### Windows Hello provider（#227、physical acceptance待ち）
+### Windows Hello provider（#227、physical acceptance PASS 2026-09-19）
 
 Windows provider は native Win32 WebAuthn broker と dedicated platform-authenticator ES256 credential を使用します。provisioning は `WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable`、platform attachment、required user verification を必須にし、CUMG が export するのは bounded credential ID と X9.63 public verifier を含む `recovery-webauthn-verifier.json` だけです。assertion は exact credential、RP ID `cumg-recovery.invalid`、platform attachment、signed UP+UV flags に固定します。external authenticator、password、software key、Agent key、unattended Task Scheduler fallback はありません。
 
