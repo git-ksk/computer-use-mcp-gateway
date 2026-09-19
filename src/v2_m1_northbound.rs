@@ -50,6 +50,7 @@ use crate::{
     },
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
+    v2_m1_filesystem::DEFAULT_MAX_FILE_BYTES,
     v2_m1_hub::{HubCommandError, HubHandle},
     v2_semantic_constraints::{SemanticConstraintError, SemanticConstraintPolicy},
 };
@@ -3140,12 +3141,19 @@ impl ServerHandler for V2NorthboundMcp {
                 })
             }
             TOOL_READ_FILE => {
-                let args: PathArgs = parse_arguments(arguments)?;
-                Ok(DeviceCommand::ReadFile { path: args.path })
+                let args: ReadFileArgs = parse_arguments(arguments)?;
+                Ok(DeviceCommand::ReadFile {
+                    path: args.path,
+                    offset: args.offset,
+                    max_bytes: args.max_bytes,
+                })
             }
             TOOL_LIST_DIRECTORY => {
-                let args: PathArgs = parse_arguments(arguments)?;
-                Ok(DeviceCommand::ListDirectory { path: args.path })
+                let args: ListDirectoryArgs = parse_arguments(arguments)?;
+                Ok(DeviceCommand::ListDirectory {
+                    path: args.path,
+                    after: args.after,
+                })
             }
             TOOL_LIST_WINDOWS => {
                 let args: ListWindowsArgs = parse_arguments(arguments)?;
@@ -4410,14 +4418,27 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_READ_FILE,
-            "Read a bounded file from an Agent-approved filesystem root.",
-            object_schema(vec![("path", string_schema())], &["path"]),
+            "Read a bounded stateless byte range from a file under an Agent-approved filesystem root. offset defaults to 0; max_bytes defaults to the 8 KiB carrier-safe limit. Each call is an independent observation, not a snapshot continuation.",
+            object_schema(
+                vec![
+                    ("path", string_schema()),
+                    ("offset", json!({"type":"integer","minimum":0})),
+                    (
+                        "max_bytes",
+                        bounded_positive_integer_schema(DEFAULT_MAX_FILE_BYTES as u64),
+                    ),
+                ],
+                &["path"],
+            ),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
         Tool::new(
             TOOL_LIST_DIRECTORY,
-            "List a bounded directory from an Agent-approved filesystem root.",
-            object_schema(vec![("path", string_schema())], &["path"]),
+            "List a deterministic bounded page from a directory under an Agent-approved filesystem root. Pass the prior next_cursor as after to continue. Pagination is stateless and assumes directory contents remain stable between calls; oversized scans fail closed.",
+            object_schema(
+                vec![("path", string_schema()), ("after", string_schema())],
+                &["path"],
+            ),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
         Tool::new(
@@ -5826,8 +5847,20 @@ struct ShellArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PathArgs {
+struct ReadFileArgs {
     path: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListDirectoryArgs {
+    path: String,
+    #[serde(default)]
+    after: Option<String>,
 }
 
 fn parse_arguments<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
@@ -7490,7 +7523,7 @@ mod tests {
             requested_operation_id(TOOL_READ_FILE, &mut observe).unwrap(),
             None
         );
-        assert!(parse_arguments::<PathArgs>(observe).is_err());
+        assert!(parse_arguments::<ReadFileArgs>(observe).is_err());
 
         assert_eq!(
             recoverable_result_json(RecoverableOperationResult::EffectfulStatus),

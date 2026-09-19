@@ -71,6 +71,12 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     let fs_root = temp_dir("hub-runtime-fs");
     let outside_root = temp_dir("hub-runtime-outside");
     std::fs::write(fs_root.join("note.txt"), b"bounded filesystem read")?;
+    for index in 0..260 {
+        std::fs::write(
+            fs_root.join(format!("entry-{index:03}.txt")),
+            index.to_string().as_bytes(),
+        )?;
+    }
     std::fs::write(outside_root.join("secret.txt"), b"must-not-read")?;
     std::os::unix::fs::symlink(outside_root.join("secret.txt"), fs_root.join("escape"))?;
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
@@ -207,18 +213,55 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     assert_eq!(shell.output.stdout, "SHELL\n");
     assert!(!shell.output.cancelled && !shell.output.timed_out);
 
-    let (bytes, truncated) = handle
-        .read_file(fs_root.join("note.txt").to_string_lossy().into_owned())
-        .await?;
+    let note_path = fs_root.join("note.txt").to_string_lossy().into_owned();
+    let (bytes, truncated) = handle.read_file(note_path.clone()).await?;
     assert_eq!(bytes, b"bounded filesystem read");
     assert!(!truncated);
 
-    let (entries, truncated) = handle
-        .list_directory(fs_root.to_string_lossy().into_owned())
+    let (bytes, truncated, offset, next_offset) =
+        handle.read_file_range(note_path, 8, Some(6)).await?;
+    assert_eq!(bytes, b"filesy");
+    assert!(truncated);
+    assert_eq!(offset, 8);
+    assert_eq!(next_offset, Some(14));
+
+    let directory_path = fs_root.to_string_lossy().into_owned();
+    let (first_page, truncated, next_cursor) = handle
+        .list_directory_page(directory_path.clone(), None)
+        .await?;
+    assert!(truncated);
+    assert!(!first_page.is_empty());
+    assert!(first_page.len() <= 256);
+    let next_cursor = next_cursor.expect("first page continuation");
+    assert_eq!(
+        first_page.last().map(|entry| entry.name.as_str()),
+        Some(next_cursor.as_str())
+    );
+
+    let (second_page, truncated, final_cursor) = handle
+        .list_directory_page(directory_path, Some(next_cursor.clone()))
         .await?;
     assert!(!truncated);
-    assert!(entries.iter().any(|entry| entry.name == "note.txt"));
-    assert!(entries.iter().any(|entry| entry.name == "escape"));
+    assert!(final_cursor.is_none());
+    assert!(!second_page.is_empty());
+    assert!(
+        second_page
+            .iter()
+            .all(|entry| entry.name.as_str() > next_cursor.as_str())
+    );
+    assert_eq!(first_page.len() + second_page.len(), 262);
+    assert!(
+        first_page
+            .iter()
+            .chain(second_page.iter())
+            .any(|entry| entry.name == "note.txt")
+    );
+    assert!(
+        first_page
+            .iter()
+            .chain(second_page.iter())
+            .any(|entry| entry.name == "escape")
+    );
 
     assert_eq!(
         handle
