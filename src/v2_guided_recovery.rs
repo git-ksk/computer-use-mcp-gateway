@@ -7,14 +7,15 @@
 //! that path never mutates or widens `supported_decisions`.
 
 use crate::{
+    v2_execution_safety::RetirementPolicy,
     v2_incident_brief::{IncidentBrief, IncidentHumanSummary},
     v2_maintenance::ReconciliationSupportedDecision,
-    v2_online_recovery::RecoveryChallenge,
+    v2_online_recovery::{RecoveryChallenge, RecoveryPhase},
     v2_operator_status::OperatorOverallStatus,
 };
 use serde::Serialize;
 
-pub const GUIDED_RECOVERY_SCHEMA_VERSION: u16 = 2;
+pub const GUIDED_RECOVERY_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +69,15 @@ pub struct GuidedHumanHistoricalAssertion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuidedCurrentStateAcceptance {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<RetirementPolicy>,
+    pub requires_interactive_human: bool,
+    pub mutation_resume_required_after_acceptance: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GuidedRecoveryPlan {
     pub schema_version: u16,
     pub disposition: GuidedRecoveryDisposition,
@@ -78,6 +88,8 @@ pub struct GuidedRecoveryPlan {
     /// Separate Human-only historical assertion path. These choices are never
     /// copied into or treated as authoritative `supported_decisions`.
     pub human_historical_assertion: GuidedHumanHistoricalAssertion,
+    /// Separate continuation authority; this never claims the historical outcome.
+    pub current_state_acceptance: GuidedCurrentStateAcceptance,
     pub incident: IncidentHumanSummary,
     pub observational_diagnostics_present: bool,
     pub old_operation_replayed: bool,
@@ -91,6 +103,12 @@ impl GuidedRecoveryPlan {
     pub fn allows(&self, decision: ReconciliationSupportedDecision) -> bool {
         self.disposition == GuidedRecoveryDisposition::HumanSelectionRequired
             && self.supported_decisions.contains(&decision)
+    }
+
+    pub fn allows_current_state_acceptance(&self, policy: RetirementPolicy) -> bool {
+        self.current_state_acceptance.available
+            && self.current_state_acceptance.policy == Some(policy)
+            && self.supported_decisions.is_empty()
     }
 }
 
@@ -107,7 +125,8 @@ pub fn compose_guided_recovery_plan(
     brief: &IncidentBrief,
     challenge: &RecoveryChallenge,
 ) -> GuidedRecoveryPlan {
-    let binding_matches = brief.operation.operation_id == challenge.operation_id
+    let binding_matches = challenge.phase == RecoveryPhase::QuarantineResolution
+        && brief.operation.operation_id == challenge.operation_id
         && brief.operation.device_id == challenge.device_id
         && brief.operation.original_generation == challenge.quarantine_generation
         && brief.operation.current_generation == Some(challenge.current_generation)
@@ -159,6 +178,30 @@ pub fn compose_guided_recovery_plan(
         },
     };
 
+    let continuation_policy = match brief.continuation.policy.as_deref() {
+        Some("transient_ui_interaction_v1") => Some(RetirementPolicy::TransientUiInteractionV1),
+        Some("acknowledged_unknown_pointer_click_v1") => {
+            Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1)
+        }
+        _ => None,
+    };
+    let current_state_acceptance_available = binding_matches
+        && brief.cumg.supported_decisions.is_empty()
+        && brief.continuation.current_state_acceptance_eligibility == "eligible"
+        && brief.continuation.authority.as_deref() == Some("local_user_presence")
+        && continuation_policy.is_some();
+    let current_state_acceptance = GuidedCurrentStateAcceptance {
+        available: current_state_acceptance_available,
+        policy: if current_state_acceptance_available {
+            continuation_policy
+        } else {
+            None
+        },
+        requires_interactive_human: true,
+        mutation_resume_required_after_acceptance: current_state_acceptance_available
+            && brief.continuation.mutation_resume_required_after_acceptance,
+    };
+
     GuidedRecoveryPlan {
         schema_version: GUIDED_RECOVERY_SCHEMA_VERSION,
         disposition,
@@ -172,6 +215,7 @@ pub fn compose_guided_recovery_plan(
         },
         supported_decisions: brief.cumg.supported_decisions.clone(),
         human_historical_assertion,
+        current_state_acceptance,
         incident: brief.human_summary.clone(),
         observational_diagnostics_present: !brief.diagnostics.is_empty(),
         old_operation_replayed: brief.cumg.replay_old_operation,
@@ -230,6 +274,27 @@ pub fn revalidate_guided_human_historical_selection(
     Ok(())
 }
 
+/// Revalidate Human current-state acceptance separately from factual reconciliation.
+pub fn revalidate_guided_current_state_acceptance(
+    reviewed: &GuidedRecoveryPlan,
+    fresh: &GuidedRecoveryPlan,
+    policy: RetirementPolicy,
+) -> Result<(), GuidedRecoveryRevalidationError> {
+    if reviewed.disposition != GuidedRecoveryDisposition::KeepQuarantine
+        || fresh.disposition != GuidedRecoveryDisposition::KeepQuarantine
+        || reviewed.authority_binding.is_none()
+        || reviewed.authority_binding != fresh.authority_binding
+        || reviewed.review_snapshot != fresh.review_snapshot
+        || !reviewed.supported_decisions.is_empty()
+        || !fresh.supported_decisions.is_empty()
+        || reviewed.current_state_acceptance != fresh.current_state_acceptance
+        || !fresh.allows_current_state_acceptance(policy)
+    {
+        return Err(GuidedRecoveryRevalidationError::ReinspectRequired);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuidedRecoveryPostDisposition {
@@ -265,10 +330,11 @@ mod tests {
     use super::*;
     use crate::{
         v2_incident_brief::{
-            IncidentDecisionGuidance, IncidentDiagnosticAuthority, IncidentDiagnosticFinding,
-            IncidentDiagnosticObservation, IncidentDiagnosticRelation, IncidentDiagnosticSource,
-            IncidentHumanSummary, IncidentMutationAuthorityAvailability,
-            IncidentMutationAuthoritySummary, IncidentOperationSummary,
+            INCIDENT_BRIEF_SCHEMA_VERSION, IncidentContinuationSummary, IncidentDecisionGuidance,
+            IncidentDiagnosticAuthority, IncidentDiagnosticFinding, IncidentDiagnosticObservation,
+            IncidentDiagnosticRelation, IncidentDiagnosticSource, IncidentHumanSummary,
+            IncidentMutationAuthorityAvailability, IncidentMutationAuthoritySummary,
+            IncidentOperationSummary,
         },
         v2_maintenance::{
             AgentTerminalEvidenceStatus, AgentTerminalMarkerStatus, ReconciliationAuditReason,
@@ -280,7 +346,7 @@ mod tests {
 
     fn brief(decisions: Vec<ReconciliationSupportedDecision>) -> IncidentBrief {
         IncidentBrief {
-            schema_version: 1,
+            schema_version: INCIDENT_BRIEF_SCHEMA_VERSION,
             operation: IncidentOperationSummary {
                 operation_id: "op_guided".into(),
                 capability: "launch_application".into(),
@@ -293,6 +359,12 @@ mod tests {
                 indeterminate_reason: "backend_timed_out".into(),
                 execution_outcome: "indeterminate".into(),
                 retry_safe: false,
+            },
+            continuation: IncidentContinuationSummary {
+                current_state_acceptance_eligibility: "ineligible_policy".into(),
+                policy: None,
+                authority: None,
+                mutation_resume_required_after_acceptance: false,
             },
             cumg: ReconciliationReadinessAudit {
                 operation_id: "op_guided".into(),
@@ -340,6 +412,7 @@ mod tests {
     fn challenge() -> RecoveryChallenge {
         RecoveryChallenge {
             schema_version: 1,
+            phase: crate::v2_online_recovery::RecoveryPhase::QuarantineResolution,
             device_id: "dev_guided".into(),
             operation_id: "op_guided".into(),
             quarantine_generation: 7,
@@ -551,7 +624,7 @@ mod tests {
     fn json_contract_separates_authoritative_decisions_from_human_assertion() {
         let plan = compose_guided_recovery_plan(&brief(Vec::new()), &challenge());
         let value = serde_json::to_value(&plan).unwrap();
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], GUIDED_RECOVERY_SCHEMA_VERSION);
         assert_eq!(value["supported_decisions"], serde_json::json!([]));
         assert_eq!(value["human_historical_assertion"]["available"], true);
         assert_eq!(
@@ -569,6 +642,40 @@ mod tests {
         assert_eq!(
             value["human_historical_assertion"]["choices"],
             serde_json::json!(["confirmed_completed", "confirmed_not_executed"])
+        );
+    }
+
+    #[test]
+    fn pointer_click_current_state_acceptance_stays_separate_from_factual_decisions() {
+        let mut incident = brief(Vec::new());
+        incident.operation.capability = "pointer_click".into();
+        incident.cumg.capability = "pointer_click".into();
+        incident.continuation = IncidentContinuationSummary {
+            current_state_acceptance_eligibility: "eligible".into(),
+            policy: Some("acknowledged_unknown_pointer_click_v1".into()),
+            authority: Some("local_user_presence".into()),
+            mutation_resume_required_after_acceptance: true,
+        };
+        let reviewed = compose_guided_recovery_plan(&incident, &challenge());
+        assert!(reviewed.supported_decisions.is_empty());
+        assert!(reviewed.current_state_acceptance.available);
+        assert_eq!(
+            reviewed.current_state_acceptance.policy,
+            Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1)
+        );
+        assert!(
+            reviewed
+                .current_state_acceptance
+                .mutation_resume_required_after_acceptance
+        );
+        let fresh = compose_guided_recovery_plan(&incident, &challenge());
+        assert_eq!(
+            revalidate_guided_current_state_acceptance(
+                &reviewed,
+                &fresh,
+                RetirementPolicy::AcknowledgedUnknownPointerClickV1,
+            ),
+            Ok(())
         );
     }
 

@@ -48,9 +48,9 @@ use crate::v2_m1_process::{
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
-    RecoveryAuthorization, RecoveryError, RecoveryResolved, clear_authorization,
+    RecoveryAuthorization, RecoveryError, RecoveryPhase, RecoveryResolved, clear_authorization,
     clear_recovery_handoff, clear_recovery_resolved, load_authorization, load_challenge,
-    recovery_decision_name, store_challenge, store_recovery_resolved,
+    recovery_decision_name, recovery_phase_name, store_challenge, store_recovery_resolved,
     validate_authorization_against_challenge, verify_recovery_challenge,
     verify_recovery_resolved_for_authorization,
 };
@@ -677,6 +677,7 @@ impl AgentService {
         let mut recovery_poll = tokio::time::interval(Duration::from_millis(250));
         recovery_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pending_recovery_request: Option<RecoveryAuthorization> = None;
+        let mut last_recovery_warning: Option<(RecoveryPhase, [u8; 32])> = None;
 
         let session_result = async {
             loop {
@@ -937,6 +938,11 @@ impl AgentService {
                                 );
                                 continue;
                             }
+                            // Preserve the prior phase acknowledgement across reconnect so the
+                            // Human can verify it, but once a fresh authorization is ready to relay,
+                            // remove that stale acknowledgement before waiting for the exact new one.
+                            clear_recovery_resolved(&self.config.state_dir)
+                                .map_err(AgentServiceError::OnlineRecovery)?;
                             send_agent(
                                 &outbound_tx,
                                 AgentToHub::RecoveryAuthorization(authorization.clone()),
@@ -1034,20 +1040,42 @@ impl AgentService {
                             .map_err(AgentServiceError::OnlineRecovery)?;
                             clear_authorization(&self.config.state_dir)
                                 .map_err(AgentServiceError::OnlineRecovery)?;
-                            clear_recovery_resolved(&self.config.state_dir)
-                                .map_err(AgentServiceError::OnlineRecovery)?;
+                            // Preserve the last signed durable acknowledgement until a newer
+                            // one replaces it. Exact request/phase verification prevents stale
+                            // acknowledgements from satisfying a new recovery request, while
+                            // keeping the first-stage receipt observable across the forced
+                            // generation rollover used by PointerClick recovery.
                             store_challenge(&self.config.state_dir, &recovery)
                                 .map_err(AgentServiceError::OnlineRecovery)?;
                             pending_recovery_request = None;
-                            tracing::warn!(
-                                event = "v2_recovery_challenge_received",
-                                operation_id = %recovery.operation_id,
-                                device_id = %session.device_id,
-                                generation = session.generation,
-                                quarantine_generation = recovery.quarantine_generation,
-                                outcome = "local_user_action_required",
-                                "Hub-signed online recovery challenge published for local user inspection"
-                            );
+                            let subject = (recovery.phase, recovery.quarantine_fingerprint);
+                            if last_recovery_warning != Some(subject) {
+                                last_recovery_warning = Some(subject);
+                                tracing::warn!(
+                                    event = "v2_recovery_challenge_received",
+                                    operation_id = %recovery.operation_id,
+                                    device_id = %session.device_id,
+                                    generation = session.generation,
+                                    quarantine_generation = recovery.quarantine_generation,
+                                    recovery_phase = recovery_phase_name(recovery.phase),
+                                    outcome = if recovery.phase == RecoveryPhase::MutationResume {
+                                        "mutation_resume_required"
+                                    } else {
+                                        "local_user_action_required"
+                                    },
+                                    "Hub-signed online recovery challenge published for local user inspection"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    event = "v2_recovery_challenge_refreshed",
+                                    operation_id = %recovery.operation_id,
+                                    device_id = %session.device_id,
+                                    generation = session.generation,
+                                    recovery_phase = recovery_phase_name(recovery.phase),
+                                    outcome = "unchanged_challenge_refreshed",
+                                    "unchanged recovery challenge refreshed without repeated operator warning"
+                                );
+                            }
                         }
                         HubToAgent::RecoveryResolved(resolved) => {
                             let expected_authorization = pending_recovery_request
@@ -1065,6 +1093,7 @@ impl AgentService {
                                 operation_id = %resolved.operation_id,
                                 device_id = %session.device_id,
                                 generation = session.generation,
+                                recovery_phase = recovery_phase_name(resolved.phase),
                                 outcome = recovery_decision_name(resolved.decision),
                                 "Hub durably completed local-user recovery without replaying the old operation"
                             );

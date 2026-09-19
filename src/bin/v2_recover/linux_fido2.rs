@@ -8,8 +8,8 @@ use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
     v2_online_recovery::{
         RecoveryAuditAssessment, RecoveryAuthorization, WebAuthnRecoveryVerifierDocument,
-        new_authorization, new_current_state_acceptance_authorization, recovery_decision_name,
-        store_authorization,
+        new_authorization, new_current_state_acceptance_authorization,
+        new_mutation_resume_authorization, recovery_decision_name, store_authorization,
     },
 };
 use std::path::{Path, PathBuf};
@@ -130,16 +130,13 @@ pub(super) fn accept_current_state_linux_fido2(
     state_dir: PathBuf,
     hub_public_key_file: PathBuf,
     provider: LinuxFido2ProviderArgs,
+    policy: RetirementPolicy,
     evidence: String,
     wait_secs: u64,
 ) -> Result<()> {
     let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
-    let authorization = new_current_state_acceptance_authorization(
-        &challenge,
-        RetirementPolicy::TransientUiInteractionV1,
-        evidence,
-    )
-    .context("current-state acceptance is not valid for this recovery schema")?;
+    let authorization = new_current_state_acceptance_authorization(&challenge, policy, evidence)
+        .context("current-state acceptance is not valid for this recovery schema")?;
     println!("accepting_current_state_linux_fido2");
     println!("device_id={}", authorization.device_id);
     println!("operation_id={}", authorization.operation_id);
@@ -167,10 +164,55 @@ pub(super) fn accept_current_state_linux_fido2(
     _state_dir: PathBuf,
     _hub_public_key_file: PathBuf,
     _provider: LinuxFido2ProviderArgs,
+    _policy: RetirementPolicy,
     _evidence: String,
     _wait_secs: u64,
 ) -> Result<()> {
     bail!("Linux FIDO2 current-state acceptance is supported only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn resume_mutations_linux_fido2(
+    state_dir: PathBuf,
+    hub_public_key_file: PathBuf,
+    provider: LinuxFido2ProviderArgs,
+    evidence: String,
+    wait_secs: u64,
+) -> Result<()> {
+    let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
+    let authorization = new_mutation_resume_authorization(&challenge, evidence)
+        .context("mutation resume is not valid for this recovery challenge")?;
+    println!("resuming_mutations_linux_fido2");
+    println!("device_id={}", authorization.device_id);
+    println!("operation_id={}", authorization.operation_id);
+    println!("current_generation={}", authorization.current_generation);
+    println!("fresh_mutations_only=true");
+    println!("old_operation_replayed=false");
+    println!("linux_fido2_user_verification=required");
+    println!("uv_mode={}", provider.uv_mode.name());
+    let credential = load_linux_fido2(
+        &provider.tool_dir,
+        &provider.device,
+        provider.uv_mode,
+        &provider.verifier_file,
+    )?;
+    let authorization = credential
+        .sign_authorization(authorization)
+        .context("Linux FIDO2 user verification was not completed")?;
+    store_authorization(&state_dir, &authorization)
+        .context("failed to publish Linux FIDO2 mutation-resume authorization")?;
+    finish_authorization(&state_dir, &hub_public_key_file, &authorization, wait_secs)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn resume_mutations_linux_fido2(
+    _state_dir: PathBuf,
+    _hub_public_key_file: PathBuf,
+    _provider: LinuxFido2ProviderArgs,
+    _evidence: String,
+    _wait_secs: u64,
+) -> Result<()> {
+    bail!("Linux FIDO2 mutation resume is supported only on Linux")
 }
 
 #[cfg(target_os = "linux")]
@@ -204,6 +246,7 @@ fn finish_authorization(
             state_dir,
             hub_public_key_file,
             &ExpectedRecoveryCompletion {
+                phase: authorization.phase,
                 request_id: authorization.request_id.clone(),
                 device_id: authorization.device_id.clone(),
                 operation_id: authorization.operation_id.clone(),

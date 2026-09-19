@@ -673,6 +673,60 @@ impl HubAdmissionController {
             .map_or(CompletionDecision::Idle, CompletionDecision::StartNext))
     }
 
+    /// Retire an indeterminate operation while explicitly discarding all queued
+    /// work for the same device and without activating any successor. This is
+    /// the fail-closed primitive used when recovery crosses a mutation boundary
+    /// that requires a separate Human re-arm before any new effectful work.
+    pub fn retire_indeterminate_and_cancel_queued(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<Vec<OperationRef>, ExecutionError> {
+        let operation = self
+            .operations
+            .get(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        if operation.state != HubOperationState::Indeterminate
+            || self.retired_indeterminate.contains(operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+        if self.retired_indeterminate.len() >= MAX_RETIRED_OPERATION_TOMBSTONES {
+            return Err(ExecutionError::RetirementCapacityExhausted);
+        }
+        let device_id = operation.operation.device_id.clone();
+        if self
+            .blocked_by_indeterminate
+            .get(&device_id)
+            .is_none_or(|blocked| blocked != operation_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+
+        let queued: Vec<_> = self
+            .queued_by_device
+            .get(&device_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        if queued.iter().any(|queued| {
+            self.operations
+                .get(&queued.operation_id)
+                .is_none_or(|record| record.state != HubOperationState::Queued)
+        }) {
+            return Err(ExecutionError::InvalidTransition);
+        }
+
+        self.blocked_by_indeterminate.remove(&device_id);
+        self.retired_indeterminate.insert(operation_id.to_owned());
+        self.queued_by_device.remove(&device_id);
+        for queued in &queued {
+            self.operations
+                .get_mut(&queued.operation_id)
+                .expect("queued operation validated above")
+                .state = HubOperationState::Cancelled;
+        }
+        Ok(queued)
+    }
+
     /// Drop the full retired operation record after its detailed audit record has
     /// rotated out. The exact replay-deny tombstone remains authoritative.
     pub fn compact_retired_indeterminate_detail(
@@ -987,6 +1041,7 @@ pub enum ExecutionError {
     GenerationChangeWhileActive,
     OwnershipFenceMismatch,
     DeviceIndeterminate { operation_id: String },
+    MutationResumeRequired { operation_id: String },
     InvalidSnapshot,
 }
 

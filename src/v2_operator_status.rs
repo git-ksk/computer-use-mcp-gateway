@@ -45,6 +45,7 @@ impl OperatorOverallStatus {
 pub enum OperatorReasonCode {
     None,
     PreviousOperationOutcomeUnknown,
+    MutationResumeRequired,
     HandoffRecoveryRequired,
     HandoffFaulted,
     UpgradeInProgress,
@@ -67,6 +68,7 @@ impl OperatorReasonCode {
         match self {
             Self::None => "none",
             Self::PreviousOperationOutcomeUnknown => "previous_operation_outcome_unknown",
+            Self::MutationResumeRequired => "mutation_resume_required",
             Self::HandoffRecoveryRequired => "handoff_recovery_required",
             Self::HandoffFaulted => "handoff_faulted",
             Self::UpgradeInProgress => "upgrade_in_progress",
@@ -91,6 +93,7 @@ impl OperatorReasonCode {
 pub enum OperatorNextAction {
     None,
     ReviewIncident,
+    ResumeMutations,
     CompleteRecovery,
     InspectUpgrade,
     FixConfiguration,
@@ -105,6 +108,7 @@ impl OperatorNextAction {
         match self {
             Self::None => "none",
             Self::ReviewIncident => "review_incident",
+            Self::ResumeMutations => "resume_mutations",
             Self::CompleteRecovery => "complete_recovery",
             Self::InspectUpgrade => "inspect_upgrade",
             Self::FixConfiguration => "fix_configuration",
@@ -457,7 +461,9 @@ fn summarize_recovery(doctor: &DoctorReport) -> RecoverySummary {
     RecoverySummary {
         quarantine,
         live_quarantine_count: doctor.hub.live_quarantine_count,
-        replay_safe: (quarantine == QuarantineStatus::Present).then_some(false),
+        replay_safe: (quarantine == QuarantineStatus::Present
+            || doctor.hub.recovery_mode == "mutation_resume_required")
+            .then_some(false),
         recovery_mode: doctor.hub.recovery_mode.clone(),
         incident_review,
         key_readiness: doctor.recovery_key_readiness.status,
@@ -582,6 +588,13 @@ fn primary_operator_state(
             OperatorOverallStatus::ActionRequired,
             OperatorReasonCode::PreviousOperationOutcomeUnknown,
             OperatorNextAction::ReviewIncident,
+        );
+    }
+    if recovery.recovery_mode == "mutation_resume_required" {
+        return (
+            OperatorOverallStatus::ActionRequired,
+            OperatorReasonCode::MutationResumeRequired,
+            OperatorNextAction::ResumeMutations,
         );
     }
     if matches!(
@@ -1056,6 +1069,44 @@ mod tests {
             OperatorReasonCode::PreviousOperationOutcomeUnknown
         );
         assert_eq!(report.next_action, OperatorNextAction::ReviewIncident);
+        assert_eq!(report.recovery.replay_safe, Some(false));
+        assert_eq!(report.lanes.computer_use_observation, LaneReadiness::Ready);
+        assert_eq!(
+            report.lanes.effectful_execution,
+            LaneReadiness::IndeterminateFenced
+        );
+    }
+
+    #[test]
+    fn mutation_resume_barrier_routes_directly_to_local_user_resume() {
+        let mut doctor = healthy_doctor();
+        doctor.hub.live_quarantine_count = Some(0);
+        doctor.hub.recovery_mode = "mutation_resume_required".into();
+        doctor.readiness.device = "degraded_operator_action_required".into();
+        doctor.readiness.blocking_operation_present = Some(true);
+        doctor.readiness.blocking_operation_retry_safe = Some(false);
+        doctor.readiness.operator_action = Some("resume_mutations".into());
+        doctor.readiness.lanes.effectful_execution = LaneReadiness::IndeterminateFenced;
+        doctor.readiness.lanes.browser_effectful_execution = LaneReadiness::IndeterminateFenced;
+        doctor.checks.retain(|check| check.name != "recovery_mode");
+        doctor.checks.push(check(
+            "recovery_mode",
+            CheckStatus::Warning,
+            "mutation_resume_required",
+        ));
+
+        let report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::NotConfigured,
+            UpgradeStatusInput::None,
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::ActionRequired);
+        assert_eq!(
+            report.primary_reason,
+            OperatorReasonCode::MutationResumeRequired
+        );
+        assert_eq!(report.next_action, OperatorNextAction::ResumeMutations);
+        assert_eq!(report.recovery.quarantine, QuarantineStatus::Clear);
         assert_eq!(report.recovery.replay_safe, Some(false));
         assert_eq!(report.lanes.computer_use_observation, LaneReadiness::Ready);
         assert_eq!(

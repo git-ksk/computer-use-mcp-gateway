@@ -7,10 +7,10 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: scripts/v2-single-mac-upgrade.sh [--preflight-only] [--artifact-bundle PATH]
+usage: scripts/v2-single-mac-upgrade.sh [--preflight-only] [--artifact-bundle PATH] [--preserve-quarantine-operation-id OPERATION_ID]
 
 Normal artifact-backed upgrade:
-  bash <bundle>/install/v2-single-mac-upgrade.sh --artifact-bundle <bundle> [--preflight-only]
+  bash <bundle>/install/v2-single-mac-upgrade.sh --artifact-bundle <bundle> [--preflight-only]\n\nQuarantine-preserving recovery runtime upgrade (artifact mode only):\n  bash <bundle>/install/v2-single-mac-upgrade.sh --artifact-bundle <bundle> --preserve-quarantine-operation-id <operation_id>
 
 Without --artifact-bundle the historical source-build path remains maintainer-only.
 Environment overrides:
@@ -34,12 +34,16 @@ USAGE
 
 PRELIGHT_ONLY=0
 ARTIFACT_BUNDLE=""
+PRESERVE_QUARANTINE_OPERATION_ID=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --preflight-only) PRELIGHT_ONLY=1; shift ;;
     --artifact-bundle)
       [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 64; }
       ARTIFACT_BUNDLE="$2"; shift 2 ;;
+    --preserve-quarantine-operation-id)
+      [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 64; }
+      PRESERVE_QUARANTINE_OPERATION_ID="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 64 ;;
   esac
@@ -134,6 +138,14 @@ trap cleanup_artifact_tmp EXIT
 ROOT="${CUMG_V2_INSTALL_ROOT:-$HOME/Library/Application Support/computer-use-mcp-gateway}"
 RUN_ROOT="${CUMG_V2_RUN_ROOT:-$HOME/Library/Caches/cumg-v2}"
 BIN_DIR="$ROOT/bin"
+RECOVERY_UPGRADE_MODE=0
+if [[ -n "$PRESERVE_QUARANTINE_OPERATION_ID" ]]; then
+  RECOVERY_UPGRADE_MODE=1
+  [[ "$ARTIFACT_MODE" == "1" ]] || { echo "REFUSED reason=quarantine_recovery_requires_artifact_mode" >&2; exit 2; }
+  [[ "$PRESERVE_QUARANTINE_OPERATION_ID" =~ ^[A-Za-z0-9._-]{1,180}$ ]] || {
+    echo "REFUSED reason=invalid_preserved_quarantine_operation_id" >&2; exit 2;
+  }
+fi
 HUB_STATE="$ROOT/v2/state/hub"
 AGENT_STATE="$ROOT/v2/state/agent"
 MUTATION_AUTHORITY_DIR="$ROOT/mutation-authority"
@@ -150,7 +162,12 @@ EXPECTED_HANDOFF_COMMIT="${CUMG_V2_EXPECTED_HANDOFF_COMMIT:-}"
 CARGO_BUILD_JOBS="${CUMG_V2_CARGO_BUILD_JOBS:-2}"
 MIN_BUILD_FREE_MIB="${CUMG_V2_MIN_BUILD_FREE_MIB:-6144}"
 UPGRADE_TRANSACTION_HELPER="$SUPPORT_ROOT/v2_upgrade_transaction.py"
-UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/upgrade-transaction.json"
+if [[ "$RECOVERY_UPGRADE_MODE" == "1" ]]; then
+  RECOVERY_UPGRADE_ATTEMPT_ID="$(date '+%s')-$$"
+  UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/quarantine-recovery-upgrade-$RECOVERY_UPGRADE_ATTEMPT_ID.json"
+else
+  UPGRADE_TRANSACTION_FILE="$ROOT/v2/maintenance/upgrade-transaction.json"
+fi
 [[ "$CARGO_BUILD_JOBS" =~ ^[1-8]$ ]] || { echo "REFUSED reason=invalid_cargo_build_jobs" >&2; exit 2; }
 [[ "$MIN_BUILD_FREE_MIB" =~ ^[0-9]+$ && "$MIN_BUILD_FREE_MIB" -ge 1024 && "$MIN_BUILD_FREE_MIB" -le 65536 ]] || {
   echo "REFUSED reason=invalid_min_build_free_mib" >&2; exit 2
@@ -293,6 +310,22 @@ if [[ "$MUTATION_AUTHORITY_PREFLIGHT_OUTPUT" == *"migration=required"* ]]; then
   }
 fi
 printf '%s\n' "$MUTATION_AUTHORITY_PREFLIGHT_OUTPUT"
+CURRENT_ALLOWED_FILE_ROOTS="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_ALLOWED_FILE_ROOTS' "$AGENT_PLIST" 2>/dev/null || true)"
+ALLOWED_FILE_ROOTS_MIGRATION=0
+if [[ -z "$CURRENT_ALLOWED_FILE_ROOTS" ]]; then
+  ALLOWED_FILE_ROOTS_MIGRATION=1
+else
+  python3 - "$CURRENT_ALLOWED_FILE_ROOTS" <<'PYFILEROOTS' || {
+import pathlib, sys
+for raw in sys.argv[1].split(","):
+    value = raw.strip()
+    if not value or not pathlib.Path(value).is_absolute():
+        raise SystemExit(2)
+PYFILEROOTS
+    echo "REFUSED reason=agent_allowed_file_roots_invalid" >&2
+    exit 2
+  }
+fi
 HANDOFF_ENV_FILE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_ENV_FILE' "$AGENT_PLIST" 2>/dev/null || true)"
 [[ "$HANDOFF_ENV_FILE" == /* && -f "$HANDOFF_ENV_FILE" && ! -L "$HANDOFF_ENV_FILE" ]] || {
   echo "REFUSED reason=agent_handoff_runtime_env_missing_or_unsafe" >&2; exit 2;
@@ -433,11 +466,110 @@ elif [[ "$EXTERNAL_SIGNER" != "0" ]]; then
   exit 2
 fi
 
+quarantine_binding() {
+  local payload="$1"
+  python3 - "$PRESERVE_QUARANTINE_OPERATION_ID" "$payload" <<'PYQUARANTINE'
+import json, sys
+operation_id, payload = sys.argv[1], sys.argv[2]
+data = json.loads(payload)
+items = data.get("quarantines")
+if not isinstance(items, list) or len(items) != 1:
+    raise SystemExit(2)
+q = items[0]
+required = {
+    "blocking_operation_id": operation_id,
+    "capability": "pointer_click",
+    "execution_outcome": "indeterminate",
+    "retry_safe": False,
+    "dispatch_recorded": True,
+}
+for key, expected in required.items():
+    if q.get(key) != expected:
+        raise SystemExit(3)
+if q.get("reconciliation_status") not in {"operator_required", "unrecoverable_evidence_gap"}:
+    raise SystemExit(4)
+original = q.get("device_generation")
+current = q.get("current_device_generation")
+if not isinstance(original, int) or not isinstance(current, int) or current <= original:
+    raise SystemExit(5)
+binding = {
+    "blocking_operation_id": q.get("blocking_operation_id"),
+    "device_id": q.get("device_id"),
+    "device_generation": original,
+    "capability": q.get("capability"),
+    "dispatch_binding_present": q.get("dispatch_binding_present"),
+    "dispatched_at_ms": q.get("dispatched_at_ms"),
+    "indeterminate_at_ms": q.get("indeterminate_at_ms"),
+    "indeterminate_reason": q.get("indeterminate_reason"),
+    "execution_outcome": q.get("execution_outcome"),
+}
+if not isinstance(binding["device_id"], str) or not binding["device_id"]:
+    raise SystemExit(6)
+if binding["dispatch_binding_present"] is not True or not isinstance(binding["dispatched_at_ms"], int):
+    raise SystemExit(7)
+print(json.dumps(binding, sort_keys=True, separators=(",", ":")))
+PYQUARANTINE
+}
+
+recovery_quarantine_ready() {
+  local payload="$1"
+  python3 - "$payload" <<'PYRECOVERYQ'
+import json, sys
+data = json.loads(sys.argv[1])
+items = data.get("quarantines")
+if not isinstance(items, list) or len(items) != 1:
+    raise SystemExit(2)
+q = items[0]
+if q.get("current_state_acceptance_eligibility") != "eligible":
+    raise SystemExit(3)
+if q.get("current_state_acceptance_policy") != "acknowledged_unknown_pointer_click_v1":
+    raise SystemExit(4)
+if q.get("current_state_acceptance_authority") != "local_user_presence":
+    raise SystemExit(5)
+PYRECOVERYQ
+}
+
+recovery_doctor_ready() {
+  local payload="$1"
+  python3 - "$payload" <<'PYRECOVERYDOCTOR'
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get("runtime", {}).get("manifest_verified") is not True:
+    raise SystemExit(2)
+hub = d.get("hub", {})
+if hub.get("live_quarantine_count") != 1 or hub.get("recovery_mode") != "restricted_read_only":
+    raise SystemExit(3)
+checks = {item.get("name"): item for item in d.get("checks", []) if isinstance(item, dict)}
+required_ok = [
+    "runtime_manifest", "agent_service", "agent_hub_transport", "hub_state",
+    "agent_state", "hub_service", "grant_signer_service", "grant_signer_socket",
+    "mutation_authority",
+]
+for name in required_ok:
+    if checks.get(name, {}).get("status") != "ok":
+        raise SystemExit(4)
+if checks.get("live_quarantine", {}).get("detail") != "present":
+    raise SystemExit(5)
+if checks.get("recovery_mode", {}).get("detail") != "restricted_read_only":
+    raise SystemExit(6)
+for name, item in checks.items():
+    if item.get("status") == "error" and name != "live_quarantine":
+        raise SystemExit(7)
+PYRECOVERYDOCTOR
+}
+
 QUARANTINE_JSON="$("$BIN_DIR/v2_maint" inspect-quarantine --state-dir "$HUB_STATE")" || {
   echo "REFUSED reason=quarantine_inspection_failed" >&2; exit 2;
 }
 QUARANTINE_COUNT="$(printf '%s' "$QUARANTINE_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("quarantines", [])))')"
-[[ "$QUARANTINE_COUNT" == "0" ]] || { echo "REFUSED reason=live_quarantine count=$QUARANTINE_COUNT" >&2; exit 2; }
+PRESERVED_QUARANTINE_BINDING=""
+if [[ "$RECOVERY_UPGRADE_MODE" == "1" ]]; then
+  PRESERVED_QUARANTINE_BINDING="$(quarantine_binding "$QUARANTINE_JSON")" || {
+    echo "REFUSED reason=preserved_quarantine_not_exact_pointer_click" >&2; exit 2;
+  }
+else
+  [[ "$QUARANTINE_COUNT" == "0" ]] || { echo "REFUSED reason=live_quarantine count=$QUARANTINE_COUNT" >&2; exit 2; }
+fi
 
 for label in "$HUB_LABEL" "$AGENT_LABEL"; do
   launchctl print "$DOMAIN/$label" >/dev/null 2>&1 || { echo "REFUSED reason=service_not_loaded label=$label" >&2; exit 2; }
@@ -474,9 +606,9 @@ if [[ "$ARTIFACT_MODE" == "0" ]]; then
     exit 2
   fi
   BUILD_FREE_MIB=$((BUILD_FREE_KIB / 1024))
-  echo "PREFLIGHT_OK source=checkout source_commit=$HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required build_jobs=$CARGO_BUILD_JOBS build_free_mib=$BUILD_FREE_MIB"
+  echo "PREFLIGHT_OK source=checkout source_commit=$HEAD quarantine=$([[ "$RECOVERY_UPGRADE_MODE" == "1" ]] && echo preserved || echo 0) handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required build_jobs=$CARGO_BUILD_JOBS build_free_mib=$BUILD_FREE_MIB"
 else
-  echo "PREFLIGHT_OK source=verified_artifact source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD quarantine=0 handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required"
+  echo "PREFLIGHT_OK source=verified_artifact source_commit=$HEAD handoff_source_commit=$HANDOFF_HEAD quarantine=$([[ "$RECOVERY_UPGRADE_MODE" == "1" ]] && echo preserved || echo 0) handoff=agent_owned mutation_authority_migration=$MUTATION_AUTHORITY_MIGRATION stable_tcc_signing=required"
 fi
 if [[ "$PRELIGHT_ONLY" == "1" ]]; then
   [[ -n "$ARTIFACT_TMP" ]] && rm -rf "$ARTIFACT_TMP"
@@ -505,13 +637,23 @@ upgrade_transaction_exit() {
 }
 trap upgrade_transaction_exit EXIT
 tx_advance() {
-  python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" advance "$@" >/dev/null || {
-    UPGRADE_FAILURE_STATUS="operator_action_required"
-    UPGRADE_FAILURE_REASON="transaction_update_failed"
-    UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
-    echo "REFUSED reason=upgrade_transaction_update_failed" >&2
+  local tx_error tx_detail
+  tx_error="$(mktemp /private/tmp/cumg-v2-tx-error.XXXXXX)"
+  if ! python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" advance "$@" >/dev/null 2>"$tx_error"; then
+    tx_detail="$(head -c 512 "$tx_error" | tr '\n\r' '  ' | sed 's/[^A-Za-z0-9_.:= -]/_/g')"
+    rm -f "$tx_error"
+    if [[ "$UPGRADE_FAILURE_STATUS" == "failed_before_install" ]]; then
+      UPGRADE_FAILURE_REASON="transaction_update_failed"
+      UPGRADE_OPERATOR_ACTION="restore_capacity_and_retry"
+    else
+      UPGRADE_FAILURE_STATUS="operator_action_required"
+      UPGRADE_FAILURE_REASON="transaction_update_failed"
+      UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+    fi
+    echo "REFUSED reason=upgrade_transaction_update_failed detail=$tx_detail" >&2
     exit 2
-  }
+  fi
+  rm -f "$tx_error"
 }
 
 if [[ "$ARTIFACT_MODE" == "0" ]]; then
@@ -747,7 +889,7 @@ fi
 tx_advance --flag handoff_runtime_paired
 
 MUTATION_AUTHORITY_CREATED=0
-STAMP="$(date '+%Y%m%dT%H%M%S%z')"
+STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
 ROLLBACK="$ROOT/rollback/runtime-upgrade-$STAMP"
 tx_advance --phase backup --rollback-asset "$(basename "$ROLLBACK")"
 umask 077
@@ -855,19 +997,43 @@ STOPPED_QUARANTINE_JSON="$("$BIN_DIR/v2_maint" inspect-quarantine --state-dir "$
   exit 2
 }
 STOPPED_QUARANTINE_COUNT="$(printf '%s' "$STOPPED_QUARANTINE_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("quarantines", [])))')"
-if [[ "$STOPPED_QUARANTINE_COUNT" != "0" ]]; then
-  UPGRADE_FAILURE_STATUS="operator_action_required"
-  UPGRADE_FAILURE_REASON="quarantine_created_during_drain"
-  UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
-  [[ "$EXTERNAL_SIGNER" == "1" ]] && launchctl bootstrap "$DOMAIN" "$SIGNER_PLIST" >/dev/null 2>&1 || true
-  launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
-  sleep 1
-  launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" >/dev/null 2>&1 || true
-  echo "REFUSED reason=quarantine_created_during_drain count=$STOPPED_QUARANTINE_COUNT rollback=$ROLLBACK" >&2
-  exit 2
+if [[ "$RECOVERY_UPGRADE_MODE" == "1" ]]; then
+  STOPPED_QUARANTINE_BINDING="$(quarantine_binding "$STOPPED_QUARANTINE_JSON")" || {
+    UPGRADE_FAILURE_STATUS="operator_action_required"
+    UPGRADE_FAILURE_REASON="preserved_quarantine_changed_during_drain"
+    UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+    [[ "$EXTERNAL_SIGNER" == "1" ]] && launchctl bootstrap "$DOMAIN" "$SIGNER_PLIST" >/dev/null 2>&1 || true
+    launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
+    sleep 1
+    launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" >/dev/null 2>&1 || true
+    echo "REFUSED reason=preserved_quarantine_changed_during_drain rollback=$ROLLBACK" >&2
+    exit 2
+  }
+  [[ "$STOPPED_QUARANTINE_BINDING" == "$PRESERVED_QUARANTINE_BINDING" ]] || {
+    UPGRADE_FAILURE_STATUS="operator_action_required"
+    UPGRADE_FAILURE_REASON="preserved_quarantine_binding_mismatch"
+    UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+    [[ "$EXTERNAL_SIGNER" == "1" ]] && launchctl bootstrap "$DOMAIN" "$SIGNER_PLIST" >/dev/null 2>&1 || true
+    launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
+    sleep 1
+    launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" >/dev/null 2>&1 || true
+    echo "REFUSED reason=preserved_quarantine_binding_mismatch rollback=$ROLLBACK" >&2
+    exit 2
+  }
+else
+  if [[ "$STOPPED_QUARANTINE_COUNT" != "0" ]]; then
+    UPGRADE_FAILURE_STATUS="operator_action_required"
+    UPGRADE_FAILURE_REASON="quarantine_created_during_drain"
+    UPGRADE_OPERATOR_ACTION="inspect_upgrade_status"
+    [[ "$EXTERNAL_SIGNER" == "1" ]] && launchctl bootstrap "$DOMAIN" "$SIGNER_PLIST" >/dev/null 2>&1 || true
+    launchctl bootstrap "$DOMAIN" "$HUB_PLIST" >/dev/null 2>&1 || true
+    sleep 1
+    launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" >/dev/null 2>&1 || true
+    echo "REFUSED reason=quarantine_created_during_drain count=$STOPPED_QUARANTINE_COUNT rollback=$ROLLBACK" >&2
+    exit 2
+  fi
+  tx_advance --flag quarantine_clear
 fi
-
-tx_advance --flag quarantine_clear
 tx_advance --phase authority_migration
 if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
   if ! "$BUILD_BIN_DIR/v2_maint" mutation-authority-init \
@@ -975,6 +1141,13 @@ if [[ "$MUTATION_AUTHORITY_MIGRATION" == "1" ]]; then
   if ! plutil -insert EnvironmentVariables.CUMG_MUTATION_AUTHORITY_DIR -string "$MUTATION_AUTHORITY_DIR" "$AGENT_PLIST"; then
     restore_preinstall_profile
     echo "REFUSED reason=agent_mutation_authority_update_failed rollback=$ROLLBACK" >&2
+    exit 2
+  fi
+fi
+if [[ "$ALLOWED_FILE_ROOTS_MIGRATION" == "1" ]]; then
+  if ! plutil -insert EnvironmentVariables.CUMG_V2_ALLOWED_FILE_ROOTS -string "$HOME" "$AGENT_PLIST"; then
+    restore_preinstall_profile
+    echo "REFUSED reason=agent_allowed_file_roots_update_failed rollback=$ROLLBACK" >&2
     exit 2
   fi
 fi
@@ -1101,7 +1274,17 @@ fi
 DOCTOR_OUTPUT=""
 DOCTOR_OK=0
 for _attempt in $(seq 1 15); do
-  if DOCTOR_OUTPUT="$("$BIN_DIR/v2_doctor" "${DOCTOR_ARGS[@]}" 2>/dev/null)"; then
+  if [[ "$RECOVERY_UPGRADE_MODE" == "1" ]]; then
+    DOCTOR_OUTPUT="$("$BIN_DIR/v2_doctor" "${DOCTOR_ARGS[@]}" 2>/dev/null || true)"
+    POST_QUARANTINE_JSON="$("$BIN_DIR/v2_maint" inspect-quarantine --state-dir "$HUB_STATE" 2>/dev/null || true)"
+    POST_QUARANTINE_BINDING="$(quarantine_binding "$POST_QUARANTINE_JSON" 2>/dev/null || true)"
+    if [[ "$POST_QUARANTINE_BINDING" == "$PRESERVED_QUARANTINE_BINDING" ]] \
+      && recovery_quarantine_ready "$POST_QUARANTINE_JSON" \
+      && recovery_doctor_ready "$DOCTOR_OUTPUT"; then
+      DOCTOR_OK=1
+      break
+    fi
+  elif DOCTOR_OUTPUT="$("$BIN_DIR/v2_doctor" "${DOCTOR_ARGS[@]}" 2>/dev/null)"; then
     DOCTOR_OK=1
     break
   fi
@@ -1109,6 +1292,16 @@ for _attempt in $(seq 1 15); do
 done
 [[ "$DOCTOR_OK" == "1" ]] || fail_poststart "doctor"
 printf '%s\n' "$DOCTOR_OUTPUT"
+if [[ "$RECOVERY_UPGRADE_MODE" == "1" ]]; then
+  tx_advance --flag runtime_manifest_verified
+  python3 "$UPGRADE_TRANSACTION_HELPER" --state-file "$UPGRADE_TRANSACTION_FILE" fail \
+    --status operator_action_required --reason quarantine_recovery_required \
+    --operator-action complete_recovery >/dev/null || fail_poststart "recovery_upgrade_transaction_finalize"
+  UPGRADE_TRANSACTION_ACTIVE=0
+  [[ -n "$ARTIFACT_TMP" ]] && rm -rf "$ARTIFACT_TMP" && ARTIFACT_TMP=""
+  echo "RECOVERY_UPGRADE_OK source_commit=$HEAD preserved_operation_id=$PRESERVE_QUARANTINE_OPERATION_ID rollback=$ROLLBACK"
+  exit 0
+fi
 tx_advance --flag runtime_manifest_verified --flag quarantine_clear --flag doctor_healthy
 tx_advance --phase cleanup
 UPGRADE_FAILURE_STATUS="operator_action_required"

@@ -164,9 +164,9 @@ For the normal single-Mac operator path, use the guided recovery workflow instea
 ```bash
 v2_recover guide \
   --hub-state-dir /var/lib/cumg-v2/hub \
-  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --agent-state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --mutation-authority-dir /var/lib/cumg-v2/mutation-authority \
   --wait-secs 60
@@ -183,8 +183,8 @@ Agent-assisted UI may inspect the privacy-bounded plan without gaining mutation 
 ```bash
 v2_recover guide \
   --hub-state-dir /var/lib/cumg-v2/hub \
-  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --agent-state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
   --json
 ```
 

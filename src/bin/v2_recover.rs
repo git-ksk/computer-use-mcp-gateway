@@ -2,29 +2,30 @@ use anyhow::{Context, Result, bail};
 #[path = "v2_recover/linux_fido2.rs"]
 mod linux_fido2;
 use linux_fido2::{
-    LinuxFido2ProviderArgs, accept_current_state_linux_fido2, init_linux_fido2, resolve_linux_fido2,
+    LinuxFido2ProviderArgs, accept_current_state_linux_fido2, init_linux_fido2,
+    resolve_linux_fido2, resume_mutations_linux_fido2,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(any(target_os = "macos", windows))]
 use computer_use_mcp_gateway::v2_online_recovery::{
     RecoveryAuditAssessment, new_authorization, new_current_state_acceptance_authorization,
-    recovery_decision_name, store_authorization,
+    new_mutation_resume_authorization, recovery_decision_name, store_authorization,
 };
 use computer_use_mcp_gateway::{
     v2_execution_safety::RetirementPolicy,
     v2_guided_recovery::{
         GuidedRecoveryDisposition, GuidedRecoveryPlan, GuidedRecoveryPostDisposition,
         classify_guided_recovery_post_status, compose_guided_recovery_plan,
-        decision_name as guided_decision_name, revalidate_guided_human_historical_selection,
-        revalidate_guided_recovery_selection,
+        decision_name as guided_decision_name, revalidate_guided_current_state_acceptance,
+        revalidate_guided_human_historical_selection, revalidate_guided_recovery_selection,
     },
     v2_incident_brief::{build_incident_brief_read_only, render_incident_brief_text},
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::{load_secret_text, load_verifying_key},
     v2_maintenance::{ReconciliationSupportedDecision, inspect_quarantines_read_only},
     v2_online_recovery::{
-        RecoveryChallenge, RecoveryDecision, RecoveryResolved, load_challenge,
+        RecoveryChallenge, RecoveryDecision, RecoveryPhase, RecoveryResolved, load_challenge,
         load_recovery_resolved, verify_recovery_challenge, verify_recovery_resolved,
     },
     v2_operator_status::OperatorOverallStatus,
@@ -142,6 +143,28 @@ enum Command {
         uv_mode: LinuxFido2UvModeArg,
         #[arg(long, env = "CUMG_V2_RECOVERY_WEBAUTHN_VERIFIER_FILE")]
         verifier_file: PathBuf,
+        /// Reviewed continuation policy. PointerClick requires the dedicated policy and a later resume step.
+        #[arg(long, value_enum, default_value = "transient-ui-interaction-v1")]
+        policy: CurrentStatePolicyArg,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
+    },
+    /// Re-arm fresh effectful admission with the provisioned Linux FIDO2 credential.
+    ResumeMutationsLinuxFido2 {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_FIDO2_TOOL_DIR")]
+        tool_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_FIDO2_DEVICE")]
+        device: PathBuf,
+        #[arg(long, value_enum)]
+        uv_mode: LinuxFido2UvModeArg,
+        #[arg(long, env = "CUMG_V2_RECOVERY_WEBAUTHN_VERIFIER_FILE")]
+        verifier_file: PathBuf,
         #[arg(long)]
         evidence: String,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
@@ -213,10 +236,29 @@ enum Command {
         key_file: PathBuf,
         #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
         secure_enclave_helper: PathBuf,
+        /// Reviewed continuation policy. PointerClick requires its dedicated policy and a later resume-mutations approval.
+        #[arg(long, value_enum, default_value = "transient-ui-interaction-v1")]
+        policy: CurrentStatePolicyArg,
         /// Short metadata stating what the local user inspected. Never include a screenshot or secret.
         #[arg(long)]
         evidence: String,
         /// Wait up to this many seconds for the exact signed Hub durable-completion acknowledgement.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
+        wait_secs: u64,
+    },
+    /// Re-arm fresh effectful admission after an acknowledged unknown PointerClick and generation rollover.
+    ResumeMutations {
+        #[arg(long, env = "CUMG_V2_STATE_DIR")]
+        state_dir: PathBuf,
+        #[arg(long, env = "CUMG_V2_HUB_PUBLIC_KEY_FILE")]
+        hub_public_key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_KEY_FILE")]
+        key_file: PathBuf,
+        #[arg(long, env = "CUMG_V2_RECOVERY_HELPER")]
+        secure_enclave_helper: PathBuf,
+        /// Short metadata acknowledging that only fresh mutations will be admitted after this re-arm.
+        #[arg(long)]
+        evidence: String,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
         wait_secs: u64,
     },
@@ -236,6 +278,9 @@ enum Command {
         current_generation: u64,
         #[arg(long, value_enum)]
         decision: RecoveryDecisionArg,
+        /// Required for current-state-accepted confirmation so the exact policy is signature-bound.
+        #[arg(long, value_enum)]
+        policy: Option<CurrentStatePolicyArg>,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=120))]
         wait_secs: u64,
     },
@@ -278,6 +323,26 @@ enum RecoveryDecisionArg {
     ConfirmedCompleted,
     ConfirmedNotExecuted,
     CurrentStateAccepted,
+    MutationsResumed,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CurrentStatePolicyArg {
+    TransientUiInteractionV1,
+    AcknowledgedUnknownPointerClickV1,
+}
+
+impl From<CurrentStatePolicyArg> for RetirementPolicy {
+    fn from(value: CurrentStatePolicyArg) -> Self {
+        match value {
+            CurrentStatePolicyArg::TransientUiInteractionV1 => {
+                RetirementPolicy::TransientUiInteractionV1
+            }
+            CurrentStatePolicyArg::AcknowledgedUnknownPointerClickV1 => {
+                RetirementPolicy::AcknowledgedUnknownPointerClickV1
+            }
+        }
+    }
 }
 
 impl RecoveryDecisionArg {
@@ -286,13 +351,16 @@ impl RecoveryDecisionArg {
             Self::ConfirmedCompleted => RecoveryDecision::ConfirmedCompleted,
             Self::ConfirmedNotExecuted => RecoveryDecision::ConfirmedNotExecuted,
             Self::CurrentStateAccepted => RecoveryDecision::CurrentStateAccepted,
+            Self::MutationsResumed => RecoveryDecision::MutationsResumed,
         }
     }
 
-    fn current_state_policy(self) -> Option<RetirementPolicy> {
+    fn phase(self) -> RecoveryPhase {
         match self {
-            Self::CurrentStateAccepted => Some(RetirementPolicy::TransientUiInteractionV1),
-            Self::ConfirmedCompleted | Self::ConfirmedNotExecuted => None,
+            Self::MutationsResumed => RecoveryPhase::MutationResume,
+            Self::ConfirmedCompleted | Self::ConfirmedNotExecuted | Self::CurrentStateAccepted => {
+                RecoveryPhase::QuarantineResolution
+            }
         }
     }
 }
@@ -302,26 +370,43 @@ const MAX_GUIDED_DIAGNOSTICS_BYTES: u64 = 64 * 1024;
 const GUIDED_RECOVERY_EVIDENCE: &str = "guided_recovery_authoritative_incident_review_v1";
 #[cfg(target_os = "macos")]
 const GUIDED_HUMAN_HISTORICAL_EVIDENCE: &str = "guided_recovery_human_historical_assertion_v1";
+#[cfg(target_os = "macos")]
+const GUIDED_CURRENT_STATE_EVIDENCE: &str = "guided_recovery_current_state_accepted_v1";
+const GUIDED_MUTATION_RESUME_EVIDENCE: &str = "guided_recovery_mutation_resume_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuidedRecoverySelection {
     Authoritative(ReconciliationSupportedDecision),
     HumanHistorical(ReconciliationSupportedDecision),
+    CurrentStateAccepted(RetirementPolicy),
 }
 
 impl GuidedRecoverySelection {
-    #[cfg(target_os = "macos")]
-    const fn decision(self) -> ReconciliationSupportedDecision {
-        match self {
-            Self::Authoritative(decision) | Self::HumanHistorical(decision) => decision,
-        }
-    }
-
     #[cfg(target_os = "macos")]
     const fn authority_name(self) -> &'static str {
         match self {
             Self::Authoritative(_) => "authoritative_reconciliation",
             Self::HumanHistorical(_) => "human_historical_assertion",
+            Self::CurrentStateAccepted(_) => "local_user_current_state_acceptance",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const fn selection_name(self) -> &'static str {
+        match self {
+            Self::Authoritative(ReconciliationSupportedDecision::ConfirmedCompleted) => {
+                "confirmed_completed"
+            }
+            Self::Authoritative(ReconciliationSupportedDecision::ConfirmedNotExecuted) => {
+                "confirmed_not_executed"
+            }
+            Self::HumanHistorical(ReconciliationSupportedDecision::ConfirmedCompleted) => {
+                "human_confirmed_completed"
+            }
+            Self::HumanHistorical(ReconciliationSupportedDecision::ConfirmedNotExecuted) => {
+                "human_confirmed_not_executed"
+            }
+            Self::CurrentStateAccepted(_) => "current_state_accepted_historical_outcome_unknown",
         }
     }
 }
@@ -361,6 +446,7 @@ struct PostRecoveryStatus {
 
 #[derive(Debug, Clone)]
 struct ExpectedRecoveryCompletion {
+    phase: RecoveryPhase,
     request_id: String,
     device_id: String,
     operation_id: String,
@@ -477,9 +563,32 @@ fn main() -> Result<()> {
             device,
             uv_mode,
             verifier_file,
+            policy,
             evidence,
             wait_secs,
         } => accept_current_state_linux_fido2(
+            state_dir,
+            hub_public_key_file,
+            LinuxFido2ProviderArgs {
+                tool_dir,
+                device,
+                uv_mode: uv_mode.into(),
+                verifier_file,
+            },
+            policy.into(),
+            evidence,
+            wait_secs,
+        ),
+        Command::ResumeMutationsLinuxFido2 {
+            state_dir,
+            hub_public_key_file,
+            tool_dir,
+            device,
+            uv_mode,
+            verifier_file,
+            evidence,
+            wait_secs,
+        } => resume_mutations_linux_fido2(
             state_dir,
             hub_public_key_file,
             LinuxFido2ProviderArgs {
@@ -521,6 +630,10 @@ fn main() -> Result<()> {
             hub_public_key_file,
         } => {
             let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
+            println!(
+                "recovery_phase={}",
+                computer_use_mcp_gateway::v2_online_recovery::recovery_phase_name(challenge.phase)
+            );
             println!("device_id={}", challenge.device_id);
             println!("operation_id={}", challenge.operation_id);
             println!("quarantine_generation={}", challenge.quarantine_generation);
@@ -551,9 +664,26 @@ fn main() -> Result<()> {
             hub_public_key_file,
             key_file,
             secure_enclave_helper,
+            policy,
             evidence,
             wait_secs,
         } => accept_current_state(
+            state_dir,
+            hub_public_key_file,
+            key_file,
+            secure_enclave_helper,
+            policy.into(),
+            evidence,
+            wait_secs,
+        ),
+        Command::ResumeMutations {
+            state_dir,
+            hub_public_key_file,
+            key_file,
+            secure_enclave_helper,
+            evidence,
+            wait_secs,
+        } => resume_mutations(
             state_dir,
             hub_public_key_file,
             key_file,
@@ -569,20 +699,39 @@ fn main() -> Result<()> {
             operation_id,
             current_generation,
             decision,
+            policy,
             wait_secs,
-        } => wait_for_completion(
-            &state_dir,
-            &hub_public_key_file,
-            &ExpectedRecoveryCompletion {
-                request_id,
-                device_id,
-                operation_id,
-                current_generation,
-                decision: decision.decision(),
-                current_state_policy: decision.current_state_policy(),
-            },
-            wait_secs,
-        ),
+        } => {
+            let current_state_policy = match decision {
+                RecoveryDecisionArg::CurrentStateAccepted => Some(
+                    policy
+                        .context("--policy is required when confirming current-state-accepted")?
+                        .into(),
+                ),
+                RecoveryDecisionArg::ConfirmedCompleted
+                | RecoveryDecisionArg::ConfirmedNotExecuted
+                | RecoveryDecisionArg::MutationsResumed => {
+                    if policy.is_some() {
+                        anyhow::bail!("--policy is valid only with current-state-accepted");
+                    }
+                    None
+                }
+            };
+            wait_for_completion(
+                &state_dir,
+                &hub_public_key_file,
+                &ExpectedRecoveryCompletion {
+                    phase: decision.phase(),
+                    request_id,
+                    device_id,
+                    operation_id,
+                    current_generation,
+                    decision: decision.decision(),
+                    current_state_policy,
+                },
+                wait_secs,
+            )
+        }
     }
 }
 
@@ -675,9 +824,14 @@ fn prompt_human_historical_assertion(
     println!(
         "Do not guess. Choose a historical assertion only if you personally observed this exact operation."
     );
-    println!("  0) I do not know / keep quarantine");
+    println!("  0) Keep quarantine / cancel");
     println!("  1) I directly observed this exact operation complete");
     println!("  2) I directly observed this exact operation did not execute");
+    if plan.current_state_acceptance.available {
+        println!(
+            "  3) Historical outcome remains unknown; accept the current desktop state without replay"
+        );
+    }
     loop {
         print!("Select a Human historical assertion: ");
         std::io::stdout().flush()?;
@@ -697,14 +851,72 @@ fn prompt_human_historical_assertion(
                     ReconciliationSupportedDecision::ConfirmedNotExecuted,
                 )));
             }
-            _ => println!(
-                "Invalid selection; choose 1/2 only for direct personal observation, or 0 to keep quarantine."
-            ),
+            "3" if plan.current_state_acceptance.available => {
+                let policy = plan
+                    .current_state_acceptance
+                    .policy
+                    .context("guided current-state policy is missing")?;
+                return Ok(Some(GuidedRecoverySelection::CurrentStateAccepted(policy)));
+            }
+            _ => println!("Invalid selection; choose a listed option or 0 to keep quarantine."),
         }
     }
 }
 
 fn guide(args: GuidedRecoveryArgs) -> Result<()> {
+    let current_challenge = verified_challenge(&args.agent_state_dir, &args.hub_public_key_file)?;
+    if current_challenge.phase == RecoveryPhase::MutationResume {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "phase": "mutation_resume",
+                    "device_id": current_challenge.device_id,
+                    "source_operation_id": current_challenge.operation_id,
+                    "current_generation": current_challenge.current_generation,
+                    "historical_execution_outcome": "indeterminate",
+                    "old_operation_replayed": false,
+                    "user_presence_required": true,
+                    "next_action": "resume_mutations"
+                }))?
+            );
+            return Ok(());
+        }
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            anyhow::bail!("mutation resume requires an interactive Human terminal");
+        }
+        println!("Mutation resume required");
+        println!("  Historical PointerClick outcome remains unknown.");
+        println!("  The old operation will not be replayed.");
+        println!("  0) Keep fresh mutations fenced");
+        println!("  1) Re-arm only fresh effectful operations in this new generation");
+        print!("Select: ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        if stdin.read_line(&mut input)? == 0 || input.trim() != "1" {
+            println!("guided_outcome=mutation_resume_deferred");
+            println!("fresh_mutations=fenced");
+            return Ok(());
+        }
+        let key_file = args
+            .key_file
+            .clone()
+            .context("--key-file is required for interactive guided recovery")?;
+        let secure_enclave_helper = args
+            .secure_enclave_helper
+            .clone()
+            .context("--secure-enclave-helper is required for interactive guided recovery")?;
+        return resume_mutations(
+            args.agent_state_dir.clone(),
+            args.hub_public_key_file.clone(),
+            key_file,
+            secure_enclave_helper,
+            GUIDED_MUTATION_RESUME_EVIDENCE.into(),
+            args.wait_secs,
+        );
+    }
     let reviewed = load_guided_review(&args)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&reviewed.plan)?);
@@ -769,6 +981,9 @@ fn guide(args: GuidedRecoveryArgs) -> Result<()> {
         }
         GuidedRecoverySelection::HumanHistorical(decision) => {
             revalidate_guided_human_historical_selection(&reviewed.plan, &fresh.plan, decision)
+        }
+        GuidedRecoverySelection::CurrentStateAccepted(policy) => {
+            revalidate_guided_current_state_acceptance(&reviewed.plan, &fresh.plan, policy)
         }
     };
     if let Err(error) = revalidation {
@@ -848,6 +1063,25 @@ fn guide(args: GuidedRecoveryArgs) -> Result<()> {
     );
     println!("post_recovery_runtime={}", post_status.runtime);
 
+    if matches!(
+        selected,
+        GuidedRecoverySelection::CurrentStateAccepted(
+            RetirementPolicy::AcknowledgedUnknownPointerClickV1
+        )
+    ) {
+        if !exact_quarantine_cleared {
+            anyhow::bail!("current-state acceptance was acknowledged but quarantine did not clear");
+        }
+        if post_status.recovery_mode != "mutation_resume_required" {
+            anyhow::bail!(
+                "PointerClick current-state acceptance did not enter the required mutation-resume barrier"
+            );
+        }
+        println!("recovery_outcome=mutation_resume_required");
+        println!("next_action=rerun_guide_or_resume_mutations");
+        return Ok(());
+    }
+
     let disposition = classify_guided_recovery_post_status(
         true,
         exact_quarantine_cleared,
@@ -881,40 +1115,59 @@ fn publish_guided_authorization(
     selected: GuidedRecoverySelection,
 ) -> Result<ExpectedRecoveryCompletion> {
     use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
-    let selected_decision = selected.decision();
-    let decision = match selected_decision {
-        ReconciliationSupportedDecision::ConfirmedCompleted => {
-            IndeterminateResolution::ConfirmedCompleted
+    let authorization = match selected {
+        GuidedRecoverySelection::Authoritative(decision) => {
+            let (assessment, evidence) = match decision {
+                ReconciliationSupportedDecision::ConfirmedCompleted => {
+                    (RecoveryAuditAssessment::Completed, GUIDED_RECOVERY_EVIDENCE)
+                }
+                ReconciliationSupportedDecision::ConfirmedNotExecuted => (
+                    RecoveryAuditAssessment::NotExecuted,
+                    GUIDED_RECOVERY_EVIDENCE,
+                ),
+            };
+            let resolution = match decision {
+                ReconciliationSupportedDecision::ConfirmedCompleted => {
+                    IndeterminateResolution::ConfirmedCompleted
+                }
+                ReconciliationSupportedDecision::ConfirmedNotExecuted => {
+                    IndeterminateResolution::ConfirmedNotExecuted
+                }
+            };
+            new_authorization(challenge, assessment, resolution, evidence)
+                .context("failed to construct exact guided recovery authorization")?
         }
-        ReconciliationSupportedDecision::ConfirmedNotExecuted => {
-            IndeterminateResolution::ConfirmedNotExecuted
+        GuidedRecoverySelection::HumanHistorical(decision) => {
+            let resolution = match decision {
+                ReconciliationSupportedDecision::ConfirmedCompleted => {
+                    IndeterminateResolution::ConfirmedCompleted
+                }
+                ReconciliationSupportedDecision::ConfirmedNotExecuted => {
+                    IndeterminateResolution::ConfirmedNotExecuted
+                }
+            };
+            new_authorization(
+                challenge,
+                RecoveryAuditAssessment::Inconclusive,
+                resolution,
+                GUIDED_HUMAN_HISTORICAL_EVIDENCE,
+            )
+            .context("failed to construct Human historical authorization")?
+        }
+        GuidedRecoverySelection::CurrentStateAccepted(policy) => {
+            new_current_state_acceptance_authorization(
+                challenge,
+                policy,
+                GUIDED_CURRENT_STATE_EVIDENCE,
+            )
+            .context("failed to construct current-state acceptance authorization")?
         }
     };
-    let (assessment, evidence) = match selected {
-        GuidedRecoverySelection::Authoritative(
-            ReconciliationSupportedDecision::ConfirmedCompleted,
-        ) => (RecoveryAuditAssessment::Completed, GUIDED_RECOVERY_EVIDENCE),
-        GuidedRecoverySelection::Authoritative(
-            ReconciliationSupportedDecision::ConfirmedNotExecuted,
-        ) => (
-            RecoveryAuditAssessment::NotExecuted,
-            GUIDED_RECOVERY_EVIDENCE,
-        ),
-        GuidedRecoverySelection::HumanHistorical(_) => (
-            RecoveryAuditAssessment::Inconclusive,
-            GUIDED_HUMAN_HISTORICAL_EVIDENCE,
-        ),
-    };
-    let authorization = new_authorization(challenge, assessment, decision, evidence)
-        .context("failed to construct exact guided recovery authorization")?;
-    println!(
-        "human_selection={}",
-        guided_decision_name(selected_decision)
-    );
+    println!("human_selection={}", selected.selection_name());
     println!("decision_authority={}", selected.authority_name());
     println!(
         "audit_assessment={}",
-        match assessment {
+        match authorization.audit_assessment {
             RecoveryAuditAssessment::Completed => "completed",
             RecoveryAuditAssessment::NotExecuted => "not_executed",
             RecoveryAuditAssessment::Inconclusive => "inconclusive",
@@ -929,6 +1182,7 @@ fn publish_guided_authorization(
     store_authorization(state_dir, &authorization)
         .context("failed to publish recovery authorization to Agent")?;
     Ok(ExpectedRecoveryCompletion {
+        phase: authorization.phase,
         request_id: authorization.request_id,
         device_id: authorization.device_id,
         operation_id: authorization.operation_id,
@@ -1323,6 +1577,7 @@ fn resolve(
             &state_dir,
             &hub_public_key_file,
             &ExpectedRecoveryCompletion {
+                phase: authorization.phase,
                 request_id: authorization.request_id.clone(),
                 device_id: authorization.device_id.clone(),
                 operation_id: authorization.operation_id.clone(),
@@ -1344,17 +1599,14 @@ fn accept_current_state(
     hub_public_key_file: PathBuf,
     key_file: PathBuf,
     secure_enclave_helper: PathBuf,
+    policy: RetirementPolicy,
     evidence: String,
     wait_secs: u64,
 ) -> Result<()> {
     use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
     let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
-    let authorization = new_current_state_acceptance_authorization(
-        &challenge,
-        RetirementPolicy::TransientUiInteractionV1,
-        evidence,
-    )
-    .context("current-state acceptance is not valid for this recovery schema")?;
+    let authorization = new_current_state_acceptance_authorization(&challenge, policy, evidence)
+        .context("current-state acceptance is not valid for this recovery schema")?;
     println!("accepting_current_state");
     println!("device_id={}", authorization.device_id);
     println!("operation_id={}", authorization.operation_id);
@@ -1366,11 +1618,26 @@ fn accept_current_state(
     println!("historical_execution_outcome=indeterminate");
     println!("operator_observation=current_state_accepted");
     println!("operational_disposition=current_state_accepted");
-    println!("retirement_policy=transient_ui_interaction_v1");
-    println!("old_operation_replayed=false");
     println!(
-        "statement=I inspected the current screen. This state is acceptable to continue from."
+        "retirement_policy={}",
+        match policy {
+            RetirementPolicy::TransientUiInteractionV1 => "transient_ui_interaction_v1",
+            RetirementPolicy::AcknowledgedUnknownPointerClickV1 => {
+                "acknowledged_unknown_pointer_click_v1"
+            }
+        }
     );
+    println!("old_operation_replayed=false");
+    if policy == RetirementPolicy::AcknowledgedUnknownPointerClickV1 {
+        println!("mutation_resume_required=true");
+        println!(
+            "statement=I understand the prior click may or may not have executed and may already have caused side effects. I accept the current device state without asserting either historical outcome; fresh mutations remain fenced until a separate local-user resume."
+        );
+    } else {
+        println!(
+            "statement=I inspected the current screen. This state is acceptable to continue from."
+        );
+    }
     println!("user_presence=required");
     let key = MacRecoveryKey::load(&secure_enclave_helper, &key_file)
         .context("recovery key is not provisioned")?;
@@ -1386,6 +1653,64 @@ fn accept_current_state(
             &state_dir,
             &hub_public_key_file,
             &ExpectedRecoveryCompletion {
+                phase: authorization.phase,
+                request_id: authorization.request_id.clone(),
+                device_id: authorization.device_id.clone(),
+                operation_id: authorization.operation_id.clone(),
+                current_generation: authorization.current_generation,
+                decision: authorization.decision,
+                current_state_policy: authorization.current_state_policy,
+            },
+            wait_secs,
+        )?;
+    } else {
+        println!("durable_completion=not_checked");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn resume_mutations(
+    state_dir: PathBuf,
+    hub_public_key_file: PathBuf,
+    key_file: PathBuf,
+    secure_enclave_helper: PathBuf,
+    evidence: String,
+    wait_secs: u64,
+) -> Result<()> {
+    use computer_use_mcp_gateway::v2_online_recovery::macos::MacRecoveryKey;
+    let challenge = verified_challenge(&state_dir, &hub_public_key_file)?;
+    if challenge.phase != RecoveryPhase::MutationResume {
+        anyhow::bail!("current recovery challenge is not a mutation-resume challenge");
+    }
+    let authorization = new_mutation_resume_authorization(&challenge, evidence)
+        .context("mutation resume is not valid for this recovery challenge")?;
+    println!("resuming_mutations");
+    println!("device_id={}", authorization.device_id);
+    println!("source_operation_id={}", authorization.operation_id);
+    println!("current_generation={}", authorization.current_generation);
+    println!("historical_execution_outcome=indeterminate");
+    println!("old_operation_replayed=false");
+    println!("stale_workflow_resumed=false");
+    println!(
+        "statement=I explicitly re-arm only fresh effectful operations from this new device generation. The prior click remains historically unknown and is not replayed."
+    );
+    println!("user_presence=required");
+    let key = MacRecoveryKey::load(&secure_enclave_helper, &key_file)
+        .context("recovery key is not provisioned")?;
+    let authorization = key
+        .sign_authorization(authorization)
+        .context("OS user-presence approval was not completed")?;
+    store_authorization(&state_dir, &authorization)
+        .context("failed to publish mutation-resume authorization to Agent")?;
+    println!("request_id={}", authorization.request_id);
+    println!("authorization=published");
+    if wait_secs > 0 {
+        wait_for_completion(
+            &state_dir,
+            &hub_public_key_file,
+            &ExpectedRecoveryCompletion {
+                phase: authorization.phase,
                 request_id: authorization.request_id.clone(),
                 device_id: authorization.device_id.clone(),
                 operation_id: authorization.operation_id.clone(),
@@ -1402,11 +1727,24 @@ fn accept_current_state(
 }
 
 #[cfg(not(target_os = "macos"))]
+fn resume_mutations(
+    _state_dir: PathBuf,
+    _hub_public_key_file: PathBuf,
+    _key_file: PathBuf,
+    _secure_enclave_helper: PathBuf,
+    _evidence: String,
+    _wait_secs: u64,
+) -> Result<()> {
+    bail!("local user-presence mutation resume is supported only on macOS")
+}
+
+#[cfg(not(target_os = "macos"))]
 fn accept_current_state(
     _state_dir: PathBuf,
     _hub_public_key_file: PathBuf,
     _key_file: PathBuf,
     _secure_enclave_helper: PathBuf,
+    _policy: RetirementPolicy,
     _evidence: String,
     _wait_secs: u64,
 ) -> Result<()> {
@@ -1441,6 +1779,33 @@ fn wait_for_completion(
     Ok(())
 }
 
+fn recovery_completion_matches_expected(
+    resolved: &RecoveryResolved,
+    trusted_hub: &ed25519_dalek::VerifyingKey,
+    expected: &ExpectedRecoveryCompletion,
+) -> Result<bool> {
+    // A previously completed recovery may legitimately remain on disk while the
+    // next phase is being authorized. Verify that receipt as authentic first,
+    // but do not confuse a valid stale receipt with the exact completion we are
+    // waiting for.
+    verify_recovery_resolved(
+        resolved,
+        trusted_hub,
+        &resolved.request_id,
+        &resolved.device_id,
+        resolved.current_generation,
+    )
+    .context("durable recovery acknowledgement has an invalid Hub signature")?;
+
+    Ok(resolved.phase == expected.phase
+        && resolved.request_id == expected.request_id
+        && resolved.device_id == expected.device_id
+        && resolved.operation_id == expected.operation_id
+        && resolved.current_generation == expected.current_generation
+        && resolved.decision == expected.decision
+        && resolved.current_state_policy == expected.current_state_policy)
+}
+
 fn wait_for_completion_verified(
     state_dir: &Path,
     hub_public_key_file: &Path,
@@ -1450,31 +1815,133 @@ fn wait_for_completion_verified(
     let trusted_hub =
         load_verifying_key(hub_public_key_file).context("failed to load pinned Hub public key")?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    let mut saw_other_valid_ack = false;
     loop {
         if let Some(resolved) = load_recovery_resolved(state_dir)
             .context("failed to read durable recovery acknowledgement")?
         {
-            verify_recovery_resolved(
-                &resolved,
-                &trusted_hub,
-                &expected.request_id,
-                &expected.device_id,
-                expected.current_generation,
-            )
-            .context("durable recovery acknowledgement is stale, mismatched, or invalid")?;
-            if resolved.operation_id != expected.operation_id
-                || resolved.decision != expected.decision
-                || resolved.current_state_policy != expected.current_state_policy
-            {
-                anyhow::bail!(
-                    "durable recovery acknowledgement does not match the exact operation/decision"
-                );
+            if recovery_completion_matches_expected(&resolved, &trusted_hub, expected)? {
+                return Ok(resolved);
             }
-            return Ok(resolved);
+            saw_other_valid_ack = true;
         }
         if wait_secs == 0 || std::time::Instant::now() >= deadline {
+            if saw_other_valid_ack {
+                anyhow::bail!(
+                    "durable Hub recovery completion is not yet verified; latest acknowledgement belongs to a different recovery request or phase"
+                );
+            }
             anyhow::bail!("durable Hub recovery completion is not yet verified");
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod completion_wait_tests {
+    use super::*;
+    use computer_use_mcp_gateway::{
+        v2_m0_transport::HubIdentity,
+        v2_m1_keys::write_new_verifying_key,
+        v2_online_recovery::{
+            ONLINE_RECOVERY_SCHEMA_VERSION, RecoveryAuditAssessment, RecoveryAuthorization,
+            build_recovery_resolved, store_recovery_resolved,
+        },
+    };
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cumg-v2-recover-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+
+    fn authorization(
+        phase: RecoveryPhase,
+        request_id: &str,
+        generation: u64,
+        decision: RecoveryDecision,
+        policy: Option<RetirementPolicy>,
+    ) -> RecoveryAuthorization {
+        RecoveryAuthorization {
+            schema_version: ONLINE_RECOVERY_SCHEMA_VERSION,
+            phase,
+            request_id: request_id.to_owned(),
+            device_id: "dev_completion_wait".into(),
+            operation_id: "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            quarantine_generation: 7,
+            current_generation: generation,
+            quarantine_fingerprint: [7; 32],
+            challenge_nonce: [9; 32],
+            challenge_expires_at_ms: u64::MAX,
+            audit_assessment: RecoveryAuditAssessment::Inconclusive,
+            decision,
+            current_state_policy: policy,
+            evidence: "test".into(),
+            signature: vec![],
+        }
+    }
+
+    #[test]
+    fn completion_wait_ignores_valid_stale_stage_one_receipt_until_stage_two_arrives() {
+        let root = temp_dir("stale-stage-one");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let hub = HubIdentity::generate();
+        let hub_public = root.join("hub.pub");
+        write_new_verifying_key(&hub_public, &hub.verifier()).unwrap();
+
+        let stale_authorization = authorization(
+            RecoveryPhase::QuarantineResolution,
+            "rec_11111111111111111111111111111111",
+            1140,
+            RecoveryDecision::CurrentStateAccepted,
+            Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1),
+        );
+        let stale = build_recovery_resolved(&hub, &stale_authorization, 10).unwrap();
+        store_recovery_resolved(&state_dir, &stale).unwrap();
+
+        let expected_authorization = authorization(
+            RecoveryPhase::MutationResume,
+            "rec_22222222222222222222222222222222",
+            1141,
+            RecoveryDecision::MutationsResumed,
+            Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1),
+        );
+        let expected = ExpectedRecoveryCompletion {
+            phase: expected_authorization.phase,
+            request_id: expected_authorization.request_id.clone(),
+            device_id: expected_authorization.device_id.clone(),
+            operation_id: expected_authorization.operation_id.clone(),
+            current_generation: expected_authorization.current_generation,
+            decision: expected_authorization.decision,
+            current_state_policy: expected_authorization.current_state_policy,
+        };
+        let matching = build_recovery_resolved(&hub, &expected_authorization, 20).unwrap();
+        let writer_state = state_dir.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            store_recovery_resolved(&writer_state, &matching).unwrap();
+        });
+
+        let resolved = wait_for_completion_verified(&state_dir, &hub_public, &expected, 2).unwrap();
+        writer.join().unwrap();
+        assert_eq!(resolved.request_id, expected.request_id);
+        assert_eq!(resolved.phase, RecoveryPhase::MutationResume);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

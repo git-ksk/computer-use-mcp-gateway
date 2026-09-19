@@ -33,6 +33,14 @@ const LEGACY_MAINTENANCE_LABEL_PREFIXES: [&str; 2] = [
 #[cfg(target_os = "macos")]
 const MAX_MAINTENANCE_JOBS: usize = 64;
 
+pub fn default_single_mac_recovery_key_file(install_root: &Path, home: &Path) -> PathBuf {
+    let packaged = install_root.join("v2/secrets/recovery.sealed");
+    if packaged.is_file() {
+        return packaged;
+    }
+    home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed")
+}
+
 #[derive(Debug, Clone)]
 pub struct DoctorConfig {
     pub hub_state_dir: PathBuf,
@@ -371,6 +379,7 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     let readiness = summarize_readiness(
         &checks,
         hub.live_quarantine_count,
+        hub.recovery_mode == "mutation_resume_required",
         supported_capabilities.as_deref(),
         config.cua_command.is_some(),
         mutation_authority.as_ref(),
@@ -886,6 +895,15 @@ fn inspect_hub(
         max_global_active: 1,
         max_queued_per_device: 1,
     });
+    let mutation_resume_required = restored
+        .as_ref()
+        .ok()
+        .and_then(|(_, execution)| {
+            device_id
+                .as_deref()
+                .map(|device_id| execution.mutation_resume_barrier(device_id).is_some())
+        })
+        .unwrap_or(false);
     if restored.is_err() || summary.device_count != 1 || summary.capability_schema.is_none() {
         push(
             checks,
@@ -907,7 +925,7 @@ fn inspect_hub(
                 classify_quarantine_report(&report, summary.device_count, in_band_agent_descendant);
             summary.live_quarantine_count = Some(persistent_count);
             let (recovery_mode, recovery_mode_status) =
-                recovery_mode_for_quarantine_count(persistent_count);
+                recovery_mode_for_quarantine_count(persistent_count, mutation_resume_required);
             summary.recovery_mode = recovery_mode.to_owned();
             if persistent_count == 0 {
                 push(checks, "live_quarantine", CheckStatus::Ok, "none");
@@ -964,6 +982,7 @@ fn capability_group_supported(
 fn summarize_readiness(
     checks: &[DoctorCheck],
     live_quarantine_count: Option<usize>,
+    mutation_resume_required: bool,
     capabilities: Option<&[DeviceCapability]>,
     cua_configured: bool,
     mutation_authority: Option<&MutationAuthoritySummary>,
@@ -1035,7 +1054,11 @@ fn summarize_readiness(
         Some(true) => LaneReadiness::Ready,
         None => LaneReadiness::Unknown,
     };
-    let blocking_operation_present = live_quarantine_count.map(|count| count > 0);
+    let blocking_operation_present = if mutation_resume_required {
+        Some(true)
+    } else {
+        live_quarantine_count.map(|count| count > 0)
+    };
     let effectful_lane = |supported: Option<bool>, backend_required: bool| match supported {
         Some(false) => LaneReadiness::Unsupported,
         Some(true) if blocking_operation_present == Some(true) => {
@@ -1095,7 +1118,9 @@ fn summarize_readiness(
         lanes,
         blocking_operation_present,
         blocking_operation_retry_safe: (blocking_operation_present == Some(true)).then_some(false),
-        operator_action: if blocking_operation_present == Some(true) {
+        operator_action: if mutation_resume_required {
+            Some("resume_mutations".to_owned())
+        } else if blocking_operation_present == Some(true) {
             Some("inspect_reconciliation_status".to_owned())
         } else if blocking_operation_present.is_none() || diagnostic_attention {
             Some("inspect_doctor_failures".to_owned())
@@ -1105,11 +1130,16 @@ fn summarize_readiness(
     }
 }
 
-fn recovery_mode_for_quarantine_count(persistent_count: usize) -> (&'static str, CheckStatus) {
-    if persistent_count == 0 {
-        ("normal", CheckStatus::Ok)
-    } else {
+fn recovery_mode_for_quarantine_count(
+    persistent_count: usize,
+    mutation_resume_required: bool,
+) -> (&'static str, CheckStatus) {
+    if persistent_count > 0 {
         ("restricted_read_only", CheckStatus::Warning)
+    } else if mutation_resume_required {
+        ("mutation_resume_required", CheckStatus::Warning)
+    } else {
+        ("normal", CheckStatus::Ok)
     }
 }
 
@@ -1815,6 +1845,9 @@ mod tests {
             execution_outcome: "indeterminate".into(),
             retirement_eligibility: "ineligible_policy".into(),
             retirement_policy: None,
+            current_state_acceptance_eligibility: "ineligible_policy".into(),
+            current_state_acceptance_policy: None,
+            current_state_acceptance_authority: None,
             recommended_action: "keep_quarantine".into(),
         }
     }
@@ -1898,6 +1931,7 @@ mod tests {
         let readiness = summarize_readiness(
             &checks,
             Some(1),
+            false,
             Some(&capabilities),
             true,
             Some(&authority),
@@ -1927,6 +1961,43 @@ mod tests {
     }
 
     #[test]
+    fn readiness_requires_explicit_mutation_resume_after_quarantine_clears() {
+        let checks = readiness_checks(CheckStatus::Ok);
+        let capabilities = readiness_capabilities();
+        let authority = v2_mutation_authority();
+        let readiness = summarize_readiness(
+            &checks,
+            Some(0),
+            true,
+            Some(&capabilities),
+            true,
+            Some(&authority),
+        );
+
+        assert_eq!(readiness.device, "degraded_operator_action_required");
+        assert_eq!(readiness.lanes.control_plane, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.computer_use_observation,
+            LaneReadiness::Ready
+        );
+        assert_eq!(readiness.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.effectful_execution,
+            LaneReadiness::IndeterminateFenced
+        );
+        assert_eq!(
+            readiness.lanes.browser_effectful_execution,
+            LaneReadiness::IndeterminateFenced
+        );
+        assert_eq!(readiness.blocking_operation_present, Some(true));
+        assert_eq!(readiness.blocking_operation_retry_safe, Some(false));
+        assert_eq!(
+            readiness.operator_action.as_deref(),
+            Some("resume_mutations")
+        );
+    }
+
+    #[test]
     fn readiness_reports_supported_lanes_ready_without_quarantine() {
         let checks = readiness_checks(CheckStatus::Ok);
         let capabilities = readiness_capabilities();
@@ -1934,6 +2005,7 @@ mod tests {
         let readiness = summarize_readiness(
             &checks,
             Some(0),
+            false,
             Some(&capabilities),
             true,
             Some(&authority),
@@ -1963,6 +2035,7 @@ mod tests {
         let readiness = summarize_readiness(
             &checks,
             Some(0),
+            false,
             Some(&capabilities),
             true,
             Some(&authority),
@@ -1992,8 +2065,14 @@ mod tests {
         let checks = readiness_checks(CheckStatus::Ok);
         let capabilities = readiness_capabilities();
         let authority = v2_mutation_authority();
-        let readiness =
-            summarize_readiness(&checks, None, Some(&capabilities), true, Some(&authority));
+        let readiness = summarize_readiness(
+            &checks,
+            None,
+            false,
+            Some(&capabilities),
+            true,
+            Some(&authority),
+        );
 
         assert_eq!(readiness.device, "degraded");
         assert_eq!(readiness.lanes.effectful_execution, LaneReadiness::Unknown);
@@ -2095,15 +2174,19 @@ mod tests {
     #[test]
     fn doctor_recovery_mode_is_explicitly_restricted_when_quarantine_exists() {
         assert_eq!(
-            recovery_mode_for_quarantine_count(0),
+            recovery_mode_for_quarantine_count(0, false),
             ("normal", CheckStatus::Ok)
         );
         assert_eq!(
-            recovery_mode_for_quarantine_count(1),
+            recovery_mode_for_quarantine_count(0, true),
+            ("mutation_resume_required", CheckStatus::Warning)
+        );
+        assert_eq!(
+            recovery_mode_for_quarantine_count(1, false),
             ("restricted_read_only", CheckStatus::Warning)
         );
         assert_eq!(
-            recovery_mode_for_quarantine_count(3),
+            recovery_mode_for_quarantine_count(3, false),
             ("restricted_read_only", CheckStatus::Warning)
         );
     }
@@ -2217,6 +2300,32 @@ mod tests {
         assert!(!is_launchd_maintenance_label(
             "com.github.git-ksk.cumg-v2-maintenance.bad/secret"
         ));
+    }
+
+    #[test]
+    fn default_recovery_key_path_prefers_packaged_layout_and_falls_back_to_legacy() {
+        let root = temp_dir("recovery-key-default");
+        let home = root.join("home");
+        let install = home.join("Library/Application Support/computer-use-mcp-gateway");
+        let legacy =
+            home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed");
+        let packaged = install.join("v2/secrets/recovery.sealed");
+
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(
+            default_single_mac_recovery_key_file(&install, &home),
+            legacy
+        );
+
+        std::fs::create_dir_all(packaged.parent().unwrap()).unwrap();
+        std::fs::write(&packaged, b"packaged").unwrap();
+        assert_eq!(
+            default_single_mac_recovery_key_file(&install, &home),
+            packaged
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]

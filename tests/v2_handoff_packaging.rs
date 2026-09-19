@@ -136,6 +136,9 @@ fn single_mac_upgrade_enforces_cross_control_plane_mutation_authority() {
     assert!(upgrade.contains("mutation-authority-init"));
     assert!(upgrade.contains("--owner v2"));
     assert!(upgrade.contains("CUMG_MUTATION_AUTHORITY_DIR"));
+    assert!(upgrade.contains("CUMG_V2_ALLOWED_FILE_ROOTS"));
+    assert!(upgrade.contains("ALLOWED_FILE_ROOTS_MIGRATION"));
+    assert!(upgrade.contains("agent_allowed_file_roots_update_failed"));
     assert!(upgrade.contains(r#"--mutation-authority-dir "$MUTATION_AUTHORITY_DIR""#));
     assert!(upgrade.contains(r#"fail_poststart "mutation_authority_preflight""#));
     assert!(preflight.contains("shared_mutation_authority_missing"));
@@ -164,4 +167,42 @@ fn single_mac_upgrade_uses_explicit_one_shot_launchd_maintenance_jobs() {
     assert!(runner.contains("com.git-ksk.cumg-v2-upgrade-"));
     assert!(!runner.contains("[launchctl, \"submit\""));
     assert!(!upgrade.contains("launchctl submit "));
+}
+
+#[test]
+fn quarantine_recovery_upgrade_preserves_exact_unknown_pointer_click_without_weakening_normal_upgrade()
+ {
+    let upgrade = include_str!("../scripts/v2-single-mac-upgrade.sh");
+
+    assert!(upgrade.contains("--preserve-quarantine-operation-id"));
+    assert!(upgrade.contains("quarantine_recovery_requires_artifact_mode"));
+    assert!(upgrade.contains("quarantine-recovery-upgrade-$RECOVERY_UPGRADE_ATTEMPT_ID.json"));
+    assert!(upgrade.contains("preserved_quarantine_not_exact_pointer_click"));
+    assert!(upgrade.contains("\"capability\": \"pointer_click\""));
+    assert!(upgrade.contains("\"execution_outcome\": \"indeterminate\""));
+    assert!(upgrade.contains("\"retry_safe\": False"));
+    assert!(upgrade.contains("PRESERVED_QUARANTINE_BINDING"));
+    assert!(upgrade.contains("STOPPED_QUARANTINE_BINDING"));
+    assert!(upgrade.contains("POST_QUARANTINE_BINDING"));
+    assert!(upgrade.contains("preserved_quarantine_binding_mismatch"));
+    assert!(upgrade.contains("current_state_acceptance_eligibility"));
+    assert!(upgrade.contains("acknowledged_unknown_pointer_click_v1"));
+    assert!(upgrade.contains("local_user_presence"));
+    assert!(upgrade.contains("RECOVERY_UPGRADE_OK"));
+    assert!(upgrade.contains("--reason quarantine_recovery_required"));
+    assert!(upgrade.contains("date -u '+%Y%m%dT%H%M%SZ'"));
+    assert!(!upgrade.contains("date '+%Y%m%dT%H%M%S%z'"));
+    assert!(upgrade.contains("--operator-action complete_recovery"));
+
+    // Normal upgrade still requires quarantine=0 and still records its ordinary
+    // quarantine_clear / doctor_healthy completion gates.
+    assert!(upgrade.contains("REFUSED reason=live_quarantine count=$QUARANTINE_COUNT"));
+    assert!(upgrade.contains(
+        "tx_advance --flag runtime_manifest_verified --flag quarantine_clear --flag doctor_healthy"
+    ));
+    // Recovery mode exits before health-confirmed cleanup and never claims those
+    // normal completion flags.
+    let recovery_ok = upgrade.find("RECOVERY_UPGRADE_OK").unwrap();
+    let normal_cleanup = upgrade.find("--health-confirmed").unwrap();
+    assert!(recovery_ok < normal_cleanup);
 }

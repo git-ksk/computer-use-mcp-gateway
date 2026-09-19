@@ -30,8 +30,8 @@ use crate::{
     v2_execution_safety::{
         OperationAdmissionMetadata, OperationAuditMetadata, OperationEvidenceEnvelope,
         OperationOwner, OperationRequestFingerprint, RecoverableOperationResult,
-        SemanticConstraintAdmissionEvidence, fingerprint_process_request,
-        fingerprint_shell_request, text_input_evidence_envelope,
+        SemanticConstraintAdmissionEvidence, fingerprint_pointer_click_request,
+        fingerprint_process_request, fingerprint_shell_request, text_input_evidence_envelope,
     },
     v2_handoff_coordinator::{HandoffAdmission, HandoffCoordinator, HandoffCoordinatorError},
     v2_interaction_context::{
@@ -2670,6 +2670,9 @@ impl V2NorthboundMcp {
                 fingerprint_process_request(secret, request)
             }
             DeviceCommand::Shell { request } => fingerprint_shell_request(secret, request),
+            DeviceCommand::PointerClick { .. } | DeviceCommand::PointerClickAdvanced { .. } => {
+                fingerprint_pointer_click_request(secret, command)
+            }
             _ => return Ok(None),
         }
         .map_err(|_| McpError::internal_error("Request fingerprinting failed", None))?;
@@ -3907,6 +3910,11 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
             "device_indeterminate",
             Some(operation_id),
         ),
+        HubCommandError::MutationResumeRequired { operation_id } => (
+            "Local-user mutation resume is required before effectful work can continue",
+            "mutation_resume_required",
+            Some(operation_id),
+        ),
         HubCommandError::Indeterminate => (
             "Operation outcome is indeterminate; execution may already have occurred",
             "device_indeterminate",
@@ -3989,6 +3997,11 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
                 "inspect_reconciliation_status"
             },
         );
+    } else if code == "mutation_resume_required" {
+        data["historical_outcome"] = json!("indeterminate");
+        data["blind_replay_safe"] = json!(false);
+        data["effectful_execution_fenced"] = json!(true);
+        data["next_action"] = json!("local_user_resume_mutations");
     }
     McpError::invalid_request(message, Some(data))
 }
