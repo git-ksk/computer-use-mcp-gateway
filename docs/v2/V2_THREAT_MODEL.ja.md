@@ -208,6 +208,10 @@ Agent-native process cancellation は GUI-backend cancellation より強い guar
 
 Agent-native process/shell の definite な validation / spawn failure は、raw host detail を公開しなくても remediation できます。signed Agent->Hub result が運ぶのは closed な `DeviceErrorCode` だけで、northbound は `working_directory_denied`、`working_directory_invalid`、`invalid_timeout`、`invalid_program`、`program_denied`、`too_many_arguments`、`environment_key_denied`、`invalid_environment`、`too_many_environment_entries`、`process_spawn_failed` など review 済み category を固定 message に map します。requested/allowed path、program/argv、environment key/value、raw OS error は返しません。Shell は inner process error の safe category を保持し、generic wrapper code へ潰しません。意図的に分類していない executor/configuration failure は `internal_failure` / generic fail-closed error のままです。native runtime timeout / cancellation は proven process-termination outcome（`timed_out` / `cancelled`）のままで、dispatch 後の outcome が prove できなければ `Indeterminate` + quarantine のままです。この error taxonomy は no-replay / quarantine semantics を弱めません。
 
+## Ephemeral workspace data references
+
+v0.5 workspace foundation は public ephemeral-ref authorization を Hub-side に置き、Agent-private staging には bounded な opaque-locator data だけを保持します。public ref と Agent locator は別の short-lived / non-authoritative value であり、どちらも capability authorization、operation settlement、quarantine clear、durable recovery truth にはなりません。Agent restart で invalid になり得ることを仕様とします。[V2_EPHEMERAL_DATA_REFS.ja.md](V2_EPHEMERAL_DATA_REFS.ja.md) を参照してください。
+
 ## Browser transfer data boundary
 
 Browser transfer は意図的に filesystem access より narrow です。upload northbound traffic は bounded byte と path-safe logical name を運び、context/generation/revision-bound one-shot ref を mint します。その backend value は Agent-private staging handle です。Agent は hardened state directory 配下に実 file を作り、symlink/directory/replacement/size violation を拒否し、southbound Cua call 直前に canonical regular file であることを再度 prove します。raw host path は northbound caller から受け取らず、返しもしません。
