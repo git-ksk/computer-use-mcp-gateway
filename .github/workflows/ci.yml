@@ -93,6 +93,11 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           rustup default 1.88.0
 
+      - name: Windows filesystem reparse confinement test
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo test --locked --lib windows_reparse_replacement_cannot_escape_capability_root
+
       - name: Install Cua runtime dependencies (Linux)
         if: runner.os == 'Linux'
         shell: bash

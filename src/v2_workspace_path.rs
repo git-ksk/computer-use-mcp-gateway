@@ -238,31 +238,51 @@ mod tests {
     fn windows_reparse_replacement_cannot_escape_capability_root() {
         use std::process::Command;
 
+        fn junction(link: &Path, target: &Path) {
+            let status = Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .expect("create junction");
+            assert!(status.success());
+        }
+
         let root = temp_root("windows-root");
         let outside = temp_root("windows-outside");
-        let candidate = root.join("candidate");
-        fs::create_dir_all(&candidate).unwrap();
-        fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        let file_parent = root.join("file-parent");
+        let directory = root.join("directory");
+        fs::create_dir_all(&file_parent).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(file_parent.join("note.txt"), b"inside").unwrap();
+        fs::write(outside.join("note.txt"), b"outside").unwrap();
 
         let roots = WorkspaceRoots::new(vec![root.clone()]).unwrap();
-        let resolved = roots.resolve_existing(candidate.to_str().unwrap()).unwrap();
+        let resolved_file = roots
+            .resolve_existing(file_parent.join("note.txt").to_str().unwrap())
+            .unwrap();
+        let resolved_dir = roots.resolve_existing(directory.to_str().unwrap()).unwrap();
 
-        fs::remove_dir(&candidate).unwrap();
-        let status = Command::new("cmd.exe")
-            .args(["/D", "/C", "mklink", "/J"])
-            .arg(&candidate)
-            .arg(&outside)
-            .status()
-            .expect("create junction");
-        assert!(status.success());
+        fs::remove_file(file_parent.join("note.txt")).unwrap();
+        fs::remove_dir(&file_parent).unwrap();
+        fs::remove_dir(&directory).unwrap();
+        junction(&file_parent, &outside);
+        junction(&directory, &outside);
 
-        let denied = matches!(
-            resolved.open_dir(),
+        let file_denied = matches!(
+            resolved_file.open_file(),
             Err(WorkspacePathError::PathDenied) | Err(WorkspacePathError::Io(_))
         );
-        fs::remove_dir(&candidate).unwrap();
+        let directory_denied = matches!(
+            resolved_dir.open_dir(),
+            Err(WorkspacePathError::PathDenied) | Err(WorkspacePathError::Io(_))
+        );
+
+        fs::remove_dir(&file_parent).unwrap();
+        fs::remove_dir(&directory).unwrap();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
-        assert!(denied);
+        assert!(file_denied);
+        assert!(directory_denied);
     }
 }
