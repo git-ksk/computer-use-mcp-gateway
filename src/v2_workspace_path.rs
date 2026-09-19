@@ -278,11 +278,18 @@ mod tests {
             Err(WorkspacePathError::PathDenied) | Err(WorkspacePathError::Io(_))
         );
 
+        assert!(file_denied);
+        assert!(directory_denied);
+
+        // Windows keeps the approved root handle open for the lifetime of the
+        // capability objects. Drop them before fixture cleanup so removing the
+        // temporary root does not fail with a sharing violation.
+        drop(resolved_file);
+        drop(resolved_dir);
+        drop(roots);
         fs::remove_dir(&file_parent).unwrap();
         fs::remove_dir(&directory).unwrap();
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
-        assert!(file_denied);
-        assert!(directory_denied);
     }
 }
