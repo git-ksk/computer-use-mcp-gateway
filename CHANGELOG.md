@@ -1,13 +1,13 @@
 # Changelog
 
-## v0.4.0 — 2026-09-03
+## v0.4.0 — 2026-09-19
 
 V2 Recovery, Identity & Semantic Authorization release. This release consolidates the post-v0.3 recovery/reconciliation hardening, provider-neutral multi-principal identity, and narrow typed semantic authorization into one reviewed minor release without widening unaccepted platform/provider support claims.
 
 ### Recovery and execution safety
 
-- durable recovery/reconciliation and operator guidance were tightened across current-state acceptance, historical Human resolution, runtime/tool skew detection, recovery-key readiness, and replay-tombstone handling (#103/#115/#136/#137/#253/#254/#255/#256);
-- execution-safety durable schema v12 records only bounded semantic-authorization admission evidence (snapshot revision/digest plus constraint kind/rule ID); v11 and earlier supported state remains readable, while a downgrade that would discard v12 semantic evidence fails closed;
+- durable recovery/reconciliation and operator guidance were tightened across current-state acceptance, historical Human resolution, runtime/tool skew detection, recovery-key readiness, replay-tombstone handling, long-lived PointerClick recovery, exact completion acknowledgement, and packaged recovery-key discovery (#103/#115/#136/#137/#253/#254/#255/#256/#305/#309/#310);
+- execution-safety durable schema v13 adds explicit mutation-resume barriers/records for acknowledged-unknown PointerClick recovery; schema v12 retains bounded semantic-authorization admission evidence (snapshot revision/digest plus constraint kind/rule ID). Older supported state remains readable, while downgrade fails closed whenever it would discard v13 mutation-resume state or v12 semantic evidence;
 - permanent no-auto-replay, `Indeterminate` quarantine, exact operation ownership, and pre-dispatch cancellation semantics remain authoritative.
 
 ### Identity and authorization
@@ -30,13 +30,15 @@ V2 Recovery, Identity & Semantic Authorization release. This release consolidate
 
 - `v0.4.0` is a pre-1.0 minor compatibility boundary and must be deployed as a version-paired Hub/Agent/maintenance/recovery/Handoff set; mixed/incompatible schema or durable-state representations continue to fail closed;
 - the GitHub Release remains source-only unless reviewed binary assets, SBOM/license inventory, and provenance/attestation are explicitly attached; CI release-candidate artifacts are evidence, not automatically supported installers;
-- generic signed-token support remains withheld until #139 physical/dogfood acceptance is recorded; Windows Hello recovery (#227), Linux FIDO2 UV recovery (#228), and cross-platform parity (#217) remain support-claim acceptance work only;
+- Windows Hello recovery is release-supported after trusted physical interactive-desktop acceptance passed on #227; generic signed-token support remains withheld until #139 physical/dogfood acceptance is recorded, Linux FIDO2 UV recovery remains withheld until #228 physical acceptance, and #217 remains the cross-platform parity umbrella;
 - Cloud Run remains unsupported, and Linux/Windows CI artifacts do not become official binary-installer claims.
 
 ### Acceptance evidence
 
 - #221 merged after local full regression (`530 passed / 0 failed`, six existing physical-only tests ignored), warning-free all-target clippy, synchronized EN/JA docs, and all 15 GitHub checks green;
-- the standing Product Readiness gate is rerun by the dedicated `release/v0.4.0` PR and tracked in #272 before the immutable tag/GitHub Release is created.
+- #227 trusted physical Windows Hello acceptance passed on PR #252: cancel preserved the exact quarantine, approval produced durable_completion=verified, a fresh unrelated ScreenGeometry succeeded, Hub restart preserved the terminal resolution, and the old operation remained permanently non-replayed (ONLINE_RECOVERY_PHYSICAL_PASS operation_replayed=false);
+- #305/#307 trusted physical macOS recovery dogfood cleared a long-lived PointerClick quarantine through explicit two-stage local-user authorization without replay; #309/#310 then closed completion-reporting and packaged recovery-key diagnostic gaps discovered by that run;
+- the dedicated release/v0.4.0 PR reruns the standing Product Readiness gate against the exact release commit before the immutable tag/source-only GitHub pre-release is created.
 
 ## v0.3.0 — 2026-08-27
 

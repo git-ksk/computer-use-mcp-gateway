@@ -2,7 +2,7 @@
 
 > この日本語版は [`V2_040_RELEASE_SCOPE.md`](V2_040_RELEASE_SCOPE.md) の翻訳です。**英語版をcanonicalとします。**
 
-Status: **active `v0.4.0` release-candidate scope。`v0.4.0` tag / GitHub Release はまだshipしていません。** この文書をcandidateのsupport-claim boundaryとします。
+Status: **released `v0.4.0` scope（2026-09-19）。** この文書は release acceptance と support-claim boundary を記録します。
 
 ## Purpose
 
@@ -17,7 +17,7 @@ Status: **active `v0.4.0` release-candidate scope。`v0.4.0` tag / GitHub Releas
 
 ## Included baseline
 
-`0.4.0` candidateには以下のcompatible workを含みます。
+`0.4.0` release には以下の compatible work を含めます。
 
 - durable Recovery & Reconciliation、permanent no-replay、reviewed current-state/Human recovery (#103, #137, #136, #115, #255);
 - recovery/operator hardening/readiness (#253, #254, #256);
@@ -42,9 +42,9 @@ Status: **active `v0.4.0` release-candidate scope。`v0.4.0` tag / GitHub Releas
 | Cloud Run hosted Hub | design only / NO-GO | `0.4.0` support claimではない。#215 implementation/acceptanceはfuture work |
 | Second real computer-use backend | #222 future evidence | `0.4.0`必須ではない。backend-neutral claimはexisting evidenceの範囲に限定 |
 
-## Release closeout gate
+## Release closeout record
 
-`v0.4.0`は次を満たした場合のみadmitします。
+`v0.4.0` tag / Release は以下を満たした場合にのみ admit しました。
 
 1. #221 / PR #271をmergeし、typed constraint、immutable final-command binding、durable bounded audit evidence、stale-decision fencing、full regression、EN/JA normative docsのCI evidenceを確定。
 2. exact candidate commitに対してstanding [`../PRODUCT_READINESS.ja.md`](../PRODUCT_READINESS.ja.md) gateを再実行する。

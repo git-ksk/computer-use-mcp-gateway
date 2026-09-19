@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-03 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、current released version は `v0.3.0` で、`v0.4.0` はfinal acceptance中です。**
+2026-09-19 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が released baseline で、`v0.5.0` Least-privilege Workspace が次の planned feature minor です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,15 +34,15 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Released baseline: `0.3.x`; active candidate: `0.4.0`
+## Released baseline: `0.4.x`; next planned feature minor: `0.5.0`
 
-`v0.3.0` はreleased baselineのままです。`v0.4.0` はfinal Recovery, Identity & Semantic Authorization candidateで、#227 physical Windows Hello acceptanceは2026-09-19にPASSしました。残るのは通常のrelease closeout / publicationです。release後のplanned feature minorは **`v0.5.0` — Least-privilege Workspace** です。
+`v0.4.0` は released Recovery, Identity & Semantic Authorization baseline です。#227 physical Windows Hello acceptance は 2026-09-19 に PASS しました。次の planned feature minor は **`v0.5.0` — Least-privilege Workspace** です。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate として残ります。
 
-`0.4.0` candidate は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていたworkを統合します。implementationはcompleteで、選択したWindows physical acceptanceを通すまでrelease/tagは作りません。
+`0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
-### `0.4.0` integrated release candidate
+### `0.4.0` released scope
 
-`0.4.0` はactive **Recovery, Identity & Semantic Authorization** release candidateです。 canonical candidate scope / support-claim matrix は [`v2/V2_040_RELEASE_SCOPE.ja.md`](v2/V2_040_RELEASE_SCOPE.ja.md) に固定します。recovery/reconciliation foundation、provider-neutral multi-principal identity、typed semantic authorization boundary をまとめつつ、optional platform/hosted support claim は artifact 本体より狭く保ちます。
+`0.4.0` は released **Recovery, Identity & Semantic Authorization** baseline です。canonical released scope / support-claim matrix は [`v2/V2_040_RELEASE_SCOPE.ja.md`](v2/V2_040_RELEASE_SCOPE.ja.md) に固定します。recovery/reconciliation foundation、provider-neutral multi-principal identity plumbing、typed semantic authorization boundary をまとめつつ、optional platform/hosted support claim は compiled surface より狭く保ちます。
 
 | `0.4.0` track | Issues / PR | Status | Release role |
 | --- | --- | --- | --- |
@@ -62,7 +62,7 @@ release closeout は次の順で完了しました。
 1. **#221 / PR #271をmerge/verify済み**。typed backend-neutral semantic constraint boundary、full regression/CI、EN/JA normative docsを完了。
 2. standing [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateで **`0.4.0` release closeout** を行う。version/durable-schema compatibility、source-free candidate artifact、clean install/upgrade/rollback、doctor/status、recovery/no-replay、dependency/CodeQL、docs、release noteを対象にする。
 3. generic signed-token identityをrelease-supportedと表現する前に **#139 signed-token dogfood** を完了する。artifactにimplementationが入っていても、acceptance前はsupport claimを保留できる。
-4. **#227をrelease前に完了**する。`v0.4.0` tag/Release作成前にphysical Windows interactive-desktop Windows Hello acceptanceを記録する。**#228 supportはdefer**し、physical Linux + real UV-capable FIDO2 acceptanceまでLinux online recoveryはunsupportedとする。#217はparity用にOPEN維持する。
+4. **#227 physical Windows acceptance は完了済み。** 2026-09-19 の trusted interactive-desktop run で cancel -> approve -> exact durable resolution -> restart/no-replay まで PASS しました。**#228 support は defer** し、physical Linux + real UV-capable FIDO2 acceptance まで Linux online recovery は unsupported とします。#217 は parity 用に OPEN 維持します。
 5. **#215 implementationをrelease gateへ引き込まない。** Cloud Run designはmain上の有用なevidenceだが、hosted Hub supportは別contractのdurable-state/fencing/ingress/acceptanceが実装されるまでNO-GOのままにする。
 
 これはrelease scopeの統合であり、acceptanceの弱体化ではありません。artifactに実装が含まれても、**support claimをcompiled surfaceより狭くする**ことがあり、その境界はrelease note/statusで明示します。
@@ -83,11 +83,11 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 ## Post-v0.4 の製品化シーケンス
 
-CUMG は `v0.4.0` Recovery, Identity & Semantic Authorization release candidateを仕上げています。残る#227 physical gateとrelease publication後は、execution-safety boundary を弱めず、security-focused な source release から install / operate しやすい product への移行を継続します。以下の minor number は現在の作業順であり日程の約束ではありません。minor release は admitted public-contract scope と evidence が揃った場合だけ切ります。
+`v0.4.0` は released Recovery, Identity & Semantic Authorization baseline です。post-v0.4 では execution-safety boundary を弱めず、security-focused な source release から install / operate しやすい product への移行を継続します。以下の minor number は現在の作業順であり日程の約束ではありません。minor release は admitted public-contract scope と evidence が揃った場合だけ切ります。
 
 現在の作業順:
 
-- **`0.4.0` — active Recovery, Identity & Semantic Authorization candidate:** implementationはcomplete。release前に#227 physical Windows Hello acceptanceを残す。#139と#228はnon-blocking support-claim gateとして残し、signed-token / Linux online-recovery claimはevidenceまで保留する。
+- **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance は 2026-09-19 に PASS 済み。#139 と #228 は non-blocking support-claim gate として残し、signed-token / Linux online-recovery claim は evidence まで保留します。
 - **`0.5.0` — Least-privilege Workspace:** #83 bounded retrievable output、#105 ranged/deterministic filesystem observation、#107 explicit writable root配下のatomic workspace mutationでDangerous shell authorityへの依存を減らす。
 - **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
@@ -162,7 +162,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 
 open issue はrevised release sequenceで分類し、roadmap visibilityからsilentに落ちないようにします。milestoneはordering/admission guidanceです。optional support-claim acceptanceは、そのsupport claimを明示的に保留する限りbase artifact release後もOPENのままにできます。
 
-- **`0.4.0 — active release candidate`:** #221 / PR #271はmerge済み・green。#227 physical Windows Hello acceptanceが残るrelease gateです。#139 signed-token dogfoodと#228 physical Linux FIDO2 acceptanceはdeferred support-claim gateで、#217はparity用にOPEN維持します。
+- **`0.4.0 — released baseline`:** #221 / PR #271 は merge 済み・green で、#227 physical Windows Hello acceptance は 2026-09-19 に PASS 済みです。#139 signed-token dogfood と #228 physical Linux FIDO2 acceptance は deferred support-claim gate で、#217 は parity 用に OPEN 維持します。
 - **`0.5.0 — Least-privilege Workspace`:** #83 bounded retrievable process/shell output、#105 ranged/deterministic filesystem observation、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation。
 - **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation、#275 hosted Handoff architecture（#276 pin adoption / #277 hosted operator-routing implementation）、#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
