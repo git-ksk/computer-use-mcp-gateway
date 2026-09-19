@@ -270,6 +270,61 @@ class LaunchdMaintenanceTests(unittest.TestCase):
             self.assertIs(plist["KeepAlive"], False)
             self.assertFalse(any(call[1] == "kickstart" for call in fake.calls))
 
+    def test_artifact_quarantine_recovery_upgrade_passes_exact_preserved_operation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            bundle = root / "cumg-v0.4.0-macos-arm64"
+            install = bundle / "install"
+            install.mkdir(parents=True)
+            upgrade = install / "v2-single-mac-upgrade.sh"
+            upgrade.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+            jobs = root / "jobs"
+            fake = FakeLaunchctl(job_exit=0)
+            operation_id = "op_995567b2ac068a8cb5faac2f46ccbf1e"
+            exit_code = mod.run_upgrade_one_shot(
+                repo_root=None,
+                artifact_bundle=bundle,
+                preserve_quarantine_operation_id=operation_id,
+                domain=DOMAIN,
+                launchctl="/bin/launchctl",
+                job_dir=jobs,
+                environment={"PATH": "/usr/bin", "HOME": str(root)},
+                timeout_secs=5,
+                runner=fake,
+                sleep=lambda _seconds: None,
+                now=lambda: 1234.0,
+                token_hex=lambda _count: "deadbeef",
+            )
+            self.assertEqual(exit_code, 0)
+            plist = fake.plists[0]
+            self.assertEqual(
+                plist["ProgramArguments"][-2:],
+                ["--preserve-quarantine-operation-id", operation_id],
+            )
+
+    def test_source_upgrade_refuses_quarantine_recovery_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            repo = root / "repo"
+            scripts = repo / "scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "v2-single-mac-upgrade.sh").write_text("#!/bin/bash\nexit 0\n")
+            with self.assertRaisesRegex(mod.MaintenanceError, "quarantine_recovery_requires_artifact_mode"):
+                mod.run_upgrade_one_shot(
+                    repo_root=repo,
+                    artifact_bundle=None,
+                    preserve_quarantine_operation_id="op_test",
+                    domain=DOMAIN,
+                    launchctl="/bin/launchctl",
+                    job_dir=root / "jobs",
+                    environment={"PATH": "/usr/bin", "HOME": str(root)},
+                    timeout_secs=5,
+                    runner=FakeLaunchctl(job_exit=0),
+                    sleep=lambda _seconds: None,
+                    now=lambda: 1234.0,
+                    token_hex=lambda _count: "deadbeef",
+                )
+
     def test_nonzero_upgrade_exit_runs_once_and_cleanup_always_boots_out_and_unlinks_plist(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

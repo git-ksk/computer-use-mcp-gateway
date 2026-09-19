@@ -8,8 +8,9 @@ use crate::v2_execution_safety::{
     ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner, ReconciliationStatus,
     RequestFingerprintComparison, ResolutionRecord, RetirementAuthority, RetirementCapacity,
     RetirementDisposition, RetirementPolicy, RetirementRecord, TextInputTargetEvidence,
-    compare_request_fingerprint, fingerprint_process_request, fingerprint_shell_request,
-    fingerprint_text_input_candidate, retirement_policy_for_capability,
+    compare_request_fingerprint, current_state_acceptance_policy_for_capability,
+    fingerprint_process_request, fingerprint_shell_request, fingerprint_text_input_candidate,
+    retirement_policy_for_capability,
 };
 use crate::v2_m0::{
     CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
@@ -96,6 +97,9 @@ pub struct QuarantineInspection {
     pub execution_outcome: String,
     pub retirement_eligibility: String,
     pub retirement_policy: Option<String>,
+    pub current_state_acceptance_eligibility: String,
+    pub current_state_acceptance_policy: Option<String>,
+    pub current_state_acceptance_authority: Option<String>,
     pub recommended_action: String,
 }
 
@@ -326,8 +330,29 @@ pub fn inspect_quarantines_read_only(
             } else {
                 "eligible"
             };
+            let current_state_policy =
+                current_state_acceptance_policy_for_capability(inspection.capability);
+            let current_state_acceptance_eligibility = if current_state_policy.is_none() {
+                "ineligible_policy"
+            } else if !matches!(
+                inspection.reconciliation_status,
+                ReconciliationStatus::OperatorRequired
+                    | ReconciliationStatus::UnrecoverableEvidenceGap
+            ) {
+                "await_reconciliation"
+            } else if inspection.dispatched_at_ms.is_none() {
+                "ineligible_missing_dispatch_record"
+            } else if current_device_generation
+                .is_none_or(|generation| generation <= inspection.operation.device_generation)
+            {
+                "requires_newer_generation"
+            } else {
+                "eligible"
+            };
             let recommended_action = if retirement_eligibility == "eligible" {
                 "retire_with_local_maintenance_authorization"
+            } else if current_state_acceptance_eligibility == "eligible" {
+                "accept_current_state_with_local_user_presence"
             } else {
                 "keep_quarantine"
             };
@@ -383,6 +408,13 @@ pub fn inspect_quarantines_read_only(
                 retirement_policy: retirement_policy
                     .map(retirement_policy_name)
                     .map(str::to_owned),
+                current_state_acceptance_eligibility: current_state_acceptance_eligibility
+                    .to_owned(),
+                current_state_acceptance_policy: current_state_policy
+                    .map(retirement_policy_name)
+                    .map(str::to_owned),
+                current_state_acceptance_authority: current_state_policy
+                    .map(|_| "local_user_presence".to_owned()),
                 recommended_action: recommended_action.to_owned(),
             }
         })
@@ -992,6 +1024,9 @@ const fn reconciliation_disposition(status: ReconciliationStatus) -> &'static st
 const fn retirement_policy_name(policy: RetirementPolicy) -> &'static str {
     match policy {
         RetirementPolicy::TransientUiInteractionV1 => "transient_ui_interaction_v1",
+        RetirementPolicy::AcknowledgedUnknownPointerClickV1 => {
+            "acknowledged_unknown_pointer_click_v1"
+        }
     }
 }
 
@@ -2640,6 +2675,37 @@ mod tests {
             before_duplicate_count
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pointer_click_inspection_separates_offline_retirement_from_local_user_continuation() {
+        let root = test_dir("pointer-click-continuation");
+        std::fs::create_dir_all(&root).unwrap();
+        let (_device_id, operation_id) =
+            seed_retirable_quarantine(&root, DeviceCapability::PointerClick, 2);
+
+        let report = inspect_quarantines_read_only(&root, None).unwrap();
+        let inspection = report
+            .quarantines
+            .iter()
+            .find(|inspection| inspection.blocking_operation_id == operation_id)
+            .unwrap();
+        assert_eq!(inspection.retirement_eligibility, "ineligible_policy");
+        assert_eq!(inspection.retirement_policy, None);
+        assert_eq!(inspection.current_state_acceptance_eligibility, "eligible");
+        assert_eq!(
+            inspection.current_state_acceptance_policy.as_deref(),
+            Some("acknowledged_unknown_pointer_click_v1")
+        );
+        assert_eq!(
+            inspection.current_state_acceptance_authority.as_deref(),
+            Some("local_user_presence")
+        );
+        assert_eq!(
+            inspection.recommended_action,
+            "accept_current_state_with_local_user_presence"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

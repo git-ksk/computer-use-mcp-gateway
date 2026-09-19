@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-pub const INCIDENT_BRIEF_SCHEMA_VERSION: u16 = 1;
+pub const INCIDENT_BRIEF_SCHEMA_VERSION: u16 = 2;
 pub const INCIDENT_DIAGNOSTICS_SCHEMA_VERSION: u16 = 1;
 pub const MAX_INCIDENT_DIAGNOSTIC_OBSERVATIONS: usize = 16;
 
@@ -233,11 +233,23 @@ pub struct IncidentMutationAuthoritySummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IncidentContinuationSummary {
+    pub current_state_acceptance_eligibility: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    pub mutation_resume_required_after_acceptance: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IncidentBrief {
     pub schema_version: u16,
     pub operation: IncidentOperationSummary,
     /// Exact #133 audit: this remains the controlling CUMG authority view.
     pub cumg: ReconciliationReadinessAudit,
+    /// Continuation authority is deliberately separate from factual reconciliation.
+    pub continuation: IncidentContinuationSummary,
     pub mutation_authority: IncidentMutationAuthoritySummary,
     pub diagnostics: Vec<IncidentDiagnosticObservation>,
     pub contradictions: Vec<IncidentContradiction>,
@@ -366,10 +378,23 @@ fn compose_incident_brief(
         retry_safe: inspection.retry_safe,
     };
 
+    let continuation = IncidentContinuationSummary {
+        current_state_acceptance_eligibility: inspection
+            .current_state_acceptance_eligibility
+            .clone(),
+        mutation_resume_required_after_acceptance: inspection
+            .current_state_acceptance_policy
+            .as_deref()
+            == Some("acknowledged_unknown_pointer_click_v1"),
+        policy: inspection.current_state_acceptance_policy.clone(),
+        authority: inspection.current_state_acceptance_authority.clone(),
+    };
+
     Ok(IncidentBrief {
         schema_version: INCIDENT_BRIEF_SCHEMA_VERSION,
         operation,
         cumg: audit,
+        continuation,
         mutation_authority: IncidentMutationAuthoritySummary {
             availability: IncidentMutationAuthorityAvailability::NotRequested,
             owner: None,
@@ -621,6 +646,22 @@ pub fn render_incident_brief_text(brief: &IncidentBrief) -> String {
     }
 
     output.push_str("\nSafe actions\n");
+    output.push_str("\nContinuation authority\n");
+    output.push_str(&format!(
+        "  current_state_acceptance={}\n",
+        brief.continuation.current_state_acceptance_eligibility
+    ));
+    if let Some(policy) = brief.continuation.policy.as_deref() {
+        output.push_str(&format!("  policy={policy}\n"));
+    }
+    if let Some(authority) = brief.continuation.authority.as_deref() {
+        output.push_str(&format!("  authority={authority}\n"));
+    }
+    output.push_str(&format!(
+        "  mutation_resume_required_after_acceptance={}\n",
+        brief.continuation.mutation_resume_required_after_acceptance
+    ));
+
     if brief.cumg.supported_decisions.is_empty() {
         match brief.cumg.recommended_action {
             ReconciliationRecommendedAction::AwaitAuthoritativeSelfReconciliation => {
@@ -683,6 +724,9 @@ mod tests {
             execution_outcome: "indeterminate".into(),
             retirement_eligibility: "ineligible_policy".into(),
             retirement_policy: None,
+            current_state_acceptance_eligibility: "ineligible_policy".into(),
+            current_state_acceptance_policy: None,
+            current_state_acceptance_authority: None,
             recommended_action: "keep_quarantine".into(),
         }
     }
@@ -774,6 +818,38 @@ mod tests {
         let encoded = serde_json::to_string(&brief).unwrap();
         assert!(encoded.contains("observational_only"));
         assert!(!encoded.contains("confirmed_not_executed"));
+    }
+
+    #[test]
+    fn pointer_click_brief_exposes_continuation_without_claiming_historical_truth() {
+        let mut inspection = inspection("pointer_click");
+        inspection.current_state_acceptance_eligibility = "eligible".into();
+        inspection.current_state_acceptance_policy =
+            Some("acknowledged_unknown_pointer_click_v1".into());
+        inspection.current_state_acceptance_authority = Some("local_user_presence".into());
+        inspection.recommended_action = "accept_current_state_with_local_user_presence".into();
+
+        let brief = compose_incident_brief(inspection, audit("pointer_click"), Vec::new()).unwrap();
+
+        assert!(brief.cumg.supported_decisions.is_empty());
+        assert_eq!(
+            brief.continuation.current_state_acceptance_eligibility,
+            "eligible"
+        );
+        assert_eq!(
+            brief.continuation.policy.as_deref(),
+            Some("acknowledged_unknown_pointer_click_v1")
+        );
+        assert_eq!(
+            brief.continuation.authority.as_deref(),
+            Some("local_user_presence")
+        );
+        assert!(brief.continuation.mutation_resume_required_after_acceptance);
+        assert_eq!(brief.operation.execution_outcome, "indeterminate");
+        let rendered = render_incident_brief_text(&brief);
+        assert!(rendered.contains("Continuation authority"));
+        assert!(rendered.contains("current_state_acceptance=eligible"));
+        assert!(rendered.contains("mutation_resume_required_after_acceptance=true"));
     }
 
     #[test]

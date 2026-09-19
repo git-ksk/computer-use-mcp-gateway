@@ -1,6 +1,6 @@
 use clap::Parser;
 use computer_use_mcp_gateway::{
-    v2_doctor::{DoctorConfig, run_doctor},
+    v2_doctor::{DoctorConfig, default_single_mac_recovery_key_file, run_doctor},
     v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control},
     v2_operator_status::{
         HandoffStatusInput, UpgradeStatusInput, build_operator_status, render_operator_status_text,
@@ -143,11 +143,9 @@ fn main() -> ExitCode {
         mutation_authority_dir,
         handoff_control_socket: handoff_control_socket.clone(),
         maintenance_job_exclude_label: None,
-        recovery_key_file: args.recovery_key_file.or_else(|| {
-            Some(
-                home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed"),
-            )
-        }),
+        recovery_key_file: args
+            .recovery_key_file
+            .or_else(|| Some(default_single_mac_recovery_key_file(&root, &home))),
         recovery_helper: args
             .recovery_helper
             .or_else(|| Some(root.join("bin/v2_recovery_enclave_helper"))),
