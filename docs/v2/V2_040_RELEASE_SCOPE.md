@@ -2,7 +2,7 @@
 
 > English is canonical. [日本語版 / Japanese translation](V2_040_RELEASE_SCOPE.ja.md)
 
-Status: **active `v0.4.0` release-candidate scope; no `v0.4.0` tag or GitHub Release has shipped yet**. This document is the candidate support-claim boundary.
+Status: **released `v0.4.0` scope (2026-09-19).** This document records the release acceptance and support-claim boundary.
 
 ## Purpose
 
@@ -17,7 +17,7 @@ A capability can therefore be present in the artifact while its support claim re
 
 ## Included baseline
 
-The `0.4.0` candidate includes the compatible work below:
+The `0.4.0` release includes the compatible work below:
 
 - durable Recovery & Reconciliation semantics, permanent no-replay and reviewed current-state/Human recovery paths (#103, #137, #136, #115, #255);
 - recovery/operator hardening and readiness (#253, #254, #256);
@@ -42,9 +42,9 @@ The `0.4.0` candidate includes the compatible work below:
 | Cloud Run hosted Hub | Design only / NO-GO | Not a `0.4.0` support claim; #215 implementation/acceptance remains future work |
 | Second real computer-use backend | #222 future evidence | Not required for `0.4.0`; current backend-neutral claims remain bounded to existing evidence |
 
-## Release closeout gate
+## Release closeout record
 
-Before creating the `v0.4.0` tag/Release:
+The `v0.4.0` tag/Release was admitted only after:
 
 1. #221 / PR #271 merged with typed constraints, immutable final-command binding, durable bounded audit evidence, stale-decision fencing, full regression, and EN/JA normative docs.
 2. The standing [`../PRODUCT_READINESS.md`](../PRODUCT_READINESS.md) gate is rerun for the exact candidate commit.

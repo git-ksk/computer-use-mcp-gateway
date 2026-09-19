@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-09-03: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; the current released version is `v0.3.0`, with `v0.4.0` in final acceptance.**
+Status as of 2026-09-19: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; `v0.4.0` is the released baseline and `v0.5.0` Least-privilege Workspace is the next planned feature minor.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -34,15 +34,15 @@ An ambiguous state-changing operation is never automatically retried or replayed
 
 The completed V1/V2 implementation history and acceptance evidence remain available through [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), [`v2/STATUS.md`](v2/STATUS.md), [`v2/acceptance/`](v2/acceptance/), and [`archive/`](archive/). This file intentionally focuses on work that is still relevant after the V2 closeout.
 
-## Released baseline: `0.3.x`; active candidate: `0.4.0`
+## Released baseline: `0.4.x`; next planned feature minor: `0.5.0`
 
-`v0.3.0` remains the released baseline. `v0.4.0` is the final Recovery, Identity & Semantic Authorization candidate; #227 physical Windows Hello acceptance passed on 2026-09-19, so the remaining work is ordinary release closeout/publication. The planned feature minor after release is **`v0.5.0` — Least-privilege Workspace**.
+`v0.4.0` is the released Recovery, Identity & Semantic Authorization baseline. #227 physical Windows Hello acceptance passed on 2026-09-19. The next planned feature minor is **`v0.5.0` — Least-privilege Workspace**; #139 signed-token dogfood and #228 physical Linux FIDO2 remain separate support-claim gates.
 
-The `0.4.0` candidate consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Implementation is complete; the release remains untagged until the selected Windows physical acceptance passes.
+The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Its accepted support boundary is recorded in the release-scope and status documents.
 
-### `0.4.0` integrated release candidate
+### `0.4.0` released scope
 
-`0.4.0` is the active **Recovery, Identity & Semantic Authorization** release candidate. The canonical candidate scope and support-claim matrix are maintained in [`v2/V2_040_RELEASE_SCOPE.md`](v2/V2_040_RELEASE_SCOPE.md). It combines the completed recovery/reconciliation foundation with provider-neutral multi-principal identity and the typed semantic authorization boundary, while keeping optional platform/hosted support claims narrower than the artifact itself.
+`0.4.0` is the released **Recovery, Identity & Semantic Authorization** baseline. The canonical released scope / support-claim matrix is maintained in [`v2/V2_040_RELEASE_SCOPE.md`](v2/V2_040_RELEASE_SCOPE.md). It combines the completed recovery/reconciliation foundation with provider-neutral multi-principal identity plumbing and the typed semantic authorization boundary, while keeping optional platform/hosted support claims narrower than the compiled surface.
 
 | `0.4.0` track | Issues / PR | Status | Release role |
 | --- | --- | --- | --- |
@@ -83,11 +83,11 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 
 ## Post-v0.4 productization sequence
 
-CUMG is finishing the `v0.4.0` Recovery, Identity & Semantic Authorization release candidate. The #227 physical Windows gate passed on 2026-09-19; after ordinary release closeout/publication, post-v0.4 work should continue moving the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
+`v0.4.0` is the released Recovery, Identity & Semantic Authorization baseline. Post-v0.4 work continues moving the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
 
 The working sequence is:
 
-- **`0.4.0` — active Recovery, Identity & Semantic Authorization candidate:** implementation is complete and #227 physical Windows Hello acceptance passed on 2026-09-19. Ordinary release closeout/publication remains. #139 and #228 stay non-blocking support-claim gates, with signed-token and Linux online-recovery claims withheld until their evidence exists.
+- **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance passed on 2026-09-19. #139 and #228 remain non-blocking support-claim gates, with signed-token and Linux online-recovery claims withheld until their evidence exists.
 - **`0.5.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through bounded retrievable output (#83), ranged/deterministic filesystem observation (#105), and atomic workspace mutation under explicitly separate writable roots (#107).
 - **`0.6.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106), separately sandboxed Playwright/E2E execution (#114), and optional Linux cgroup-v2 execution containment (#267), informed by completed #96 rather than by background-shell escape compatibility.
 
@@ -162,7 +162,7 @@ This queue records the practical result of continued Handoff integration and phy
 
 The repository's open issues are classified by the revised release sequence so work cannot silently fall out of roadmap visibility. Milestones are ordering/admission guidance; an optional support-claim acceptance issue may remain open after the base artifact is released if that support claim is explicitly withheld.
 
-- **`0.4.0 — active release candidate`:** #221 / PR #271 is merged and green; #227 physical Windows Hello acceptance passed on 2026-09-19. Ordinary release closeout/publication remains. #139 signed-token dogfood and #228 physical Linux FIDO2 acceptance are deferred support-claim gates; #217 remains open for parity.
+- **`0.4.0 — released baseline`:** #221 / PR #271 is merged and green; #227 physical Windows Hello acceptance passed on 2026-09-19. #139 signed-token dogfood and #228 physical Linux FIDO2 acceptance remain deferred support-claim gates; #217 remains open for parity.
 - **`0.5.0 — Least-privilege Workspace`:** #83 adds bounded retrievable process/shell output, #105 adds ranged/deterministic filesystem observation, and #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority.
 - **`0.6.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle, #114 adds separately sandboxed Playwright/E2E execution, and #267 owns optional Linux cgroup-v2 containment.
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation, #275 hosted Handoff architecture with #276 pin adoption / #277 hosted operator-routing implementation, and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.
