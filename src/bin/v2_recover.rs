@@ -1553,6 +1553,33 @@ fn wait_for_completion(
     Ok(())
 }
 
+fn recovery_completion_matches_expected(
+    resolved: &RecoveryResolved,
+    trusted_hub: &ed25519_dalek::VerifyingKey,
+    expected: &ExpectedRecoveryCompletion,
+) -> Result<bool> {
+    // A previously completed recovery may legitimately remain on disk while the
+    // next phase is being authorized. Verify that receipt as authentic first,
+    // but do not confuse a valid stale receipt with the exact completion we are
+    // waiting for.
+    verify_recovery_resolved(
+        resolved,
+        trusted_hub,
+        &resolved.request_id,
+        &resolved.device_id,
+        resolved.current_generation,
+    )
+    .context("durable recovery acknowledgement has an invalid Hub signature")?;
+
+    Ok(resolved.phase == expected.phase
+        && resolved.request_id == expected.request_id
+        && resolved.device_id == expected.device_id
+        && resolved.operation_id == expected.operation_id
+        && resolved.current_generation == expected.current_generation
+        && resolved.decision == expected.decision
+        && resolved.current_state_policy == expected.current_state_policy)
+}
+
 fn wait_for_completion_verified(
     state_dir: &Path,
     hub_public_key_file: &Path,
@@ -1562,32 +1589,133 @@ fn wait_for_completion_verified(
     let trusted_hub =
         load_verifying_key(hub_public_key_file).context("failed to load pinned Hub public key")?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    let mut saw_other_valid_ack = false;
     loop {
         if let Some(resolved) = load_recovery_resolved(state_dir)
             .context("failed to read durable recovery acknowledgement")?
         {
-            verify_recovery_resolved(
-                &resolved,
-                &trusted_hub,
-                &expected.request_id,
-                &expected.device_id,
-                expected.current_generation,
-            )
-            .context("durable recovery acknowledgement is stale, mismatched, or invalid")?;
-            if resolved.phase != expected.phase
-                || resolved.operation_id != expected.operation_id
-                || resolved.decision != expected.decision
-                || resolved.current_state_policy != expected.current_state_policy
-            {
-                anyhow::bail!(
-                    "durable recovery acknowledgement does not match the exact operation/decision"
-                );
+            if recovery_completion_matches_expected(&resolved, &trusted_hub, expected)? {
+                return Ok(resolved);
             }
-            return Ok(resolved);
+            saw_other_valid_ack = true;
         }
         if wait_secs == 0 || std::time::Instant::now() >= deadline {
+            if saw_other_valid_ack {
+                anyhow::bail!(
+                    "durable Hub recovery completion is not yet verified; latest acknowledgement belongs to a different recovery request or phase"
+                );
+            }
             anyhow::bail!("durable Hub recovery completion is not yet verified");
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod completion_wait_tests {
+    use super::*;
+    use computer_use_mcp_gateway::{
+        v2_m0_transport::HubIdentity,
+        v2_m1_keys::write_new_verifying_key,
+        v2_online_recovery::{
+            ONLINE_RECOVERY_SCHEMA_VERSION, RecoveryAuditAssessment, RecoveryAuthorization,
+            build_recovery_resolved, store_recovery_resolved,
+        },
+    };
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cumg-v2-recover-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        path
+    }
+
+    fn authorization(
+        phase: RecoveryPhase,
+        request_id: &str,
+        generation: u64,
+        decision: RecoveryDecision,
+        policy: Option<RetirementPolicy>,
+    ) -> RecoveryAuthorization {
+        RecoveryAuthorization {
+            schema_version: ONLINE_RECOVERY_SCHEMA_VERSION,
+            phase,
+            request_id: request_id.to_owned(),
+            device_id: "dev_completion_wait".into(),
+            operation_id: "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            quarantine_generation: 7,
+            current_generation: generation,
+            quarantine_fingerprint: [7; 32],
+            challenge_nonce: [9; 32],
+            challenge_expires_at_ms: u64::MAX,
+            audit_assessment: RecoveryAuditAssessment::Inconclusive,
+            decision,
+            current_state_policy: policy,
+            evidence: "test".into(),
+            signature: vec![],
+        }
+    }
+
+    #[test]
+    fn completion_wait_ignores_valid_stale_stage_one_receipt_until_stage_two_arrives() {
+        let root = temp_dir("stale-stage-one");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let hub = HubIdentity::generate();
+        let hub_public = root.join("hub.pub");
+        write_new_verifying_key(&hub_public, &hub.verifier()).unwrap();
+
+        let stale_authorization = authorization(
+            RecoveryPhase::QuarantineResolution,
+            "rec_11111111111111111111111111111111",
+            1140,
+            RecoveryDecision::CurrentStateAccepted,
+            Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1),
+        );
+        let stale = build_recovery_resolved(&hub, &stale_authorization, 10).unwrap();
+        store_recovery_resolved(&state_dir, &stale).unwrap();
+
+        let expected_authorization = authorization(
+            RecoveryPhase::MutationResume,
+            "rec_22222222222222222222222222222222",
+            1141,
+            RecoveryDecision::MutationsResumed,
+            Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1),
+        );
+        let expected = ExpectedRecoveryCompletion {
+            phase: expected_authorization.phase,
+            request_id: expected_authorization.request_id.clone(),
+            device_id: expected_authorization.device_id.clone(),
+            operation_id: expected_authorization.operation_id.clone(),
+            current_generation: expected_authorization.current_generation,
+            decision: expected_authorization.decision,
+            current_state_policy: expected_authorization.current_state_policy,
+        };
+        let matching = build_recovery_resolved(&hub, &expected_authorization, 20).unwrap();
+        let writer_state = state_dir.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            store_recovery_resolved(&writer_state, &matching).unwrap();
+        });
+
+        let resolved = wait_for_completion_verified(&state_dir, &hub_public, &expected, 2).unwrap();
+        writer.join().unwrap();
+        assert_eq!(resolved.request_id, expected.request_id);
+        assert_eq!(resolved.phase, RecoveryPhase::MutationResume);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
