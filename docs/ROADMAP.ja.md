@@ -51,7 +51,7 @@ completion provable?
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | implementation + CI complete、physical signed-token dogfood pending | implementation は含める。provider-specific support claim は acceptance 待ち |
 | Typed semantic authorization | #221 / PR #271 | Complete / merged / CI green | Included |
-| Windows Hello recovery | #227 / PR #252 | implementation + CI green、physical Windows interactive-desktop acceptance PASS（2026-09-19） | release gateは解消済み。通常の`v0.4.0` closeout / publicationへ進む |
+| Windows Hello recovery | #227 / PR #252 | implementation + CI green、physical Windows interactive-desktop acceptance PASS（2026-09-19） | `v0.4.0`でrelease済み・support acceptance済み |
 | Linux FIDO2 UV recovery | #228 / PR #259 | implementation + CI complete、physical acceptance deferred | non-blocking support-claim gate。physical Linux + real UV-capable FIDO2 acceptanceまでLinux online recoveryはunsupported |
 | Cross-platform recovery parity umbrella | #217 | physical acceptance dependent | 実際にsupport claimするplatform setのevidenceが揃うまでOPEN可 |
 | Hosted Cloud Run Hub | #215 | design complete、implementation/acceptance pending | **`0.4.0` support claimではない**。future hosted-deployment track |
@@ -60,7 +60,7 @@ completion provable?
 release closeout は次の順で完了しました。
 
 1. **#221 / PR #271をmerge/verify済み**。typed backend-neutral semantic constraint boundary、full regression/CI、EN/JA normative docsを完了。
-2. standing [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateで **`0.4.0` release closeout** を行う。version/durable-schema compatibility、source-free candidate artifact、clean install/upgrade/rollback、doctor/status、recovery/no-replay、dependency/CodeQL、docs、release noteを対象にする。
+2. standing [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateで **`0.4.0` release closeoutを完了済み**。version/durable-schema compatibility、source-free candidate artifact、clean install/upgrade/rollback、doctor/status、recovery/no-replay、dependency/CodeQL、docs、release noteを確認しました。
 3. generic signed-token identityをrelease-supportedと表現する前に **#139 signed-token dogfood** を完了する。artifactにimplementationが入っていても、acceptance前はsupport claimを保留できる。
 4. **#227 physical Windows acceptance は完了済み。** 2026-09-19 の trusted interactive-desktop run で cancel -> approve -> exact durable resolution -> restart/no-replay まで PASS しました。**#228 support は defer** し、physical Linux + real UV-capable FIDO2 acceptance まで Linux online recovery は unsupported とします。#217 は parity 用に OPEN 維持します。
 5. **#215 implementationをrelease gateへ引き込まない。** Cloud Run designはmain上の有用なevidenceだが、hosted Hub supportは別contractのdurable-state/fencing/ingress/acceptanceが実装されるまでNO-GOのままにする。

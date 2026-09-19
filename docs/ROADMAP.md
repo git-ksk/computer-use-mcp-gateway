@@ -51,7 +51,7 @@ The `0.4.0` release consolidates the work that had previously been split across 
 | Recovery dogfood hardening | #253, #254, #115, #255 | Complete | Included compatibility/hardening evidence |
 | Multi-principal OIDC/JWT identity | #139 / PR #269 | Implementation + CI complete; physical signed-token dogfood pending | Included implementation; provider-specific support claim waits for acceptance |
 | Typed semantic authorization | #221 / PR #271 | Complete / merged / CI green | Included |
-| Windows Hello recovery | #227 / PR #252 | Implementation + CI green; physical Windows interactive-desktop acceptance PASS (2026-09-19) | Release gate cleared; carry the accepted provider through ordinary `v0.4.0` closeout/publication |
+| Windows Hello recovery | #227 / PR #252 | Implementation + CI green; physical Windows interactive-desktop acceptance PASS (2026-09-19) | Released and support-accepted in `v0.4.0` |
 | Linux FIDO2 UV recovery | #228 / PR #259 | Implementation + CI complete; physical acceptance deferred | Non-blocking support-claim gate; Linux online recovery remains unsupported until physical Linux + real UV-capable FIDO2 acceptance |
 | Cross-platform recovery parity umbrella | #217 | Physical acceptance dependent | May remain open until each platform actually advertised as supported has evidence |
 | Hosted Cloud Run Hub | #215 | Design complete; implementation/acceptance pending | **Not a `0.4.0` support claim**; future hosted-deployment track |
@@ -60,9 +60,9 @@ The `0.4.0` release consolidates the work that had previously been split across 
 The release closeout followed this order:
 
 1. **#221 merged/verified** via PR #271 with full regression/CI and EN/JA normative documentation.
-2. **Run the `0.4.0` release closeout** against the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate: version/durable-schema compatibility, source-free candidate artifacts, clean install/upgrade/rollback, doctor/status, recovery/no-replay, dependency/CodeQL, docs, and release notes.
+2. **`0.4.0` release closeout passed** against the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate: version/durable-schema compatibility, source-free candidate artifacts, clean install/upgrade/rollback, doctor/status, recovery/no-replay, dependency/CodeQL, docs, and release notes.
 3. **Complete #139 signed-token dogfood before advertising generic signed-token identity as release-supported.** The implementation may be present in the artifact while that explicit support claim remains acceptance-gated.
-4. **#227 physical Windows acceptance is complete.** The 2026-09-19 trusted interactive-desktop run passed cancel -> approve -> exact durable resolution -> restart/no-replay. Proceed with ordinary `v0.4.0` closeout/publication. **Defer #228 support**, keeping Linux online recovery explicitly unsupported until physical Linux + real UV-capable FIDO2 acceptance exists. #217 remains open for parity.
+4. **#227 physical Windows acceptance is complete and shipped in `v0.4.0`.** The 2026-09-19 trusted interactive-desktop run passed cancel -> approve -> exact durable resolution -> restart/no-replay. **#228 support remains deferred**, keeping Linux online recovery explicitly unsupported until physical Linux + real UV-capable FIDO2 acceptance exists. #217 remains open for parity.
 5. **Do not pull #215 implementation into the release gate.** The Cloud Run design is useful evidence already on `main`, but hosted Hub support remains NO-GO until its separate durable-state/fencing/ingress/acceptance contract is implemented.
 
 This is a release-scope consolidation, not a weakening of acceptance. The artifact may contain implementation whose **support claim is narrower than its compiled surface**; release notes and status docs must state those boundaries explicitly.
