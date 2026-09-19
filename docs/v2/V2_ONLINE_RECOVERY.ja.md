@@ -118,12 +118,14 @@ reviewed low-impact current-state path は同じ provider/verifier 引数で `ac
 `v2_recover` と stable-signed `v2_recovery_enclave_helper` を `v2_agent` と一緒にinstallします。Agentを動かすログインユーザーでowner-private recovery directoryを作り、一度だけSecure Enclave recovery keyを作成します。
 
 ```bash
-install -d -m 700 "$HOME/Library/Application Support/cumg-v2-agent/recovery"
+install -d -m 700 "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets"
 v2_recover init-key \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
-  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-public-key.p256"
+  --public-key-out "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery-public-key.new.p256"
 ```
+
+reviewed single-Mac package の現在の local sealed-key location は <install-root>/v2/secrets/recovery.sealed です。v2_status / v2_doctor はこの packaged location を優先し、packaged file が存在しない場合だけ legacy の ~/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed へ fallback します。これにより、残存した古い sealed key が現在の packaged recovery authority を上書きして誤判定することを防ぎます。
 
 exportされるのは公開鍵だけです。operator-authenticated provisioning channelでHubへ移し、次へ配置します。
 
@@ -140,9 +142,9 @@ quarantine発生後の canonical operator workflow は `v2_recover guide` です
 ```bash
 v2_recover guide \
   --hub-state-dir "<HUB_STATE_DIR>" \
-  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --agent-state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --mutation-authority-dir "<MUTATION_AUTHORITY_DIR>" \
   --wait-secs 60
@@ -161,8 +163,8 @@ Agent-assisted explanation / UI composition には read-only JSON planning mode 
 ```bash
 v2_recover guide \
   --hub-state-dir "<HUB_STATE_DIR>" \
-  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --agent-state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
   --json
 ```
 
@@ -172,9 +174,9 @@ JSON mode は prompt/sign/publish/quarantine clear/replay を一切行いませ�
 
 ```bash
 v2_recover accept-current-state \
-  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --evidence "local human inspected and accepted the current screen as the continuation point" \
   --wait-secs 30

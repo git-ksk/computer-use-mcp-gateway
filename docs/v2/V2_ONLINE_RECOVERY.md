@@ -148,12 +148,14 @@ For the separately reviewed low-impact current-state path, use `accept-current-s
 Build/install `v2_recover` and the stable-signed `v2_recovery_enclave_helper` alongside `v2_agent`. From the logged-in Agent user account, create an owner-private recovery directory and initialize a new Secure Enclave recovery key once:
 
 ```bash
-install -d -m 700 "$HOME/Library/Application Support/cumg-v2-agent/recovery"
+install -d -m 700 "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets"
 v2_recover init-key \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
-  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-public-key.p256"
+  --public-key-out "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery-public-key.new.p256"
 ```
+
+The reviewed single-Mac package uses <install-root>/v2/secrets/recovery.sealed as the current local sealed-key location. v2_status and v2_doctor prefer that packaged location and fall back to the legacy ~/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed path only when the packaged file is absent. This precedence prevents a stale legacy sealed key from overriding the current packaged recovery authority.
 
 `init-key` uses create-new semantics and refuses an existing sealed-key path. The sealed file is not a software private key: it is the bounded Secure Enclave representation required to re-open the non-exportable key on this Mac. Keep it owner-private and local. Transfer only the exported public key through the operator-authenticated provisioning channel to the Hub and install it as:
 
@@ -170,9 +172,9 @@ When quarantine occurs, the connected Agent receives a fresh challenge. The cano
 ```bash
 v2_recover guide \
   --hub-state-dir "<HUB_STATE_DIR>" \
-  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --agent-state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --mutation-authority-dir "<MUTATION_AUTHORITY_DIR>" \
   --wait-secs 60
@@ -191,8 +193,8 @@ For Agent-assisted explanation or UI composition, the same command has a strictl
 ```bash
 v2_recover guide \
   --hub-state-dir "<HUB_STATE_DIR>" \
-  --agent-state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
+  --agent-state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
   --json
 ```
 
@@ -202,13 +204,13 @@ The lower-level commands remain available for advanced diagnostics and break-gla
 
 ```bash
 v2_recover status \
-  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub"
+  --state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub"
 
 v2_recover resolve \
-  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --decision confirmed-completed \
   --evidence "local user inspected the current desktop" \
@@ -219,9 +221,9 @@ For a reviewed low-impact `Scroll`/`MovePointer` ambiguity where history cannot 
 
 ```bash
 v2_recover accept-current-state \
-  --state-dir "$HOME/Library/Application Support/cumg-v2-agent/state" \
-  --hub-public-key-file "$HOME/Library/Application Support/cumg-v2-agent/trust/hub.pub" \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --state-dir "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/state/agent" \
+  --hub-public-key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/trust/hub.pub" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
   --evidence "local human inspected and accepted the current screen as the continuation point" \
   --wait-secs 30

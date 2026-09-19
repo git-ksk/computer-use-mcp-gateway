@@ -89,12 +89,14 @@ The macOS Agent remains a LaunchAgent in the interactive login session; online r
 Initialize the recovery key once as the Agent's logged-in user:
 
 ```bash
-install -d -m 700 "$HOME/Library/Application Support/cumg-v2-agent/recovery"
+install -d -m 700 "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets"
 v2_recover init-key \
-  --key-file "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed" \
+  --key-file "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed" \
   --secure-enclave-helper "$HOME/Library/Application Support/computer-use-mcp-gateway/bin/v2_recovery_enclave_helper" \
-  --public-key-out "$HOME/Library/Application Support/cumg-v2-agent/recovery/recovery-public-key.p256"
+  --public-key-out "$HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery-public-key.new.p256"
 ```
+
+The packaged single-Mac layout treats $HOME/Library/Application Support/computer-use-mcp-gateway/v2/secrets/recovery.sealed as the current sealed-key path. Diagnostics prefer it and use the former cumg-v2-agent/recovery/recovery-key.sealed location only as a compatibility fallback when the packaged path is absent.
 
 The private P-256 key remains in the Secure Enclave and requires user presence for signing. Only its bounded sealed representation is stored in the owner-private `--key-file`; `init-key` is create-new and refuses an existing key-file path. Move only the exported public key through the operator-authenticated provisioning channel and install it as `<HUB_STATE_DIR>/recovery-public-key.p256` with reviewed ownership/permissions. Restart the Hub so it explicitly loads the new recovery verifier.
 

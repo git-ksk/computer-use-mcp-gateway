@@ -1,5 +1,7 @@
 use clap::Parser;
-use computer_use_mcp_gateway::v2_doctor::{DoctorConfig, run_doctor};
+use computer_use_mcp_gateway::v2_doctor::{
+    DoctorConfig, default_single_mac_recovery_key_file, run_doctor,
+};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -101,11 +103,9 @@ fn main() -> ExitCode {
             .or_else(|| Some(root.join("mutation-authority"))),
         handoff_control_socket: args.handoff_control_socket,
         maintenance_job_exclude_label: args.maintenance_job_exclude_label,
-        recovery_key_file: args.recovery_key_file.or_else(|| {
-            Some(
-                home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed"),
-            )
-        }),
+        recovery_key_file: args
+            .recovery_key_file
+            .or_else(|| Some(default_single_mac_recovery_key_file(&root, &home))),
         recovery_helper: args
             .recovery_helper
             .or_else(|| Some(root.join("bin/v2_recovery_enclave_helper"))),

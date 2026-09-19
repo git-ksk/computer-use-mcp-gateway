@@ -33,6 +33,14 @@ const LEGACY_MAINTENANCE_LABEL_PREFIXES: [&str; 2] = [
 #[cfg(target_os = "macos")]
 const MAX_MAINTENANCE_JOBS: usize = 64;
 
+pub fn default_single_mac_recovery_key_file(install_root: &Path, home: &Path) -> PathBuf {
+    let packaged = install_root.join("v2/secrets/recovery.sealed");
+    if packaged.is_file() {
+        return packaged;
+    }
+    home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed")
+}
+
 #[derive(Debug, Clone)]
 pub struct DoctorConfig {
     pub hub_state_dir: PathBuf,
@@ -2295,6 +2303,32 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn default_recovery_key_path_prefers_packaged_layout_and_falls_back_to_legacy() {
+        let root = temp_dir("recovery-key-default");
+        let home = root.join("home");
+        let install = home.join("Library/Application Support/computer-use-mcp-gateway");
+        let legacy =
+            home.join("Library/Application Support/cumg-v2-agent/recovery/recovery-key.sealed");
+        let packaged = install.join("v2/secrets/recovery.sealed");
+
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(
+            default_single_mac_recovery_key_file(&install, &home),
+            legacy
+        );
+
+        std::fs::create_dir_all(packaged.parent().unwrap()).unwrap();
+        std::fs::write(&packaged, b"packaged").unwrap();
+        assert_eq!(
+            default_single_mac_recovery_key_file(&install, &home),
+            packaged
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn recovery_key_readiness_uses_only_verified_public_helper_without_user_presence() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
