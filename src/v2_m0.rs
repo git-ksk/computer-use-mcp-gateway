@@ -496,9 +496,15 @@ pub enum DeviceCommand {
     },
     ReadFile {
         path: String,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
     },
     ListDirectory {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
     },
     ListWindows {
         process_id: Option<u32>,
@@ -1653,10 +1659,14 @@ pub enum DeviceResult {
     FileContents {
         bytes: Vec<u8>,
         truncated: bool,
+        offset: u64,
+        next_offset: Option<u64>,
     },
     DirectoryEntries {
         entries: Vec<DirectoryEntry>,
         truncated: bool,
+        after: Option<String>,
+        next_cursor: Option<String>,
     },
     Windows {
         windows: Vec<WindowInfo>,
@@ -1703,6 +1713,58 @@ impl DeviceResult {
         if let (Self::Browser { result }, DeviceCommand::Browser { command }) = (self, command) {
             return result.matches_command(command);
         }
+        if let (
+            Self::FileContents {
+                bytes,
+                truncated,
+                offset: result_offset,
+                next_offset,
+            },
+            DeviceCommand::ReadFile {
+                offset, max_bytes, ..
+            },
+        ) = (self, command)
+        {
+            let within_requested_limit = max_bytes
+                .map(|limit| u64::try_from(bytes.len()).is_ok_and(|len| len <= limit))
+                .unwrap_or(true);
+            let expected_next = if *truncated {
+                u64::try_from(bytes.len())
+                    .ok()
+                    .and_then(|len| result_offset.checked_add(len))
+            } else {
+                None
+            };
+            return result_offset == offset
+                && within_requested_limit
+                && *next_offset == expected_next;
+        }
+        if let (
+            Self::DirectoryEntries {
+                entries,
+                truncated,
+                after: result_after,
+                next_cursor,
+            },
+            DeviceCommand::ListDirectory { after, .. },
+        ) = (self, command)
+        {
+            let strictly_sorted = entries.windows(2).all(|pair| pair[0].name < pair[1].name);
+            let after_bound_valid = result_after
+                .as_ref()
+                .map(|cursor| entries.iter().all(|entry| entry.name > *cursor))
+                .unwrap_or(true);
+            let cursor_shape_valid = if *truncated {
+                !entries.is_empty()
+                    && next_cursor.as_ref() == entries.last().map(|entry| &entry.name)
+            } else {
+                next_cursor.is_none()
+            };
+            return result_after == after
+                && strictly_sorted
+                && after_bound_valid
+                && cursor_shape_valid;
+        }
         matches!(
             (self, command),
             (Self::Applications { .. }, DeviceCommand::ListApplications)
@@ -1726,11 +1788,6 @@ impl DeviceResult {
                 )
                 | (Self::Process { .. }, DeviceCommand::ExecuteProcess { .. })
                 | (Self::Shell { .. }, DeviceCommand::Shell { .. })
-                | (Self::FileContents { .. }, DeviceCommand::ReadFile { .. })
-                | (
-                    Self::DirectoryEntries { .. },
-                    DeviceCommand::ListDirectory { .. }
-                )
                 | (Self::Windows { .. }, DeviceCommand::ListWindows { .. })
                 | (
                     Self::ApplicationLaunched { .. },
@@ -2368,6 +2425,60 @@ mod tests {
         assert_eq!(
             DeviceCapability::BrowserDownload.class(),
             CapabilityClass::Dangerous
+        );
+    }
+
+    #[test]
+    fn filesystem_results_bind_requested_range_and_cursor() {
+        let read = DeviceCommand::ReadFile {
+            path: "/workspace/log.txt".into(),
+            offset: 8,
+            max_bytes: Some(6),
+        };
+        assert!(
+            DeviceResult::FileContents {
+                bytes: b"abcdef".to_vec(),
+                truncated: true,
+                offset: 8,
+                next_offset: Some(14),
+            }
+            .matches_command(&read)
+        );
+        assert!(
+            !DeviceResult::FileContents {
+                bytes: b"abcdef".to_vec(),
+                truncated: true,
+                offset: 0,
+                next_offset: Some(6),
+            }
+            .matches_command(&read)
+        );
+
+        let list = DeviceCommand::ListDirectory {
+            path: "/workspace".into(),
+            after: Some("m.txt".into()),
+        };
+        let entries = vec![DirectoryEntry {
+            name: "z.txt".into(),
+            kind: DirectoryEntryKind::File,
+        }];
+        assert!(
+            DeviceResult::DirectoryEntries {
+                entries: entries.clone(),
+                truncated: false,
+                after: Some("m.txt".into()),
+                next_cursor: None,
+            }
+            .matches_command(&list)
+        );
+        assert!(
+            !DeviceResult::DirectoryEntries {
+                entries,
+                truncated: false,
+                after: None,
+                next_cursor: None,
+            }
+            .matches_command(&list)
         );
     }
 

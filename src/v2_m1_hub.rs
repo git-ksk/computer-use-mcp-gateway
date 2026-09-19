@@ -2793,13 +2793,32 @@ impl HubHandle {
         &self,
         path: impl Into<String>,
     ) -> Result<(Vec<u8>, bool), HubCommandError> {
+        let (bytes, truncated, _, _) = self.read_file_range(path, 0, None).await?;
+        Ok((bytes, truncated))
+    }
+
+    pub async fn read_file_range(
+        &self,
+        path: impl Into<String>,
+        offset: u64,
+        max_bytes: Option<u64>,
+    ) -> Result<(Vec<u8>, bool, u64, Option<u64>), HubCommandError> {
         let result = self
-            .start_command(DeviceCommand::ReadFile { path: path.into() })
+            .start_command(DeviceCommand::ReadFile {
+                path: path.into(),
+                offset,
+                max_bytes,
+            })
             .await?
             .wait()
             .await?;
         match result.result {
-            DeviceResult::FileContents { bytes, truncated } => Ok((bytes, truncated)),
+            DeviceResult::FileContents {
+                bytes,
+                truncated,
+                offset,
+                next_offset,
+            } => Ok((bytes, truncated, offset, next_offset)),
             _ => Err(HubCommandError::UnexpectedResult),
         }
     }
@@ -2808,13 +2827,30 @@ impl HubHandle {
         &self,
         path: impl Into<String>,
     ) -> Result<(Vec<DirectoryEntry>, bool), HubCommandError> {
+        let (entries, truncated, _) = self.list_directory_page(path, None).await?;
+        Ok((entries, truncated))
+    }
+
+    pub async fn list_directory_page(
+        &self,
+        path: impl Into<String>,
+        after: Option<String>,
+    ) -> Result<(Vec<DirectoryEntry>, bool, Option<String>), HubCommandError> {
         let result = self
-            .start_command(DeviceCommand::ListDirectory { path: path.into() })
+            .start_command(DeviceCommand::ListDirectory {
+                path: path.into(),
+                after,
+            })
             .await?
             .wait()
             .await?;
         match result.result {
-            DeviceResult::DirectoryEntries { entries, truncated } => Ok((entries, truncated)),
+            DeviceResult::DirectoryEntries {
+                entries,
+                truncated,
+                next_cursor,
+                ..
+            } => Ok((entries, truncated, next_cursor)),
             _ => Err(HubCommandError::UnexpectedResult),
         }
     }

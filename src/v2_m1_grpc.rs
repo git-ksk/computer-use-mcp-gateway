@@ -179,6 +179,8 @@ mod tests {
                 result: DeviceResult::FileContents {
                     bytes: vec![255; crate::v2_m1_filesystem::DEFAULT_MAX_FILE_BYTES],
                     truncated: true,
+                    offset: 0,
+                    next_offset: Some(crate::v2_m1_filesystem::DEFAULT_MAX_FILE_BYTES as u64),
                 },
             },
             signature: vec![0; 64],

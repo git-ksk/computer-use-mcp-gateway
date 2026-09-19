@@ -1367,12 +1367,19 @@ impl AgentService {
                                     });
                                     ActiveCancellation::None
                                 }
-                                DeviceCommand::ReadFile { path } => {
+                                DeviceCommand::ReadFile {
+                                    path,
+                                    offset,
+                                    max_bytes,
+                                } => {
                                     let filesystem = self.filesystem.clone();
                                     tokio::spawn(async move {
-                                        let result = tokio::task::spawn_blocking(move || filesystem.read_file(&path)).await
-                                            .map_err(|_| AgentOperationError::WorkerPanicked)
-                                            .and_then(|result| result.map_err(AgentOperationError::Filesystem));
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            filesystem.read_file_range(&path, offset, max_bytes)
+                                        })
+                                        .await
+                                        .map_err(|_| AgentOperationError::WorkerPanicked)
+                                        .and_then(|result| result.map_err(AgentOperationError::Filesystem));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
                                             device_generation: worker_generation,
@@ -1381,12 +1388,15 @@ impl AgentService {
                                     });
                                     ActiveCancellation::None
                                 }
-                                DeviceCommand::ListDirectory { path } => {
+                                DeviceCommand::ListDirectory { path, after } => {
                                     let filesystem = self.filesystem.clone();
                                     tokio::spawn(async move {
-                                        let result = tokio::task::spawn_blocking(move || filesystem.list_directory(&path)).await
-                                            .map_err(|_| AgentOperationError::WorkerPanicked)
-                                            .and_then(|result| result.map_err(AgentOperationError::Filesystem));
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            filesystem.list_directory_page(&path, after.as_deref())
+                                        })
+                                        .await
+                                        .map_err(|_| AgentOperationError::WorkerPanicked)
+                                        .and_then(|result| result.map_err(AgentOperationError::Filesystem));
                                         let _ = done.send(OperationCompletion {
                                             operation_id: worker_operation_id,
                                             device_generation: worker_generation,
