@@ -340,13 +340,17 @@ pub fn terminal_evidence_for_device_result(
             HubOperationState::Failed,
             ExecutionEvidence::VerifiedRemoteError,
         )),
-        DeviceResult::Process { output } | DeviceResult::Shell { output } if output.cancelled => {
+        DeviceResult::Process { output, .. } | DeviceResult::Shell { output, .. }
+            if output.cancelled =>
+        {
             Some((
                 HubOperationState::Cancelled,
                 ExecutionEvidence::ProvenProcessTermination,
             ))
         }
-        DeviceResult::Process { output } | DeviceResult::Shell { output } if output.timed_out => {
+        DeviceResult::Process { output, .. } | DeviceResult::Shell { output, .. }
+            if output.timed_out =>
+        {
             Some((
                 HubOperationState::Failed,
                 ExecutionEvidence::ProvenProcessTermination,

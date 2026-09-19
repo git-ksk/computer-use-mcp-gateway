@@ -1,6 +1,6 @@
 # V2 Ephemeral Data References
 
-Status: v0.5.0 の #313 foundation です。
+Status: v0.5.0 の #313 foundation に、current v0.5 branch で #83 process/shell output consumer を実装した状態です。
 
 この日本語版は V2_EPHEMERAL_DATA_REFS.md の翻訳です。英語版を canonical とします。
 
@@ -37,9 +37,29 @@ Windows を含む packaged deployment では、authoritative Agent state/rollbac
 
 raw staged bytes、Agent path、public ref、private locator は default telemetry に出しません。expiry、quota、generation、revision、operation、kind mismatch は payload / host path を含まない stable error category だけを公開できます。wrong-owner は unknown ref と同じ stale category に潰し、cross-principal existence oracle を作りません。
 
+## #83 process/shell output consumer
+
+#83 consumer でも通常の inline contract は変更しません。stdout / stderr は通常の process/shell result では各 16 KiB 上限のままです。
+
+stream がこの inline cap を超え、dedicated Agent ephemeral-data parent が設定されている場合:
+
+- stdout / stderr を別々に、display decode 前の raw byte として retain します。
+- retain 上限は 1 stream あたり 4 MiB、1 operation 合計では最大 8 MiB です。
+- retention ceiling 到達後も supervised pipe は EOF まで drain し、超過 byte は蓄積せず discard します。
+- Agent から Hub へは opaque private locator と bounded metadata だけを返します。
+- Hub は別の public `output_ref` を mint し、owner、device、generation、capability revision、source operation、stream kind、TTL に bind します。
+- `read_process_output` は Shell/ExecuteProcess authority を継承せず、独立した exact Observe capability です。
+- follow-up read は default 8 KiB、最大 64 KiB です。
+- offset / length は retained prefix 上の raw-byte offset とし、northbound byte は base64 encode するため、UTF-16 / invalid UTF-8 でも offset semantics は曖昧になりません。
+- `complete=true` は retained prefix が stream 全体を含むことを示し、`complete=false` は stream が 4 MiB ceiling を超え、その後続 byte が意図的に unavailable であることを示します。
+
+dedicated ephemeral-data parent が未設定なら、process/shell execution は従来どおり 16 KiB inline result のみで動作し、live output ref は作りません。packaged path selection、readiness/permission preflight、upgrade/schema integration は #314 の責務です。
+
+durable `get_operation` が persist するのは従来の bounded inline process/shell result だけです。live public ref、Agent locator、retained extended-output byte は persist しません。
+
 ## Recovery / quarantine
 
-将来 read-only output retrieval を exact original owner/operation に対する bounded recovery evidence として admit する場合も、read lane のままです。retrieved bytes は terminal evidence を manufacture せず、replay authorization、quarantine clear、mutation-resume barrier bypass に使いません。
+`ReadProcessOutput` は read-only recovery evidence として分類します。Hub は先に public ref を resolve し、retrieval を exact source operation に bind します。quarantine 中に admit できるのは、その quarantine が同じ source operation に属する場合だけです。この read が quarantine を settle したり terminal evidence を manufacture したり、replay authorization や mutation-resume barrier bypass に使われることはありません。
 
 ## Non-goals
 

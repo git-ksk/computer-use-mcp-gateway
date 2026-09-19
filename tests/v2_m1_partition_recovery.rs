@@ -66,6 +66,7 @@ fn agent_config(
         allowed_file_roots: vec![cwd.clone()],
         allowed_cwd_roots: vec![cwd],
         state_dir,
+        ephemeral_data_parent: None,
         heartbeat_interval: Duration::from_millis(50),
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(10),

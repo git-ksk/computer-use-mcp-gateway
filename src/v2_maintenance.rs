@@ -905,7 +905,9 @@ fn capability_effect_class(capability: DeviceCapability) -> &'static str {
 
 fn capability_target_class(capability: DeviceCapability) -> &'static str {
     match capability {
-        DeviceCapability::ExecuteProcess | DeviceCapability::Shell => "process",
+        DeviceCapability::ExecuteProcess
+        | DeviceCapability::Shell
+        | DeviceCapability::ReadProcessOutput => "process",
         DeviceCapability::ReadFile | DeviceCapability::ListDirectory => "filesystem",
         DeviceCapability::BrowserInspect
         | DeviceCapability::BrowserPrepare

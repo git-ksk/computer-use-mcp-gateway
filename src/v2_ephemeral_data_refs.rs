@@ -103,6 +103,11 @@ impl fmt::Debug for HubEphemeralRefRecord {
             .field("agent_locator", &"[redacted]")
             .field("bytes", &self.bytes)
             .field("expires_at_ms", &self.expires_at_ms)
+            .field(
+                "operation_id",
+                &self.operation_id.as_ref().map(|_| "[redacted]"),
+            )
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -112,6 +117,8 @@ pub struct ResolvedHubEphemeralRef {
     agent_locator: String,
     pub bytes: u64,
     pub expires_at_ms: u64,
+    pub operation_id: Option<String>,
+    pub kind: EphemeralDataKind,
 }
 
 impl fmt::Debug for ResolvedHubEphemeralRef {
@@ -236,6 +243,32 @@ impl HubEphemeralRefRegistry {
         expected_kind: EphemeralDataKind,
         now_ms: u64,
     ) -> Result<ResolvedHubEphemeralRef, HubEphemeralRefError> {
+        let resolved = self.resolve_owned(
+            public_ref,
+            owner,
+            device_id,
+            device_generation,
+            capability_revision,
+            now_ms,
+        )?;
+        if resolved.kind != expected_kind {
+            return Err(HubEphemeralRefError::KindMismatch);
+        }
+        if resolved.operation_id.as_deref() != operation_id {
+            return Err(HubEphemeralRefError::OperationMismatch);
+        }
+        Ok(resolved)
+    }
+
+    pub fn resolve_owned(
+        &mut self,
+        public_ref: &str,
+        owner: &OperationOwner,
+        device_id: &str,
+        device_generation: u64,
+        capability_revision: u64,
+        now_ms: u64,
+    ) -> Result<ResolvedHubEphemeralRef, HubEphemeralRefError> {
         let Some(record) = self.refs.get(public_ref) else {
             return Err(HubEphemeralRefError::UnknownRef);
         };
@@ -258,16 +291,12 @@ impl HubEphemeralRefRegistry {
         if record.capability_revision != capability_revision {
             return Err(HubEphemeralRefError::CapabilityRevisionMismatch);
         }
-        if record.kind != expected_kind {
-            return Err(HubEphemeralRefError::KindMismatch);
-        }
-        if record.operation_id.as_deref() != operation_id {
-            return Err(HubEphemeralRefError::OperationMismatch);
-        }
         Ok(ResolvedHubEphemeralRef {
             agent_locator: record.agent_locator.clone(),
             bytes: record.bytes,
             expires_at_ms: record.expires_at_ms,
+            operation_id: record.operation_id.clone(),
+            kind: record.kind,
         })
     }
 

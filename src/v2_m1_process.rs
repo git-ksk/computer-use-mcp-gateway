@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_MAX_ARGS: usize = 256;
 const DEFAULT_MAX_ENV: usize = 64;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+pub(crate) const DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const DEFAULT_POLL_MS: u64 = 10;
 
@@ -45,6 +46,7 @@ pub struct ProcessPolicy {
     max_args: usize,
     max_env_entries: usize,
     max_output_bytes_per_stream: usize,
+    max_retained_output_bytes_per_stream: usize,
     max_timeout_ms: u64,
     poll_interval: Duration,
 }
@@ -149,6 +151,7 @@ impl ProcessPolicy {
             max_args: DEFAULT_MAX_ARGS,
             max_env_entries: DEFAULT_MAX_ENV,
             max_output_bytes_per_stream: DEFAULT_MAX_OUTPUT_BYTES,
+            max_retained_output_bytes_per_stream: DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM,
             max_timeout_ms: DEFAULT_MAX_TIMEOUT_MS,
             poll_interval: Duration::from_millis(DEFAULT_POLL_MS),
         })
@@ -209,7 +212,7 @@ impl ProcessExecutor {
         cancellation: &ProcessCancellation,
     ) -> Result<ProcessOutput, ProcessError> {
         let validated = self.validate_request(request)?;
-        self.execute_validated(
+        self.execute_validated_captured(
             ProcessLaunch {
                 program: &request.program,
                 args: &request.args,
@@ -219,6 +222,30 @@ impl ProcessExecutor {
             &request.env,
             request.timeout_ms,
             cancellation,
+            self.policy.max_output_bytes_per_stream,
+        )
+        .map(|captured| captured.output)
+    }
+
+    pub(crate) fn execute_captured(
+        &self,
+        request: &ProcessRequest,
+        cancellation: &ProcessCancellation,
+    ) -> Result<CapturedProcessOutput, ProcessError> {
+        let validated = self.validate_request(request)?;
+        self.execute_validated_captured(
+            ProcessLaunch {
+                program: &request.program,
+                args: &request.args,
+                _windows_raw_arg: None,
+            },
+            &validated.cwd,
+            &request.env,
+            request.timeout_ms,
+            cancellation,
+            self.policy
+                .max_retained_output_bytes_per_stream
+                .max(self.policy.max_output_bytes_per_stream),
         )
     }
 
@@ -244,7 +271,7 @@ impl ProcessExecutor {
         return Err(ProcessError::ShellUnsupportedPlatform);
 
         #[cfg(any(unix, windows))]
-        self.execute_validated(
+        self.execute_validated_captured(
             ProcessLaunch {
                 program: &program,
                 args: &args,
@@ -254,27 +281,72 @@ impl ProcessExecutor {
             &request.env,
             request.timeout_ms,
             cancellation,
+            self.policy.max_output_bytes_per_stream,
+        )
+        .map(|captured| captured.output)
+    }
+
+    pub(crate) fn execute_shell_captured(
+        &self,
+        request: &ShellRequest,
+        cancellation: &ProcessCancellation,
+    ) -> Result<CapturedProcessOutput, ProcessError> {
+        let cwd = self.validate_common(&request.cwd, &request.env, request.timeout_ms)?;
+        #[cfg(unix)]
+        let (program, args, windows_raw_arg) = (
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), request.command.clone()],
+            None,
+        );
+        #[cfg(windows)]
+        let (program, args, windows_raw_arg) = (
+            "cmd.exe".to_owned(),
+            vec!["/D".to_owned(), "/S".to_owned(), "/C".to_owned()],
+            Some(request.command.as_str()),
+        );
+        #[cfg(not(any(unix, windows)))]
+        return Err(ProcessError::ShellUnsupportedPlatform);
+
+        #[cfg(any(unix, windows))]
+        self.execute_validated_captured(
+            ProcessLaunch {
+                program: &program,
+                args: &args,
+                _windows_raw_arg: windows_raw_arg,
+            },
+            &cwd,
+            &request.env,
+            request.timeout_ms,
+            cancellation,
+            self.policy
+                .max_retained_output_bytes_per_stream
+                .max(self.policy.max_output_bytes_per_stream),
         )
     }
 
-    fn execute_validated(
+    fn execute_validated_captured(
         &self,
         launch: ProcessLaunch<'_>,
         cwd: &Path,
         env: &[ProcessEnvVar],
         timeout_ms: u64,
         cancellation: &ProcessCancellation,
-    ) -> Result<ProcessOutput, ProcessError> {
+        retained_max: usize,
+    ) -> Result<CapturedProcessOutput, ProcessError> {
         if cancellation.is_cancelled() {
-            return Ok(ProcessOutput {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                stdout_truncated: false,
-                stderr_truncated: false,
-                timed_out: false,
-                cancelled: true,
-                duration_ms: 0,
+            return Ok(CapturedProcessOutput {
+                output: ProcessOutput {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    timed_out: false,
+                    cancelled: true,
+                    duration_ms: 0,
+                },
+                stdout_retained: None,
+                stderr_retained: None,
             });
         }
 
@@ -330,10 +402,10 @@ impl ProcessExecutor {
                 return Err(ProcessError::PipeUnavailable);
             }
         };
-        let max = self.policy.max_output_bytes_per_stream;
+        let inline_max = self.policy.max_output_bytes_per_stream;
         let stdout_reader = match thread::Builder::new()
             .name("cumg-process-stdout".into())
-            .spawn(move || drain_bounded(stdout, max))
+            .spawn(move || drain_retained(stdout, inline_max, retained_max))
         {
             Ok(reader) => reader,
             Err(error) => {
@@ -343,7 +415,7 @@ impl ProcessExecutor {
         };
         let stderr_reader = match thread::Builder::new()
             .name("cumg-process-stderr".into())
-            .spawn(move || drain_bounded(stderr, max))
+            .spawn(move || drain_retained(stderr, inline_max, retained_max))
         {
             Ok(reader) => reader,
             Err(error) => {
@@ -403,15 +475,27 @@ impl ProcessExecutor {
         let stderr = stderr_reader
             .join()
             .map_err(|_| ProcessError::ReaderPanicked)??;
-        Ok(ProcessOutput {
-            exit_code: status.code(),
-            stdout: decode_process_output(&stdout.bytes),
-            stderr: decode_process_output(&stderr.bytes),
-            stdout_truncated: stdout.truncated,
-            stderr_truncated: stderr.truncated,
-            timed_out,
-            cancelled,
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        let stdout_retained = stdout.inline_truncated.then_some(RetainedProcessOutput {
+            bytes: stdout.retained_bytes,
+            complete: !stdout.retention_truncated,
+        });
+        let stderr_retained = stderr.inline_truncated.then_some(RetainedProcessOutput {
+            bytes: stderr.retained_bytes,
+            complete: !stderr.retention_truncated,
+        });
+        Ok(CapturedProcessOutput {
+            output: ProcessOutput {
+                exit_code: status.code(),
+                stdout: decode_process_output(&stdout.inline_bytes),
+                stderr: decode_process_output(&stderr.inline_bytes),
+                stdout_truncated: stdout.inline_truncated,
+                stderr_truncated: stderr.inline_truncated,
+                timed_out,
+                cancelled,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            },
+            stdout_retained,
+            stderr_retained,
         })
     }
 
@@ -498,9 +582,24 @@ struct ValidatedRequest {
 }
 
 #[derive(Debug)]
-struct BoundedBytes {
-    bytes: Vec<u8>,
-    truncated: bool,
+struct RetainedBytes {
+    inline_bytes: Vec<u8>,
+    retained_bytes: Vec<u8>,
+    inline_truncated: bool,
+    retention_truncated: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetainedProcessOutput {
+    pub bytes: Vec<u8>,
+    pub complete: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct CapturedProcessOutput {
+    pub output: ProcessOutput,
+    pub stdout_retained: Option<RetainedProcessOutput>,
+    pub stderr_retained: Option<RetainedProcessOutput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,25 +696,42 @@ fn decode_windows_utf16(bytes: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&units.collect::<Vec<_>>()))
 }
 
-fn drain_bounded<R: Read>(mut reader: R, max: usize) -> Result<BoundedBytes, ProcessError> {
-    let mut kept = Vec::with_capacity(max.min(4096));
-    let mut truncated = false;
+fn drain_retained<R: Read>(
+    mut reader: R,
+    inline_max: usize,
+    retained_max: usize,
+) -> Result<RetainedBytes, ProcessError> {
+    debug_assert!(retained_max >= inline_max);
+    let mut inline = Vec::with_capacity(inline_max.min(4096));
+    let mut retained = Vec::with_capacity(retained_max.min(4096));
+    let mut inline_truncated = false;
+    let mut retention_truncated = false;
     let mut buffer = [0_u8; 4096];
     loop {
         let read = reader.read(&mut buffer).map_err(ProcessError::Io)?;
         if read == 0 {
             break;
         }
-        let remaining = max.saturating_sub(kept.len());
-        let copy = read.min(remaining);
-        kept.extend_from_slice(&buffer[..copy]);
-        if copy < read {
-            truncated = true;
+
+        let inline_remaining = inline_max.saturating_sub(inline.len());
+        let inline_copy = read.min(inline_remaining);
+        inline.extend_from_slice(&buffer[..inline_copy]);
+        if inline_copy < read {
+            inline_truncated = true;
+        }
+
+        let retained_remaining = retained_max.saturating_sub(retained.len());
+        let retained_copy = read.min(retained_remaining);
+        retained.extend_from_slice(&buffer[..retained_copy]);
+        if retained_copy < read {
+            retention_truncated = true;
         }
     }
-    Ok(BoundedBytes {
-        bytes: kept,
-        truncated,
+    Ok(RetainedBytes {
+        inline_bytes: inline,
+        retained_bytes: retained,
+        inline_truncated,
+        retention_truncated,
     })
 }
 
@@ -694,7 +810,11 @@ impl std::error::Error for ProcessError {}
 mod tests {
     use super::*;
     use crate::v2_m0::ProcessRequest;
-    use std::sync::mpsc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        mpsc,
+    };
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -790,6 +910,26 @@ mod tests {
         }
     }
 
+    struct CountingReader {
+        remaining: usize,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let read = self.remaining.min(buffer.len());
+            for (index, byte) in buffer[..read].iter_mut().enumerate() {
+                *byte = u8::try_from((self.remaining + index) % 251).unwrap();
+            }
+            self.remaining -= read;
+            self.bytes_read.fetch_add(read, AtomicOrdering::SeqCst);
+            Ok(read)
+        }
+    }
+
     #[test]
     fn failed_termination_without_terminal_proof_is_indeterminate() {
         let mut child = FaultChild {
@@ -836,9 +976,42 @@ mod tests {
 
     #[test]
     fn output_reader_failure_remains_terminal_error_category() {
-        let error = drain_bounded(FailingReader, 16).unwrap_err();
+        let error = drain_retained(FailingReader, 16, 16).unwrap_err();
         assert!(matches!(error, ProcessError::Io(_)));
         assert_eq!(error.outcome_unproven_stage(), None);
+    }
+
+    #[test]
+    fn retained_output_keeps_stable_raw_bytes_before_display_decoding() {
+        let source = vec![0xff, 0xfe, 0x41, 0x00, 0x00, 0xd8, 0x42, 0x00, 0x80, 0xff];
+        let drained = drain_retained(std::io::Cursor::new(source.clone()), 4, 64).unwrap();
+        assert_eq!(drained.inline_bytes, source[..4]);
+        assert_eq!(drained.retained_bytes, source);
+        assert!(drained.inline_truncated);
+        assert!(!drained.retention_truncated);
+    }
+
+    #[test]
+    fn retained_output_ceiling_discards_excess_but_drains_pipe_to_eof() {
+        let inline_max = 16 * 1024;
+        let retained_max = DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM;
+        let produced = retained_max + 256 * 1024 + 37;
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let drained = drain_retained(
+            CountingReader {
+                remaining: produced,
+                bytes_read: bytes_read.clone(),
+            },
+            inline_max,
+            retained_max,
+        )
+        .unwrap();
+
+        assert_eq!(drained.inline_bytes.len(), inline_max);
+        assert_eq!(drained.retained_bytes.len(), retained_max);
+        assert!(drained.inline_truncated);
+        assert!(drained.retention_truncated);
+        assert_eq!(bytes_read.load(AtomicOrdering::SeqCst), produced);
     }
 
     #[cfg(windows)]

@@ -45,6 +45,9 @@ struct Config {
     tls_root_der_file: PathBuf,
     #[arg(long, env = "CUMG_V2_STATE_DIR")]
     state_dir: PathBuf,
+    /// Dedicated non-authoritative parent for short-lived workspace/process output data.
+    #[arg(long, env = "CUMG_V2_EPHEMERAL_DATA_PARENT")]
+    ephemeral_data_parent: Option<PathBuf>,
     #[arg(
         long = "allowed-cwd-root",
         env = "CUMG_V2_ALLOWED_CWD_ROOTS",
@@ -210,6 +213,7 @@ async fn main() -> Result<()> {
         allowed_cwd_roots: args.allowed_cwd_roots,
         allowed_file_roots: args.allowed_file_roots,
         state_dir: args.state_dir,
+        ephemeral_data_parent: args.ephemeral_data_parent,
         heartbeat_interval: Duration::from_secs(args.heartbeat_secs),
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(args.reconnect_initial_ms),

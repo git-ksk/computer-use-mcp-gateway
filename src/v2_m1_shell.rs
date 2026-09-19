@@ -7,7 +7,8 @@
 
 use crate::v2_m0::{ProcessOutput, ShellRequest};
 use crate::v2_m1_process::{
-    ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy, ProcessUnprovenStage,
+    CapturedProcessOutput, ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy,
+    ProcessUnprovenStage,
 };
 use crate::v2_observability::SafeErrorCode;
 use std::fmt;
@@ -39,6 +40,22 @@ impl ShellExecutor {
         }
         self.process
             .execute_shell(request, cancellation)
+            .map_err(ShellError::Process)
+    }
+
+    pub(crate) fn execute_captured(
+        &self,
+        request: &ShellRequest,
+        cancellation: &ProcessCancellation,
+    ) -> Result<CapturedProcessOutput, ShellError> {
+        if request.command.trim().is_empty() {
+            return Err(ShellError::InvalidCommand);
+        }
+        if request.command.len() > MAX_SHELL_COMMAND_BYTES {
+            return Err(ShellError::CommandTooLarge);
+        }
+        self.process
+            .execute_shell_captured(request, cancellation)
             .map_err(ShellError::Process)
     }
 }

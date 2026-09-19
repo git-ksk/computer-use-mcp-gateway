@@ -27,6 +27,7 @@ use crate::{
         BrowserBackendClickTarget, BrowserBackendCommand, BrowserBackendResult,
         BrowserBackendSemanticRef, BrowserStagedUploadFile,
     },
+    v2_ephemeral_data_refs::DEFAULT_MAX_AGENT_EPHEMERAL_READ_BYTES,
     v2_execution_safety::{
         OperationAdmissionMetadata, OperationAuditMetadata, OperationEvidenceEnvelope,
         OperationOwner, OperationRequestFingerprint, RecoverableOperationResult,
@@ -108,6 +109,7 @@ const TOOL_DRAG: &str = "drag";
 const TOOL_TYPE_TEXT: &str = "type_text";
 const TOOL_EXECUTE_PROCESS: &str = "execute_process";
 const TOOL_SHELL: &str = "shell";
+const TOOL_READ_PROCESS_OUTPUT: &str = "read_process_output";
 const TOOL_GET_OPERATION: &str = "get_operation";
 const TOOL_READ_FILE: &str = "read_file";
 const TOOL_LIST_DIRECTORY: &str = "list_directory";
@@ -2929,6 +2931,50 @@ impl ServerHandler for V2NorthboundMcp {
             context.client_info(),
         );
 
+        if request.name.as_ref() == TOOL_READ_PROCESS_OUTPUT {
+            let args: ReadProcessOutputArgs = parse_arguments(arguments)?;
+            let max_bytes = args.max_bytes.unwrap_or(8 * 1024);
+            if max_bytes == 0
+                || max_bytes
+                    > u64::try_from(DEFAULT_MAX_AGENT_EPHEMERAL_READ_BYTES).map_err(|_| {
+                        McpError::internal_error("Process output range bound unavailable", None)
+                    })?
+            {
+                return Err(McpError::invalid_params(
+                    "max_bytes exceeds the bounded process-output range limit",
+                    None,
+                ));
+            }
+            return match self
+                .hub
+                .read_process_output_ref_as(
+                    OperationOwner::from_principal(&auth.principal),
+                    &args.output_ref,
+                    args.offset,
+                    Some(max_bytes),
+                )
+                .await
+            {
+                Ok(range) => {
+                    let payload = json!({
+                        "type": "process_output_range",
+                        "bytes_base64": STANDARD.encode(&range.bytes),
+                        "stream": range.stream,
+                        "source_operation_id": range.source_operation_id,
+                        "offset": range.offset,
+                        "next_offset": range.next_offset,
+                        "total_bytes": range.total_bytes,
+                        "eof": range.eof,
+                    });
+                    Ok(
+                        CallToolResult::success(vec![ContentBlock::text(payload.to_string())])
+                            .into(),
+                    )
+                }
+                Err(error) => Ok(execution_error_response(hub_error_to_mcp(error))),
+            };
+        }
+
         if request.name.as_ref() == TOOL_BROWSER_STAGE_UPLOAD_FILE {
             return self
                 .call_browser_stage_upload(
@@ -3938,6 +3984,12 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
             "semantic_constraint_snapshot_stale",
             None,
         ),
+        HubCommandError::EphemeralRef(error) => {
+            return McpError::invalid_request(
+                "Process output reference is stale or unavailable",
+                Some(json!({"code": error.safe_error_code()})),
+            );
+        }
         HubCommandError::GrantSigningUnavailable => {
             return McpError::internal_error(
                 "Grant signing is temporarily unavailable",
@@ -4072,6 +4124,7 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_TYPE_TEXT => Some(DeviceCapability::TypeText),
         TOOL_EXECUTE_PROCESS => Some(DeviceCapability::ExecuteProcess),
         TOOL_SHELL => Some(DeviceCapability::Shell),
+        TOOL_READ_PROCESS_OUTPUT => Some(DeviceCapability::ReadProcessOutput),
         TOOL_READ_FILE => Some(DeviceCapability::ReadFile),
         TOOL_LIST_DIRECTORY => Some(DeviceCapability::ListDirectory),
         TOOL_LIST_WINDOWS => Some(DeviceCapability::ListWindows),
@@ -4383,6 +4436,27 @@ fn all_tools() -> Vec<Tool> {
             TOOL_GET_OPERATION,
             "Read durable owner-scoped status for a prior effectful operation without replaying it. Process/shell may include bounded output; desktop/browser recovery is status-only and retains no raw GUI/browser payload.",
             object_schema(vec![("operation_id", operation_id_schema())], &["operation_id"]),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_READ_PROCESS_OUTPUT,
+            "Read a bounded stable byte range from short-lived process/shell output previously omitted by the 16 KiB inline result. The opaque output_ref is owner/device/operation scoped, expires, and does not survive Agent restart.",
+            object_schema(
+                vec![
+                    (
+                        "output_ref",
+                        json!({"type":"string","minLength":1,"maxLength":512}),
+                    ),
+                    ("offset", json!({"type":"integer","minimum":0})),
+                    (
+                        "max_bytes",
+                        bounded_positive_integer_schema(
+                            DEFAULT_MAX_AGENT_EPHEMERAL_READ_BYTES as u64,
+                        ),
+                    ),
+                ],
+                &["output_ref"],
+            ),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
         Tool::new(
@@ -5847,6 +5921,16 @@ struct ShellArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReadProcessOutputArgs {
+    output_ref: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileArgs {
     path: String,
     #[serde(default)]
@@ -7145,6 +7229,10 @@ mod tests {
             (TOOL_TYPE_TEXT, DeviceCapability::TypeText),
             (TOOL_EXECUTE_PROCESS, DeviceCapability::ExecuteProcess),
             (TOOL_SHELL, DeviceCapability::Shell),
+            (
+                TOOL_READ_PROCESS_OUTPUT,
+                DeviceCapability::ReadProcessOutput,
+            ),
             (TOOL_READ_FILE, DeviceCapability::ReadFile),
             (TOOL_LIST_DIRECTORY, DeviceCapability::ListDirectory),
             (TOOL_LIST_WINDOWS, DeviceCapability::ListWindows),

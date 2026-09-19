@@ -12,13 +12,18 @@ use crate::v2_browser_staging::{
     BrowserDownloadStagingBroker, BrowserDownloadStagingError, BrowserStagingStartupError,
     BrowserUploadStagingBroker, BrowserUploadStagingError,
 };
+use crate::v2_ephemeral_data_refs::{
+    AgentEphemeralBinding, AgentEphemeralDataError, AgentEphemeralDataLimits,
+    AgentEphemeralDataStore, EphemeralDataKind,
+};
 use crate::v2_execution_safety::{
     AgentTerminalEvidence, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES, terminal_evidence_for_device_result,
 };
 use crate::v2_m0::{
-    CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CapabilityClass,
-    CommandResultEnvelope, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
-    DeviceSession, GrantLedger, VerificationStatus,
+    AgentProcessOutputLocator, AgentProcessOutputLocators, CAPABILITY_SCHEMA_VERSION,
+    CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CapabilityClass, CommandResultEnvelope,
+    DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult, DeviceSession, GrantLedger,
+    ProcessOutputStream, VerificationStatus,
 };
 use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
 use crate::v2_m0_transport::{
@@ -43,7 +48,8 @@ use crate::v2_m1_grpc::{
 use crate::v2_m1_keys::AgentProvisionedMaterial;
 use crate::v2_m1_persistence::{AgentPersistentState, CheckpointStore, PersistenceError};
 use crate::v2_m1_process::{
-    ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy, ProcessUnprovenStage,
+    CapturedProcessOutput, ProcessCancellation, ProcessError, ProcessExecutor, ProcessPolicy,
+    ProcessUnprovenStage,
 };
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_observability::SafeErrorCode;
@@ -61,8 +67,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
@@ -144,6 +150,9 @@ pub struct AgentServiceConfig {
     pub allowed_cwd_roots: Vec<PathBuf>,
     pub allowed_file_roots: Vec<PathBuf>,
     pub state_dir: PathBuf,
+    /// Dedicated non-authoritative storage parent for short-lived workspace/process data.
+    /// None disables retrievable extended process output until packaging configures it.
+    pub ephemeral_data_parent: Option<PathBuf>,
     pub heartbeat_interval: Duration,
     pub reconnect: ReconnectPolicy,
     pub cua: Option<CuaAgentConfig>,
@@ -192,6 +201,7 @@ pub struct AgentService {
     executor: ProcessExecutor,
     shell: ShellExecutor,
     filesystem: FilesystemExecutor,
+    ephemeral_data: Option<Arc<StdMutex<AgentEphemeralDataStore>>>,
     browser_upload_staging: BrowserUploadStagingBroker,
     browser_download_staging: BrowserDownloadStagingBroker,
     computer_use: Option<Arc<dyn ComputerUseBackendAdapter>>,
@@ -314,6 +324,13 @@ impl AgentService {
             }
             Err(error) => return Err(AgentServiceError::Persistence(error)),
         };
+        let ephemeral_data = match config.ephemeral_data_parent.as_deref() {
+            Some(parent) => Some(Arc::new(StdMutex::new(
+                AgentEphemeralDataStore::new(parent, AgentEphemeralDataLimits::default())
+                    .map_err(AgentServiceError::EphemeralDataStartup)?,
+            ))),
+            None => None,
+        };
         let browser_upload_staging = match BrowserUploadStagingBroker::new(&config.state_dir) {
             Ok(staging) => staging,
             Err(error) => {
@@ -342,6 +359,7 @@ impl AgentService {
             executor,
             shell,
             filesystem,
+            ephemeral_data,
             browser_upload_staging,
             browser_download_staging,
             computer_use,
@@ -389,6 +407,9 @@ impl AgentService {
             DeviceCapability::ReadFile,
             DeviceCapability::ListDirectory,
         ];
+        if self.ephemeral_data.is_some() {
+            supported.push(DeviceCapability::ReadProcessOutput);
+        }
         let backend = if let Some(computer_use) = &self.computer_use {
             let advertisement = computer_use.advertisement();
             let backend = format!("agent-native+{}", advertisement.backend);
@@ -1300,15 +1321,44 @@ impl AgentService {
                                     let cancellation = ProcessCancellation::default();
                                     let worker_cancel = cancellation.clone();
                                     let executor = self.executor.clone();
+                                    let ephemeral_data = self.ephemeral_data.clone();
+                                    let worker_device_id = session.device_id.clone();
+                                    let worker_revision = session.capabilities.revision;
+                                    let source_operation_id = worker_operation_id.clone();
                                     tokio::spawn(async move {
                                         let result = tokio::task::spawn_blocking(move || {
-                                            executor.execute(&request, &worker_cancel)
-                                        }).await;
-                                        let _ = done.send(OperationCompletion {
-                                            operation_id: worker_operation_id,
-                                            device_generation: worker_generation,
-                                            outcome: process_operation_outcome(result),
-                                        }).await;
+                                            if ephemeral_data.is_some() {
+                                                executor
+                                                    .execute_captured(&request, &worker_cancel)
+                                                    .map(|captured| {
+                                                        stage_captured_process_result(
+                                                            captured,
+                                                            ephemeral_data.as_ref(),
+                                                            &worker_device_id,
+                                                            worker_generation,
+                                                            worker_revision,
+                                                            &source_operation_id,
+                                                            false,
+                                                        )
+                                                    })
+                                            } else {
+                                                executor.execute(&request, &worker_cancel).map(|output| {
+                                                    DeviceResult::Process {
+                                                        output,
+                                                        output_refs: None,
+                                                        agent_output_locators: None,
+                                                    }
+                                                })
+                                            }
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: process_operation_outcome(result),
+                                            })
+                                            .await;
                                     });
                                     ActiveCancellation::Process(cancellation)
                                 }
@@ -1316,17 +1366,129 @@ impl AgentService {
                                     let cancellation = ProcessCancellation::default();
                                     let worker_cancel = cancellation.clone();
                                     let shell = self.shell.clone();
+                                    let ephemeral_data = self.ephemeral_data.clone();
+                                    let worker_device_id = session.device_id.clone();
+                                    let worker_revision = session.capabilities.revision;
+                                    let source_operation_id = worker_operation_id.clone();
                                     tokio::spawn(async move {
                                         let result = tokio::task::spawn_blocking(move || {
-                                            shell.execute(&request, &worker_cancel)
-                                        }).await;
-                                        let _ = done.send(OperationCompletion {
-                                            operation_id: worker_operation_id,
-                                            device_generation: worker_generation,
-                                            outcome: shell_operation_outcome(result),
-                                        }).await;
+                                            if ephemeral_data.is_some() {
+                                                shell.execute_captured(&request, &worker_cancel).map(
+                                                    |captured| {
+                                                        stage_captured_process_result(
+                                                            captured,
+                                                            ephemeral_data.as_ref(),
+                                                            &worker_device_id,
+                                                            worker_generation,
+                                                            worker_revision,
+                                                            &source_operation_id,
+                                                            true,
+                                                        )
+                                                    },
+                                                )
+                                            } else {
+                                                shell.execute(&request, &worker_cancel).map(|output| {
+                                                    DeviceResult::Shell {
+                                                        output,
+                                                        output_refs: None,
+                                                        agent_output_locators: None,
+                                                    }
+                                                })
+                                            }
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: shell_operation_outcome(result),
+                                            })
+                                            .await;
                                     });
                                     ActiveCancellation::Process(cancellation)
+                                }
+                                DeviceCommand::ReadProcessOutput {
+                                    locator,
+                                    source_operation_id,
+                                    stream,
+                                    offset,
+                                    max_bytes,
+                                } => {
+                                    let ephemeral_data = self.ephemeral_data.clone();
+                                    let worker_device_id = session.device_id.clone();
+                                    let worker_revision = session.capabilities.revision;
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let Some(store) = ephemeral_data else {
+                                                return DeviceResult::Error {
+                                                    code: DeviceErrorCode::InvalidRequest,
+                                                };
+                                            };
+                                            let max_bytes = match usize::try_from(max_bytes) {
+                                                Ok(max_bytes) => max_bytes,
+                                                Err(_) => {
+                                                    return DeviceResult::Error {
+                                                        code: DeviceErrorCode::InvalidRequest,
+                                                    };
+                                                }
+                                            };
+                                            let kind = match stream {
+                                                ProcessOutputStream::Stdout => EphemeralDataKind::ProcessStdout,
+                                                ProcessOutputStream::Stderr => EphemeralDataKind::ProcessStderr,
+                                            };
+                                            let Some(now_ms) = agent_unix_time_ms() else {
+                                                return DeviceResult::Error {
+                                                    code: DeviceErrorCode::IoFailure,
+                                                };
+                                            };
+                                            let range = match store.lock() {
+                                                Ok(mut store) => store.read_range(
+                                                    &locator,
+                                                    &worker_device_id,
+                                                    worker_generation,
+                                                    worker_revision,
+                                                    Some(&source_operation_id),
+                                                    kind,
+                                                    offset,
+                                                    max_bytes,
+                                                    now_ms,
+                                                ),
+                                                Err(_) => {
+                                                    return DeviceResult::Error {
+                                                        code: DeviceErrorCode::IoFailure,
+                                                    };
+                                                }
+                                            };
+                                            match range {
+                                                Ok(range) => DeviceResult::ProcessOutputRange {
+                                                    bytes: range.bytes,
+                                                    stream,
+                                                    source_operation_id,
+                                                    offset: range.offset,
+                                                    next_offset: range.next_offset,
+                                                    total_bytes: range.total_bytes,
+                                                    eof: range.eof,
+                                                },
+                                                Err(error) => DeviceResult::Error {
+                                                    code: ephemeral_data_error_code(&error),
+                                                },
+                                            }
+                                        })
+                                        .await
+                                        .map_err(|_| AgentOperationError::WorkerPanicked);
+                                        let outcome = match result {
+                                            Ok(result) => AgentOperationOutcome::Result(Ok(result)),
+                                            Err(error) => AgentOperationOutcome::Result(Err(error)),
+                                        };
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome,
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
                                 }
                                 DeviceCommand::StageBrowserUploadFile {
                                     context_id,
@@ -1588,11 +1750,109 @@ struct OperationCompletion {
     outcome: AgentOperationOutcome,
 }
 
+fn agent_unix_time_ms() -> Option<u64> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(elapsed.as_millis()).ok()
+}
+
+fn stage_captured_process_result(
+    captured: CapturedProcessOutput,
+    ephemeral_data: Option<&Arc<StdMutex<AgentEphemeralDataStore>>>,
+    device_id: &str,
+    device_generation: u64,
+    capability_revision: u64,
+    operation_id: &str,
+    shell: bool,
+) -> DeviceResult {
+    let mut locators = AgentProcessOutputLocators {
+        stdout: None,
+        stderr: None,
+    };
+    if let (Some(store), Some(now_ms)) = (ephemeral_data, agent_unix_time_ms()) {
+        match store.lock() {
+            Ok(mut store) => {
+                if let Some(retained) = captured.stdout_retained.as_ref() {
+                    let binding = AgentEphemeralBinding::new(
+                        device_id.to_owned(),
+                        device_generation,
+                        capability_revision,
+                        Some(operation_id.to_owned()),
+                        EphemeralDataKind::ProcessStdout,
+                    );
+                    if let Ok(binding) = binding {
+                        match store.stage(binding, &retained.bytes, now_ms) {
+                            Ok(staged) => {
+                                locators.stdout = Some(AgentProcessOutputLocator {
+                                    locator: staged.locator().to_owned(),
+                                    retained_bytes: staged.bytes,
+                                    complete: retained.complete,
+                                });
+                            }
+                            Err(error) => tracing::warn!(
+                                event = "v2_process_output_spool_refused",
+                                stream = "stdout",
+                                error_code = error.safe_error_code(),
+                                "extended process output was not retained; inline result remains authoritative"
+                            ),
+                        }
+                    }
+                }
+                if let Some(retained) = captured.stderr_retained.as_ref() {
+                    let binding = AgentEphemeralBinding::new(
+                        device_id.to_owned(),
+                        device_generation,
+                        capability_revision,
+                        Some(operation_id.to_owned()),
+                        EphemeralDataKind::ProcessStderr,
+                    );
+                    if let Ok(binding) = binding {
+                        match store.stage(binding, &retained.bytes, now_ms) {
+                            Ok(staged) => {
+                                locators.stderr = Some(AgentProcessOutputLocator {
+                                    locator: staged.locator().to_owned(),
+                                    retained_bytes: staged.bytes,
+                                    complete: retained.complete,
+                                });
+                            }
+                            Err(error) => tracing::warn!(
+                                event = "v2_process_output_spool_refused",
+                                stream = "stderr",
+                                error_code = error.safe_error_code(),
+                                "extended process output was not retained; inline result remains authoritative"
+                            ),
+                        }
+                    }
+                }
+            }
+            Err(_) => tracing::warn!(
+                event = "v2_process_output_spool_refused",
+                error_code = "ephemeral_data_lock_poisoned",
+                "extended process output store unavailable; inline result remains authoritative"
+            ),
+        }
+    }
+    let agent_output_locators =
+        (locators.stdout.is_some() || locators.stderr.is_some()).then_some(Box::new(locators));
+    if shell {
+        DeviceResult::Shell {
+            output: captured.output,
+            output_refs: None,
+            agent_output_locators,
+        }
+    } else {
+        DeviceResult::Process {
+            output: captured.output,
+            output_refs: None,
+            agent_output_locators,
+        }
+    }
+}
+
 fn process_operation_outcome(
-    result: Result<Result<crate::v2_m0::ProcessOutput, ProcessError>, tokio::task::JoinError>,
+    result: Result<Result<DeviceResult, ProcessError>, tokio::task::JoinError>,
 ) -> AgentOperationOutcome {
     match result {
-        Ok(Ok(output)) => AgentOperationOutcome::Result(Ok(DeviceResult::Process { output })),
+        Ok(Ok(result)) => AgentOperationOutcome::Result(Ok(result)),
         Ok(Err(error)) => match error.outcome_unproven_stage() {
             Some(stage) => AgentOperationOutcome::Indeterminate(
                 AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
@@ -1606,10 +1866,10 @@ fn process_operation_outcome(
 }
 
 fn shell_operation_outcome(
-    result: Result<Result<crate::v2_m0::ProcessOutput, ShellError>, tokio::task::JoinError>,
+    result: Result<Result<DeviceResult, ShellError>, tokio::task::JoinError>,
 ) -> AgentOperationOutcome {
     match result {
-        Ok(Ok(output)) => AgentOperationOutcome::Result(Ok(DeviceResult::Shell { output })),
+        Ok(Ok(result)) => AgentOperationOutcome::Result(Ok(result)),
         Ok(Err(error)) => match error.outcome_unproven_stage() {
             Some(stage) => AgentOperationOutcome::Indeterminate(
                 AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
@@ -1721,6 +1981,30 @@ async fn terminate_active(
         .abandon_on_disconnect(&operation.operation_id)
         .map_err(AgentServiceError::Execution)?;
     Ok(())
+}
+
+fn ephemeral_data_error_code(error: &AgentEphemeralDataError) -> DeviceErrorCode {
+    match error {
+        AgentEphemeralDataError::UnknownLocator | AgentEphemeralDataError::Expired => {
+            DeviceErrorCode::NotFound
+        }
+        AgentEphemeralDataError::DeviceMismatch
+        | AgentEphemeralDataError::GenerationMismatch
+        | AgentEphemeralDataError::CapabilityRevisionMismatch
+        | AgentEphemeralDataError::KindMismatch
+        | AgentEphemeralDataError::OperationMismatch => DeviceErrorCode::PermissionDenied,
+        AgentEphemeralDataError::ReadTooLarge
+        | AgentEphemeralDataError::InvalidRange
+        | AgentEphemeralDataError::InvalidBinding
+        | AgentEphemeralDataError::InvalidObject
+        | AgentEphemeralDataError::InvalidLimits
+        | AgentEphemeralDataError::InvalidPrivateRoot
+        | AgentEphemeralDataError::ObjectTooLarge
+        | AgentEphemeralDataError::ObjectLimitExceeded
+        | AgentEphemeralDataError::ByteLimitExceeded
+        | AgentEphemeralDataError::IdentifierCollision => DeviceErrorCode::InvalidRequest,
+        AgentEphemeralDataError::Io => DeviceErrorCode::IoFailure,
+    }
 }
 
 fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
@@ -2264,6 +2548,7 @@ pub enum AgentServiceError {
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
     Filesystem(FilesystemError),
+    EphemeralDataStartup(AgentEphemeralDataError),
     BrowserUploadStagingStartup(BrowserStagingStartupError),
     BrowserDownloadStagingStartup(BrowserStagingStartupError),
     BrowserUploadStaging(BrowserUploadStagingError),
@@ -2334,6 +2619,7 @@ impl SafeErrorCode for AgentServiceError {
             Self::Execution(_) => "execution_error",
             Self::Process(_) => "process_error",
             Self::Filesystem(_) => "filesystem_error",
+            Self::EphemeralDataStartup(error) => error.safe_error_code(),
             Self::BrowserUploadStagingStartup(error) => error.upload_safe_error_code(),
             Self::BrowserDownloadStagingStartup(error) => error.download_safe_error_code(),
             Self::BrowserUploadStaging(error) => error.safe_error_code(),
@@ -2505,11 +2791,10 @@ mod tests {
 
     #[tokio::test]
     async fn process_worker_panic_is_fail_closed_indeterminate() {
-        let joined =
-            tokio::task::spawn_blocking(|| -> Result<crate::v2_m0::ProcessOutput, ProcessError> {
-                panic!("injected process worker panic");
-            })
-            .await;
+        let joined = tokio::task::spawn_blocking(|| -> Result<DeviceResult, ProcessError> {
+            panic!("injected process worker panic");
+        })
+        .await;
         assert!(matches!(
             process_operation_outcome(joined),
             AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
@@ -2607,6 +2892,7 @@ mod tests {
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: std::env::temp_dir().join("cumg-v2-agent-config-test"),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_secs(5),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),
@@ -2650,6 +2936,7 @@ mod tests {
             allowed_cwd_roots: vec![base.clone()],
             allowed_file_roots: vec![file_root.clone()],
             state_dir: state_dir.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_secs(5),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),
@@ -2720,6 +3007,7 @@ mod tests {
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
             state_dir: std::env::temp_dir().join("cumg-v2-agent-file-roots-missing"),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_secs(5),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),
@@ -2800,6 +3088,7 @@ mod tests {
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: state_dir.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_secs(5),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),
@@ -2871,6 +3160,7 @@ mod tests {
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: state_dir.clone(),
+            ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_secs(5),
             reconnect: ReconnectPolicy {
                 initial_delay: Duration::from_millis(10),
@@ -2976,6 +3266,8 @@ mod tests {
                 cancelled: false,
                 duration_ms: 1,
             },
+            output_refs: None,
+            agent_output_locators: None,
         };
         let mut journal = VecDeque::new();
         record_terminal_evidence(&mut journal, "dev-a", &active, &result).unwrap();

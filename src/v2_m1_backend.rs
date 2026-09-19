@@ -1144,6 +1144,9 @@ fn map_command(
         DeviceCommand::Shell { .. } => {
             Err(M1BackendError::UnsupportedCommand(DeviceCapability::Shell))
         }
+        DeviceCommand::ReadProcessOutput { .. } => Err(M1BackendError::UnsupportedCommand(
+            DeviceCapability::ReadProcessOutput,
+        )),
         DeviceCommand::ReadFile { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ReadFile,
         )),
@@ -1277,6 +1280,9 @@ fn normalize_result(
         DeviceCommand::Shell { .. } => {
             Err(M1BackendError::UnsupportedCommand(DeviceCapability::Shell))
         }
+        DeviceCommand::ReadProcessOutput { .. } => Err(M1BackendError::UnsupportedCommand(
+            DeviceCapability::ReadProcessOutput,
+        )),
         DeviceCommand::ReadFile { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ReadFile,
         )),
