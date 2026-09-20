@@ -39,7 +39,7 @@ The target is never opened for in-place writing.
 5. Re-prove deny policy and destination identity/content immediately before publication.
 6. Create uses same-directory hard-link publication, which atomically fails if the destination appeared after the earlier check; the temporary name is then removed.
 7. Replace uses same-parent atomic rename over the re-proven destination.
-8. Sync the parent directory after publication.
+8. Preflight parent-directory sync support before publication. Filesystems that support it must sync the parent after publication. Only explicit Unsupported / directory-fsync InvalidInput is treated as unavailable; other preflight errors fail closed before effect, while a post-publication sync failure after successful preflight is Indeterminate.
 
 A publication or flush outcome that cannot be proven is Indeterminate. The Agent reconnects without a terminal result so the existing Hub execution-safety path quarantines the operation. The initial slice never automatically retries or infers success from resulting content.
 

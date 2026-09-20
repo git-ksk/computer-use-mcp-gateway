@@ -39,7 +39,7 @@ target path へ直接 in-place write はしません。
 5. publication直前に deny policy と destination identity/content を再証明。
 6. create は same-directory hard-link publish。途中でdestinationが出現していれば原子的に失敗し、temp nameを削除。
 7. replace は re-proven destination へ same-parent atomic rename。
-8. publish後に parent directory をsync。
+8. publish前に parent-directory sync capabilityをpreflightし、supportedなfilesystemではpublish後にdirectoryもsyncする。Unsupported / directory-fsync固有のInvalidInputだけはnot supportedとして扱い、それ以外のpreflight errorはeffect前にfail closed、supported判定後のpost-publish sync failureはIndeterminateにする。
 
 publish/flushの結果を証明できない場合は Indeterminate とし、Agentはterminal resultを作らずreconnectします。既存Hub execution-safety pathがquarantineし、初期sliceは自動retryもcontentからの成功推測もしません。
 

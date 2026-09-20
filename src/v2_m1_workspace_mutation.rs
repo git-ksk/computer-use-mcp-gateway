@@ -143,6 +143,7 @@ impl WorkspaceMutationExecutor {
             }
         };
 
+        let sync_parent_after_publish = preflight_parent_sync(parent)?;
         let (temp_name, mut temp) = create_temp(parent)?;
         let publish_result = (|| {
             if let TargetState::Existing(existing) = &initial {
@@ -194,7 +195,9 @@ impl WorkspaceMutationExecutor {
                 _ => return Err(WorkspaceMutationError::PreconditionFailed),
             }
 
-            sync_parent(parent).map_err(WorkspaceMutationError::OutcomeUnproven)?;
+            if sync_parent_after_publish {
+                sync_parent(parent).map_err(WorkspaceMutationError::OutcomeUnproven)?;
+            }
             Ok(())
         })();
 
@@ -338,6 +341,21 @@ fn remove_temp_if_present(parent: &Dir, name: &Path) -> Result<(), std::io::Erro
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn preflight_parent_sync(parent: &Dir) -> Result<bool, WorkspaceMutationError> {
+    match sync_parent(parent) {
+        Ok(()) => Ok(true),
+        Err(error) if parent_sync_is_unsupported(&error) => Ok(false),
+        Err(error) => Err(WorkspaceMutationError::Io(error)),
+    }
+}
+
+fn parent_sync_is_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+    )
 }
 
 fn sync_parent(parent: &Dir) -> Result<(), std::io::Error> {
@@ -668,6 +686,25 @@ mod tests {
         assert!(matches!(error, WorkspaceMutationError::PathDenied));
         assert_eq!(fs::read(root.join("Secret.txt")).unwrap(), b"secret");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_sync_preflight_only_skips_explicit_unsupported_errors() {
+        assert!(parent_sync_is_unsupported(&std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        )));
+        assert!(parent_sync_is_unsupported(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid for directory fsync",
+        )));
+        assert!(!parent_sync_is_unsupported(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )));
+        assert!(!parent_sync_is_unsupported(&std::io::Error::other(
+            "io failure",
+        )));
     }
 
     #[test]
