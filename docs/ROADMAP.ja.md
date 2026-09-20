@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-19 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が released baseline で、`v0.5.0` Least-privilege Workspace が次の planned feature minor です。**
+2026-09-20 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が released baseline、`v0.5.0` Least-privilege Workspace が active next feature minor です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -88,7 +88,7 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 現在の作業順:
 
 - **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance は 2026-09-19 に PASS 済み。#139 と #228 は non-blocking support-claim gate として残し、signed-token / Linux online-recovery claim は evidence まで保留します。
-- **`0.5.0` — Least-privilege Workspace:** #313 bounded owner-scoped ephemeral ref/data lifecycle、#105 ranged/deterministic filesystem observation、#83 retrievable truncated process/shell output、#107 explicit writable root配下のatomic workspace mutation、#314 schema/config/readiness/upgrade release integrationでDangerous shell authorityへの依存を減らす。
+- **`0.5.0` — Least-privilege Workspace:** #313 bounded owner-scoped ephemeral ref/data lifecycle、#105 ranged/deterministic filesystem observation、#83 retrievable truncated process/shell output、#107 explicit writable root配下のatomic workspace mutation、production dogfood で判明した duration-bearing effectful input の timeout-budget reliability fix #319、#314 schema/config/readiness/upgrade release integrationでDangerous shell authorityへの依存を減らす。
 - **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
 `0.5.0` の実装順は **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #314 release integration/acceptance** を基本とします。#105 は stateless bounded range の方が安全なら ref を必須にしませんが、stateful continuation を使う場合は reviewed bounded lifecycle を再利用し、別の ad-hoc store を作りません。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
@@ -165,7 +165,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 open issue はrevised release sequenceで分類し、roadmap visibilityからsilentに落ちないようにします。milestoneはordering/admission guidanceです。optional support-claim acceptanceは、そのsupport claimを明示的に保留する限りbase artifact release後もOPENのままにできます。
 
 - **`0.4.0 — released baseline`:** #221 / PR #271 は merge 済み・green で、#227 physical Windows Hello acceptance は 2026-09-19 に PASS 済みです。#139 signed-token dogfood と #228 physical Linux FIDO2 acceptance は deferred support-claim gate で、#217 は parity 用に OPEN 維持します。
-- **`0.5.0 — Least-privilege Workspace`:** #313 bounded owner-scoped ephemeral ref/data foundation、#105 ranged/deterministic filesystem observation、#83 bounded retrievable process/shell output、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation、#314 schema/config/readiness/upgrade/release integrationとfinal acceptance。
+- **`0.5.0 — Least-privilege Workspace`:** #313 bounded owner-scoped ephemeral ref/data foundation、#105 ranged/deterministic filesystem observation、#83 bounded retrievable process/shell output、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation、#319 duration-bearing effectful input の production-dogfood timeout-budget mismatch 修正（fail-closed / no-replay維持）、#314 schema/config/readiness/upgrade/release integrationとfinal acceptance。#290 は related だが independently scoped な durable-receipt work で、`0.5.0` prerequisite にはしません。
 - **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation、#275 hosted Handoff architecture（#276 pin adoption / #277 hosted operator-routing implementation）、#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
 - **Upstream-blocked V1 compatibility:** #14/#15はupstream Cua blockedのままでactive CUMG release blockerではない。
