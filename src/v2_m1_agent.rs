@@ -1631,7 +1631,7 @@ impl AgentService {
                                                 return Err(WorkspaceMutationError::InvalidPayload);
                                             }
                                             workspace_mutation.write_file(
-                                                &path,
+                                                path.as_str(),
                                                 &bytes,
                                                 &precondition,
                                             )

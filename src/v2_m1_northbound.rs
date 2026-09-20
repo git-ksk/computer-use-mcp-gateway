@@ -48,7 +48,7 @@ use crate::{
         MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
         PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
         ScrollTarget, ShellRequest, UiElementAction, UiPredicate, UiRect, UiRole,
-        WorkspaceWritePayload, WorkspaceWritePrecondition,
+        WorkspaceWritePath, WorkspaceWritePayload, WorkspaceWritePrecondition,
     },
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
@@ -3239,7 +3239,7 @@ impl ServerHandler for V2NorthboundMcp {
                     McpError::invalid_params("workspace write payload length is invalid", None)
                 })?;
                 Ok(DeviceCommand::WriteWorkspaceFile {
-                    path: args.path,
+                    path: WorkspaceWritePath::after_contract_validation(args.path),
                     data_base64: WorkspaceWritePayload::after_contract_validation(args.data_base64),
                     expected_bytes,
                     content_sha256: sha256_hex(&bytes),

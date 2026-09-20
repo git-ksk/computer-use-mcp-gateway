@@ -502,6 +502,26 @@ impl fmt::Debug for BrowserUploadPayload {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct WorkspaceWritePath(String);
+
+impl WorkspaceWritePath {
+    pub(crate) fn after_contract_validation(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkspaceWritePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WorkspaceWritePath([redacted])")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct WorkspaceWritePayload(String);
 
 impl WorkspaceWritePayload {
@@ -603,7 +623,7 @@ pub enum DeviceCommand {
         after: Option<String>,
     },
     WriteWorkspaceFile {
-        path: String,
+        path: WorkspaceWritePath,
         data_base64: WorkspaceWritePayload,
         expected_bytes: u64,
         content_sha256: String,
@@ -2788,9 +2808,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_mutation_debug_redacts_path_and_payload() {
+        let command = DeviceCommand::WriteWorkspaceFile {
+            path: WorkspaceWritePath::after_contract_validation(
+                "/private/workspace/secret.txt".into(),
+            ),
+            data_base64: WorkspaceWritePayload::after_contract_validation(
+                "c2Vuc2l0aXZlLXBheWxvYWQ=".into(),
+            ),
+            expected_bytes: 17,
+            content_sha256: "f".repeat(64),
+            precondition: WorkspaceWritePrecondition::ExpectedAbsent,
+        };
+        let debug = format!("{command:?}");
+        assert!(!debug.contains("/private/workspace/secret.txt"));
+        assert!(!debug.contains("c2Vuc2l0aXZlLXBheWxvYWQ="));
+        assert!(debug.contains("WorkspaceWritePath([redacted])"));
+        assert!(debug.contains("WorkspaceWritePayload([redacted])"));
+    }
+
+    #[test]
     fn workspace_mutation_result_binds_bytes_hash_and_create_mode() {
         let command = DeviceCommand::WriteWorkspaceFile {
-            path: "/workspace/note.txt".into(),
+            path: WorkspaceWritePath::after_contract_validation("/workspace/note.txt".into()),
             data_base64: WorkspaceWritePayload::after_contract_validation("bmV3".into()),
             expected_bytes: 3,
             content_sha256: "11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437"

@@ -388,7 +388,8 @@ mod tests {
     fn max_workspace_mutation_command_fits_ordinary_signed_carrier() {
         use crate::v2_m0::{
             CONTROL_SCHEMA_VERSION, CapabilityClass, CommandEnvelope, DeviceCapability,
-            GrantPayload, GrantToken, WorkspaceWritePayload, WorkspaceWritePrecondition,
+            GrantPayload, GrantToken, WorkspaceWritePath, WorkspaceWritePayload,
+            WorkspaceWritePrecondition,
         };
         use crate::v2_m0_transport::{HUB_AGENT_SCHEMA_VERSION, RemoteCommand};
         use crate::v2_m1_workspace_mutation::{
@@ -407,7 +408,9 @@ mod tests {
                 capability_revision: u64::MAX,
                 operation_id: "op_0123456789abcdef0123456789abcdef".into(),
                 command: DeviceCommand::WriteWorkspaceFile {
-                    path: "p".repeat(DEFAULT_MAX_WORKSPACE_PATH_BYTES),
+                    path: WorkspaceWritePath::after_contract_validation(
+                        "p".repeat(DEFAULT_MAX_WORKSPACE_PATH_BYTES),
+                    ),
                     data_base64: payload,
                     expected_bytes: raw.len() as u64,
                     content_sha256: sha256_hex(&raw),
