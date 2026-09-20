@@ -141,7 +141,9 @@ impl std::error::Error for GrpcCarrierError {}
 mod tests {
     use super::*;
     use crate::v2_m0::{CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement};
-    use crate::v2_m0_transport::{AgentHello, HUB_AGENT_SCHEMA_VERSION};
+    use crate::v2_m0_transport::{
+        AgentHello, HUB_AGENT_SCHEMA_VERSION, RemoteIndeterminateAck, RemoteIndeterminateCause,
+    };
     use base64::Engine as _;
     use prost::Message;
 
@@ -162,6 +164,21 @@ mod tests {
         });
         let decoded = decode_agent_frame(encode_agent_frame(&hello).unwrap()).unwrap();
         assert_eq!(decoded, hello);
+    }
+
+    #[test]
+    fn indeterminate_timeout_ack_round_trips_the_bounded_carrier() {
+        let message = AgentToHub::IndeterminateAck(RemoteIndeterminateAck {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            device_id: "dev-test".into(),
+            device_generation: 7,
+            operation_id: "op_timeout_0123456789abcdef".into(),
+            cause: RemoteIndeterminateCause::BackendTimedOut,
+            signature: vec![0; 64],
+        });
+        let frame = encode_agent_frame(&message).unwrap();
+        assert!(frame.signed_message_json.len() < 1024);
+        assert_eq!(decode_agent_frame(frame).unwrap(), message);
     }
 
     #[test]

@@ -510,6 +510,22 @@ pub struct RemoteCancellationAck {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteIndeterminateCause {
+    BackendTimedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteIndeterminateAck {
+    pub schema_version: u16,
+    pub device_id: String,
+    pub device_generation: u64,
+    pub operation_id: String,
+    pub cause: RemoteIndeterminateCause,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHeartbeat {
     pub schema_version: u16,
@@ -537,6 +553,7 @@ pub enum AgentToHub {
     Result(RemoteResult),
     ReconciliationReport(RemoteReconciliationReport),
     CancellationAck(RemoteCancellationAck),
+    IndeterminateAck(RemoteIndeterminateAck),
     BackendSessionEnded(RemoteBackendSessionEnded),
     RecoveryAuthorization(RecoveryAuthorization),
     HandoffResponse(RemoteHandoffResponse),
@@ -568,6 +585,7 @@ impl AgentToHub {
             Self::Result(_) => "result",
             Self::ReconciliationReport(_) => "reconciliation_report",
             Self::CancellationAck(_) => "cancellation_ack",
+            Self::IndeterminateAck(_) => "indeterminate_ack",
             Self::BackendSessionEnded(_) => "backend_session_ended",
             Self::RecoveryAuthorization(_) => "recovery_authorization",
             Self::HandoffResponse(_) => "handoff_response",
@@ -788,6 +806,43 @@ pub fn verify_remote_cancellation_ack(
         return Err(TransportError::HandshakeMismatch);
     }
     let transcript = remote_cancellation_ack_bytes(hello, challenge, ack)?;
+    registry
+        .verify_device_signature(&hello.device_id, &transcript, &ack.signature)
+        .map_err(TransportError::Control)
+}
+
+pub fn build_remote_indeterminate_ack(
+    identity: &DeviceIdentity,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    device_generation: u64,
+    operation_id: String,
+    cause: RemoteIndeterminateCause,
+) -> Result<RemoteIndeterminateAck, TransportError> {
+    let mut ack = RemoteIndeterminateAck {
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: hello.device_id.clone(),
+        device_generation,
+        operation_id,
+        cause,
+        signature: Vec::new(),
+    };
+    let transcript = remote_indeterminate_ack_bytes(hello, challenge, &ack)?;
+    ack.signature = identity.sign_message(&transcript);
+    Ok(ack)
+}
+
+pub fn verify_remote_indeterminate_ack(
+    registry: &DeviceRegistry,
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &RemoteIndeterminateAck,
+) -> Result<(), TransportError> {
+    validate_schema(ack.schema_version)?;
+    if ack.device_id != hello.device_id {
+        return Err(TransportError::HandshakeMismatch);
+    }
+    let transcript = remote_indeterminate_ack_bytes(hello, challenge, ack)?;
     registry
         .verify_device_signature(&hello.device_id, &transcript, &ack.signature)
         .map_err(TransportError::Control)
@@ -1387,6 +1442,35 @@ fn remote_cancellation_ack_bytes(
     .map_err(TransportError::Serialization)
 }
 
+fn remote_indeterminate_ack_bytes(
+    hello: &AgentHello,
+    challenge: &HubChallenge,
+    ack: &RemoteIndeterminateAck,
+) -> Result<Vec<u8>, TransportError> {
+    #[derive(Serialize)]
+    struct Transcript<'a> {
+        domain: &'static str,
+        schema_version: u16,
+        device_id: &'a str,
+        agent_nonce: &'a [u8; 32],
+        hub_nonce: &'a [u8; 32],
+        device_generation: u64,
+        operation_id: &'a str,
+        cause: RemoteIndeterminateCause,
+    }
+    serde_json::to_vec(&Transcript {
+        domain: "cumg-v2-m1-remote-indeterminate-ack-v1",
+        schema_version: HUB_AGENT_SCHEMA_VERSION,
+        device_id: &ack.device_id,
+        agent_nonce: &hello.agent_nonce,
+        hub_nonce: &challenge.hub_nonce,
+        device_generation: ack.device_generation,
+        operation_id: &ack.operation_id,
+        cause: ack.cause,
+    })
+    .map_err(TransportError::Serialization)
+}
+
 fn remote_reconciliation_report_bytes(
     hello: &AgentHello,
     challenge: &HubChallenge,
@@ -1718,6 +1802,37 @@ mod tests {
         tampered_ack.disposition = CancellationDisposition::AlreadyTerminal;
         assert!(matches!(
             verify_remote_cancellation_ack(&registry, &hello, &challenge, &tampered_ack),
+            Err(TransportError::Control(
+                ControlError::InvalidDeviceSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn indeterminate_ack_is_signed_connection_bound_and_payload_free() {
+        let (registry, identity, device_id) = enrolled();
+        let hub = HubIdentity::generate();
+        let hello = AgentHello::new(device_id, caps());
+        let challenge = hub.challenge(&hello).unwrap();
+        let ack = build_remote_indeterminate_ack(
+            &identity,
+            &hello,
+            &challenge,
+            7,
+            "op_timeout_0123456789abcdef".into(),
+            RemoteIndeterminateCause::BackendTimedOut,
+        )
+        .unwrap();
+        verify_remote_indeterminate_ack(&registry, &hello, &challenge, &ack).unwrap();
+        let encoded = serde_json::to_string(&ack).unwrap();
+        assert!(encoded.contains("backend_timed_out"));
+        assert!(!encoded.contains("typed text"));
+        assert!(!encoded.contains("window"));
+        let mut tampered = ack;
+        tampered.cause = RemoteIndeterminateCause::BackendTimedOut;
+        tampered.operation_id = "op_other_0123456789abcdef".into();
+        assert!(matches!(
+            verify_remote_indeterminate_ack(&registry, &hello, &challenge, &tampered),
             Err(TransportError::Control(
                 ControlError::InvalidDeviceSignature
             ))
