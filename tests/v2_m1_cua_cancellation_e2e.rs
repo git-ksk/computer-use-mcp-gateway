@@ -106,6 +106,8 @@ async fn real_cua_cancel_is_propagated_and_quarantined_indeterminate() -> Result
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![cwd.clone()],
             state_dir: temp_dir("v2-real-cua-agent-state"),
             ephemeral_data_parent: None,

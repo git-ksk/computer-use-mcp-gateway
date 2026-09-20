@@ -63,6 +63,20 @@ struct Config {
         required = true
     )]
     allowed_file_roots: Vec<PathBuf>,
+    /// Effectful writable workspace roots. No implicit fallback to read/cwd roots.
+    #[arg(
+        long = "allowed-write-root",
+        env = "CUMG_V2_ALLOWED_WRITE_ROOTS",
+        value_delimiter = ','
+    )]
+    allowed_write_roots: Vec<PathBuf>,
+    /// Explicit deny subpaths inside writable roots. Deny wins over allow.
+    #[arg(
+        long = "denied-write-subpath",
+        env = "CUMG_V2_DENIED_WRITE_SUBPATHS",
+        value_delimiter = ','
+    )]
+    denied_write_subpaths: Vec<PathBuf>,
     #[arg(long, env = "CUMG_V2_HEARTBEAT_SECS", default_value_t = 15)]
     heartbeat_secs: u64,
     #[arg(long, env = "CUMG_V2_RECONNECT_INITIAL_MS", default_value_t = 250)]
@@ -212,6 +226,8 @@ async fn main() -> Result<()> {
         device_id: args.device_id,
         allowed_cwd_roots: args.allowed_cwd_roots,
         allowed_file_roots: args.allowed_file_roots,
+        allowed_write_roots: args.allowed_write_roots,
+        denied_write_subpaths: args.denied_write_subpaths,
         state_dir: args.state_dir,
         ephemeral_data_parent: args.ephemeral_data_parent,
         heartbeat_interval: Duration::from_secs(args.heartbeat_secs),

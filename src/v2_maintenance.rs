@@ -908,7 +908,9 @@ fn capability_target_class(capability: DeviceCapability) -> &'static str {
         DeviceCapability::ExecuteProcess
         | DeviceCapability::Shell
         | DeviceCapability::ReadProcessOutput => "process",
-        DeviceCapability::ReadFile | DeviceCapability::ListDirectory => "filesystem",
+        DeviceCapability::ReadFile
+        | DeviceCapability::ListDirectory
+        | DeviceCapability::WriteWorkspaceFile => "filesystem",
         DeviceCapability::BrowserInspect
         | DeviceCapability::BrowserPrepare
         | DeviceCapability::BrowserNavigate

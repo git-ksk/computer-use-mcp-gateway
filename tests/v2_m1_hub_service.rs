@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use anyhow::{Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use computer_use_mcp_gateway::{
     v2_execution_safety::{OperationOwner, RecoverableOperationResult},
     v2_grant_signer::{
@@ -24,6 +25,7 @@ use computer_use_mcp_gateway::{
         write_new_trusted_text, write_new_verifying_key,
     },
     v2_m1_northbound::{TrustedProxyConfig, V2NorthboundMcp, build_trusted_proxy_router},
+    v2_m1_workspace_mutation::sha256_hex,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use std::{env, process::Stdio, time::Duration};
@@ -79,6 +81,8 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     }
     std::fs::write(outside_root.join("secret.txt"), b"must-not-read")?;
     std::os::unix::fs::symlink(outside_root.join("secret.txt"), fs_root.join("escape"))?;
+    let denied_write_root = fs_root.join("private");
+    std::fs::create_dir_all(&denied_write_root)?;
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_pem = cert.pem();
     let cert_der = cert.der().to_vec();
@@ -134,6 +138,8 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
+            allowed_write_roots: vec![fs_root.clone()],
+            denied_write_subpaths: vec![denied_write_root.clone()],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
             ephemeral_data_parent: Some(agent_ephemeral.clone()),
@@ -317,7 +323,7 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
             .iter()
             .all(|entry| entry.name.as_str() > next_cursor.as_str())
     );
-    assert_eq!(first_page.len() + second_page.len(), 262);
+    assert_eq!(first_page.len() + second_page.len(), 263);
     assert!(
         first_page
             .iter()
@@ -342,6 +348,76 @@ async fn deployable_hub_and_agent_execute_and_cancel_over_grpc_tls() -> Result<(
     // A rejected bounded-filesystem request is command-local; it must not tear
     // down the authenticated Agent session.
     assert!(handle.is_online().await);
+
+    // The bounded mutation lane is separate from read/cwd authority. Replace
+    // requires exact expected-old SHA-256 and returns only a bounded receipt.
+    let mutation_payload = b"workspace mutation e2e payload";
+    let mutation_command: DeviceCommand = serde_json::from_value(serde_json::json!({
+        "type": "write_workspace_file",
+        "path": fs_root.join("note.txt").to_string_lossy(),
+        "data_base64": STANDARD.encode(mutation_payload),
+        "expected_bytes": mutation_payload.len(),
+        "content_sha256": sha256_hex(mutation_payload),
+        "precondition": {
+            "type": "expected_sha256",
+            "sha256": sha256_hex(b"bounded filesystem read")
+        }
+    }))?;
+    let mutation = handle
+        .start_command(mutation_command)
+        .await
+        .map_err(|error| anyhow!("Hub workspace mutation start failed: {error:?}"))?
+        .wait()
+        .await
+        .map_err(|error| anyhow!("Hub workspace mutation failed: {error:?}"))?;
+    assert_eq!(std::fs::read(fs_root.join("note.txt"))?, mutation_payload);
+    assert!(matches!(
+        mutation.result,
+        computer_use_mcp_gateway::v2_m0::DeviceResult::WorkspaceFileWritten {
+            bytes_written,
+            ref content_sha256,
+            created: false,
+        } if bytes_written == mutation_payload.len() as u64
+            && content_sha256 == &sha256_hex(mutation_payload)
+    ));
+
+    // A stale expected-old hash is command-local and does not overwrite.
+    let stale_command: DeviceCommand = serde_json::from_value(serde_json::json!({
+        "type": "write_workspace_file",
+        "path": fs_root.join("note.txt").to_string_lossy(),
+        "data_base64": STANDARD.encode(b"must-not-land"),
+        "expected_bytes": 13,
+        "content_sha256": sha256_hex(b"must-not-land"),
+        "precondition": {
+            "type": "expected_sha256",
+            "sha256": sha256_hex(b"stale-old")
+        }
+    }))?;
+    let stale = handle.start_command(stale_command).await?.wait().await;
+    assert_eq!(
+        stale,
+        Err(HubCommandError::Remote(
+            computer_use_mcp_gateway::v2_m0::DeviceErrorCode::WorkspacePreconditionFailed
+        ))
+    );
+    assert_eq!(std::fs::read(fs_root.join("note.txt"))?, mutation_payload);
+    assert!(handle.is_online().await);
+
+    // Neither requested path nor raw mutation bytes are persisted in Hub/Agent
+    // authoritative checkpoints. Durable recovery keeps payload-free effectful status.
+    let recognizable_path = fs_root.join("note.txt").to_string_lossy().into_owned();
+    let recognizable_payload = String::from_utf8_lossy(mutation_payload);
+    for state_root in [&hub_state, &agent_state] {
+        for entry in std::fs::read_dir(state_root)? {
+            let path = entry?.path();
+            if path.is_file() {
+                let checkpoint_bytes = std::fs::read(path)?;
+                let checkpoint = String::from_utf8_lossy(&checkpoint_bytes);
+                assert!(!checkpoint.contains(&recognizable_path));
+                assert!(!checkpoint.contains(recognizable_payload.as_ref()));
+            }
+        }
+    }
 
     let pending = handle
         .start_process(ProcessRequest {
@@ -637,6 +713,8 @@ async fn planned_shutdown_drain_waits_for_dispatched_work_and_rejects_new_admiss
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![cwd, fs_root.clone()],
             state_dir: agent_state.clone(),
             ephemeral_data_parent: None,
@@ -797,6 +875,8 @@ async fn checkpoint_high_water_rolls_generation_without_quarantine() -> Result<(
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
             ephemeral_data_parent: None,
@@ -964,6 +1044,8 @@ async fn session_lifetime_reauthenticates_cleanly_without_quarantine() -> Result
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
             ephemeral_data_parent: None,
@@ -1085,6 +1167,8 @@ async fn hard_session_lifetime_cuts_off_unsettled_work_fail_closed() -> Result<(
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone(), fs_root.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![cwd.clone(), fs_root.clone()],
             state_dir: agent_state.clone(),
             ephemeral_data_parent: None,
@@ -1280,6 +1364,8 @@ async fn external_grant_signer_executes_without_hub_key_custody_and_has_no_fallb
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![cwd.clone()],
             state_dir: agent_state.clone(),
             ephemeral_data_parent: None,

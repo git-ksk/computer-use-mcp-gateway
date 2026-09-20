@@ -14,6 +14,7 @@
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,66 @@ impl WorkspaceRoots {
         }
 
         Ok(Self { roots: opened })
+    }
+
+    pub(crate) fn contains_canonical_path(&self, path: &Path) -> bool {
+        self.roots
+            .iter()
+            .any(|root| path.starts_with(&root.canonical_path))
+    }
+
+    pub fn resolve_parent_for_mutation(
+        &self,
+        path: &str,
+    ) -> Result<ResolvedWorkspaceParent, WorkspacePathError> {
+        if path.trim().is_empty() {
+            return Err(WorkspacePathError::InvalidPath);
+        }
+        let requested = Path::new(path);
+        let file_name = requested
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or(WorkspacePathError::InvalidPath)?
+            .to_os_string();
+        if matches!(file_name.to_str(), Some(".") | Some("..")) {
+            return Err(WorkspacePathError::InvalidPath);
+        }
+        let parent = requested.parent().ok_or(WorkspacePathError::InvalidPath)?;
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let canonical_parent = fs::canonicalize(parent).map_err(WorkspacePathError::Io)?;
+        let root = self
+            .roots
+            .iter()
+            .filter(|root| canonical_parent.starts_with(&root.canonical_path))
+            .max_by_key(|root| root.canonical_path.components().count())
+            .ok_or(WorkspacePathError::PathDenied)?;
+        let relative_parent = canonical_parent
+            .strip_prefix(&root.canonical_path)
+            .map_err(|_| WorkspacePathError::PathDenied)?;
+        let relative_parent = if relative_parent.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative_parent.to_owned()
+        };
+        let parent_dir = root
+            .dir
+            .open_dir(&relative_parent)
+            .map_err(map_capability_open_error)?;
+        let parent_identity = directory_identity_from_cap_dir(&parent_dir)?;
+        let ambient_identity = directory_identity_from_path(&canonical_parent)?;
+        if parent_identity != ambient_identity {
+            return Err(WorkspacePathError::PathDenied);
+        }
+        Ok(ResolvedWorkspaceParent {
+            dir: parent_dir,
+            canonical_parent,
+            file_name,
+            parent_identity,
+        })
     }
 
     pub fn resolve_existing(
@@ -128,6 +189,129 @@ impl fmt::Debug for ResolvedWorkspacePath {
     }
 }
 
+pub struct ResolvedWorkspaceParent {
+    dir: Dir,
+    canonical_parent: PathBuf,
+    file_name: OsString,
+    parent_identity: WorkspaceDirectoryIdentity,
+}
+
+impl ResolvedWorkspaceParent {
+    pub(crate) fn dir(&self) -> &Dir {
+        &self.dir
+    }
+
+    pub(crate) fn file_name(&self) -> &OsStr {
+        &self.file_name
+    }
+
+    pub(crate) fn canonical_target(&self) -> PathBuf {
+        self.canonical_parent.join(&self.file_name)
+    }
+
+    pub(crate) fn reprove_parent(&self) -> Result<(), WorkspacePathError> {
+        let canonical_now =
+            fs::canonicalize(&self.canonical_parent).map_err(WorkspacePathError::Io)?;
+        if canonical_now != self.canonical_parent {
+            return Err(WorkspacePathError::PathDenied);
+        }
+        let ambient_identity = directory_identity_from_path(&self.canonical_parent)?;
+        let handle_identity = directory_identity_from_cap_dir(&self.dir)?;
+        if ambient_identity != self.parent_identity || handle_identity != self.parent_identity {
+            return Err(WorkspacePathError::PathDenied);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceDirectoryIdentity {
+    #[cfg(unix)]
+    Unix { dev: u64, ino: u64 },
+    #[cfg(windows)]
+    Windows { volume_serial: u32, file_index: u64 },
+}
+
+fn directory_identity_from_cap_dir(
+    dir: &Dir,
+) -> Result<WorkspaceDirectoryIdentity, WorkspacePathError> {
+    let file = dir
+        .try_clone()
+        .map_err(WorkspacePathError::Io)?
+        .into_std_file();
+    directory_identity_from_file(&file)
+}
+
+#[cfg(unix)]
+fn directory_identity_from_path(
+    path: &Path,
+) -> Result<WorkspaceDirectoryIdentity, WorkspacePathError> {
+    let metadata = fs::metadata(path).map_err(WorkspacePathError::Io)?;
+    directory_identity(&metadata)
+}
+
+#[cfg(windows)]
+fn directory_identity_from_path(
+    path: &Path,
+) -> Result<WorkspaceDirectoryIdentity, WorkspacePathError> {
+    let dir = Dir::open_ambient_dir(path, ambient_authority()).map_err(WorkspacePathError::Io)?;
+    let file = dir.into_std_file();
+    directory_identity_from_file(&file)
+}
+
+#[cfg(unix)]
+fn directory_identity_from_file(
+    file: &fs::File,
+) -> Result<WorkspaceDirectoryIdentity, WorkspacePathError> {
+    let metadata = file.metadata().map_err(WorkspacePathError::Io)?;
+    directory_identity(&metadata)
+}
+
+#[cfg(unix)]
+fn directory_identity(
+    metadata: &fs::Metadata,
+) -> Result<WorkspaceDirectoryIdentity, WorkspacePathError> {
+    use std::os::unix::fs::MetadataExt as _;
+    if !metadata.is_dir() {
+        return Err(WorkspacePathError::PathDenied);
+    }
+    Ok(WorkspaceDirectoryIdentity::Unix {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn directory_identity_from_file(
+    file: &fs::File,
+) -> Result<WorkspaceDirectoryIdentity, WorkspacePathError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let metadata = file.metadata().map_err(WorkspacePathError::Io)?;
+    if !metadata.is_dir() {
+        return Err(WorkspacePathError::PathDenied);
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) };
+    if ok == 0 {
+        return Err(WorkspacePathError::Io(std::io::Error::last_os_error()));
+    }
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok(WorkspaceDirectoryIdentity::Windows {
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index,
+    })
+}
+
+impl fmt::Debug for ResolvedWorkspaceParent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ResolvedWorkspaceParent([redacted])")
+    }
+}
+
 fn map_capability_open_error(error: std::io::Error) -> WorkspacePathError {
     if matches!(
         error.kind(),
@@ -179,6 +363,37 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_parent_replacement_is_reproved_before_publish() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("mutation-parent-root");
+        let outside = temp_root("mutation-parent-outside");
+        let parent = root.join("parent");
+        let moved_parent = root.join("parent-old");
+        fs::create_dir_all(&parent).unwrap();
+
+        let roots = WorkspaceRoots::new(vec![root.clone()]).unwrap();
+        let resolved = roots
+            .resolve_parent_for_mutation(parent.join("note.txt").to_str().unwrap())
+            .unwrap();
+
+        fs::rename(&parent, &moved_parent).unwrap();
+        symlink(&outside, &parent).unwrap();
+
+        assert!(matches!(
+            resolved.reprove_parent(),
+            Err(WorkspacePathError::PathDenied)
+        ));
+
+        fs::remove_file(&parent).unwrap();
+        drop(resolved);
+        drop(roots);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[cfg(unix)]

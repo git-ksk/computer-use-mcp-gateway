@@ -392,6 +392,8 @@ async fn long_lived_agent_reconnects_and_cancels_process_without_blocking_the_st
         hub_domain: "localhost".into(),
         device_id,
         allowed_file_roots: vec![cwd.clone()],
+        allowed_write_roots: vec![],
+        denied_write_subpaths: vec![],
         allowed_cwd_roots: vec![cwd],
         state_dir: state_dir.clone(),
         ephemeral_data_parent: None,

@@ -385,6 +385,59 @@ mod tests {
     }
 
     #[test]
+    fn max_workspace_mutation_command_fits_ordinary_signed_carrier() {
+        use crate::v2_m0::{
+            CONTROL_SCHEMA_VERSION, CapabilityClass, CommandEnvelope, DeviceCapability,
+            GrantPayload, GrantToken, WorkspaceWritePayload, WorkspaceWritePrecondition,
+        };
+        use crate::v2_m0_transport::{HUB_AGENT_SCHEMA_VERSION, RemoteCommand};
+        use crate::v2_m1_workspace_mutation::{
+            DEFAULT_MAX_WORKSPACE_PATH_BYTES, DEFAULT_MAX_WORKSPACE_WRITE_BYTES, sha256_hex,
+        };
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let raw = vec![7_u8; DEFAULT_MAX_WORKSPACE_WRITE_BYTES];
+        let payload = WorkspaceWritePayload::after_contract_validation(STANDARD.encode(&raw));
+        let message = HubToAgent::Command(RemoteCommand {
+            schema_version: HUB_AGENT_SCHEMA_VERSION,
+            command: CommandEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: "dev-a".into(),
+                device_generation: u64::MAX,
+                capability_revision: u64::MAX,
+                operation_id: "op_0123456789abcdef0123456789abcdef".into(),
+                command: DeviceCommand::WriteWorkspaceFile {
+                    path: "p".repeat(DEFAULT_MAX_WORKSPACE_PATH_BYTES),
+                    data_base64: payload,
+                    expected_bytes: raw.len() as u64,
+                    content_sha256: sha256_hex(&raw),
+                    precondition: WorkspaceWritePrecondition::ExpectedSha256 {
+                        sha256: "f".repeat(64),
+                    },
+                },
+            },
+            grant: GrantToken {
+                payload: GrantPayload {
+                    schema_version: CONTROL_SCHEMA_VERSION,
+                    issuer_key_id: "i".repeat(128),
+                    grant_id: "grant_0123456789abcdef0123456789abcdef".into(),
+                    device_id: "dev-a".into(),
+                    capability: CapabilityClass::Dangerous,
+                    device_capability: Some(DeviceCapability::WriteWorkspaceFile),
+                    issued_at_ms: u64::MAX - 1,
+                    expires_at_ms: u64::MAX,
+                },
+                signature: vec![255; 64],
+            },
+            handoff: None,
+            signature: vec![255; 64],
+        });
+        let frame = encode_hub_frame(&message)
+            .expect("bounded workspace mutation must fit the ordinary carrier");
+        assert!(frame.signed_message_json.len() < MAX_GRPC_APPLICATION_MESSAGE_BYTES);
+    }
+
+    #[test]
     fn staged_browser_upload_gets_only_the_reviewed_bounded_large_carrier() {
         use crate::v2_m0::{
             BrowserUploadPayload, CONTROL_SCHEMA_VERSION, CapabilityClass, CommandEnvelope,

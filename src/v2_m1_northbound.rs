@@ -48,11 +48,15 @@ use crate::{
         MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
         PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
         ScrollTarget, ShellRequest, UiElementAction, UiPredicate, UiRect, UiRole,
+        WorkspaceWritePayload, WorkspaceWritePrecondition,
     },
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_filesystem::DEFAULT_MAX_FILE_BYTES,
     v2_m1_hub::{HubCommandError, HubHandle},
+    v2_m1_workspace_mutation::{
+        DEFAULT_MAX_WORKSPACE_PATH_BYTES, DEFAULT_MAX_WORKSPACE_WRITE_BYTES, sha256_hex,
+    },
     v2_semantic_constraints::{SemanticConstraintError, SemanticConstraintPolicy},
 };
 use async_trait::async_trait;
@@ -113,6 +117,7 @@ const TOOL_READ_PROCESS_OUTPUT: &str = "read_process_output";
 const TOOL_GET_OPERATION: &str = "get_operation";
 const TOOL_READ_FILE: &str = "read_file";
 const TOOL_LIST_DIRECTORY: &str = "list_directory";
+const TOOL_WRITE_WORKSPACE_FILE: &str = "write_workspace_file";
 const TOOL_LIST_WINDOWS: &str = "list_windows";
 const TOOL_LAUNCH_APPLICATION: &str = "launch_application";
 const TOOL_INSPECT_WINDOW: &str = "inspect_window";
@@ -3201,6 +3206,46 @@ impl ServerHandler for V2NorthboundMcp {
                     after: args.after,
                 })
             }
+            TOOL_WRITE_WORKSPACE_FILE => {
+                let args: WriteWorkspaceFileArgs = parse_arguments(arguments)?;
+                if args.path.is_empty() || args.path.len() > DEFAULT_MAX_WORKSPACE_PATH_BYTES {
+                    return Err(McpError::invalid_params(
+                        "workspace path exceeds the 4096-byte bound",
+                        None,
+                    ));
+                }
+                let bytes = STANDARD.decode(&args.data_base64).map_err(|_| {
+                    McpError::invalid_params("data_base64 must be valid base64", None)
+                })?;
+                if bytes.len() > DEFAULT_MAX_WORKSPACE_WRITE_BYTES {
+                    return Err(McpError::invalid_params(
+                        "workspace write payload exceeds the 32 KiB bound",
+                        None,
+                    ));
+                }
+                let precondition = match (args.expected_absent, args.expected_sha256) {
+                    (true, None) => WorkspaceWritePrecondition::ExpectedAbsent,
+                    (false, Some(sha256)) if valid_sha256_hex(&sha256) => {
+                        WorkspaceWritePrecondition::ExpectedSha256 { sha256 }
+                    }
+                    _ => {
+                        return Err(McpError::invalid_params(
+                            "exactly one write precondition is required: expected_absent=true or expected_sha256",
+                            None,
+                        ));
+                    }
+                };
+                let expected_bytes = u64::try_from(bytes.len()).map_err(|_| {
+                    McpError::invalid_params("workspace write payload length is invalid", None)
+                })?;
+                Ok(DeviceCommand::WriteWorkspaceFile {
+                    path: args.path,
+                    data_base64: WorkspaceWritePayload::after_contract_validation(args.data_base64),
+                    expected_bytes,
+                    content_sha256: sha256_hex(&bytes),
+                    precondition,
+                })
+            }
             TOOL_LIST_WINDOWS => {
                 let args: ListWindowsArgs = parse_arguments(arguments)?;
                 Ok(DeviceCommand::ListWindows {
@@ -4127,6 +4172,7 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_READ_PROCESS_OUTPUT => Some(DeviceCapability::ReadProcessOutput),
         TOOL_READ_FILE => Some(DeviceCapability::ReadFile),
         TOOL_LIST_DIRECTORY => Some(DeviceCapability::ListDirectory),
+        TOOL_WRITE_WORKSPACE_FILE => Some(DeviceCapability::WriteWorkspaceFile),
         TOOL_LIST_WINDOWS => Some(DeviceCapability::ListWindows),
         TOOL_LAUNCH_APPLICATION => Some(DeviceCapability::LaunchApplication),
         TOOL_INSPECT_WINDOW => Some(DeviceCapability::InspectWindow),
@@ -4515,6 +4561,43 @@ fn all_tools() -> Vec<Tool> {
             ),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_WRITE_WORKSPACE_FILE,
+            "Atomically create or replace one regular file under an operator-approved writable workspace root without shell authority. Creation requires expected_absent=true. Replacement requires expected_sha256 for compare-and-swap. Payload is base64 and capped at 32 KiB raw. Supply operation_id for durable recovery; never blindly replay an unknown outcome.",
+            object_schema(
+                vec![
+                    ("operation_id", operation_id_schema()),
+                    (
+                        "path",
+                        json!({
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": DEFAULT_MAX_WORKSPACE_PATH_BYTES
+                        }),
+                    ),
+                    (
+                        "data_base64",
+                        json!({
+                            "type": "string",
+                            "minLength": 0,
+                            "maxLength": DEFAULT_MAX_WORKSPACE_WRITE_BYTES.div_ceil(3) * 4
+                        }),
+                    ),
+                    ("expected_absent", boolean_schema()),
+                    (
+                        "expected_sha256",
+                        json!({
+                            "type": "string",
+                            "minLength": 64,
+                            "maxLength": 64,
+                            "pattern": "^[0-9a-f]{64}$"
+                        }),
+                    ),
+                ],
+                &["path", "data_base64"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_LIST_WINDOWS,
             "List top-level windows through the enrolled computer-use backend using a backend-neutral window model.",
@@ -5947,6 +6030,25 @@ struct ListDirectoryArgs {
     after: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteWorkspaceFileArgs {
+    path: String,
+    data_base64: String,
+    #[serde(default)]
+    expected_absent: bool,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+}
+
 fn parse_arguments<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
     serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
         .map_err(|_| McpError::invalid_params("Tool arguments do not match the input schema", None))
@@ -6338,6 +6440,47 @@ mod tests {
         assert_eq!(visible, vec![TOOL_READ_FILE.to_owned()]);
         assert!(!visible.contains(&TOOL_SCREENSHOT.to_owned()));
         assert!(!visible.contains(&TOOL_TYPE_TEXT.to_owned()));
+    }
+
+    #[test]
+    fn workspace_mutation_authority_is_exact_and_principal_scoped() {
+        let principal = AuthenticatedClientPrincipal::new("https://auth.example", "u1").unwrap();
+        let other = AuthenticatedClientPrincipal::new("https://auth.example", "u2").unwrap();
+        let mut policy = ClientAuthorizationPolicy::default();
+        policy.allow_device_capability(&principal, "dev-a", DeviceCapability::WriteWorkspaceFile);
+
+        assert!(
+            policy
+                .authorize_device_capability(
+                    &principal,
+                    "dev-a",
+                    DeviceCapability::WriteWorkspaceFile,
+                )
+                .is_ok()
+        );
+        assert!(
+            policy
+                .authorize_device_capability(&principal, "dev-a", DeviceCapability::Shell)
+                .is_err()
+        );
+        assert!(
+            policy
+                .authorize_device_capability(&other, "dev-a", DeviceCapability::WriteWorkspaceFile,)
+                .is_err()
+        );
+
+        let visible: Vec<_> = all_tools()
+            .into_iter()
+            .filter(|tool| {
+                tool_capability(tool.name.as_ref()).is_some_and(|capability| {
+                    policy
+                        .authorize_device_capability(&principal, "dev-a", capability)
+                        .is_ok()
+                })
+            })
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(visible, vec![TOOL_WRITE_WORKSPACE_FILE.to_owned()]);
     }
 
     #[test]
@@ -7235,6 +7378,10 @@ mod tests {
             ),
             (TOOL_READ_FILE, DeviceCapability::ReadFile),
             (TOOL_LIST_DIRECTORY, DeviceCapability::ListDirectory),
+            (
+                TOOL_WRITE_WORKSPACE_FILE,
+                DeviceCapability::WriteWorkspaceFile,
+            ),
             (TOOL_LIST_WINDOWS, DeviceCapability::ListWindows),
             (TOOL_LAUNCH_APPLICATION, DeviceCapability::LaunchApplication),
             (TOOL_INSPECT_WINDOW, DeviceCapability::InspectWindow),

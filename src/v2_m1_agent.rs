@@ -52,6 +52,9 @@ use crate::v2_m1_process::{
     ProcessUnprovenStage,
 };
 use crate::v2_m1_shell::{ShellError, ShellExecutor};
+use crate::v2_m1_workspace_mutation::{
+    WorkspaceMutationError, WorkspaceMutationExecutor, WorkspaceMutationPolicy, sha256_hex,
+};
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryAuthorization, RecoveryError, RecoveryPhase, RecoveryResolved, clear_authorization,
@@ -149,6 +152,11 @@ pub struct AgentServiceConfig {
     pub device_id: String,
     pub allowed_cwd_roots: Vec<PathBuf>,
     pub allowed_file_roots: Vec<PathBuf>,
+    /// Effectful workspace mutation roots. Empty disables the capability.
+    /// These never inherit from cwd or read-only roots.
+    pub allowed_write_roots: Vec<PathBuf>,
+    /// Explicit deny subpaths inside writable roots. Deny wins over allow.
+    pub denied_write_subpaths: Vec<PathBuf>,
     pub state_dir: PathBuf,
     /// Dedicated non-authoritative storage parent for short-lived workspace/process data.
     /// None disables retrievable extended process output until packaging configures it.
@@ -188,6 +196,11 @@ impl AgentServiceConfig {
                 "at least one allowed file root is required",
             ));
         }
+        if self.allowed_write_roots.is_empty() && !self.denied_write_subpaths.is_empty() {
+            return Err(AgentServiceError::InvalidConfig(
+                "workspace mutation deny subpaths require at least one writable root",
+            ));
+        }
         if let Some(cua) = &self.cua {
             cua.validate()?;
         }
@@ -201,6 +214,7 @@ pub struct AgentService {
     executor: ProcessExecutor,
     shell: ShellExecutor,
     filesystem: FilesystemExecutor,
+    workspace_mutation: Option<WorkspaceMutationExecutor>,
     ephemeral_data: Option<Arc<StdMutex<AgentEphemeralDataStore>>>,
     browser_upload_staging: BrowserUploadStagingBroker,
     browser_download_staging: BrowserDownloadStagingBroker,
@@ -278,6 +292,17 @@ impl AgentService {
             FilesystemPolicy::new(config.allowed_file_roots.clone())
                 .map_err(AgentServiceError::Filesystem)?,
         );
+        let workspace_mutation = if config.allowed_write_roots.is_empty() {
+            None
+        } else {
+            Some(WorkspaceMutationExecutor::new(
+                WorkspaceMutationPolicy::new(
+                    config.allowed_write_roots.clone(),
+                    config.denied_write_subpaths.clone(),
+                )
+                .map_err(AgentServiceError::WorkspaceMutationStartup)?,
+            ))
+        };
         // Loading the checkpoint first establishes/hardens the private state root.
         // Browser transfer staging is created only after that reviewed root exists.
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
@@ -359,6 +384,7 @@ impl AgentService {
             executor,
             shell,
             filesystem,
+            workspace_mutation,
             ephemeral_data,
             browser_upload_staging,
             browser_download_staging,
@@ -407,6 +433,9 @@ impl AgentService {
             DeviceCapability::ReadFile,
             DeviceCapability::ListDirectory,
         ];
+        if self.workspace_mutation.is_some() {
+            supported.push(DeviceCapability::WriteWorkspaceFile);
+        }
         if self.ephemeral_data.is_some() {
             supported.push(DeviceCapability::ReadProcessOutput);
         }
@@ -902,6 +931,19 @@ impl AgentService {
                                         failure_stage = stage.as_str(),
                                         error_code = "process_outcome_unproven",
                                         "process/shell terminality is unproven after spawn; reconnecting without a terminal result"
+                                    );
+                                    return Ok(SessionExit::Reconnect);
+                                }
+                                AgentIndeterminateCause::WorkspaceMutationOutcomeUnproven => {
+                                    tracing::warn!(
+                                        event = "v2_agent_workspace_mutation_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "indeterminate",
+                                        indeterminate_reason = "workspace_mutation_outcome_unproven",
+                                        error_code = "workspace_mutation_outcome_unproven",
+                                        "workspace mutation publication is unproven; reconnecting without a terminal result"
                                     );
                                     return Ok(SessionExit::Reconnect);
                                 }
@@ -1567,6 +1609,43 @@ impl AgentService {
                                     });
                                     ActiveCancellation::None
                                 }
+                                DeviceCommand::WriteWorkspaceFile {
+                                    path,
+                                    data_base64,
+                                    expected_bytes,
+                                    content_sha256,
+                                    precondition,
+                                } => {
+                                    let workspace_mutation = self.workspace_mutation.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let Some(workspace_mutation) = workspace_mutation else {
+                                                return Err(WorkspaceMutationError::NoAllowedRoots);
+                                            };
+                                            let bytes = STANDARD
+                                                .decode(data_base64.as_str())
+                                                .map_err(|_| WorkspaceMutationError::InvalidPayload)?;
+                                            if u64::try_from(bytes.len()).ok() != Some(expected_bytes)
+                                                || sha256_hex(&bytes) != content_sha256
+                                            {
+                                                return Err(WorkspaceMutationError::InvalidPayload);
+                                            }
+                                            workspace_mutation.write_file(
+                                                &path,
+                                                &bytes,
+                                                &precondition,
+                                            )
+                                        })
+                                        .await;
+                                        let outcome = workspace_mutation_operation_outcome(result);
+                                        let _ = done.send(OperationCompletion {
+                                            operation_id: worker_operation_id,
+                                            device_generation: worker_generation,
+                                            outcome,
+                                        }).await;
+                                    });
+                                    ActiveCancellation::None
+                                }
                                 command @ (DeviceCommand::ListApplications
                                 | DeviceCommand::ScreenGeometry
                                 | DeviceCommand::Screenshot
@@ -1741,6 +1820,7 @@ enum AgentIndeterminateCause {
     CancellationPropagated,
     BackendTimedOut,
     ProcessOutcomeUnproven(ProcessUnprovenStage),
+    WorkspaceMutationOutcomeUnproven,
 }
 
 #[derive(Debug)]
@@ -1882,11 +1962,29 @@ fn shell_operation_outcome(
     }
 }
 
+fn workspace_mutation_operation_outcome(
+    result: Result<Result<DeviceResult, WorkspaceMutationError>, tokio::task::JoinError>,
+) -> AgentOperationOutcome {
+    match result {
+        Ok(Ok(result)) => AgentOperationOutcome::Result(Ok(result)),
+        Ok(Err(error)) if error.outcome_unproven() => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::WorkspaceMutationOutcomeUnproven,
+        ),
+        Ok(Err(error)) => {
+            AgentOperationOutcome::Result(Err(AgentOperationError::WorkspaceMutation(error)))
+        }
+        Err(_) => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::WorkspaceMutationOutcomeUnproven,
+        ),
+    }
+}
+
 #[derive(Debug)]
 pub enum AgentOperationError {
     Process(ProcessError),
     Shell(ShellError),
     Filesystem(FilesystemError),
+    WorkspaceMutation(WorkspaceMutationError),
     BrowserUploadStaging(BrowserUploadStagingError),
     BrowserDownloadStaging(BrowserDownloadStagingError),
     Backend(M1BackendError),
@@ -2012,6 +2110,7 @@ fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
         AgentOperationError::Process(error) => error.safe_error_code(),
         AgentOperationError::Shell(error) => error.safe_error_code(),
         AgentOperationError::Filesystem(error) => error.safe_error_code(),
+        AgentOperationError::WorkspaceMutation(error) => error.safe_error_code(),
         AgentOperationError::BrowserUploadStaging(error) => error.safe_error_code(),
         AgentOperationError::BrowserDownloadStaging(error) => error.safe_error_code(),
         AgentOperationError::Backend(error) => error.safe_error_code(),
@@ -2021,6 +2120,21 @@ fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
 
 fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
     match error {
+        AgentOperationError::WorkspaceMutation(WorkspaceMutationError::PreconditionFailed) => {
+            DeviceErrorCode::WorkspacePreconditionFailed
+        }
+        AgentOperationError::WorkspaceMutation(WorkspaceMutationError::PayloadTooLarge) => {
+            DeviceErrorCode::WorkspacePayloadTooLarge
+        }
+        AgentOperationError::WorkspaceMutation(
+            WorkspaceMutationError::PathDenied | WorkspaceMutationError::HardLinkDenied,
+        ) => DeviceErrorCode::PermissionDenied,
+        AgentOperationError::WorkspaceMutation(WorkspaceMutationError::Io(_)) => {
+            DeviceErrorCode::IoFailure
+        }
+        AgentOperationError::WorkspaceMutation(WorkspaceMutationError::OutcomeUnproven(_)) => {
+            DeviceErrorCode::BackendOutcomeIndeterminate
+        }
         AgentOperationError::Filesystem(FilesystemError::PathDenied) => {
             DeviceErrorCode::PermissionDenied
         }
@@ -2087,7 +2201,8 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         AgentOperationError::Process(ProcessError::InvalidRequest)
         | AgentOperationError::Shell(ShellError::InvalidCommand | ShellError::CommandTooLarge)
         | AgentOperationError::Shell(ShellError::Process(ProcessError::InvalidRequest))
-        | AgentOperationError::Filesystem(_) => DeviceErrorCode::InvalidRequest,
+        | AgentOperationError::Filesystem(_)
+        | AgentOperationError::WorkspaceMutation(_) => DeviceErrorCode::InvalidRequest,
         AgentOperationError::Process(
             ProcessError::NoAllowedWorkingDirectories
             | ProcessError::InvalidPolicyLimit
@@ -2548,6 +2663,7 @@ pub enum AgentServiceError {
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
     Filesystem(FilesystemError),
+    WorkspaceMutationStartup(WorkspaceMutationError),
     EphemeralDataStartup(AgentEphemeralDataError),
     BrowserUploadStagingStartup(BrowserStagingStartupError),
     BrowserDownloadStagingStartup(BrowserStagingStartupError),
@@ -2619,6 +2735,7 @@ impl SafeErrorCode for AgentServiceError {
             Self::Execution(_) => "execution_error",
             Self::Process(_) => "process_error",
             Self::Filesystem(_) => "filesystem_error",
+            Self::WorkspaceMutationStartup(error) => error.safe_error_code(),
             Self::EphemeralDataStartup(error) => error.safe_error_code(),
             Self::BrowserUploadStagingStartup(error) => error.upload_safe_error_code(),
             Self::BrowserDownloadStagingStartup(error) => error.download_safe_error_code(),
@@ -2890,6 +3007,8 @@ mod tests {
             hub_domain: "localhost".into(),
             device_id: "dev-a".into(),
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: std::env::temp_dir().join("cumg-v2-agent-config-test"),
             ephemeral_data_parent: None,
@@ -2935,6 +3054,8 @@ mod tests {
             device_id: "dev-file-roots".into(),
             allowed_cwd_roots: vec![base.clone()],
             allowed_file_roots: vec![file_root.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             state_dir: state_dir.clone(),
             ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_secs(5),
@@ -3006,6 +3127,8 @@ mod tests {
             device_id: "dev-file-roots-missing".into(),
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             state_dir: std::env::temp_dir().join("cumg-v2-agent-file-roots-missing"),
             ephemeral_data_parent: None,
             heartbeat_interval: Duration::from_secs(5),
@@ -3086,6 +3209,8 @@ mod tests {
             hub_domain: "localhost".into(),
             device_id: "dev-custom-backend".into(),
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: state_dir.clone(),
             ephemeral_data_parent: None,
@@ -3158,6 +3283,8 @@ mod tests {
             hub_domain: "localhost".into(),
             device_id: "dev-rotation".into(),
             allowed_file_roots: vec![std::env::current_dir().unwrap()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![std::env::current_dir().unwrap()],
             state_dir: state_dir.clone(),
             ephemeral_data_parent: None,
