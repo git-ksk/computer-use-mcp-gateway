@@ -29,6 +29,7 @@ pub mod v2_m1_filesystem;
 pub mod v2_m1_grpc;
 pub mod v2_m1_hub;
 pub mod v2_m1_northbound;
+pub mod v2_m1_workspace_mutation;
 
 pub mod v2_enrollment;
 pub mod v2_ephemeral_data_refs;

@@ -290,6 +290,7 @@ pub const fn capability_name(capability: DeviceCapability) -> &'static str {
         DeviceCapability::ReadProcessOutput => "read_process_output",
         DeviceCapability::ReadFile => "read_file",
         DeviceCapability::ListDirectory => "list_directory",
+        DeviceCapability::WriteWorkspaceFile => "write_workspace_file",
         DeviceCapability::ListWindows => "list_windows",
         DeviceCapability::LaunchApplication => "launch_application",
         DeviceCapability::InspectWindow => "inspect_window",

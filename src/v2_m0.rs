@@ -59,6 +59,7 @@ pub enum DeviceCapability {
     ReadProcessOutput,
     ReadFile,
     ListDirectory,
+    WriteWorkspaceFile,
     ListWindows,
     LaunchApplication,
     InspectWindow,
@@ -148,7 +149,8 @@ impl DeviceCapability {
             | Self::Shell
             | Self::TerminateApplication
             | Self::BrowserUploadFile
-            | Self::BrowserDownload => CapabilityClass::Dangerous,
+            | Self::BrowserDownload
+            | Self::WriteWorkspaceFile => CapabilityClass::Dangerous,
         }
     }
 }
@@ -498,6 +500,53 @@ impl fmt::Debug for BrowserUploadPayload {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkspaceWritePath(String);
+
+impl WorkspaceWritePath {
+    pub(crate) fn after_contract_validation(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkspaceWritePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WorkspaceWritePath([redacted])")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkspaceWritePayload(String);
+
+impl WorkspaceWritePayload {
+    pub(crate) fn after_contract_validation(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkspaceWritePayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WorkspaceWritePayload([redacted])")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceWritePrecondition {
+    ExpectedAbsent,
+    ExpectedSha256 { sha256: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeviceCommand {
@@ -572,6 +621,13 @@ pub enum DeviceCommand {
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,
+    },
+    WriteWorkspaceFile {
+        path: WorkspaceWritePath,
+        data_base64: WorkspaceWritePayload,
+        expected_bytes: u64,
+        content_sha256: String,
+        precondition: WorkspaceWritePrecondition,
     },
     ListWindows {
         process_id: Option<u32>,
@@ -713,6 +769,7 @@ impl DeviceCommand {
             Self::ReadProcessOutput { .. } => DeviceCapability::ReadProcessOutput,
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
             Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
+            Self::WriteWorkspaceFile { .. } => DeviceCapability::WriteWorkspaceFile,
             Self::ListWindows { .. } => DeviceCapability::ListWindows,
             Self::LaunchApplication { .. } => DeviceCapability::LaunchApplication,
             Self::InspectWindow { .. } | Self::InspectWindowContextual { .. } => {
@@ -1579,6 +1636,8 @@ pub enum DeviceErrorCode {
     ProgramDenied,
     TooManyArguments,
     ProcessSpawnFailed,
+    WorkspacePreconditionFailed,
+    WorkspacePayloadTooLarge,
     BrowserRouteUnavailable,
     BrowserRequiresSetup,
     BrowserBindingAmbiguous,
@@ -1621,6 +1680,8 @@ impl DeviceErrorCode {
             Self::ProgramDenied => "program_denied",
             Self::TooManyArguments => "too_many_arguments",
             Self::ProcessSpawnFailed => "process_spawn_failed",
+            Self::WorkspacePreconditionFailed => "workspace_precondition_failed",
+            Self::WorkspacePayloadTooLarge => "workspace_payload_too_large",
             Self::BrowserRouteUnavailable => "browser_route_unavailable",
             Self::BrowserRequiresSetup => "browser_requires_setup",
             Self::BrowserBindingAmbiguous => "browser_binding_ambiguous",
@@ -1754,6 +1815,11 @@ pub enum DeviceResult {
         after: Option<String>,
         next_cursor: Option<String>,
     },
+    WorkspaceFileWritten {
+        bytes_written: u64,
+        content_sha256: String,
+        created: bool,
+    },
     Windows {
         windows: Vec<WindowInfo>,
         truncated: bool,
@@ -1885,6 +1951,26 @@ impl DeviceResult {
                 && strictly_sorted
                 && after_bound_valid
                 && cursor_shape_valid;
+        }
+        if let (
+            Self::WorkspaceFileWritten {
+                bytes_written,
+                content_sha256: result_sha256,
+                created,
+            },
+            DeviceCommand::WriteWorkspaceFile {
+                expected_bytes,
+                content_sha256,
+                precondition,
+                ..
+            },
+        ) = (self, command)
+        {
+            let expected_created =
+                matches!(precondition, WorkspaceWritePrecondition::ExpectedAbsent);
+            return bytes_written == expected_bytes
+                && result_sha256 == content_sha256
+                && *created == expected_created;
         }
         matches!(
             (self, command),
@@ -2675,6 +2761,109 @@ mod tests {
             ),
             Err(ControlError::DeviceCapabilityGrantMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn workspace_mutation_exact_grant_rejects_class_only_and_other_dangerous_capability() {
+        let authority = GrantAuthority::generate();
+        let mut ledger = GrantLedger::new(authority.verifier());
+
+        let class_only = authority
+            .issue("dev", CapabilityClass::Dangerous, 1_000, 30_000)
+            .unwrap();
+        assert!(matches!(
+            ledger.authorize_device_capability_once(
+                &class_only,
+                "dev",
+                DeviceCapability::WriteWorkspaceFile,
+                1_001,
+            ),
+            Err(ControlError::DeviceCapabilityGrantMismatch { .. })
+        ));
+
+        let shell = authority
+            .issue_for_device_capability("dev", DeviceCapability::Shell, 1_000, 30_000)
+            .unwrap();
+        assert!(matches!(
+            ledger.authorize_device_capability_once(
+                &shell,
+                "dev",
+                DeviceCapability::WriteWorkspaceFile,
+                1_001,
+            ),
+            Err(ControlError::DeviceCapabilityGrantMismatch { .. })
+        ));
+
+        let exact = authority
+            .issue_for_device_capability("dev", DeviceCapability::WriteWorkspaceFile, 1_000, 30_000)
+            .unwrap();
+        ledger
+            .authorize_device_capability_once(
+                &exact,
+                "dev",
+                DeviceCapability::WriteWorkspaceFile,
+                1_001,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn workspace_mutation_debug_redacts_path_and_payload() {
+        let command = DeviceCommand::WriteWorkspaceFile {
+            path: WorkspaceWritePath::after_contract_validation(
+                "/private/workspace/secret.txt".into(),
+            ),
+            data_base64: WorkspaceWritePayload::after_contract_validation(
+                "c2Vuc2l0aXZlLXBheWxvYWQ=".into(),
+            ),
+            expected_bytes: 17,
+            content_sha256: "f".repeat(64),
+            precondition: WorkspaceWritePrecondition::ExpectedAbsent,
+        };
+        let debug = format!("{command:?}");
+        assert!(!debug.contains("/private/workspace/secret.txt"));
+        assert!(!debug.contains("c2Vuc2l0aXZlLXBheWxvYWQ="));
+        assert!(debug.contains("WorkspaceWritePath([redacted])"));
+        assert!(debug.contains("WorkspaceWritePayload([redacted])"));
+    }
+
+    #[test]
+    fn workspace_mutation_result_binds_bytes_hash_and_create_mode() {
+        let command = DeviceCommand::WriteWorkspaceFile {
+            path: WorkspaceWritePath::after_contract_validation("/workspace/note.txt".into()),
+            data_base64: WorkspaceWritePayload::after_contract_validation("bmV3".into()),
+            expected_bytes: 3,
+            content_sha256: "11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437"
+                .into(),
+            precondition: WorkspaceWritePrecondition::ExpectedAbsent,
+        };
+        assert!(
+            DeviceResult::WorkspaceFileWritten {
+                bytes_written: 3,
+                content_sha256: "11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437"
+                    .into(),
+                created: true,
+            }
+            .matches_command(&command)
+        );
+        assert!(
+            !DeviceResult::WorkspaceFileWritten {
+                bytes_written: 3,
+                content_sha256: "11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437"
+                    .into(),
+                created: false,
+            }
+            .matches_command(&command)
+        );
+        assert!(
+            !DeviceResult::WorkspaceFileWritten {
+                bytes_written: 2,
+                content_sha256: "11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437"
+                    .into(),
+                created: true,
+            }
+            .matches_command(&command)
+        );
     }
 
     #[test]

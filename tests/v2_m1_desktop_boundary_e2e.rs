@@ -117,6 +117,8 @@ async fn shell_and_cua_share_one_owner_fence_quarantine_and_resolution_boundary(
             hub_domain: "localhost".into(),
             device_id,
             allowed_file_roots: vec![cwd.clone(), state_root.clone()],
+            allowed_write_roots: vec![],
+            denied_write_subpaths: vec![],
             allowed_cwd_roots: vec![cwd.clone(), state_root.clone()],
             state_dir: agent_state,
             ephemeral_data_parent: None,

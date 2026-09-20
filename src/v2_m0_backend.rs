@@ -201,6 +201,11 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::ListDirectory,
                 ));
             }
+            DeviceCommand::WriteWorkspaceFile { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    DeviceCapability::WriteWorkspaceFile,
+                ));
+            }
             DeviceCommand::SetUiValue { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::SetUiValue,
