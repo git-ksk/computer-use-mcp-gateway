@@ -359,7 +359,7 @@ fn parent_sync_is_unsupported(error: &std::io::Error) -> bool {
 }
 
 fn sync_parent(parent: &Dir) -> Result<(), std::io::Error> {
-    parent.try_clone()?.into_std_file().sync_all()
+    parent.open(".")?.sync_all()
 }
 
 fn validate_precondition(
