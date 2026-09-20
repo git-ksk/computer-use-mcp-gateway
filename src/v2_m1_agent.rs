@@ -29,12 +29,12 @@ use crate::v2_m0_execution::{AgentExecutionGate, OperationRef};
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubToAgent,
     RemoteBackendSessionEnd, RemoteHandoffErrorCode, RemoteHandoffResponseKind,
-    TrustedSessionClock, build_agent_heartbeat, build_agent_proof,
+    RemoteIndeterminateCause, TrustedSessionClock, build_agent_heartbeat, build_agent_proof,
     build_remote_backend_session_ended, build_remote_cancellation_ack,
-    build_remote_handoff_response, build_remote_reconciliation_report, build_remote_result,
-    verify_hub_challenge, verify_hub_heartbeat_ack, verify_remote_backend_session_end,
-    verify_remote_cancel, verify_remote_command, verify_remote_handoff_request,
-    verify_session_accepted,
+    build_remote_handoff_response, build_remote_indeterminate_ack,
+    build_remote_reconciliation_report, build_remote_result, verify_hub_challenge,
+    verify_hub_heartbeat_ack, verify_remote_backend_session_end, verify_remote_cancel,
+    verify_remote_command, verify_remote_handoff_request, verify_session_accepted,
 };
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
@@ -900,9 +900,20 @@ impl AgentService {
                                     );
                                 }
                                 AgentIndeterminateCause::BackendTimedOut => {
-                                    // No cancellation acknowledgement exists for an autonomous
-                                    // provider timeout. Reconnect deliberately forces the Hub's
-                                    // connection-loss path to settle the operation as unknown.
+                                    // Preserve only the payload-free ambiguity cause. This signed
+                                    // acknowledgement is diagnostic/quarantine metadata, never
+                                    // terminal evidence and never replay authority.
+                                    let ack = build_remote_indeterminate_ack(
+                                        &self.material.device_identity,
+                                        &hello,
+                                        &challenge,
+                                        session.generation,
+                                        completion.operation_id.clone(),
+                                        RemoteIndeterminateCause::BackendTimedOut,
+                                    )
+                                    .map_err(AgentServiceError::Protocol)?;
+                                    send_agent(&outbound_tx, AgentToHub::IndeterminateAck(ack))
+                                        .await?;
                                     tracing::warn!(
                                         event = "v2_agent_backend_indeterminate",
                                         operation_id = %completion.operation_id,
@@ -911,7 +922,7 @@ impl AgentService {
                                         outcome = "indeterminate",
                                         indeterminate_reason = "backend_timed_out",
                                         error_code = "backend_timeout_ambiguous",
-                                        "backend timed out with ambiguous outcome; reconnecting without a success result"
+                                        "backend timed out with ambiguous outcome; signed cause acknowledgement sent before reconnect"
                                     );
                                     return Ok(SessionExit::Reconnect);
                                 }
@@ -2239,6 +2250,9 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
             BrowserDownloadStagingError::Io | BrowserDownloadStagingError::InvalidRoot,
         ) => DeviceErrorCode::IoFailure,
         AgentOperationError::BrowserDownloadStaging(_) => DeviceErrorCode::InvalidRequest,
+        AgentOperationError::Backend(M1BackendError::ExecutionBudgetExceeded) => {
+            DeviceErrorCode::ExecutionBudgetExceeded
+        }
         AgentOperationError::Backend(M1BackendError::BrowserRefused(reason)) => {
             browser_refusal_error_code(*reason)
         }
@@ -2954,6 +2968,24 @@ mod tests {
             let rendered = format!("{error:?}");
             assert!(!rendered.contains("PRIVATE_HOST_PATH"));
         }
+    }
+
+    #[test]
+    fn execution_budget_rejection_is_a_terminal_typed_remote_error() {
+        let error = AgentOperationError::Backend(M1BackendError::ExecutionBudgetExceeded);
+        assert_eq!(
+            operation_error_code(&error),
+            DeviceErrorCode::ExecutionBudgetExceeded
+        );
+        assert_eq!(
+            terminal_evidence_for_device_result(&DeviceResult::Error {
+                code: DeviceErrorCode::ExecutionBudgetExceeded,
+            }),
+            Some((
+                crate::v2_m0_execution::HubOperationState::Failed,
+                crate::v2_execution_safety::ExecutionEvidence::VerifiedRemoteError,
+            ))
+        );
     }
 
     #[test]

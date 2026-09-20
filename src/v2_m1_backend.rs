@@ -119,6 +119,7 @@ pub struct CuaMcpAdapter {
     backend_version: String,
     platform: String,
     revision: u64,
+    tool_timeout: Duration,
 }
 
 impl std::fmt::Debug for CuaMcpAdapter {
@@ -129,6 +130,76 @@ impl std::fmt::Debug for CuaMcpAdapter {
             .field("revision", &self.revision)
             .finish_non_exhaustive()
     }
+}
+
+const EXECUTION_BUDGET_MIN_RESERVE_MS: u64 = 2_000;
+const EXECUTION_BUDGET_RESERVE_DIVISOR: u64 = 5;
+const TYPE_TEXT_DEFAULT_DELAY_MS: u16 = 30;
+const TYPE_TEXT_FIXED_DRAIN_MS: u64 = 2_000;
+const CUA_MACOS_PHYSICAL_BASE_MS: u64 = 24;
+const CUA_MACOS_MIN_DELAY_MS: u64 = 8;
+const CUA_WINDOWS_WORST_CHAR_BASE_MS: u64 = 28;
+const CUA_LINUX_KEY_BASE_MS: u64 = 10;
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn effective_execution_budget_ms(tool_timeout: Duration) -> u64 {
+    let total_ms = duration_millis_saturating(tool_timeout);
+    let reserve_ms = (total_ms / EXECUTION_BUDGET_RESERVE_DIVISOR)
+        .max(EXECUTION_BUDGET_MIN_RESERVE_MS)
+        .min(total_ms);
+    total_ms.saturating_sub(reserve_ms)
+}
+
+fn type_text_required_budget_ms(text: &str, delay_ms: u16) -> u64 {
+    let scalar_count = u64::try_from(text.chars().count()).unwrap_or(u64::MAX);
+    let delay_ms = u64::from(delay_ms);
+    // Pinned Cua 0.19.3 timing contracts:
+    // - macOS physical synthesis: 24ms + max(delay, 8ms) per Unicode scalar;
+    // - Windows PostMessage worst-case newline path: 28ms + delay per scalar;
+    // - Linux XTest path: 10ms + delay per Unicode scalar.
+    // Use the reviewed cross-platform maximum because route selection may fall
+    // back after admission. This intentionally over-budgets atomic AX/UIA paths.
+    let per_scalar_ms = CUA_MACOS_PHYSICAL_BASE_MS
+        .saturating_add(delay_ms.max(CUA_MACOS_MIN_DELAY_MS))
+        .max(CUA_WINDOWS_WORST_CHAR_BASE_MS.saturating_add(delay_ms))
+        .max(CUA_LINUX_KEY_BASE_MS.saturating_add(delay_ms));
+    scalar_count
+        .saturating_mul(per_scalar_ms)
+        .saturating_add(TYPE_TEXT_FIXED_DRAIN_MS)
+}
+
+fn semantic_execution_budget_ms(command: &DeviceCommand) -> Option<u64> {
+    match command {
+        DeviceCommand::TypeText { text } => Some(type_text_required_budget_ms(
+            text,
+            TYPE_TEXT_DEFAULT_DELAY_MS,
+        )),
+        DeviceCommand::TypeTextAdvanced { text, delay_ms, .. } => {
+            Some(type_text_required_budget_ms(text, *delay_ms))
+        }
+        DeviceCommand::PointerDrag { duration_ms, .. }
+        | DeviceCommand::PointerDragAdvanced { duration_ms, .. } => Some(*duration_ms),
+        DeviceCommand::VerifyUiState { timeout_ms, .. }
+        | DeviceCommand::VerifyUiStateContextual { timeout_ms, .. } => Some(*timeout_ms),
+        _ => None,
+    }
+}
+
+fn validate_execution_budget(
+    command: &DeviceCommand,
+    tool_timeout: Duration,
+) -> Result<(), M1BackendError> {
+    let Some(required_ms) = semantic_execution_budget_ms(command) else {
+        return Ok(());
+    };
+    let effective_ms = effective_execution_budget_ms(tool_timeout);
+    if required_ms > effective_ms {
+        return Err(M1BackendError::ExecutionBudgetExceeded);
+    }
+    Ok(())
 }
 
 impl CuaMcpAdapter {
@@ -163,6 +234,7 @@ impl CuaMcpAdapter {
             backend_version,
             platform: platform.into(),
             revision,
+            tool_timeout,
         }
     }
 
@@ -412,6 +484,8 @@ impl CuaMcpAdapter {
                 ),
             };
         }
+        let (tool, arguments) = map_command(command)?;
+        validate_execution_budget(command, self.tool_timeout)?;
         let context_session_to_refresh = match command {
             DeviceCommand::ExpandInteractionScope { context_id, .. }
             | DeviceCommand::VerifyUiStateContextual { context_id, .. } => Some(context_id),
@@ -463,7 +537,6 @@ impl CuaMcpAdapter {
                 return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
             }
         }
-        let (tool, arguments) = map_command(command)?;
         let raw = match self.backend.call_tool(tool, arguments, cancellation).await {
             Ok(result) => result,
             Err(error) if error.downcast_ref::<BackendCallCancelled>().is_some() => {
@@ -2665,6 +2738,7 @@ pub enum M1BackendError {
     MalformedResponse(&'static str),
     NumericOverflow,
     ScreenshotTooLarge,
+    ExecutionBudgetExceeded,
     InvalidRequest(&'static str),
     UnsupportedCommand(DeviceCapability),
     BrowserRefused(BrowserRefusalReason),
@@ -2679,6 +2753,7 @@ impl SafeErrorCode for M1BackendError {
             Self::MalformedResponse(_) => "backend_malformed_response",
             Self::NumericOverflow => "backend_numeric_overflow",
             Self::ScreenshotTooLarge => "backend_screenshot_too_large",
+            Self::ExecutionBudgetExceeded => "execution_budget_exceeded",
             Self::InvalidRequest(_) => "backend_invalid_request",
             Self::UnsupportedCommand(_) => "backend_unsupported_command",
             Self::BrowserRefused(reason) => reason.safe_code(),
@@ -2745,6 +2820,183 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ))
+    }
+
+    fn budget_drag(duration_ms: u64) -> DeviceCommand {
+        DeviceCommand::PointerDrag {
+            from_x: 1,
+            from_y: 2,
+            to_x: 3,
+            to_y: 4,
+            duration_ms,
+        }
+    }
+
+    fn budget_verify(timeout_ms: u64) -> DeviceCommand {
+        DeviceCommand::VerifyUiState {
+            process_id: 1,
+            window_id: 1,
+            predicates: vec![],
+            timeout_ms,
+            stable_samples: 1,
+            include_screenshot: false,
+        }
+    }
+
+    #[test]
+    fn execution_budget_reserves_backend_overhead_and_has_exact_boundary() {
+        assert_eq!(
+            effective_execution_budget_ms(Duration::from_secs(30)),
+            24_000
+        );
+        let timeout = Duration::from_millis(7_000);
+        assert_eq!(effective_execution_budget_ms(timeout), 5_000);
+        assert!(validate_execution_budget(&budget_drag(4_999), timeout).is_ok());
+        assert!(validate_execution_budget(&budget_drag(5_000), timeout).is_ok());
+        assert!(matches!(
+            validate_execution_budget(&budget_drag(5_001), timeout),
+            Err(M1BackendError::ExecutionBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn type_text_budget_uses_unicode_scalars_not_utf8_bytes() {
+        assert_eq!("ab".chars().count(), 2);
+        assert_eq!("é🙂".chars().count(), 2);
+        assert_ne!("ab".len(), "é🙂".len());
+        assert_eq!(
+            type_text_required_budget_ms("ab", 30),
+            type_text_required_budget_ms("é🙂", 30)
+        );
+        assert_eq!(type_text_required_budget_ms("ab", 30), 2_116);
+    }
+
+    #[test]
+    fn default_budget_bounds_the_maximum_accepted_type_text_delay_combination() {
+        let timeout = Duration::from_secs(30);
+        let accepted = DeviceCommand::TypeTextAdvanced {
+            context_id: None,
+            text: "x".repeat(96),
+            target: InputTarget::Desktop,
+            delivery: InputDeliveryMode::Background,
+            delay_ms: 200,
+        };
+        let rejected = DeviceCommand::TypeTextAdvanced {
+            context_id: None,
+            text: "x".repeat(97),
+            target: InputTarget::Desktop,
+            delivery: InputDeliveryMode::Background,
+            delay_ms: 200,
+        };
+        assert!(validate_execution_budget(&accepted, timeout).is_ok());
+        assert!(matches!(
+            validate_execution_budget(&rejected, timeout),
+            Err(M1BackendError::ExecutionBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn duration_bearing_capabilities_share_the_effective_backend_deadline() {
+        let timeout = Duration::from_millis(7_000);
+        let verify_equal = budget_verify(5_000);
+        let verify_above = budget_verify(5_001);
+        assert!(validate_execution_budget(&verify_equal, timeout).is_ok());
+        assert!(matches!(
+            validate_execution_budget(&verify_above, timeout),
+            Err(M1BackendError::ExecutionBudgetExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn incident_shape_is_rejected_before_any_backend_connection_or_dispatch() {
+        let adapter = fixture_with_timeout(
+            vec!["scripts/mock_cua_mcp_backend.py".into()],
+            Duration::from_secs(30),
+        );
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let command = DeviceCommand::TypeTextAdvanced {
+            context_id: None,
+            text: "x".repeat(1_403),
+            target: InputTarget::Desktop,
+            delivery: InputDeliveryMode::Background,
+            delay_ms: 30,
+        };
+        assert_eq!(semantic_execution_budget_ms(&command), Some(83_374));
+        let error = adapter.execute(&command, cancel_rx).await.unwrap_err();
+        assert!(matches!(error, M1BackendError::ExecutionBudgetExceeded));
+        assert_eq!(error.safe_error_code(), "execution_budget_exceeded");
+    }
+
+    #[test]
+    fn duration_bearing_cua_capability_audit_is_explicit() {
+        let advanced_drag = DeviceCommand::PointerDragAdvanced {
+            context_id: None,
+            from: PointerTarget::DesktopPhysical { x: 1, y: 2 },
+            to: PointerTarget::DesktopPhysical { x: 3, y: 4 },
+            button: crate::v2_m0::PointerButton::Left,
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Foreground,
+            duration_ms: 321,
+            steps: 10,
+        };
+        let contextual_verify = DeviceCommand::VerifyUiStateContextual {
+            context_id: "ctx_0123456789abcdef0123456789abcdef".into(),
+            process_id: 1,
+            window_id: 1,
+            predicates: vec![],
+            timeout_ms: 654,
+            stable_samples: 1,
+            include_screenshot: false,
+        };
+        assert_eq!(semantic_execution_budget_ms(&budget_drag(123)), Some(123));
+        assert_eq!(semantic_execution_budget_ms(&advanced_drag), Some(321));
+        assert_eq!(semantic_execution_budget_ms(&budget_verify(456)), Some(456));
+        assert_eq!(semantic_execution_budget_ms(&contextual_verify), Some(654));
+        assert!(
+            semantic_execution_budget_ms(&DeviceCommand::KeyboardInput {
+                context_id: None,
+                key: "return".into(),
+                modifiers: vec![],
+                target: InputTarget::Desktop,
+                delivery: InputDeliveryMode::Foreground,
+            })
+            .is_none()
+        );
+        assert!(
+            semantic_execution_budget_ms(&DeviceCommand::ExecuteProcess {
+                request: crate::v2_m0::ProcessRequest {
+                    program: "printf".into(),
+                    args: vec![],
+                    cwd: "/tmp".into(),
+                    env: vec![],
+                    timeout_ms: 999,
+                },
+            })
+            .is_none()
+        );
+        assert!(
+            semantic_execution_budget_ms(&DeviceCommand::Shell {
+                request: crate::v2_m0::ShellRequest {
+                    command: "true".into(),
+                    cwd: "/tmp".into(),
+                    env: vec![],
+                    timeout_ms: 999,
+                },
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_short_type_text_remains_within_default_budget() {
+        let command = DeviceCommand::TypeTextAdvanced {
+            context_id: None,
+            text: "hello".into(),
+            target: InputTarget::Desktop,
+            delivery: InputDeliveryMode::Background,
+            delay_ms: 30,
+        };
+        assert!(validate_execution_budget(&command, Duration::from_secs(30)).is_ok());
     }
 
     #[tokio::test]
@@ -3783,6 +4035,168 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "trusted-mac real-Cua paced type-text execution-budget acceptance"]
+    async fn real_cua_paced_type_text_execution_budget_acceptance() {
+        assert_eq!(
+            std::env::var("CUMG_V2_EXECUTION_BUDGET_E2E_ACK").as_deref(),
+            Ok("1"),
+            "explicit trusted-Mac acknowledgement required"
+        );
+        let command = std::env::var("CUMG_V2_CUA_COMMAND")
+            .unwrap_or_else(|_| "/Users/sawadakousuke/.local/bin/cua-driver".into());
+        let context = format!("ctx_{:032x}", rand::random::<u128>());
+        let adapter = CuaMcpAdapter::new(
+            command,
+            vec!["mcp".into()],
+            "0.19.3",
+            "macos",
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            1,
+            Duration::from_millis(50),
+        );
+        adapter.connect().await.unwrap();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let launch = adapter
+            .execute(
+                &DeviceCommand::LaunchApplication {
+                    identifier: Some("com.apple.calculator".into()),
+                    name: None,
+                    targets: vec![],
+                    new_instance: true,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let process_id = match launch {
+            BackendExecutionOutcome::Completed(DeviceResult::ApplicationLaunched {
+                process_id,
+                ..
+            }) => process_id,
+            other => panic!("unexpected Calculator launch result: {other:?}"),
+        };
+
+        let mut window_id = None;
+        for _ in 0..20 {
+            let windows = adapter
+                .execute(
+                    &DeviceCommand::ListWindows {
+                        process_id: Some(process_id),
+                        on_screen_only: false,
+                    },
+                    cancel_rx.clone(),
+                )
+                .await
+                .unwrap();
+            if let BackendExecutionOutcome::Completed(DeviceResult::Windows { windows, .. }) =
+                windows
+                && let Some(window) = windows.into_iter().find(|window| {
+                    window.window_id != 0
+                        && window.is_on_screen
+                        && window.bounds.width >= 150
+                        && window.bounds.height >= 150
+                })
+            {
+                window_id = Some(window.window_id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let window_id = window_id.expect("Calculator window did not become observable");
+
+        let before = adapter
+            .execute(
+                &DeviceCommand::InspectWindowContextual {
+                    context_id: context.clone(),
+                    process_id,
+                    window_id,
+                    query: None,
+                    max_elements: 128,
+                    max_depth: 32,
+                    include_screenshot: true,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let before_screenshot = match before {
+            BackendExecutionOutcome::Completed(DeviceResult::WindowSnapshot {
+                screenshot: Some(screenshot),
+                ..
+            }) => screenshot.data_base64,
+            other => panic!("unexpected Calculator pre-type inspect result: {other:?}"),
+        };
+
+        let text = "123456";
+        let delay_ms = 60;
+        let paced = DeviceCommand::TypeTextAdvanced {
+            context_id: Some(context.clone()),
+            text: text.into(),
+            target: InputTarget::Window {
+                process_id,
+                window_id: Some(window_id),
+            },
+            delivery: InputDeliveryMode::Foreground,
+            delay_ms,
+        };
+        assert_eq!(semantic_execution_budget_ms(&paced), Some(2_528));
+        validate_execution_budget(&paced, Duration::from_secs(30)).unwrap();
+
+        let started = std::time::Instant::now();
+        let type_outcome = adapter.execute(&paced, cancel_rx.clone()).await.unwrap();
+        let elapsed = started.elapsed();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let after = adapter
+            .execute(
+                &DeviceCommand::InspectWindowContextual {
+                    context_id: context.clone(),
+                    process_id,
+                    window_id,
+                    query: None,
+                    max_elements: 128,
+                    max_depth: 32,
+                    include_screenshot: true,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let visual_changed = match after {
+            BackendExecutionOutcome::Completed(DeviceResult::WindowSnapshot {
+                screenshot: Some(screenshot),
+                ..
+            }) => screenshot.data_base64 != before_screenshot,
+            other => panic!("unexpected Calculator post-type inspect result: {other:?}"),
+        };
+
+        let _ = adapter
+            .execute(
+                &DeviceCommand::TerminateApplication { process_id },
+                cancel_rx,
+            )
+            .await;
+        adapter.end_interaction_session(&context).await.unwrap();
+        adapter.shutdown().await.unwrap();
+
+        assert_eq!(
+            type_outcome,
+            BackendExecutionOutcome::Completed(DeviceResult::TypeTextCompleted)
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "paced foreground typing completed too quickly to exercise the delay-bearing path: {elapsed:?}"
+        );
+        assert!(
+            visual_changed,
+            "Calculator window did not visually change after paced foreground typing"
+        );
+    }
+
+    #[tokio::test]
     async fn normalizes_fixture_results_to_backend_neutral_types() {
         let adapter = fixture(vec!["scripts/mock_mcp_backend.py".into()]);
         adapter.connect().await.unwrap();
@@ -4006,17 +4420,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn type_text_timeout_is_classified_indeterminate() {
+    async fn type_text_with_impossible_backend_timeout_is_rejected_before_dispatch() {
+        let call_marker = transfer_state_dir("budget-type-text-call");
         let adapter = fixture_with_timeout(
             vec![
                 "scripts/mock_mcp_backend.py".into(),
                 "--slow-type-text".into(),
+                "--call-marker".into(),
+                call_marker.to_string_lossy().into_owned(),
             ],
             Duration::from_millis(100),
         );
         adapter.connect().await.unwrap();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let outcome = adapter
+        let error = adapter
             .execute(
                 &DeviceCommand::TypeText {
                     text: "timeout me".into(),
@@ -4024,9 +4441,14 @@ mod tests {
                 cancel_rx,
             )
             .await
-            .expect("timeout is a classified backend outcome");
-        assert_eq!(outcome, BackendExecutionOutcome::TimedOutIndeterminate);
+            .unwrap_err();
+        assert!(matches!(error, M1BackendError::ExecutionBudgetExceeded));
+        assert!(
+            !call_marker.exists(),
+            "execution-budget rejection must happen before backend dispatch"
+        );
         adapter.shutdown().await.unwrap();
+        let _ = fs::remove_file(call_marker);
     }
 
     #[test]

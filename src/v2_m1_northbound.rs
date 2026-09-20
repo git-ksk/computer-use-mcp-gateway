@@ -4065,6 +4065,9 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
                     "Environment entry limit was exceeded"
                 }
                 crate::v2_m0::DeviceErrorCode::ProcessSpawnFailed => "Process could not be started",
+                crate::v2_m0::DeviceErrorCode::ExecutionBudgetExceeded => {
+                    "Requested operation cannot fit the configured backend execution budget"
+                }
                 code if code.is_browser_refusal() => "Browser operation was refused",
                 _ => "Device operation was rejected or could not be completed",
             };
@@ -7932,6 +7935,18 @@ mod tests {
         .unwrap();
         assert!(generic.contains("internal_failure"));
         assert!(!generic.contains("process_"));
+    }
+
+    #[test]
+    fn execution_budget_error_is_typed_and_payload_free() {
+        let error = hub_error_to_mcp(HubCommandError::Remote(
+            crate::v2_m0::DeviceErrorCode::ExecutionBudgetExceeded,
+        ));
+        let serialized = serde_json::to_string(&error).unwrap();
+        assert!(serialized.contains("execution_budget_exceeded"));
+        assert!(serialized.contains("configured backend execution budget"));
+        assert!(!serialized.contains("hello"));
+        assert!(!serialized.contains("1403"));
     }
 
     #[test]

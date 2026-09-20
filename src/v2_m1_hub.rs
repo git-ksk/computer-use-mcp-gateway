@@ -29,9 +29,10 @@ use crate::v2_m0_execution::{
 use crate::v2_m0_transport::{
     AgentHello, AgentToHub, CancellationDisposition, HubChallenge, HubIdentity, HubToAgent,
     RemoteCancellationAck, RemoteHandoffAuthority, RemoteHandoffRequestKind,
-    RemoteHandoffResponseKind, RemoteReconciliationReport, RemoteResult, TrustedSessionClock,
-    verify_agent_heartbeat, verify_agent_proof, verify_remote_backend_session_ended,
-    verify_remote_cancellation_ack, verify_remote_handoff_response,
+    RemoteHandoffResponseKind, RemoteIndeterminateAck, RemoteIndeterminateCause,
+    RemoteReconciliationReport, RemoteResult, TrustedSessionClock, verify_agent_heartbeat,
+    verify_agent_proof, verify_remote_backend_session_ended, verify_remote_cancellation_ack,
+    verify_remote_handoff_response, verify_remote_indeterminate_ack,
     verify_remote_reconciliation_report, verify_remote_result,
 };
 use crate::v2_m0_trust::{DeviceKeyRotation, apply_device_key_rotation};
@@ -1250,6 +1251,18 @@ impl SingleDeviceHub {
                             };
                             let _ = reply.send(Ok(response.response));
                         }
+                        AgentToHub::IndeterminateAck(ack) => {
+                            self.handle_indeterminate_ack(
+                                ack,
+                                &outbound,
+                                &hello,
+                                &challenge,
+                                generation,
+                                session_clock,
+                                &mut pending,
+                                &mut queue_order,
+                            ).await?;
+                        }
                         AgentToHub::CancellationAck(ack) => {
                             self.handle_cancellation_ack(
                                 ack,
@@ -1924,6 +1937,159 @@ impl SingleDeviceHub {
                 DispatchOutcome::Sent => break,
                 DispatchOutcome::Rejected(following) => next = following,
             }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_indeterminate_ack(
+        &self,
+        ack: RemoteIndeterminateAck,
+        outbound: &mpsc::Sender<Result<HubFrame, Status>>,
+        hello: &AgentHello,
+        challenge: &HubChallenge,
+        generation: u64,
+        session_clock: &TrustedSessionClock,
+        pending: &mut HashMap<String, PendingOperation>,
+        queue_order: &mut VecDeque<String>,
+    ) -> Result<(), HubServiceError> {
+        if ack.device_generation != generation {
+            return Err(HubServiceError::StaleSession);
+        }
+        {
+            let persistent = self.inner.persistent.lock().await;
+            verify_remote_indeterminate_ack(&persistent.registry, hello, challenge, &ack)?;
+        }
+        let reason = match ack.cause {
+            RemoteIndeterminateCause::BackendTimedOut => IndeterminateReason::BackendTimedOut,
+        };
+        let existing_state = {
+            let persistent = self.inner.persistent.lock().await;
+            persistent.execution.state(&ack.operation_id)
+        };
+        if matches!(
+            existing_state,
+            Some(
+                HubOperationState::Indeterminate
+                    | HubOperationState::Completed
+                    | HubOperationState::Failed
+                    | HubOperationState::Cancelled
+            )
+        ) {
+            tracing::warn!(
+                event = "v2_hub_late_indeterminate_ack_ignored",
+                operation_id = %ack.operation_id,
+                ?existing_state,
+                indeterminate_reason = crate::v2_observability::indeterminate_reason_name(reason),
+                "verified late/duplicate indeterminate acknowledgement cannot mutate terminal or quarantined state"
+            );
+            return Ok(());
+        }
+
+        let operation = pending
+            .get(&ack.operation_id)
+            .ok_or(HubServiceError::PendingOperationMissing)?;
+        let owner = operation.owner.clone();
+        let capability = operation.command.capability();
+        let recovery_evidence_read = {
+            let persistent = self.inner.persistent.lock().await;
+            persistent
+                .execution
+                .is_recovery_evidence_read(&ack.operation_id)
+        };
+
+        let cancelled_queued = {
+            let mut persistent = self.inner.persistent.lock().await;
+            if !matches!(
+                persistent.execution.state(&ack.operation_id),
+                Some(HubOperationState::Dispatched | HubOperationState::CancelRequested)
+            ) {
+                return Err(HubServiceError::StateBusy);
+            }
+            if recovery_evidence_read {
+                let _ = persistent
+                    .execution
+                    .mark_recovery_read_interrupted(&ack.operation_id, unix_time_ms()?)?;
+            } else {
+                persistent.execution.mark_indeterminate(
+                    &ack.operation_id,
+                    &owner,
+                    generation,
+                    reason,
+                    unix_time_ms()?,
+                )?;
+            }
+            let cancelled: Vec<_> = pending
+                .keys()
+                .filter(|operation_id| {
+                    operation_id.as_str() != ack.operation_id
+                        && persistent.execution.state(operation_id)
+                            == Some(HubOperationState::Cancelled)
+                })
+                .cloned()
+                .collect();
+            persist_locked(&self.inner, &persistent)?;
+            cancelled
+        };
+
+        for operation_id in cancelled_queued {
+            queue_order.retain(|queued| queued != &operation_id);
+            if let Some(operation) = pending.remove(&operation_id) {
+                let _ = operation
+                    .reply
+                    .send(Err(HubCommandError::CancelledBeforeDispatch));
+            }
+        }
+        queue_order.retain(|queued| queued != &ack.operation_id);
+        if let Some(operation) = pending.remove(&ack.operation_id) {
+            let response = if recovery_evidence_read {
+                Err(HubCommandError::Remote(
+                    crate::v2_m0::DeviceErrorCode::BackendOutcomeIndeterminate,
+                ))
+            } else {
+                Err(HubCommandError::DeviceIndeterminate {
+                    operation_id: ack.operation_id.clone(),
+                })
+            };
+            let _ = operation.reply.send(response);
+        }
+
+        if recovery_evidence_read {
+            crate::v2_observability::operation_completed(
+                capability,
+                crate::v2_observability::OperationOutcome::Failed,
+            );
+            tracing::warn!(
+                event = "v2_recovery_evidence_read_failed",
+                operation_id = %ack.operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "failed_safe",
+                error_code = "backend_timed_out",
+                "recovery evidence read timed out without changing an existing quarantine"
+            );
+        } else {
+            crate::v2_observability::operation_indeterminate(reason);
+            emit_quarantine_created_alert(
+                &ack.operation_id,
+                &self.inner.device_id,
+                generation,
+                Some(capability),
+                reason,
+            );
+            tracing::warn!(
+                event = "v2_operation_indeterminate",
+                operation_id = %ack.operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                capability = crate::v2_observability::capability_name(capability),
+                outcome = "quarantined",
+                indeterminate_reason = crate::v2_observability::indeterminate_reason_name(reason),
+                error_code = "backend_timed_out",
+                "signed Agent acknowledgement preserved backend timeout as the indeterminate cause"
+            );
+            self.maybe_send_recovery_challenge(outbound, generation, session_clock)
+                .await?;
         }
         Ok(())
     }
@@ -3990,6 +4156,122 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restarted.device_id(), stable_device_id);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn signed_backend_timeout_ack_preserves_timeout_quarantine_reason() {
+        let state_dir = test_state_dir("backend-timeout-ack");
+        let device = DeviceIdentity::generate();
+        let hub_identity = HubIdentity::generate();
+        let (hub, _handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: hub_identity.clone(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let device_id = hub.inner.device_id.clone();
+        let hello = AgentHello::new(
+            device_id.clone(),
+            CapabilityAdvertisement {
+                backend: "fixture".into(),
+                backend_version: "1".into(),
+                platform: "test".into(),
+                capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+                revision: 1,
+                supported: vec![DeviceCapability::TypeText],
+            },
+        );
+        let challenge = hub_identity.challenge(&hello).unwrap();
+        let owner = OperationOwner::local_hub();
+        let operation_id = "op_timeout_ack_0123456789abcdef".to_owned();
+        {
+            let mut persistent = hub.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: device_id.clone(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::TypeText,
+                    1,
+                )
+                .unwrap();
+            persistent
+                .execution
+                .mark_dispatched(&operation_id, &owner, 1, 2)
+                .unwrap();
+            persist_locked(&hub.inner, &persistent).unwrap();
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            operation_id.clone(),
+            PendingOperation {
+                owner,
+                command: DeviceCommand::TypeText {
+                    text: "redacted".into(),
+                },
+                expected_semantic_constraint_snapshot: None,
+                handoff: None,
+                envelope: None,
+                reply: reply_tx,
+            },
+        )]);
+        let mut queue_order = VecDeque::new();
+        let (outbound, _outbound_rx) = mpsc::channel(4);
+        let ack = crate::v2_m0_transport::build_remote_indeterminate_ack(
+            &device,
+            &hello,
+            &challenge,
+            1,
+            operation_id.clone(),
+            RemoteIndeterminateCause::BackendTimedOut,
+        )
+        .unwrap();
+
+        hub.handle_indeterminate_ack(
+            ack,
+            &outbound,
+            &hello,
+            &challenge,
+            1,
+            &TrustedSessionClock::new(10),
+            &mut pending,
+            &mut queue_order,
+        )
+        .await
+        .unwrap();
+
+        assert!(pending.is_empty());
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(HubCommandError::DeviceIndeterminate { operation_id: id }) if id == operation_id
+        ));
+        let persistent = hub.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(&operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+        let quarantine = persistent.execution.quarantine(&device_id).unwrap();
+        assert_eq!(quarantine.reason, IndeterminateReason::BackendTimedOut);
+        drop(persistent);
+        drop(hub);
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
