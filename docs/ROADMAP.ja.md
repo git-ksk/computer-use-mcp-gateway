@@ -103,7 +103,19 @@ v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です�
 | Linux cgroup-v2 containment | #267 | bounded process/shell cleanup向け実装済みoptional hardening。Linux-only reviewed delegation |
 | Release integration / acceptance | #335 | schema、artifact、upgrade/rollback、dogfood、docs、support claim を閉じる required final gate |
 
-次の work は **default では v0.6.0 に admit しません**: Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、general operator/consumer ergonomics (#295/#304)。これらは下記で visibility を維持し、bounded な理由を伴う explicit roadmap/milestone change がある場合だけ admit します。
+次の work は **default では v0.6.0 に admit しません**: Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、agent/operator ergonomics (#295/#304/#342)。これらは v0.6.0 release gate の外に置き、bounded な理由を伴う explicit roadmap/milestone change がある場合だけ v0.6.0 へ admit します。
+
+### Post-v0.6 planned feature minor: v0.7.0 — Agent-facing Operational Ergonomics
+
+v0.6.0 Managed Developer Execution close 後の次 planned feature minor は **v0.7.0 — Agent-facing Operational Ergonomics** とします。既存 CUMG safety model を MCP/agent consumer が正しく inspect / use しやすくする train であり、second authorization/recovery authority を追加せず、quarantine / no-auto-replay semantics も弱めません。
+
+| v0.7.0 track | Issue | Role |
+| --- | --- | --- |
+| Unified agent-facing runtime status | #304 | existing privacy-bounded status model を read-only MCP/Gateway 1 call で公開 |
+| Bounded runtime/package identity | #295 | installed package/source identity を repository archaeology なしで直接 inspect 可能にする |
+| Caller-retained operation-ID generation contract | #342 | fresh CSPRNG 128-bit `operation_id` generation を MCP/agent consumer に明示し、replay rejection / recovery semantics は維持 |
+
+v0.7.0 の boundary は intentionally ergonomic / operational とします。schema description、read-only inspection、documentation、安全な client helper は改善できますが、heuristic recovery、automatic replay、broader effectful capability は scope 外です。
 
 released v0.5.0 baseline は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin します。v0.6 development では #106 の historical live pairing が 11/7、#114 により current live control/capability pairing が 12/8 へ進み、registry schema は8、Hub-Agent schema は6のままです。mixed live version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、v0.5.0 は per-principal path/root isolation を support claim しません。
 
@@ -180,7 +192,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 
 - **`v0.6.x — Support Claim Expansion`（v0.6.0にはnon-blocking）:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。evidence完了後にv0.6のsupport contractを広げられます。v0.6.0 freezeまでにacceptanceが完了すればv0.6.0へ含め、間に合わなければclaimをwithholdして明示的に後続へ送ります。older releaseを後からsupported扱いにはしません。
 - **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E の順とし、#267 optional Linux cgroup-v2 containment は containment contract が安定した後に並行可能です。#335 が required final integration / release gate です。
-- **Operational usability / inspectability、unnumbered:** #304 は existing unified privacy-bounded runtime status を read-only MCP/Gateway 1 call として公開し、#295 は bounded human-readable --version identity を追加します。有用な cross-cutting product improvement ですが、explicit に admit しない限り v0.6.0 blocker にはしません。
+- **v0.7.0 — Agent-facing Operational Ergonomics:** #304 は existing unified privacy-bounded runtime status を read-only MCP/Gateway 1 call として公開し、#295 は bounded human-readable --version identity を追加し、#342 は caller-retained `operation_id` の fresh CSPRNG 128-bit generation contract を MCP/agent consumer に明示します。いずれも v0.6.0 blocker ではなく、v0.6.0 close 後の planned feature minor にまとめます。
 - **Recovery evidence hardening、unnumbered:** #289 は ambiguous application operation の privacy-bounded target identity を保持し、#290 は #124 self-reconciliation を exact durable backend receipt へ拡張します。reviewed target/evidence boundary に依存するため、deliberate release admission decision までは fail-closed のまま v0.6.0 外に置きます。
 - **Hosted deployment、future independent track:** #215 が Cloud Run support gate、#275 が Agent-owned Handoff topology、#276 が reviewed Handoff consumer boundary adoption、#277 が hosted operator routing、#282 が closed one-port ingress、#283 が durable Hub state / writer-epoch fencing、#284 が replacement / partition / physical-Handoff acceptance gate です。implementation / acceptance chain が完了するまで Hosted support は NO-GO のままです。
 - **Backend semantic-neutrality evidence:** #222 は second real computer-use backend で同じ GUI semantics を証明する evidence-driven work で、numbered release gate 外に置きます。
