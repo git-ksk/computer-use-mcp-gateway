@@ -43,6 +43,8 @@ pub mod v2_interaction_context;
 pub mod v2_limits;
 pub mod v2_linux_fido2_recovery;
 pub mod v2_maintenance;
+pub mod v2_managed_job;
+pub mod v2_managed_job_refs;
 pub mod v2_multi_device;
 pub mod v2_observability;
 pub mod v2_oidc_jwt;

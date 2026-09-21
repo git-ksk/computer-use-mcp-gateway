@@ -49,6 +49,19 @@ pub struct OfflineRetirementResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedJobSafetyInspection {
+    pub device_id: String,
+    pub state_schema: u16,
+    pub fail_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedJobFailClosedClearResult {
+    pub device_id: String,
+    pub checkpoint: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationEvidenceInspection {
     pub schema_version: u16,
     pub kind: String,
@@ -907,7 +920,9 @@ fn capability_target_class(capability: DeviceCapability) -> &'static str {
     match capability {
         DeviceCapability::ExecuteProcess
         | DeviceCapability::Shell
-        | DeviceCapability::ReadProcessOutput => "process",
+        | DeviceCapability::ReadProcessOutput
+        | DeviceCapability::ManagedJobControl
+        | DeviceCapability::ManagedJobObserve => "process",
         DeviceCapability::ReadFile
         | DeviceCapability::ListDirectory
         | DeviceCapability::WriteWorkspaceFile => "filesystem",
@@ -951,7 +966,9 @@ fn capability_effect_kind(capability: DeviceCapability) -> &'static str {
         return "observation";
     }
     match capability {
-        DeviceCapability::ExecuteProcess | DeviceCapability::Shell => "execute",
+        DeviceCapability::ExecuteProcess
+        | DeviceCapability::Shell
+        | DeviceCapability::ManagedJobControl => "execute",
         DeviceCapability::LaunchApplication => "launch",
         DeviceCapability::TerminateApplication => "terminate",
         DeviceCapability::BrowserNavigate => "navigate",
@@ -1161,6 +1178,67 @@ const fn evidence_name(evidence: ExecutionEvidence) -> &'static str {
         ExecutionEvidence::OperatorResolution => "operator_resolution",
         ExecutionEvidence::RecoveryReadInterrupted => "recovery_read_interrupted",
     }
+}
+
+pub fn inspect_managed_job_safety_read_only(
+    agent_state_dir: &Path,
+) -> Result<ManagedJobSafetyInspection, MaintenanceError> {
+    let checkpoint = CheckpointStore::new(agent_state_dir.to_path_buf(), "agent")
+        .map_err(MaintenanceError::Persistence)?;
+    let state = checkpoint
+        .load_latest::<AgentPersistentState>()
+        .map_err(MaintenanceError::Persistence)?;
+    state
+        .clone()
+        .restore_with_runtime_safety()
+        .map_err(MaintenanceError::Persistence)?;
+    Ok(ManagedJobSafetyInspection {
+        device_id: state.device_id,
+        state_schema: state.schema_version,
+        fail_closed: state.managed_job_fail_closed,
+    })
+}
+
+pub fn clear_managed_job_fail_closed_offline(
+    agent_state_dir: &Path,
+    evidence: impl Into<String>,
+) -> Result<ManagedJobFailClosedClearResult, MaintenanceError> {
+    let evidence = evidence.into();
+    if evidence.trim().is_empty() || evidence.len() > 512 {
+        return Err(MaintenanceError::InvalidManagedJobRecoveryEvidence);
+    }
+    // The same state-directory lock used by the Agent makes this an offline-only
+    // operator transition. Running Agents keep the lock and therefore prevent
+    // maintenance from silently weakening a live fail-closed boundary.
+    let _state_lock =
+        StateDirectoryLock::acquire(agent_state_dir).map_err(MaintenanceError::StateLock)?;
+    let checkpoint = CheckpointStore::new(agent_state_dir.to_path_buf(), "agent")
+        .map_err(MaintenanceError::Persistence)?;
+    let mut state = checkpoint
+        .load_latest::<AgentPersistentState>()
+        .map_err(MaintenanceError::Persistence)?;
+    state
+        .clone()
+        .restore_with_runtime_safety()
+        .map_err(MaintenanceError::Persistence)?;
+    if !state.managed_job_fail_closed {
+        return Err(MaintenanceError::ManagedJobFailClosedNotSet);
+    }
+    state.managed_job_fail_closed = false;
+    // Validate the exact candidate before publication. Evidence is an explicit
+    // operator gate only and is intentionally not copied into checkpoint or logs.
+    state
+        .clone()
+        .restore_with_runtime_safety()
+        .map_err(MaintenanceError::Persistence)?;
+    let device_id = state.device_id.clone();
+    let checkpoint_path = checkpoint
+        .save(&state)
+        .map_err(MaintenanceError::Persistence)?;
+    Ok(ManagedJobFailClosedClearResult {
+        device_id,
+        checkpoint: checkpoint_path,
+    })
 }
 
 pub fn resolve_indeterminate_offline(
@@ -1434,6 +1512,8 @@ pub enum MaintenanceError {
         maintenance_state_schema: u16,
     },
     InvalidCandidateRequest,
+    InvalidManagedJobRecoveryEvidence,
+    ManagedJobFailClosedNotSet,
     AuditOperationNotQuarantined,
     PersistenceCompatibility {
         checkpoint_execution_schema: u16,
@@ -1473,6 +1553,12 @@ impl fmt::Display for MaintenanceError {
             Self::InvalidCandidateRequest => f.write_str(
                 "candidate request does not match the supported shell/process comparison contract",
             ),
+            Self::InvalidManagedJobRecoveryEvidence => {
+                f.write_str("managed-job recovery evidence must contain 1..=512 bytes")
+            }
+            Self::ManagedJobFailClosedNotSet => {
+                f.write_str("managed-job fail-closed state is not set")
+            }
             Self::AuditOperationNotQuarantined => {
                 f.write_str("reconciliation audit requires one exact quarantined operation")
             }
@@ -3081,5 +3167,59 @@ mod tests {
             ),
             Err(MaintenanceError::StateLock(StateDirectoryLockError::Busy))
         ));
+    }
+
+    #[test]
+    fn managed_job_fail_closed_requires_explicit_offline_operator_clear() {
+        let dir = test_dir("managed-job-fail-closed");
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let execution = AgentExecutionGate::default();
+        let state = AgentPersistentState::capture_with_runtime_safety(
+            "dev-managed",
+            &trusted_hub,
+            &grants,
+            &execution,
+            &[],
+            true,
+        )
+        .unwrap();
+        CheckpointStore::new(dir.clone(), "agent")
+            .unwrap()
+            .save(&state)
+            .unwrap();
+
+        let inspected = inspect_managed_job_safety_read_only(&dir).unwrap();
+        assert!(inspected.fail_closed);
+        assert_eq!(inspected.device_id, "dev-managed");
+
+        assert!(matches!(
+            clear_managed_job_fail_closed_offline(&dir, ""),
+            Err(MaintenanceError::InvalidManagedJobRecoveryEvidence)
+        ));
+
+        let cleared = clear_managed_job_fail_closed_offline(
+            &dir,
+            "operator independently verified no managed process remains",
+        )
+        .unwrap();
+        assert_eq!(cleared.device_id, "dev-managed");
+        assert!(
+            !inspect_managed_job_safety_read_only(&dir)
+                .unwrap()
+                .fail_closed
+        );
+
+        assert!(matches!(
+            clear_managed_job_fail_closed_offline(
+                &dir,
+                "repeat clear must not silently manufacture recovery",
+            ),
+            Err(MaintenanceError::ManagedJobFailClosedNotSet)
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

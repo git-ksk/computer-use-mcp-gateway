@@ -22,7 +22,7 @@ use std::io::Read;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -195,6 +195,31 @@ pub struct ProcessExecutor {
     policy: ProcessPolicy,
 }
 
+/// Structured process inside the same supervised process-control domain as ordinary execution.
+pub(crate) struct SupervisedProcess {
+    child: Box<dyn ChildWrapper>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+}
+
+impl SupervisedProcess {
+    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.stdout.take()
+    }
+    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.stderr.take()
+    }
+    pub(crate) fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProcessError> {
+        self.child.try_wait().map_err(ProcessError::Io)
+    }
+    pub(crate) fn prove_terminal(
+        &mut self,
+        failure_stage: ProcessUnprovenStage,
+    ) -> Result<ExitStatus, ProcessError> {
+        prove_process_domain_terminal(&mut *self.child, failure_stage)
+    }
+}
+
 struct ProcessLaunch<'a> {
     program: &'a str,
     args: &'a [String],
@@ -204,6 +229,55 @@ struct ProcessLaunch<'a> {
 impl ProcessExecutor {
     pub fn new(policy: ProcessPolicy) -> Self {
         Self { policy }
+    }
+
+    /// Launch a structured process in the existing supervised process-control domain without waiting for it.
+    pub(crate) fn spawn_supervised(
+        &self,
+        request: &ProcessRequest,
+    ) -> Result<SupervisedProcess, ProcessError> {
+        let validated = self.validate_managed_request(request)?;
+        let mut command = Command::new(&request.program);
+        command
+            .args(&request.args)
+            .current_dir(&validated.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear();
+        for key in &self.policy.inherited_env_keys {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        for item in &request.env {
+            command.env(&item.key, &item.value);
+        }
+        let mut command = CommandWrap::from(command);
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
+        let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+        let stdout = match child.stdout().take() {
+            Some(stdout) => stdout,
+            None => {
+                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::PipeSetup)?;
+                return Err(ProcessError::PipeUnavailable);
+            }
+        };
+        let stderr = match child.stderr().take() {
+            Some(stderr) => stderr,
+            None => {
+                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::PipeSetup)?;
+                return Err(ProcessError::PipeUnavailable);
+            }
+        };
+        Ok(SupervisedProcess {
+            child,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        })
     }
 
     pub fn execute(
@@ -518,6 +592,28 @@ impl ProcessExecutor {
     }
 
     fn validate_request(&self, request: &ProcessRequest) -> Result<ValidatedRequest, ProcessError> {
+        let cwd = self.validate_structured_request(request)?;
+        if request.timeout_ms == 0 || request.timeout_ms > self.policy.max_timeout_ms {
+            return Err(ProcessError::InvalidTimeout);
+        }
+        Ok(ValidatedRequest { cwd })
+    }
+
+    fn validate_managed_request(
+        &self,
+        request: &ProcessRequest,
+    ) -> Result<ValidatedRequest, ProcessError> {
+        let cwd = self.validate_structured_request(request)?;
+        if request.timeout_ms == 0 {
+            return Err(ProcessError::InvalidTimeout);
+        }
+        Ok(ValidatedRequest { cwd })
+    }
+
+    fn validate_structured_request(
+        &self,
+        request: &ProcessRequest,
+    ) -> Result<PathBuf, ProcessError> {
         if request.program.trim().is_empty() {
             return Err(ProcessError::InvalidRequest);
         }
@@ -532,8 +628,7 @@ impl ProcessExecutor {
         if self.policy.denied_program_names.contains(&name) {
             return Err(ProcessError::ShellProgramDenied);
         }
-        let cwd = self.validate_common(&request.cwd, &request.env, request.timeout_ms)?;
-        Ok(ValidatedRequest { cwd })
+        self.validate_common_fields(&request.cwd, &request.env)
     }
 
     fn validate_common(
@@ -542,14 +637,22 @@ impl ProcessExecutor {
         env: &[ProcessEnvVar],
         timeout_ms: u64,
     ) -> Result<PathBuf, ProcessError> {
+        if timeout_ms == 0 || timeout_ms > self.policy.max_timeout_ms {
+            return Err(ProcessError::InvalidTimeout);
+        }
+        self.validate_common_fields(cwd, env)
+    }
+
+    fn validate_common_fields(
+        &self,
+        cwd: &str,
+        env: &[ProcessEnvVar],
+    ) -> Result<PathBuf, ProcessError> {
         if cwd.trim().is_empty() {
             return Err(ProcessError::InvalidRequest);
         }
         if env.len() > self.policy.max_env_entries {
             return Err(ProcessError::TooManyEnvironmentEntries);
-        }
-        if timeout_ms == 0 || timeout_ms > self.policy.max_timeout_ms {
-            return Err(ProcessError::InvalidTimeout);
         }
         let cwd = fs::canonicalize(cwd).map_err(ProcessError::Io)?;
         if !cwd.is_dir() {
@@ -625,7 +728,7 @@ impl ProcessUnprovenStage {
     }
 }
 
-fn prove_process_domain_terminal(
+pub(crate) fn prove_process_domain_terminal(
     child: &mut dyn ChildWrapper,
     failure_stage: ProcessUnprovenStage,
 ) -> Result<std::process::ExitStatus, ProcessError> {

@@ -11,8 +11,9 @@ use computer_use_mcp_gateway::{
     v2_m0_execution::IndeterminateResolution,
     v2_m1_keys::load_secret_text,
     v2_maintenance::{
-        audit_reconciliation_read_only, compare_quarantined_request_read_only,
-        inspect_auto_resolutions_read_only, inspect_quarantines_read_only,
+        audit_reconciliation_read_only, clear_managed_job_fail_closed_offline,
+        compare_quarantined_request_read_only, inspect_auto_resolutions_read_only,
+        inspect_managed_job_safety_read_only, inspect_quarantines_read_only,
         resolve_indeterminate_offline, retire_indeterminate_offline,
     },
     v2_upgrade_transaction::{read_upgrade_transaction, upgrade_transaction_path},
@@ -79,6 +80,20 @@ enum Command {
         /// Optionally restrict output to one stable device ID.
         #[arg(long)]
         device_id: Option<String>,
+    },
+    /// Inspect Agent-local managed-job termination safety without changing state.
+    InspectManagedJobSafety {
+        #[arg(long, env = "CUMG_V2_AGENT_STATE_DIR")]
+        agent_state_dir: PathBuf,
+    },
+    /// Clear persisted managed-job fail-closed state while the Agent is stopped.
+    /// Use only after independent operator evidence proves no orphan managed process remains.
+    ClearManagedJobFailClosed {
+        #[arg(long, env = "CUMG_V2_AGENT_STATE_DIR")]
+        agent_state_dir: PathBuf,
+        /// Bounded audit rationale only; never include argv, cwd, env, output, or secrets.
+        #[arg(long)]
+        evidence: String,
     },
     /// Inspect bounded self-reconciliation history without exposing raw requests or results.
     InspectReconciliationHistory {
@@ -314,6 +329,30 @@ fn main() -> Result<()> {
             let report = inspect_quarantines_read_only(&state_dir, device_id.as_deref())
                 .context("read-only quarantine inspection failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::InspectManagedJobSafety { agent_state_dir } => {
+            let report = inspect_managed_job_safety_read_only(&agent_state_dir)
+                .context("read-only managed-job safety inspection failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::ClearManagedJobFailClosed {
+            agent_state_dir,
+            evidence,
+        } => {
+            let result = clear_managed_job_fail_closed_offline(&agent_state_dir, evidence)
+                .context("offline managed-job fail-closed clear failed")?;
+            tracing::warn!(
+                event = "v2_managed_job_fail_closed_cleared",
+                device_id = %result.device_id,
+                outcome = "operator_resolved",
+                evidence_supplied = true,
+                "offline operator explicitly cleared managed-job fail-closed state after independent verification"
+            );
+            println!(
+                "cleared managed_job_fail_closed device={} checkpoint={}",
+                result.device_id,
+                result.checkpoint.display(),
+            );
         }
         Command::InspectReconciliationHistory {
             state_dir,

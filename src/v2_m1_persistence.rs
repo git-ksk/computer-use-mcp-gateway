@@ -41,6 +41,17 @@ pub struct AgentPersistentState {
     pub execution: AgentExecutionSnapshot,
     #[serde(default)]
     pub terminal_evidence: Vec<AgentTerminalEvidence>,
+    #[serde(default)]
+    pub managed_job_fail_closed: bool,
+}
+
+pub struct RestoredAgentRuntimeSafety {
+    pub device_id: String,
+    pub trusted_hub: TrustedHubIdentity,
+    pub grant_ledger: GrantLedger,
+    pub execution: AgentExecutionGate,
+    pub terminal_evidence: Vec<AgentTerminalEvidence>,
+    pub managed_job_fail_closed: bool,
 }
 
 impl AgentPersistentState {
@@ -60,6 +71,24 @@ impl AgentPersistentState {
         execution: &AgentExecutionGate,
         terminal_evidence: &[AgentTerminalEvidence],
     ) -> Result<Self, PersistenceError> {
+        Self::capture_with_runtime_safety(
+            device_id,
+            trusted_hub,
+            grant_ledger,
+            execution,
+            terminal_evidence,
+            false,
+        )
+    }
+
+    pub fn capture_with_runtime_safety(
+        device_id: impl Into<String>,
+        trusted_hub: &TrustedHubIdentity,
+        grant_ledger: &GrantLedger,
+        execution: &AgentExecutionGate,
+        terminal_evidence: &[AgentTerminalEvidence],
+        managed_job_fail_closed: bool,
+    ) -> Result<Self, PersistenceError> {
         let device_id = device_id.into();
         if device_id.trim().is_empty()
             || terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
@@ -77,6 +106,7 @@ impl AgentPersistentState {
             grant_ledger: grant_ledger.snapshot(),
             execution: execution.snapshot_for_restart(),
             terminal_evidence: terminal_evidence.to_vec(),
+            managed_job_fail_closed,
         })
     }
 
@@ -101,6 +131,19 @@ impl AgentPersistentState {
         ),
         PersistenceError,
     > {
+        let restored = self.restore_with_runtime_safety()?;
+        Ok((
+            restored.device_id,
+            restored.trusted_hub,
+            restored.grant_ledger,
+            restored.execution,
+            restored.terminal_evidence,
+        ))
+    }
+
+    pub fn restore_with_runtime_safety(
+        self,
+    ) -> Result<RestoredAgentRuntimeSafety, PersistenceError> {
         validate_state_schema(self.schema_version)?;
         if self.device_id.trim().is_empty()
             || self.terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
@@ -119,13 +162,14 @@ impl AgentPersistentState {
             .map_err(PersistenceError::Control)?;
         let execution = AgentExecutionGate::restore_after_restart(self.execution)
             .map_err(PersistenceError::Execution)?;
-        Ok((
-            self.device_id,
+        Ok(RestoredAgentRuntimeSafety {
+            device_id: self.device_id,
             trusted_hub,
             grant_ledger,
             execution,
-            self.terminal_evidence,
-        ))
+            terminal_evidence: self.terminal_evidence,
+            managed_job_fail_closed: self.managed_job_fail_closed,
+        })
     }
 }
 
@@ -977,7 +1021,7 @@ mod tests {
             .unwrap();
 
         let current = HubPersistentState::capture(&registry, &execution);
-        for (legacy_registry_schema, legacy_capability_schema) in [(2, 2), (5, 4)] {
+        for (legacy_registry_schema, legacy_capability_schema) in [(2, 2), (5, 4), (8, 6)] {
             let mut fixture = current.clone();
             fixture.registry.schema_version = legacy_registry_schema;
             fixture.registry.devices[0]

@@ -44,6 +44,12 @@ use crate::v2_m1_persistence::{
     CheckpointStore, HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError,
 };
 use crate::v2_m1_process::DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM;
+use crate::v2_managed_job::{
+    DEFAULT_MANAGED_JOB_OUTPUT_BYTES_PER_STREAM, MAX_MANAGED_JOB_LEASE_MS,
+    MAX_MANAGED_JOB_LIFETIME_MS, MAX_MANAGED_JOB_OUTPUT_READ_BYTES, ManagedJobOutputRange,
+    ManagedJobStatus,
+};
+use crate::v2_managed_job_refs::{HubManagedJobRefLimits, HubManagedJobRefRegistry};
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryAuditAssessment, RecoveryAuthorization, RecoveryChallenge, RecoveryDecision,
@@ -81,6 +87,8 @@ pub const DEFAULT_CHECKPOINT_GENERATION_ROLLOVER_BYTES: usize = (MAX_CHECKPOINT_
 // effective remaining life and avoids treating ordinary transport latency as a
 // future-dated grant.
 const GRANT_ISSUED_AT_SAFETY_MS: u64 = 5_000;
+
+const MANAGED_JOB_REF_TERMINAL_RETENTION_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct HubProvisionedMaterial {
@@ -183,6 +191,7 @@ struct HubInner {
     recovery_verifier: Option<RecoveryVerifier>,
     recovery_runtime: Mutex<RecoveryRuntimeState>,
     ephemeral_refs: Mutex<HubEphemeralRefRegistry>,
+    managed_job_refs: Mutex<HubManagedJobRefRegistry>,
 }
 
 #[derive(Clone)]
@@ -251,6 +260,36 @@ pub struct HubProcessOutputRange {
     pub next_offset: u64,
     pub total_bytes: u64,
     pub eof: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubManagedJobStartResult {
+    pub operation_id: String,
+    pub job_ref: String,
+    pub status: ManagedJobStatus,
+    pub receipt: ExecutionReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubManagedJobStatusResult {
+    pub operation_id: String,
+    pub status: ManagedJobStatus,
+    pub receipt: ExecutionReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HubManagedJobOutputRead {
+    pub stream: ProcessOutputStream,
+    pub offset: u64,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubManagedJobOutputResult {
+    pub operation_id: String,
+    pub stream: ProcessOutputStream,
+    pub range: ManagedJobOutputRange,
+    pub receipt: ExecutionReceipt,
 }
 
 pub struct HubPendingCommand {
@@ -446,6 +485,10 @@ impl SingleDeviceHub {
 
         let ephemeral_refs = HubEphemeralRefRegistry::new(HubEphemeralRefLimits::default())
             .map_err(|_| HubServiceError::InvalidConfig("invalid ephemeral ref registry limits"))?;
+        let managed_job_refs = HubManagedJobRefRegistry::new(HubManagedJobRefLimits::default())
+            .map_err(|_| {
+                HubServiceError::InvalidConfig("invalid managed-job ref registry limits")
+            })?;
         let session_slots = Arc::new(Semaphore::new(config.max_agent_sessions));
         let session_rate = crate::v2_limits::SlidingWindowRateLimit::new(
             config.max_agent_session_starts_per_minute,
@@ -471,6 +514,7 @@ impl SingleDeviceHub {
             recovery_verifier,
             recovery_runtime: Mutex::new(RecoveryRuntimeState::default()),
             ephemeral_refs: Mutex::new(ephemeral_refs),
+            managed_job_refs: Mutex::new(managed_job_refs),
         });
         let service = Self {
             inner: inner.clone(),
@@ -2915,6 +2959,333 @@ impl HubHandle {
         random_operation_id()
     }
 
+    async fn managed_job_session_fence(&self) -> Result<(u64, u64), HubCommandError> {
+        let live = self.inner.live.lock().await;
+        let session = live.as_ref().ok_or(HubCommandError::AgentOffline)?;
+        Ok((session.generation, session.capability_revision))
+    }
+
+    async fn resolve_managed_job_ref(
+        &self,
+        owner: &OperationOwner,
+        job_ref: &str,
+    ) -> Result<(String, u64, u64), HubCommandError> {
+        if job_ref.trim().is_empty() {
+            return Err(HubCommandError::Rejected);
+        }
+        let (generation, capability_revision) = self.managed_job_session_fence().await?;
+        let resolved = {
+            let mut refs = self.inner.managed_job_refs.lock().await;
+            refs.resolve_owned(
+                job_ref,
+                owner,
+                &self.inner.device_id,
+                generation,
+                capability_revision,
+                unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
+            )
+            .map_err(|_| HubCommandError::Rejected)?
+        };
+        Ok((resolved.agent_locator, generation, capability_revision))
+    }
+
+    pub async fn managed_job_start_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        request: ProcessRequest,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubManagedJobStartResult, HubCommandError> {
+        if request.timeout_ms == 0 || request.timeout_ms > MAX_MANAGED_JOB_LIFETIME_MS {
+            return Err(HubCommandError::Rejected);
+        }
+        let (generation, capability_revision) = self.managed_job_session_fence().await?;
+        let now_ms = unix_time_ms().map_err(|_| HubCommandError::Rejected)?;
+        let expires_at_ms = now_ms
+            .saturating_add(request.timeout_ms)
+            .saturating_add(MANAGED_JOB_REF_TERMINAL_RETENTION_MS);
+        // Reserve Hub-owned authority before dispatch. Capacity/collision failure is
+        // therefore pre-dispatch and can never strand a successfully started Agent job.
+        let job_ref = self
+            .inner
+            .managed_job_refs
+            .lock()
+            .await
+            .reserve(
+                owner.clone(),
+                &self.inner.device_id,
+                generation,
+                capability_revision,
+                &operation_id,
+                expires_at_ms,
+                now_ms,
+            )
+            .map_err(|_| HubCommandError::Rejected)?;
+
+        let pending = match self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner.clone(),
+                operation_id.clone(),
+                DeviceCommand::ManagedJobStart { request },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.inner.managed_job_refs.lock().await.release_unbound(
+                    &job_ref,
+                    &owner,
+                    &self.inner.device_id,
+                    generation,
+                    capability_revision,
+                );
+                return Err(error);
+            }
+        };
+        let result = match pending.wait().await {
+            Ok(result) => result,
+            Err(error) => {
+                self.inner.managed_job_refs.lock().await.release_unbound(
+                    &job_ref,
+                    &owner,
+                    &self.inner.device_id,
+                    generation,
+                    capability_revision,
+                );
+                return Err(error);
+            }
+        };
+        match result.result {
+            DeviceResult::ManagedJobStarted {
+                agent_locator,
+                status,
+            } => {
+                if validate_managed_job_status(&status).is_err()
+                    || agent_locator.is_empty()
+                    || agent_locator.len() > 512
+                {
+                    self.inner.managed_job_refs.lock().await.release_unbound(
+                        &job_ref,
+                        &owner,
+                        &self.inner.device_id,
+                        generation,
+                        capability_revision,
+                    );
+                    return Err(HubCommandError::UnexpectedResult);
+                }
+                let bind_result = self.inner.managed_job_refs.lock().await.bind(
+                    &job_ref,
+                    &owner,
+                    &self.inner.device_id,
+                    generation,
+                    capability_revision,
+                    &operation_id,
+                    &agent_locator,
+                    unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
+                );
+                if bind_result.is_err() {
+                    self.inner.managed_job_refs.lock().await.release_unbound(
+                        &job_ref,
+                        &owner,
+                        &self.inner.device_id,
+                        generation,
+                        capability_revision,
+                    );
+                    // A current-schema Agent returned a valid start result after a
+                    // pre-reserved authority slot, so bind failure is a protocol
+                    // invariant violation. Do not expose an unusable reference.
+                    return Err(HubCommandError::Indeterminate);
+                }
+                Ok(HubManagedJobStartResult {
+                    operation_id: result.operation_id,
+                    job_ref,
+                    status,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::Error { code } => {
+                self.inner.managed_job_refs.lock().await.release_unbound(
+                    &job_ref,
+                    &owner,
+                    &self.inner.device_id,
+                    generation,
+                    capability_revision,
+                );
+                Err(HubCommandError::Remote(code))
+            }
+            _ => {
+                self.inner.managed_job_refs.lock().await.release_unbound(
+                    &job_ref,
+                    &owner,
+                    &self.inner.device_id,
+                    generation,
+                    capability_revision,
+                );
+                Err(HubCommandError::UnexpectedResult)
+            }
+        }
+    }
+
+    pub async fn managed_job_status_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        job_ref: &str,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubManagedJobStatusResult, HubCommandError> {
+        let (locator, generation, capability_revision) =
+            self.resolve_managed_job_ref(&owner, job_ref).await?;
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                operation_id,
+                DeviceCommand::ManagedJobStatus { locator },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::ManagedJobStatus { status } => {
+                validate_managed_job_status(&status)?;
+                Ok(HubManagedJobStatusResult {
+                    operation_id: result.operation_id,
+                    status,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
+    pub async fn managed_job_output_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        job_ref: &str,
+        read: HubManagedJobOutputRead,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubManagedJobOutputResult, HubCommandError> {
+        if read.max_bytes == 0
+            || read.max_bytes
+                > u64::try_from(MAX_MANAGED_JOB_OUTPUT_READ_BYTES)
+                    .map_err(|_| HubCommandError::Rejected)?
+        {
+            return Err(HubCommandError::Rejected);
+        }
+        let (locator, generation, capability_revision) =
+            self.resolve_managed_job_ref(&owner, job_ref).await?;
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                operation_id,
+                DeviceCommand::ManagedJobOutput {
+                    locator,
+                    stream: read.stream,
+                    offset: read.offset,
+                    max_bytes: read.max_bytes,
+                },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::ManagedJobOutput {
+                stream: returned_stream,
+                range,
+            } if returned_stream == read.stream => {
+                validate_managed_job_output(&range, read.offset, read.max_bytes)?;
+                Ok(HubManagedJobOutputResult {
+                    operation_id: result.operation_id,
+                    stream: read.stream,
+                    range,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::ManagedJobOutput { .. } => Err(HubCommandError::UnexpectedResult),
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
+    pub async fn managed_job_renew_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        job_ref: &str,
+        lease_ms: u64,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubManagedJobStatusResult, HubCommandError> {
+        if lease_ms == 0 || lease_ms > MAX_MANAGED_JOB_LEASE_MS {
+            return Err(HubCommandError::Rejected);
+        }
+        let (locator, generation, capability_revision) =
+            self.resolve_managed_job_ref(&owner, job_ref).await?;
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                operation_id,
+                DeviceCommand::ManagedJobRenew { locator, lease_ms },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::ManagedJobRenewed { status } => {
+                validate_managed_job_status(&status)?;
+                Ok(HubManagedJobStatusResult {
+                    operation_id: result.operation_id,
+                    status,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
+    pub async fn managed_job_stop_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        job_ref: &str,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubManagedJobStatusResult, HubCommandError> {
+        let (locator, generation, capability_revision) =
+            self.resolve_managed_job_ref(&owner, job_ref).await?;
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                operation_id,
+                DeviceCommand::ManagedJobStop { locator },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::ManagedJobStopped { status } => {
+                validate_managed_job_status(&status)?;
+                Ok(HubManagedJobStatusResult {
+                    operation_id: result.operation_id,
+                    status,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
     pub async fn start_command_as_with_id(
         &self,
         owner: OperationOwner,
@@ -3629,6 +4000,48 @@ fn unix_time_ms() -> Result<u64, HubServiceError> {
             .as_millis(),
     )
     .unwrap_or(u64::MAX))
+}
+
+fn validate_managed_job_status(status: &ManagedJobStatus) -> Result<(), HubCommandError> {
+    if status.lease_remaining_ms > MAX_MANAGED_JOB_LEASE_MS
+        || status.hard_lifetime_remaining_ms > MAX_MANAGED_JOB_LIFETIME_MS
+    {
+        return Err(HubCommandError::UnexpectedResult);
+    }
+    Ok(())
+}
+
+fn validate_managed_job_output(
+    range: &ManagedJobOutputRange,
+    requested_offset: u64,
+    max_bytes: u64,
+) -> Result<(), HubCommandError> {
+    if range.requested_offset != requested_offset
+        || range.earliest_available_offset > range.total_bytes
+        || range.next_offset > range.total_bytes
+        || range
+            .total_bytes
+            .saturating_sub(range.earliest_available_offset)
+            > u64::try_from(DEFAULT_MANAGED_JOB_OUTPUT_BYTES_PER_STREAM)
+                .map_err(|_| HubCommandError::UnexpectedResult)?
+        || u64::try_from(range.bytes.len()).map_err(|_| HubCommandError::UnexpectedResult)?
+            > max_bytes
+        || range.gap_before_range != (requested_offset < range.earliest_available_offset)
+        || range.history_truncated != (range.earliest_available_offset > 0)
+        || (range.eof && range.next_offset < range.total_bytes)
+    {
+        return Err(HubCommandError::UnexpectedResult);
+    }
+    let start = requested_offset
+        .max(range.earliest_available_offset)
+        .min(range.total_bytes);
+    let expected_next = start.saturating_add(
+        u64::try_from(range.bytes.len()).map_err(|_| HubCommandError::UnexpectedResult)?,
+    );
+    if expected_next != range.next_offset {
+        return Err(HubCommandError::UnexpectedResult);
+    }
+    Ok(())
 }
 
 fn random_operation_id() -> String {

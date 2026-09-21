@@ -1250,6 +1250,16 @@ fn inspect_agent(
     };
     summary.state_schema = Some(state.schema_version);
     summary.replay_generation = state.execution.replay_generation;
+    if state.managed_job_fail_closed {
+        push(
+            checks,
+            "managed_job_safety",
+            CheckStatus::Error,
+            "termination_unproven_fail_closed",
+        );
+    } else {
+        push(checks, "managed_job_safety", CheckStatus::Ok, "ready");
+    }
     let identity_matches = expected_device_id.is_some_and(|expected| expected == state.device_id);
     let generation_matches = hub_generation == state.execution.replay_generation;
     if state.clone().restore_with_terminal_evidence().is_err()

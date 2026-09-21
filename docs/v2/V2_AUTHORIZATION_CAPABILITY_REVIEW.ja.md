@@ -177,3 +177,7 @@ Cua Cloud Fleets、E2B、Daytona、その他 provider は、compatible provider/
 - CUMG positioning: [`V2_POSITIONING.ja.md`](V2_POSITIONING.ja.md)
 - Execution-environment boundary: [`V2_EXECUTION_ENVIRONMENT_BOUNDARY.ja.md`](V2_EXECUTION_ENVIRONMENT_BOUNDARY.ja.md)
 - Threat model: [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md)
+
+## Managed-job capability split (#106)
+
+v0.6 managed job では `ManagedJobControl` を独立した exact Dangerous capability、`ManagedJobObserve` を独立した exact Observe capability とします。`ExecuteProcess`、`Shell`、cwd root、filesystem root、class-only grant からは推論しません。lease renewal は毎回 fresh exact northbound authorization を通します。詳細は [V2_MANAGED_JOBS.ja.md](V2_MANAGED_JOBS.ja.md) を参照してください。

@@ -84,3 +84,7 @@ Linux cgroup v2は、CUMG Agentにproperly delegatedなcgroup subtreeが与え�
 - Apple Service Management: <https://developer.apple.com/documentation/servicemanagement/>
 - Apple launchd daemon/agent guidance: <https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html>
 - Linux cgroup v2: <https://docs.kernel.org/admin-guide/cgroup-v2.html>
+
+## Managed jobs (#106)
+
+managed job もこの Unix process-group baseline を再利用します。OS-wide sandbox へ拡張するものではなく、deliberate `setsid` / service-manager escape を supported にしません。より強い optional Linux cgroup-v2 containment は #267 で追跡します。

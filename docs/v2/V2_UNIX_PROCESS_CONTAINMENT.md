@@ -84,3 +84,7 @@ No released Unix support claim changes from this investigation. The documented c
 - Apple Service Management: <https://developer.apple.com/documentation/servicemanagement/>
 - Apple launchd daemon/agent guidance: <https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html>
 - Linux cgroup v2: <https://docs.kernel.org/admin-guide/cgroup-v2.html>
+
+## Managed jobs (#106)
+
+Managed jobs reuse this Unix process-group baseline. They do not broaden it into an OS-wide sandbox and do not make deliberate `setsid` or service-manager escape supported. Optional stronger Linux cgroup-v2 containment remains tracked by #267.

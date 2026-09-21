@@ -52,12 +52,12 @@ compatibility を維持すること自体が vulnerability を残す security em
 
 ## Schema version は独立管理
 
-project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。v0.5 released baseline は `CONTROL_SCHEMA_VERSION = 10`、capability schema `6`、`DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`、`HUB_AGENT_SCHEMA_VERSION = 6` を pin し、mixed live version は fail closed です。
+project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。v0.5 released baseline は `CONTROL_SCHEMA_VERSION = 10`、capability schema `6`、`DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`、`HUB_AGENT_SCHEMA_VERSION = 6` を pin します。開発中の v0.6 managed-job surface は control schema `11` / capability schema `7` を使い、outer signed envelope は変わらないため `HUB_AGENT_SCHEMA_VERSION` は `6` のままです。mixed live version は fail closed です。
 
 - `CONTROL_SCHEMA_VERSION` は live control-schema compatibility boundary が変わるときに変更;
 - capability-advertisement schema version は live advertisement boundary が変わるときに変更;
 - `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION` と `GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION` は persisted structure を独立に versioning し、future `CONTROL_SCHEMA_VERSION` bump だけを理由に変更しない。persisted structure 自体が変わる場合だけ bump する;
-- historical v0.2.x checkpoint は当時の control schema number を persisted registry / grant-ledger tag に流用していた。runtime restore が support するのは review 済みの v0.2.0 以降の lineage のみで、registry は `2/capability 2`、`3/capability 3`、`4..=6/capability 4`、`7/capability 5`、current `8/capability 6`。grant-ledger tag は独立にversioningします。prototype tag `1`、unknown/future tag、不可能な control/capability pairing は fail closed;
+- historical v0.2.x checkpoint は当時の control schema number を persisted registry / grant-ledger tag に流用していた。runtime restore が support するのは review 済みの v0.2.0 以降の lineage のみで、registry は `2/capability 2`、`3/capability 3`、`4..=6/capability 4`、`7/capability 5`、released v0.5 の `8/capability 6`、current v0.6 の `8/capability 7`。grant-ledger tag は独立にversioningします。prototype tag `1`、unknown/future tag、不可能な control/capability pairing は fail closed;
 - migration 時に historical capability advertisement を live authority へ昇格させない。Hub は historical pairing を検証し、device identity / generation を restore した上で device を offline にし、dispatch 前に current live schema の fresh Agent advertisement を要求する;
 - crate release だけを理由に schema version を自動 increment しない;
 - schema change から算術的に crate version を決めず、public compatibility impact に応じて PATCH/MINOR rule を使う。
