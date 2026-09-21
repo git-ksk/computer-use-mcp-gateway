@@ -77,6 +77,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Install Node 22 (Windows regression coverage)
+        if: runner.os == 'Windows'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
       - name: Windows supervisor rapid-exit backoff
         if: runner.os == 'Windows'
         shell: pwsh
@@ -97,6 +103,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: cargo test --locked --lib windows_reparse_replacement_cannot_escape_capability_root
+
+      - name: Windows Node/npm CSPRNG regression (#308)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo test --locked --lib windows_shell_node_crypto_initializes_with_minimal_systemroot_inheritance
+          cargo test --locked --lib windows_shell_npm_starts_repeatedly_with_minimal_systemroot_inheritance
 
       - name: Install Cua runtime dependencies (Linux)
         if: runner.os == 'Linux'
