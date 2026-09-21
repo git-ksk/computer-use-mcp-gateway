@@ -44,6 +44,8 @@ struct Args {
     cua_command: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_CUA_BACKEND_VERSION")]
     expected_cua_version: Option<String>,
+    #[arg(long)]
+    cua_tool_timeout_secs: Option<u64>,
     #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
     mutation_authority_dir: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
@@ -94,6 +96,13 @@ fn main() -> ExitCode {
         "CUMG_V2_CUA_BACKEND_VERSION",
     )
     .filter(|value| safe_version(value));
+    let agent_cua_tool_timeout_secs = read_launchd_environment(
+        &home,
+        &args.agent_launchd_label,
+        "CUMG_V2_CUA_TOOL_TIMEOUT_SECS",
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value > 0);
     let agent_mutation = read_launchd_environment(
         &home,
         &args.agent_launchd_label,
@@ -107,6 +116,10 @@ fn main() -> ExitCode {
         .or(agent_cua)
         .or_else(|| fallback_cua.is_file().then_some(fallback_cua));
     let expected_cua_version = args.expected_cua_version.or(agent_cua_version);
+    let cua_tool_timeout_secs = args
+        .cua_tool_timeout_secs
+        .or(agent_cua_tool_timeout_secs)
+        .unwrap_or(30);
     let mutation_authority_dir = args
         .mutation_authority_dir
         .or(agent_mutation)
@@ -140,6 +153,7 @@ fn main() -> ExitCode {
             .or_else(|| Some(root.join("v2/trust/tls-root.der"))),
         cua_command,
         expected_cua_version,
+        cua_tool_timeout_secs,
         mutation_authority_dir,
         handoff_control_socket: handoff_control_socket.clone(),
         maintenance_job_exclude_label: None,

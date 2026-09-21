@@ -504,6 +504,7 @@ impl AgentEphemeralDataStore {
         limits: AgentEphemeralDataLimits,
     ) -> Result<Self, AgentEphemeralDataError> {
         validate_agent_limits(limits)?;
+        prepare_private_storage_parent(storage_parent)?;
         let root = storage_parent.join(EPHEMERAL_DATA_CHILD);
         remove_private_root(&root)?;
         fs::create_dir_all(&root).map_err(|_| AgentEphemeralDataError::Io)?;
@@ -861,6 +862,51 @@ fn prove_private_regular_file(
     Ok(())
 }
 
+fn prepare_private_storage_parent(parent: &Path) -> Result<(), AgentEphemeralDataError> {
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(AgentEphemeralDataError::InvalidPrivateRoot);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent).map_err(|_| AgentEphemeralDataError::Io)?;
+            harden_directory_permissions(parent).map_err(|_| AgentEphemeralDataError::Io)?;
+        }
+        Err(_) => return Err(AgentEphemeralDataError::Io),
+    }
+
+    let metadata =
+        fs::symlink_metadata(parent).map_err(|_| AgentEphemeralDataError::InvalidPrivateRoot)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AgentEphemeralDataError::InvalidPrivateRoot);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(AgentEphemeralDataError::InvalidPrivateRoot);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(AgentEphemeralDataError::InvalidPrivateRoot);
+        }
+        crate::v2_windows_acl::validate_acl(
+            parent,
+            crate::v2_windows_acl::AclSubject::ParentDirectory,
+        )
+        .map_err(|_| AgentEphemeralDataError::InvalidPrivateRoot)?;
+    }
+
+    Ok(())
+}
+
 fn remove_private_root(root: &Path) -> Result<(), AgentEphemeralDataError> {
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
@@ -1170,6 +1216,7 @@ mod tests {
     fn agent_store_reads_bounded_ranges_and_fences_bindings() {
         let state = temp_state("range");
         fs::create_dir_all(&state).unwrap();
+        harden_directory_permissions(&state).unwrap();
         let limits = AgentEphemeralDataLimits {
             max_objects: 4,
             max_total_bytes: 32,
@@ -1309,6 +1356,7 @@ mod tests {
     fn agent_store_enforces_quotas_and_prunes_expiry() {
         let state = temp_state("quota");
         fs::create_dir_all(&state).unwrap();
+        harden_directory_permissions(&state).unwrap();
         let limits = AgentEphemeralDataLimits {
             max_objects: 2,
             max_total_bytes: 6,
@@ -1339,10 +1387,43 @@ mod tests {
         let _ = fs::remove_dir_all(state);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_store_rejects_non_private_configured_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = temp_state("unsafe-parent");
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            AgentEphemeralDataStore::new(&state, AgentEphemeralDataLimits::default()),
+            Err(AgentEphemeralDataError::InvalidPrivateRoot)
+        ));
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn agent_store_cleanup_removes_only_fixed_child() {
+        let state = temp_state("fixed-child-cleanup");
+        fs::create_dir_all(&state).unwrap();
+        harden_directory_permissions(&state).unwrap();
+        let sibling = state.join("operator-owned-sibling");
+        fs::write(&sibling, b"keep").unwrap();
+        {
+            let _store =
+                AgentEphemeralDataStore::new(&state, AgentEphemeralDataLimits::default()).unwrap();
+            assert!(state.join(EPHEMERAL_DATA_CHILD).is_dir());
+        }
+        assert!(!state.join(EPHEMERAL_DATA_CHILD).exists());
+        assert_eq!(fs::read(&sibling).unwrap(), b"keep");
+        let _ = fs::remove_dir_all(state);
+    }
+
     #[test]
     fn agent_restart_removes_orphaned_ephemeral_bytes() {
         let state = temp_state("restart");
         fs::create_dir_all(&state).unwrap();
+        harden_directory_permissions(&state).unwrap();
         let limits = AgentEphemeralDataLimits {
             max_objects: 4,
             max_total_bytes: 64,
@@ -1373,6 +1454,7 @@ mod tests {
     fn repeated_stage_prune_cycles_stay_bounded() {
         let state = temp_state("soak");
         fs::create_dir_all(&state).unwrap();
+        harden_directory_permissions(&state).unwrap();
         let limits = AgentEphemeralDataLimits {
             max_objects: 8,
             max_total_bytes: 64,
@@ -1402,6 +1484,7 @@ mod tests {
     fn debug_and_errors_do_not_expose_locator_or_private_path() {
         let state = temp_state("redaction");
         fs::create_dir_all(&state).unwrap();
+        harden_directory_permissions(&state).unwrap();
         let limits = AgentEphemeralDataLimits {
             max_objects: 2,
             max_total_bytes: 16,

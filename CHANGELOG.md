@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.5.0 — release candidate (unreleased)
+
+Least-privilege Workspace release candidate. `v0.4.0` remains the latest published tag until the dedicated v0.5.0 release publication step is completed.
+
+### Workspace and least privilege
+
+- live schemas are pinned to control **10**, capability advertisement **6**, persisted device registry **8**, and Hub-Agent transport **6**; the reviewed registry migration accepts historical pairings `2/2`, `3/3`, `4..6/4`, `7/5`, and current `8/6`, while impossible or mixed live versions fail closed;
+- bounded filesystem observation, retrievable truncated process/shell output, and atomic workspace mutation are exact capabilities rather than extensions of generic shell authority (#105/#83/#107);
+- workspace mutation defaults to disabled and is advertised only when an explicit mutation executor exists; enabling it requires an explicit allowed write root, deny paths remain deny-wins, and cwd/read roots never become write roots by fallback;
+- Agent ephemeral bytes are private, bounded, non-authoritative, outside authoritative state/rollback trees, and excluded from rollback assets.
+
+### Execution budget and ambiguity
+
+- the reviewed packaged Cua timeout remains **30 s** and the conservative effective execution budget is **24 s** for duration-bearing commands;
+- impossible paced input is rejected before backend dispatch as terminal/retry-safe; a real post-dispatch backend timeout remains `Indeterminate`, quarantines the device, and is never automatically retried or replayed (#319);
+- the Hub-Agent schema bump to 6 covers the signed payload-free `IndeterminateAck` / backend-timeout cause evidence added after v0.4.0 without turning that evidence into completion or replay authority.
+
+### Guided recovery lifecycle
+
+- guided recovery plan schema **v3** makes the interactive Human review challenge-scoped: expiry or exact binding/generation rollover invalidates the old prompt and stale selection context, requires a fresh signed review plus a fresh Human choice, and never carries an unsigned historical assertion across challenges (#323);
+- pre-auth stale review explicitly reports that user-presence authentication did not start and leaves authorization unpublished, quarantine retained, and the old operation unreplayed; challenge identity is re-checked immediately before signing and before authorization publication;
+- terminal guided recovery still requires the exact durable Hub acknowledgement and now makes recovery completion, exact quarantine clearance, effectful-execution readiness, normal recovery mode, and `old_operation_replayed=false` explicit.
+
+### Packaging, upgrade, and runtime identity
+
+- release-manifest schema **v3** records exact Hub-Agent/control/capability schemas, package/source identity, platform/architecture, and closed file digests;
+- installed runtime-manifest schema **v4** records the same three nested schema identities plus exact source/package/binary hashes; `v2_doctor` rejects any individual nested-schema mismatch as `runtime_manifest / invalid_schema_or_identity`;
+- macOS generic LaunchAgent, single-Mac LaunchAgent, Linux env, and Windows reviewed config all carry an explicit ephemeral parent and explicit workspace-mutation default of disabled;
+- v0.4 -> v0.5 upgrade migration preserves least privilege: missing mutation mode migrates to disabled only when no write policy exists, inconsistent configuration fails closed, and ephemeral data is never promoted into authoritative backup/rollback state;
+- Windows paired-upgrade preflight requires a dedicated ephemeral parent, validates mutation mode and absolute write policy, and keeps ephemeral content out of rollback backups.
+
+### Acceptance boundary
+
+- macOS physical Cua acceptance for the execution-budget hardening was already completed under #319;
+- Linux/Windows release-candidate, packaging, upgrade, and capability-advertisement checks are automated evidence and are not represented as new physical Cua smoke results;
+- `Indeterminate`, quarantine, no-auto-replay, payload/path/text-free diagnostics, exact capability authorization, and mixed-version fail-closed behavior remain unchanged security invariants.
+
+
 ## v0.4.0 — 2026-09-19
 
 V2 Recovery, Identity & Semantic Authorization release. This release consolidates the post-v0.3 recovery/reconciliation hardening, provider-neutral multi-principal identity, and narrow typed semantic authorization into one reviewed minor release without widening unaccepted platform/provider support claims.

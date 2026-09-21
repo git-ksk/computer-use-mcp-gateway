@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 9;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 5;
+pub const CONTROL_SCHEMA_VERSION: u16 = 10;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 6;
 /// First dedicated persisted registry schema. The numeric value intentionally
 /// matches the last historical control schema that was written into this field,
 /// so current rollback binaries can still read newly persisted checkpoints.
-pub const DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+pub const DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION: u16 = 8;
 /// First dedicated persisted grant-ledger schema; see the registry note above.
 pub const GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
 pub const MAX_GRANT_LIFETIME_MS: u64 = 5 * 60 * 1000;
@@ -1012,14 +1012,15 @@ impl DeviceRegistry {
             return Self::from_snapshot(snapshot);
         }
 
-        // Registry schema 7 was already persisted while capability schema 4 was
-        // current. Treat that exact historical pairing like the older persisted
-        // formats: validate it, discard stale capability advertisements, and
-        // require the Agent to advertise the current schema after reconnect.
+        // Historical persisted registry/capability pairings are exact. Validate
+        // the pairing before discarding stale capability advertisements so a
+        // checkpoint can never be reinterpreted under a different capability
+        // schema after upgrade.
         let expected_capability_schema = match snapshot.schema_version {
             2 => 2,
             3 => 3,
-            4..=DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION => 4,
+            4..=6 => 4,
+            7 => 5, // released v0.4.0
             got => return Err(ControlError::UnsupportedControlSchema { got }),
         };
         for device in &snapshot.devices {
@@ -3145,7 +3146,7 @@ mod tests {
         let current = registry.snapshot();
 
         for (legacy_schema, legacy_capability_schema) in
-            [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4), (7, 4)]
+            [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4), (7, 5)]
         {
             let mut legacy = current.clone();
             legacy.schema_version = legacy_schema;

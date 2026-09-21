@@ -249,7 +249,11 @@ desktop では別の outbound Agent を実行します。
 cargo run --locked --bin v2_agent -- --help
 ```
 
-Hub endpoint/domain、stable device ID、device secret、Hub/grant public key、TLS root、state directory、process/shell 用 cwd root、read-only filesystem 用の別 root を設定します。`CUMG_V2_ALLOWED_CWD_ROOTS` は process/shell working directory だけ、`CUMG_V2_ALLOWED_FILE_ROOTS` は `ReadFile`/`ListDirectory` だけを制御し、cwd から file root への暗黙 fallback はありません。旧設定から upgrade して同じ read behavior を維持したい場合は、旧 cwd root list を新 file-root setting へ明示的にコピーして startup を確認した後、file root を独立して狭めます。file root の未設定/空設定は read authority を広げず Agent startup を fail closed します。GUI capability に Cua を使う場合は次を設定します。
+Hub endpoint/domain、stable device ID、device secret、Hub/grant public key、TLS root、state directory、process/shell 用 cwd root、read-only filesystem 用の別 root を設定します。`CUMG_V2_ALLOWED_CWD_ROOTS` は process/shell working directory だけ、`CUMG_V2_ALLOWED_FILE_ROOTS` は `ReadFile`/`ListDirectory` だけを制御し、cwd から file root への暗黙 fallback はありません。旧設定から upgrade して同じ read behavior を維持したい場合は、旧 cwd root list を新 file-root setting へ明示的にコピーして startup を確認した後、file root を独立して狭めます。file root の未設定/空設定は read authority を広げず Agent startup を fail closed します。
+
+v0.5 workspace boundary では `CUMG_V2_EPHEMERAL_DATA_PARENT` を authoritative state/rollback tree の外にある dedicated private parent に設定し、mutation を deliberate に有効化しない限り `CUMG_V2_WORKSPACE_MUTATION_MODE=disabled` とします。mutation を enabled にする場合は少なくとも1つの explicit `CUMG_V2_ALLOWED_WRITE_ROOTS` が必須で、optional `CUMG_V2_DENIED_WRITE_SUBPATHS` は deny-wins です。cwd root / read-only file root から write authority への fallback はありません。reviewed packaged profile は explicit ephemeral parent と mutation disabled default を持ち、retained ephemeral bytes は non-authoritative / rollback 対象外です。
+
+GUI capability に Cua を使う場合は次を設定します。
 
 ```text
 CUMG_V2_CUA_COMMAND=cua-driver
@@ -257,7 +261,7 @@ CUMG_V2_CUA_ARGS=mcp
 CUMG_V2_CUA_BACKEND_VERSION=0.19.3
 ```
 
-Cua は Agent の背後に MCP stdio で配置します。production では `CUMG_V2_CUA_BACKEND_VERSION` を exact reviewed compatibility target に設定してください。concrete value を設定すると、Agent は connection / reconnect ごとに Cua MCP handshake の `serverInfo.version` を verify し、drift した場合は fail closed します。default の `external` は custom deployment 用の explicit unpinned mode であり、reviewed Cua path の recommended production setting ではありません。macOS では Agent/Cua を logged-in user session 内に置き、TCC prompt を bypass したり、GUI automation を headless system daemon に移したりしないでください。
+reviewed packaged Cua tool timeout は30秒で、duration-bearing command の conservative effective execution budget は24秒です。configured timeout が minimum paced-input contract を満たせない場合、`v2_doctor` は execution-budget error を報告します。unrelated capability の deadline は広げません。\n\nCua は Agent の背後に MCP stdio で配置します。production では `CUMG_V2_CUA_BACKEND_VERSION` を exact reviewed compatibility target に設定してください。concrete value を設定すると、Agent は connection / reconnect ごとに Cua MCP handshake の `serverInfo.version` を verify し、drift した場合は fail closed します。default の `external` は custom deployment 用の explicit unpinned mode であり、reviewed Cua path の recommended production setting ではありません。macOS では Agent/Cua を logged-in user session 内に置き、TCC prompt を bypass したり、GUI automation を headless system daemon に移したりしないでください。
 
 ## 9. remote exposure の前に確認する
 

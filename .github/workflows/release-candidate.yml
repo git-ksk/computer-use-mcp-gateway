@@ -84,6 +84,18 @@ jobs:
           )"
           source_commit="$(git rev-parse HEAD)"
           architecture="$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          read -r control_schema capability_schema < <(python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("src/v2_m0.rs").read_text(encoding="utf-8")
+          values = []
+          for name in ("CONTROL_SCHEMA_VERSION", "CAPABILITY_SCHEMA_VERSION"):
+              match = re.search(rf"pub const {name}: u16 = ([0-9]+);", text)
+              if not match:
+                  raise SystemExit(2)
+              values.append(match.group(1))
+          print(*values)
+          PY
+          )
           hub_agent_schema="$(python3 - <<'PY'
           import pathlib, re
           text = pathlib.Path("src/v2_m0_transport.rs").read_text(encoding="utf-8")
@@ -102,6 +114,8 @@ jobs:
           printf 'SOURCE_COMMIT=%s\n' "$source_commit" >> "$GITHUB_ENV"
           printf 'CANDIDATE_ARCH=%s\n' "$architecture" >> "$GITHUB_ENV"
           printf 'HUB_AGENT_SCHEMA_VERSION=%s\n' "$hub_agent_schema" >> "$GITHUB_ENV"
+          printf 'CONTROL_SCHEMA_VERSION=%s\n' "$control_schema" >> "$GITHUB_ENV"
+          printf 'CAPABILITY_SCHEMA_VERSION=%s\n' "$capability_schema" >> "$GITHUB_ENV"
 
       - name: Build self-contained single-Mac payload
         if: runner.os == 'macOS'
@@ -149,6 +163,8 @@ jobs:
             --platform "${{ matrix.platform }}"
             --architecture "$CANDIDATE_ARCH"
             --hub-agent-schema-version "$HUB_AGENT_SCHEMA_VERSION"
+            --control-schema-version "$CONTROL_SCHEMA_VERSION"
+            --capability-schema-version "$CAPABILITY_SCHEMA_VERSION"
           )
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             args+=(--paired-handoff-commit "$HANDOFF_SOURCE_COMMIT" --payload-dir artifact-payload)

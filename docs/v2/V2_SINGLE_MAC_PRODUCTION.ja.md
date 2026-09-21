@@ -108,7 +108,7 @@ signing は exact 40-hex `CUMG_V2_MACOS_CODESIGN_FINGERPRINT` を優先します
 4. old binaries/config、Handoff env、helper copy、runtime dependency を含む self-contained old Handoff generation を private rollback bundle に保存。dependency が欠けた archive は external-runtime reference のまま扱い、その runtime の cleanup を許可しない。authoritative Hub/Agent state は drain 後だけ保存;
 5. Hub を先に signal して admission close/drain、Hub/Agent/signer unload 後、alternate の既知 Hub/Agent label を plist を削除せず bootout + disable し、stopped quarantine を再確認;
 6. stopped 状態で private Handoff env と Agent plist を staged generation へ atomic retarget し、paired CUMG binaries を atomic replace;
-7. merged CUMG source commit、exact Hub/Agent application-schema version、package version、binary SHA-256 を持つ schema 3 `runtime-manifest.json` を作成;
+7. merged CUMG source commit、exact Hub/Agent・control・capability schema version、package version、binary SHA-256 を持つ schema 4 `runtime-manifest.json` を作成;
 8. signer -> Hub -> Agent で起動し、既知 launchd family の競合がないことを再確認してから read-only Handoff status を含む `v2_doctor` を実行;
 9. doctor healthy の後だけ、eligible な未参照 `runtime-*` code directory を prune。active runtime、legacy external rollback reference、bounded recent generations、symlink/unsafe candidate は保護または拒否。checkpoint/key/env/audit/control/rollback data は cleanup candidate 外。
 
@@ -144,7 +144,7 @@ JSON schema v1 が stable machine-readable contract です。overall operator st
 
 `v2_status` は composition-only です。ある lane の `ready` は別 lane の authorization ではなく、quarantine resolve、mutation authority switch、Handoff resume/cancel、upgrade retry/resume、operation replay はできません。`review_incident` は #233 incident-brief、`complete_recovery` は既存の explicit Handoff/recovery flow、`inspect_upgrade` は `v2_maint upgrade-status`、configuration/backend code は `v2_doctor` または backend diagnostics へ進むための案内です。evidence が unknown/mismatch の場合は `unknown` / `unavailable` / `action_required` に fail closed し、healthy と推測しません。
 
-runtime section は incident 前に3つの read-only compatibility signal も返します: `runtime_pairing=compatible|skewed|unknown`、`operator_tooling=compatible|stale|unavailable|unknown`、`checkpoint_reader_compatibility=compatible|incompatible|unknown` です。runtime pairing は owner-private な schema-3 manifest、installed Hub/Agent/operator binary の exact SHA-256 identity、さらに直接起動された `v2_status` / `v2_doctor` では実際に実行中の executable digest から導出します。checkpoint reader check は authoritative Hub checkpoint の bounded schema metadata だけを読み、state を変更しません。skew/stale、checkpoint より明示的に古い reader、または pairing evidence 不明の場合、`v2_status` は `next_action=inspect_upgrade` を返します。authority-bearing recovery の前に durable upgrade status を確認し、review済み version-paired runtime を復元してください。source checkout の新しい `v2_maint` だけを古い install へコピーする ad-hoc repair は support しません。
+runtime section は incident 前に3つの read-only compatibility signal も返します: `runtime_pairing=compatible|skewed|unknown`、`operator_tooling=compatible|stale|unavailable|unknown`、`checkpoint_reader_compatibility=compatible|incompatible|unknown` です。runtime pairing は owner-private な schema-4 manifest、installed Hub/Agent/operator binary の exact SHA-256 identity、さらに直接起動された `v2_status` / `v2_doctor` では実際に実行中の executable digest から導出します。checkpoint reader check は authoritative Hub checkpoint の bounded schema metadata だけを読み、state を変更しません。skew/stale、checkpoint より明示的に古い reader、または pairing evidence 不明の場合、`v2_status` は `next_action=inspect_upgrade` を返します。authority-bearing recovery の前に durable upgrade status を確認し、review済み version-paired runtime を復元してください。source checkout の新しい `v2_maint` だけを古い install へコピーする ad-hoc repair は support しません。
 
 macOS online-recovery provider では `recovery.key_readiness` も `ready` / `unprovisioned` / `sealed_key_missing` / `hub_verifier_missing` / `public_key_mismatch` / `helper_unavailable` / `readiness_unknown`（他platformでは `unsupported`）を返します。このcheckはstrictly read-onlyで、keyのcreate/rotateやsign/user-presence operationは実行しません。local sealed representationが存在する場合だけ、runtime manifestでexact identityをverify済みのinstalled `v2_recovery_enclave_helper public` を実行し、その公開鍵をHub verifierとlocal比較します。`unprovisioned` は通常/offline operationを壊しませんが `recovery.key_next_action=provision_recovery` を表示します。partial provisioning/helper failureは同じremediation付きdegraded、public-key mismatchはaction-requiredです。修復はexplicit `v2_recover init-key` とreviewed public-verifier transferで行い、diagnosticはtrustを自動修復しません。
 
@@ -160,7 +160,7 @@ durable blocking operation が存在する場合、supported effectful lane は 
 
 standard profile では次を確認します。
 
-- runtime manifest schema 3、exact Hub/Agent application-schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_status` / `v2_recover` / `v2_recovery_enclave_helper` / `v2_grant_signer` の exact SHA-256 identity;
+- runtime manifest schema 4、exact Hub/Agent・control・capability schema version、source commit、`v2_hub` / `v2_agent` / `v2_maint` / `v2_doctor` / `v2_status` / `v2_recover` / `v2_recovery_enclave_helper` / `v2_grant_signer` の exact SHA-256 identity;
 - authoritative Hub checkpoint の readability と current registry/capability schema;
 - macOS online-recovery readiness: local sealed-key presence、exact manifest-verified helper availability、user-presence promptなしでのHub verifierとのpublic-key一致;
 - enrolled single-Mac device が 1 台だけであることと current generation;
@@ -189,7 +189,7 @@ single-Mac upgrade を healthy とする前に最低限次を満たします。
 - `v2_doctor` が `overall=healthy`;
 - restart 後に fresh authenticated Agent generation がある;
 - live quarantine が 0 のまま;
-- schema-3 runtime manifest が installed paired binary と exact Hub/Agent application schema を verify;
+- schema-4 runtime manifest が installed paired binary と exact Hub/Agent・control・capability schema を verify;
 - Handoff が recovery/resume/fault なしの idle;
 - harmless northbound semantic smoke が durable terminal `Completed` に到達;
 - operator-selected bake period が終わるまで old binary/state rollback pair を保持。

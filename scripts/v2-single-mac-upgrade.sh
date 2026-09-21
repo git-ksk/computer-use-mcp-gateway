@@ -60,6 +60,8 @@ ARTIFACT_MODE=0
 ARTIFACT_TMP=""
 ARTIFACT_PACKAGE_VERSION=""
 ARTIFACT_HUB_AGENT_SCHEMA_VERSION=""
+ARTIFACT_CONTROL_SCHEMA_VERSION=""
+ARTIFACT_CAPABILITY_SCHEMA_VERSION=""
 if [[ -n "$ARTIFACT_BUNDLE" ]]; then
   ARTIFACT_MODE=1
   ARTIFACT_BUNDLE="$(python3 - "$ARTIFACT_BUNDLE" <<'PYRESOLVE'
@@ -81,6 +83,8 @@ for k,v in {
  'HANDOFF_HEAD':m.get('paired_handoff_commit'),
  'ARTIFACT_PACKAGE_VERSION':str(m.get('package_version','')),
  'ARTIFACT_HUB_AGENT_SCHEMA_VERSION':str(m.get('hub_agent_schema_version','')),
+ 'ARTIFACT_CONTROL_SCHEMA_VERSION':str(m.get('control_schema_version','')),
+ 'ARTIFACT_CAPABILITY_SCHEMA_VERSION':str(m.get('capability_schema_version','')),
  'ARTIFACT_ARCHITECTURE':str(m.get('architecture','')),
 }.items():
     if not isinstance(v,str) or not v: raise SystemExit(3)
@@ -137,6 +141,7 @@ trap cleanup_artifact_tmp EXIT
 
 ROOT="${CUMG_V2_INSTALL_ROOT:-$HOME/Library/Application Support/computer-use-mcp-gateway}"
 RUN_ROOT="${CUMG_V2_RUN_ROOT:-$HOME/Library/Caches/cumg-v2}"
+EPHEMERAL_DATA_PARENT="$RUN_ROOT/agent-ephemeral"
 BIN_DIR="$ROOT/bin"
 RECOVERY_UPGRADE_MODE=0
 if [[ -n "$PRESERVE_QUARANTINE_OPERATION_ID" ]]; then
@@ -326,6 +331,98 @@ PYFILEROOTS
     exit 2
   }
 fi
+
+CURRENT_EPHEMERAL_DATA_PARENT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_EPHEMERAL_DATA_PARENT' "$AGENT_PLIST" 2>/dev/null || true)"
+EPHEMERAL_DATA_PARENT_MIGRATION=0
+if [[ -z "$CURRENT_EPHEMERAL_DATA_PARENT" ]]; then
+  EPHEMERAL_DATA_PARENT_MIGRATION=1
+elif [[ "$CURRENT_EPHEMERAL_DATA_PARENT" != "$EPHEMERAL_DATA_PARENT" ]]; then
+  echo "REFUSED reason=agent_ephemeral_data_parent_mismatch" >&2
+  exit 2
+fi
+
+CURRENT_WORKSPACE_MUTATION_MODE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_WORKSPACE_MUTATION_MODE' "$AGENT_PLIST" 2>/dev/null || true)"
+CURRENT_ALLOWED_WRITE_ROOTS="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_ALLOWED_WRITE_ROOTS' "$AGENT_PLIST" 2>/dev/null || true)"
+CURRENT_DENIED_WRITE_SUBPATHS="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_DENIED_WRITE_SUBPATHS' "$AGENT_PLIST" 2>/dev/null || true)"
+WORKSPACE_MUTATION_MODE_MIGRATION=0
+if [[ -z "$CURRENT_WORKSPACE_MUTATION_MODE" ]]; then
+  if [[ -n "$CURRENT_ALLOWED_WRITE_ROOTS" || -n "$CURRENT_DENIED_WRITE_SUBPATHS" ]]; then
+    echo "REFUSED reason=workspace_mutation_mode_missing_with_existing_policy" >&2
+    exit 2
+  fi
+  WORKSPACE_MUTATION_MODE_MIGRATION=1
+  CURRENT_WORKSPACE_MUTATION_MODE="disabled"
+fi
+case "$CURRENT_WORKSPACE_MUTATION_MODE" in
+  disabled)
+    [[ -z "$CURRENT_ALLOWED_WRITE_ROOTS" && -z "$CURRENT_DENIED_WRITE_SUBPATHS" ]] || {
+      echo "REFUSED reason=workspace_mutation_disabled_with_policy" >&2
+      exit 2
+    }
+    ;;
+  enabled)
+    [[ -n "$CURRENT_ALLOWED_WRITE_ROOTS" ]] || {
+      echo "REFUSED reason=workspace_mutation_enabled_without_write_root" >&2
+      exit 2
+    }
+    python3 - "$CURRENT_ALLOWED_WRITE_ROOTS" "$CURRENT_DENIED_WRITE_SUBPATHS" <<'PYWRITEROOTS' || {
+import pathlib, sys
+for group in sys.argv[1:]:
+    if not group:
+        continue
+    for raw in group.split(","):
+        value = raw.strip()
+        if not value or not pathlib.Path(value).is_absolute():
+            raise SystemExit(2)
+PYWRITEROOTS
+      echo "REFUSED reason=workspace_mutation_policy_invalid" >&2
+      exit 2
+    }
+    ;;
+  *)
+    echo "REFUSED reason=workspace_mutation_mode_invalid" >&2
+    exit 2
+    ;;
+esac
+
+python3 - "$ROOT" "$EPHEMERAL_DATA_PARENT" <<'PYEPHEMERAL' || {
+import pathlib, sys
+root = pathlib.Path(sys.argv[1]).expanduser().resolve(strict=False)
+parent = pathlib.Path(sys.argv[2]).expanduser().resolve(strict=False)
+for excluded in (root / "v2/state", root / "rollback"):
+    excluded = excluded.resolve(strict=False)
+    if parent == excluded or excluded in parent.parents:
+        raise SystemExit(2)
+PYEPHEMERAL
+  echo "REFUSED reason=agent_ephemeral_data_parent_inside_authoritative_tree" >&2
+  exit 2
+}
+if [[ -e "$EPHEMERAL_DATA_PARENT" ]]; then
+  [[ -d "$EPHEMERAL_DATA_PARENT" && ! -L "$EPHEMERAL_DATA_PARENT" ]] || {
+    echo "REFUSED reason=agent_ephemeral_data_parent_unsafe" >&2
+    exit 2
+  }
+else
+  mkdir -p "$EPHEMERAL_DATA_PARENT" || {
+    echo "REFUSED reason=agent_ephemeral_data_parent_create_failed" >&2
+    exit 2
+  }
+fi
+chmod 700 "$EPHEMERAL_DATA_PARENT" || {
+  echo "REFUSED reason=agent_ephemeral_data_parent_permissions_failed" >&2
+  exit 2
+}
+python3 - "$EPHEMERAL_DATA_PARENT" <<'PYEPHEMERALMODE' || {
+import pathlib, stat, sys
+path = pathlib.Path(sys.argv[1])
+info = path.lstat()
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+    raise SystemExit(2)
+PYEPHEMERALMODE
+  echo "REFUSED reason=agent_ephemeral_data_parent_unsafe" >&2
+  exit 2
+}
+
 HANDOFF_ENV_FILE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CUMG_V2_HANDOFF_RUNTIME_ENV_FILE' "$AGENT_PLIST" 2>/dev/null || true)"
 [[ "$HANDOFF_ENV_FILE" == /* && -f "$HANDOFF_ENV_FILE" && ! -L "$HANDOFF_ENV_FILE" ]] || {
   echo "REFUSED reason=agent_handoff_runtime_env_missing_or_unsafe" >&2; exit 2;
@@ -1151,6 +1248,20 @@ if [[ "$ALLOWED_FILE_ROOTS_MIGRATION" == "1" ]]; then
     exit 2
   fi
 fi
+if [[ "$EPHEMERAL_DATA_PARENT_MIGRATION" == "1" ]]; then
+  if ! plutil -insert EnvironmentVariables.CUMG_V2_EPHEMERAL_DATA_PARENT -string "$EPHEMERAL_DATA_PARENT" "$AGENT_PLIST"; then
+    restore_preinstall_profile
+    echo "REFUSED reason=agent_ephemeral_data_parent_update_failed rollback=$ROLLBACK" >&2
+    exit 2
+  fi
+fi
+if [[ "$WORKSPACE_MUTATION_MODE_MIGRATION" == "1" ]]; then
+  if ! plutil -insert EnvironmentVariables.CUMG_V2_WORKSPACE_MUTATION_MODE -string "disabled" "$AGENT_PLIST"; then
+    restore_preinstall_profile
+    echo "REFUSED reason=agent_workspace_mutation_mode_update_failed rollback=$ROLLBACK" >&2
+    exit 2
+  fi
+fi
 
 install_atomic() {
   local source="$1" destination="$2" tmp
@@ -1167,8 +1278,22 @@ done
 if [[ "$ARTIFACT_MODE" == "1" ]]; then
   PACKAGE_VERSION="$ARTIFACT_PACKAGE_VERSION"
   HUB_AGENT_SCHEMA_VERSION="$ARTIFACT_HUB_AGENT_SCHEMA_VERSION"
+  CONTROL_SCHEMA_VERSION="$ARTIFACT_CONTROL_SCHEMA_VERSION"
+  CAPABILITY_SCHEMA_VERSION="$ARTIFACT_CAPABILITY_SCHEMA_VERSION"
 else
   PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"]=="computer-use-mcp-gateway"))')"
+  read -r CONTROL_SCHEMA_VERSION CAPABILITY_SCHEMA_VERSION < <(python3 - "$REPO_ROOT/src/v2_m0.rs" <<'PYSCHEMA'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+values = []
+for name in ("CONTROL_SCHEMA_VERSION", "CAPABILITY_SCHEMA_VERSION"):
+    match = re.search(rf'pub const {name}: u16 = ([0-9]+);', text)
+    if not match:
+        raise SystemExit(2)
+    values.append(match.group(1))
+print(*values)
+PYSCHEMA
+  ) || { echo "REFUSED reason=nested_schema_unavailable" >&2; exit 2; }
   HUB_AGENT_SCHEMA_VERSION="$(python3 - "$REPO_ROOT/src/v2_m0_transport.rs" <<'PYSCHEMA'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
@@ -1180,9 +1305,9 @@ PYSCHEMA
   )" || { echo "REFUSED reason=hub_agent_schema_unavailable" >&2; exit 2; }
 fi
 MANIFEST_TMP="$ROOT/runtime-manifest.json.new.$$"
-python3 - "$HEAD" "$PACKAGE_VERSION" "$HUB_AGENT_SCHEMA_VERSION" "$BIN_DIR" > "$MANIFEST_TMP" <<'PY'
+python3 - "$HEAD" "$PACKAGE_VERSION" "$HUB_AGENT_SCHEMA_VERSION" "$CONTROL_SCHEMA_VERSION" "$CAPABILITY_SCHEMA_VERSION" "$BIN_DIR" > "$MANIFEST_TMP" <<'PY'
 import hashlib, json, pathlib, sys
-commit, version, hub_agent_schema, bindir = sys.argv[1:]
+commit, version, hub_agent_schema, control_schema, capability_schema, bindir = sys.argv[1:]
 bindir = pathlib.Path(bindir)
 names = ["v2_hub", "v2_agent", "v2_maint", "v2_doctor", "v2_status", "v2_recover", "v2_recovery_enclave_helper", "v2_grant_signer"]
 items = []
@@ -1193,8 +1318,10 @@ for name in names:
             h.update(chunk)
     items.append({"name": name, "sha256": h.hexdigest()})
 print(json.dumps({
-    "schema_version": 3,
+    "schema_version": 4,
     "hub_agent_schema_version": int(hub_agent_schema),
+    "control_schema_version": int(control_schema),
+    "capability_schema_version": int(capability_schema),
     "source_commit": commit,
     "package_version": version,
     "binaries": items,

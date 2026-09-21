@@ -53,7 +53,7 @@ mutation payload は durable recovery にコピーしません。dispatch後にr
 
 ## Release integration
 
-#107 単体では v0.5 release integration を完了しません。#314 が以下を担当します。
+#107 単体では v0.5 release integration を完了せず #314 に委ねました。#314 で以下を統合完了しました。
 
 - control/capability/Hub-Agent schema の最終review/version bump
 - mixed-version fail-closed

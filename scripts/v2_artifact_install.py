@@ -264,8 +264,10 @@ def write_runtime_manifest(root: Path, manifest: dict[str, object]) -> None:
         regular(p)
         records.append({"name": name, "sha256": sha(p)})
     data = {
-        "schema_version": 3,
+        "schema_version": 4,
         "hub_agent_schema_version": manifest["hub_agent_schema_version"],
+        "control_schema_version": manifest["control_schema_version"],
+        "capability_schema_version": manifest["capability_schema_version"],
         "source_commit": manifest["source_commit"],
         "package_version": manifest["package_version"],
         "binaries": records,
@@ -339,7 +341,7 @@ def install(args) -> None:
         if args.preflight_only:
             print(f"ARTIFACT_INSTALL_PREFLIGHT_OK source_commit={manifest['source_commit']} handoff_source_commit={paired}")
             return
-        private_dir(root); private_dir(run_root)
+        private_dir(root); private_dir(run_root); private_dir(run_root / "agent-ephemeral")
         for rel in ("bin", "v2", "v2/state", "v2/state/hub", "v2/state/agent", "v2/handoff", "rollback"):
             private_dir(root / rel)
         copy_provisioning(provisioning, root)
@@ -414,6 +416,8 @@ def inspect(args) -> None:
         "package_version": manifest["package_version"],
         "source_commit": manifest["source_commit"],
         "hub_agent_schema_version": manifest["hub_agent_schema_version"],
+        "control_schema_version": manifest["control_schema_version"],
+        "capability_schema_version": manifest["capability_schema_version"],
         "paired_handoff_commit": manifest["paired_handoff_commit"],
         "install_profile": manifest["install_profile"],
     }, indent=2))

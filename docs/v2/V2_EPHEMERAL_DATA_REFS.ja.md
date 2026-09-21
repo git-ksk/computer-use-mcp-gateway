@@ -31,7 +31,7 @@ foundation は短い TTL と count/byte ceiling を持ちます。expiry 判定�
 
 resource exhaustion は fail closed します。通常の inline output/file limit を引き上げたり、filesystem/process authority を広げたりしません。
 
-Windows を含む packaged deployment では、authoritative Agent state/rollback tree とは別の専用 ephemeral root を作り、その親 directory の reviewed ACL boundary を継承させます。別の ACL authority model をここで増やさず、exact path / ACL / backup exclusion の preflight は v0.5 release integration gate（#314）が担当します。
+Windows を含む packaged deployment では、authoritative Agent state/rollback tree とは別の専用 ephemeral root を作り、その親 directory の reviewed ACL boundary を継承させます。別の ACL authority model をここで増やさず、v0.5 release integration gate（#314）で exact packaged path / ACL・permission preflight / backup exclusion を完了しました。
 
 ## Privacy / observability
 
@@ -53,7 +53,7 @@ stream がこの inline cap を超え、dedicated Agent ephemeral-data parent �
 - offset / length は retained prefix 上の raw-byte offset とし、northbound byte は base64 encode するため、UTF-16 / invalid UTF-8 でも offset semantics は曖昧になりません。
 - `complete=true` は retained prefix が stream 全体を含むことを示し、`complete=false` は stream が 4 MiB ceiling を超え、その後続 byte が意図的に unavailable であることを示します。
 
-dedicated ephemeral-data parent が未設定なら、process/shell execution は従来どおり 16 KiB inline result のみで動作し、live output ref は作りません。packaged path selection、readiness/permission preflight、upgrade/schema integration は #314 の責務です。
+dedicated ephemeral-data parent が未設定なら、process/shell execution は従来どおり 16 KiB inline result のみで動作し、live output ref は作りません。#314 で packaged path selection、readiness/permission preflight、upgrade/schema integration を完了し、retained bytes は non-authoritative / rollback 対象外のままです。
 
 durable `get_operation` が persist するのは従来の bounded inline process/shell result だけです。live public ref、Agent locator、retained extended-output byte は persist しません。
 

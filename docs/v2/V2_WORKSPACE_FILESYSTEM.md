@@ -9,7 +9,7 @@ Issue #105 extends the read-only filesystem lane without granting shell authorit
 - `allowed_file_roots` remain the only observation roots; cwd roots are not inherited.
 - Ambient canonicalization only selects the configured root. The actual target is reopened relative to an already-open `cap_std::fs::Dir`, so the authority proof is capability-rooted rather than canonicalize-then-open by pathname.
 - Symlink/reparse escapes fail closed. Unix replacement-race tests and a Windows junction replacement test cover the shared primitive in `v2_workspace_path`.
-- Residual assumption: configured root paths are operator-controlled startup policy and are not adversarially replaced while `FilesystemPolicy` is being constructed. #105 anchors each accepted root as an open capability for later operations; packaged permissions/ACL preflight for root trust remains #314-owned.
+- Residual assumption: configured root paths are operator-controlled startup policy and are not adversarially replaced while `FilesystemPolicy` is being constructed. #105 anchors each accepted root as an open capability for later operations; #314 integrates the packaged permissions/ACL preflight for root trust.
 - This does not sandbox `ExecuteProcess` or `Shell`; they remain separately authorized Dangerous capabilities.
 
 ## Stateless file ranges
@@ -28,6 +28,6 @@ Raw file contents, requested paths, and continuation values are not added to tel
 
 ## Schema integration
 
-#105 changes typed `DeviceCommand` / `DeviceResult` filesystem shapes but does not independently bump `CONTROL_SCHEMA_VERSION`, `CAPABILITY_SCHEMA_VERSION`, or `HUB_AGENT_SCHEMA_VERSION`. Final migration pairings, mixed-version refusal, packaged readiness, and v0.4.0 -> v0.5.0 upgrade acceptance remain owned by #314.
+#105 changes typed `DeviceCommand` / `DeviceResult` filesystem shapes but does not independently bump `CONTROL_SCHEMA_VERSION`, `CAPABILITY_SCHEMA_VERSION`, or `HUB_AGENT_SCHEMA_VERSION`. #314 completes the final migration pairings, mixed-version refusal, packaged readiness, and v0.4.0 -> v0.5.0 upgrade acceptance with control schema 10 and capability schema 6.
 
 Result/command matching binds file responses to requested offset/byte limits and directory responses to the requested cursor, so mismatched continuation responses are rejected.

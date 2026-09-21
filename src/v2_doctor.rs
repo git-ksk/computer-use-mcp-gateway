@@ -1,8 +1,11 @@
 use crate::mutation_authority::inspect_mutation_authority;
 use crate::v2_execution_safety::EXECUTION_SAFETY_SCHEMA_VERSION;
 use crate::v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control};
-use crate::v2_m0::{CapabilityClass, DeviceCapability};
+use crate::v2_m0::{
+    CAPABILITY_SCHEMA_VERSION, CONTROL_SCHEMA_VERSION, CapabilityClass, DeviceCapability,
+};
 use crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION;
+use crate::v2_m1_backend::{effective_execution_budget_ms, minimum_paced_type_text_budget_ms};
 use crate::v2_m1_persistence::{
     AgentPersistentState, CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION,
 };
@@ -18,6 +21,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const MAX_HASHED_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -55,6 +59,7 @@ pub struct DoctorConfig {
     pub tls_root_certificate: Option<PathBuf>,
     pub cua_command: Option<PathBuf>,
     pub expected_cua_version: Option<String>,
+    pub cua_tool_timeout_secs: u64,
     pub mutation_authority_dir: Option<PathBuf>,
     pub handoff_control_socket: Option<PathBuf>,
     pub maintenance_job_exclude_label: Option<String>,
@@ -194,6 +199,7 @@ pub struct ReadinessLanes {
     pub control_plane: LaneReadiness,
     pub computer_use_observation: LaneReadiness,
     pub filesystem_observation: LaneReadiness,
+    pub workspace_mutation: LaneReadiness,
     pub effectful_execution: LaneReadiness,
     pub browser_effectful_execution: LaneReadiness,
 }
@@ -292,6 +298,8 @@ impl DoctorReport {
 struct RuntimeManifest {
     schema_version: u16,
     hub_agent_schema_version: u16,
+    control_schema_version: u16,
+    capability_schema_version: u16,
     source_commit: String,
     package_version: String,
     binaries: Vec<RuntimeManifestBinary>,
@@ -366,6 +374,7 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
     }
     if let Some(command) = &config.cua_command {
         inspect_cua(command, config.expected_cua_version.as_deref(), &mut checks);
+        inspect_execution_budget(config.cua_tool_timeout_secs, &mut checks);
     }
     let mutation_authority = inspect_mutation_authority_for_doctor(
         config.mutation_authority_dir.as_deref(),
@@ -410,6 +419,27 @@ pub fn run_doctor(config: &DoctorConfig) -> DoctorReport {
         agent,
         mutation_authority,
         checks,
+    }
+}
+
+fn inspect_execution_budget(tool_timeout_secs: u64, checks: &mut Vec<DoctorCheck>) {
+    let timeout = Duration::from_secs(tool_timeout_secs);
+    let effective_ms = effective_execution_budget_ms(timeout);
+    let minimum_ms = minimum_paced_type_text_budget_ms();
+    if effective_ms < minimum_ms {
+        push(
+            checks,
+            "execution_budget",
+            CheckStatus::Error,
+            "insufficient_for_minimum_paced_input",
+        );
+    } else {
+        push(
+            checks,
+            "execution_budget",
+            CheckStatus::Ok,
+            "bounded_pre_dispatch_guard_ready",
+        );
     }
 }
 
@@ -483,8 +513,10 @@ fn verify_runtime_manifest(
                 return;
             }
         };
-    if manifest.schema_version != 3
+    if manifest.schema_version != 4
         || manifest.hub_agent_schema_version != HUB_AGENT_SCHEMA_VERSION
+        || manifest.control_schema_version != CONTROL_SCHEMA_VERSION
+        || manifest.capability_schema_version != CAPABILITY_SCHEMA_VERSION
         || manifest.source_commit.len() != 40
         || !manifest
             .source_commit
@@ -1003,10 +1035,13 @@ fn summarize_readiness(
     };
     let control_ready = control_plane == LaneReadiness::Ready;
     let cua_ready = !cua_configured
-        || !matches!(
+        || (!matches!(
             check_status(checks, "cua_version"),
             Some(CheckStatus::Error) | None
-        );
+        ) && !matches!(
+            check_status(checks, "execution_budget"),
+            Some(CheckStatus::Error) | None
+        ));
     let mutation_ready =
         !cua_configured || mutation_authority.is_some_and(|authority| authority.owner == "v2");
 
@@ -1022,6 +1057,9 @@ fn summarize_readiness(
             capability,
             DeviceCapability::ReadFile | DeviceCapability::ListDirectory
         )
+    });
+    let workspace_mutation_supported = capability_group_supported(capabilities, |capability| {
+        matches!(capability, DeviceCapability::WriteWorkspaceFile)
     });
     let effectful_supported = capability_group_supported(capabilities, |capability| {
         capability.class() != CapabilityClass::Observe
@@ -1077,6 +1115,7 @@ fn summarize_readiness(
         control_plane,
         computer_use_observation: observation_lane(computer_observation_supported, cua_configured),
         filesystem_observation: observation_lane(filesystem_observation_supported, false),
+        workspace_mutation: effectful_lane(workspace_mutation_supported, false),
         effectful_execution: effectful_lane(
             effectful_supported,
             cua_configured && computer_use_effectful_supported == Some(true),
@@ -1091,6 +1130,7 @@ fn summarize_readiness(
         lanes.control_plane,
         lanes.computer_use_observation,
         lanes.filesystem_observation,
+        lanes.workspace_mutation,
         lanes.effectful_execution,
         lanes.browser_effectful_execution,
     ]
@@ -1107,6 +1147,7 @@ fn summarize_readiness(
         lanes.control_plane,
         lanes.computer_use_observation,
         lanes.filesystem_observation,
+        lanes.workspace_mutation,
         lanes.effectful_execution,
         lanes.browser_effectful_execution,
     ]
@@ -1899,6 +1940,11 @@ mod tests {
                 status: cua_status,
                 detail: "bounded".into(),
             },
+            DoctorCheck {
+                name: "execution_budget".into(),
+                status: CheckStatus::Ok,
+                detail: "bounded_pre_dispatch_guard_ready".into(),
+            },
         ]
     }
 
@@ -1926,7 +1972,8 @@ mod tests {
     #[test]
     fn readiness_preserves_observation_while_quarantine_fences_effectful_lanes() {
         let checks = readiness_checks(CheckStatus::Ok);
-        let capabilities = readiness_capabilities();
+        let mut capabilities = readiness_capabilities();
+        capabilities.push(DeviceCapability::WriteWorkspaceFile);
         let authority = v2_mutation_authority();
         let readiness = summarize_readiness(
             &checks,
@@ -1944,6 +1991,10 @@ mod tests {
             LaneReadiness::Ready
         );
         assert_eq!(readiness.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.workspace_mutation,
+            LaneReadiness::IndeterminateFenced
+        );
         assert_eq!(
             readiness.lanes.effectful_execution,
             LaneReadiness::IndeterminateFenced
@@ -1963,7 +2014,8 @@ mod tests {
     #[test]
     fn readiness_requires_explicit_mutation_resume_after_quarantine_clears() {
         let checks = readiness_checks(CheckStatus::Ok);
-        let capabilities = readiness_capabilities();
+        let mut capabilities = readiness_capabilities();
+        capabilities.push(DeviceCapability::WriteWorkspaceFile);
         let authority = v2_mutation_authority();
         let readiness = summarize_readiness(
             &checks,
@@ -1981,6 +2033,10 @@ mod tests {
             LaneReadiness::Ready
         );
         assert_eq!(readiness.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.workspace_mutation,
+            LaneReadiness::IndeterminateFenced
+        );
         assert_eq!(
             readiness.lanes.effectful_execution,
             LaneReadiness::IndeterminateFenced
@@ -2017,6 +2073,10 @@ mod tests {
             LaneReadiness::Ready
         );
         assert_eq!(readiness.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(
+            readiness.lanes.workspace_mutation,
+            LaneReadiness::Unsupported
+        );
         assert_eq!(readiness.lanes.effectful_execution, LaneReadiness::Ready);
         assert_eq!(
             readiness.lanes.browser_effectful_execution,
@@ -2025,6 +2085,64 @@ mod tests {
         assert_eq!(readiness.blocking_operation_present, Some(false));
         assert_eq!(readiness.blocking_operation_retry_safe, None);
         assert_eq!(readiness.operator_action, None);
+    }
+
+    #[test]
+    fn readiness_workspace_mutation_is_ready_only_when_explicitly_advertised() {
+        let checks = readiness_checks(CheckStatus::Ok);
+        let mut capabilities = readiness_capabilities();
+        let authority = v2_mutation_authority();
+
+        let disabled = summarize_readiness(
+            &checks,
+            Some(0),
+            false,
+            Some(&capabilities),
+            true,
+            Some(&authority),
+        );
+        assert_eq!(
+            disabled.lanes.workspace_mutation,
+            LaneReadiness::Unsupported
+        );
+        assert_eq!(disabled.lanes.filesystem_observation, LaneReadiness::Ready);
+
+        capabilities.push(DeviceCapability::WriteWorkspaceFile);
+        let enabled = summarize_readiness(
+            &checks,
+            Some(0),
+            false,
+            Some(&capabilities),
+            true,
+            Some(&authority),
+        );
+        assert_eq!(enabled.lanes.workspace_mutation, LaneReadiness::Ready);
+        assert_eq!(enabled.lanes.filesystem_observation, LaneReadiness::Ready);
+    }
+
+    #[test]
+    fn execution_budget_readiness_rejects_impossible_timeout_and_accepts_default() {
+        let mut checks = Vec::new();
+        inspect_execution_budget(0, &mut checks);
+        assert_eq!(
+            checks,
+            vec![DoctorCheck {
+                name: "execution_budget".into(),
+                status: CheckStatus::Error,
+                detail: "insufficient_for_minimum_paced_input".into(),
+            }]
+        );
+
+        checks.clear();
+        inspect_execution_budget(30, &mut checks);
+        assert_eq!(
+            checks,
+            vec![DoctorCheck {
+                name: "execution_budget".into(),
+                status: CheckStatus::Ok,
+                detail: "bounded_pre_dispatch_guard_ready".into(),
+            }]
+        );
     }
 
     #[test]
@@ -2391,6 +2509,7 @@ mod tests {
             tls_root_certificate: None,
             cua_command: None,
             expected_cua_version: None,
+            cua_tool_timeout_secs: 30,
             mutation_authority_dir: None,
             handoff_control_socket: None,
             maintenance_job_exclude_label: None,
@@ -2450,6 +2569,7 @@ mod tests {
             tls_root_certificate: None,
             cua_command: None,
             expected_cua_version: None,
+            cua_tool_timeout_secs: 30,
             mutation_authority_dir: None,
             handoff_control_socket: None,
             maintenance_job_exclude_label: None,
@@ -2544,8 +2664,10 @@ mod tests {
         std::fs::write(
             &manifest,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "hub_agent_schema_version": HUB_AGENT_SCHEMA_VERSION,
+                "control_schema_version": CONTROL_SCHEMA_VERSION,
+                "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
                 "source_commit": "0123456789abcdef0123456789abcdef01234567",
                 "package_version": env!("CARGO_PKG_VERSION"),
                 "binaries": binaries
@@ -2566,6 +2688,7 @@ mod tests {
             tls_root_certificate: None,
             cua_command: None,
             expected_cua_version: None,
+            cua_tool_timeout_secs: 30,
             mutation_authority_dir: None,
             handoff_control_socket: None,
             maintenance_job_exclude_label: None,
@@ -2595,6 +2718,78 @@ mod tests {
     }
 
     #[test]
+    fn runtime_manifest_rejects_each_nested_schema_mismatch() {
+        for (field, mismatched) in [
+            ("hub_agent_schema_version", HUB_AGENT_SCHEMA_VERSION + 1),
+            ("control_schema_version", CONTROL_SCHEMA_VERSION + 1),
+            ("capability_schema_version", CAPABILITY_SCHEMA_VERSION + 1),
+        ] {
+            let root = temp_dir(field);
+            let manifest_path = root.join("runtime-manifest.json");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut manifest = serde_json::json!({
+                "schema_version": 4,
+                "hub_agent_schema_version": HUB_AGENT_SCHEMA_VERSION,
+                "control_schema_version": CONTROL_SCHEMA_VERSION,
+                "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+                "source_commit": "0123456789abcdef0123456789abcdef01234567",
+                "package_version": env!("CARGO_PKG_VERSION"),
+                "binaries": []
+            });
+            manifest[field] = serde_json::json!(mismatched);
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            let config = DoctorConfig {
+                hub_state_dir: root.join("hub"),
+                agent_state_dir: root.join("agent"),
+                runtime_manifest: manifest_path,
+                binary_dir: root.join("bin"),
+                hub_launchd_label: "hub".into(),
+                agent_launchd_label: "agent".into(),
+                grant_signer_launchd_label: None,
+                grant_signer_socket: None,
+                tls_server_certificate: None,
+                tls_root_certificate: None,
+                cua_command: None,
+                expected_cua_version: None,
+                cua_tool_timeout_secs: 30,
+                mutation_authority_dir: None,
+                handoff_control_socket: None,
+                maintenance_job_exclude_label: None,
+                recovery_key_file: None,
+                recovery_helper: None,
+            };
+            let mut runtime = RuntimeSummary {
+                package_version: env!("CARGO_PKG_VERSION").into(),
+                source_commit: None,
+                manifest_verified: false,
+                runtime_pairing: RuntimePairingStatus::Unknown,
+                operator_tooling: OperatorToolingStatus::Unknown,
+                checkpoint_reader_compatibility: CheckpointReaderCompatibility::Unknown,
+            };
+            let mut checks = Vec::new();
+            verify_runtime_manifest(&config, &mut runtime, &mut checks);
+            assert!(
+                !runtime.manifest_verified,
+                "{field} mismatch must fail closed"
+            );
+            assert_eq!(
+                checks,
+                vec![DoctorCheck {
+                    name: "runtime_manifest".into(),
+                    status: CheckStatus::Error,
+                    detail: "invalid_schema_or_identity".into(),
+                }],
+                "{field} mismatch must be low-cardinality"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn runtime_manifest_detects_stale_operator_binary_before_incident() {
         let root = temp_dir("manifest-stale-operator");
         let bin = root.join("bin");
@@ -2619,8 +2814,10 @@ mod tests {
         std::fs::write(
             &manifest,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "hub_agent_schema_version": HUB_AGENT_SCHEMA_VERSION,
+                "control_schema_version": CONTROL_SCHEMA_VERSION,
+                "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
                 "source_commit": "0123456789abcdef0123456789abcdef01234567",
                 "package_version": env!("CARGO_PKG_VERSION"),
                 "binaries": binaries
@@ -2641,6 +2838,7 @@ mod tests {
             tls_root_certificate: None,
             cua_command: None,
             expected_cua_version: None,
+            cua_tool_timeout_secs: 30,
             mutation_authority_dir: None,
             handoff_control_socket: None,
             maintenance_job_exclude_label: None,

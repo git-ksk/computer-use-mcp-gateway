@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-09-19: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; `v0.4.0` is the released baseline and `v0.5.0` Least-privilege Workspace is the next planned feature minor.**
+Status as of 2026-09-21: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; `v0.4.0` remains the latest published baseline, while the `v0.5.0` Least-privilege Workspace release candidate has completed #323 guided-recovery expiry/re-review hardening and is at the final #314 release-integration acceptance gate.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -34,9 +34,9 @@ An ambiguous state-changing operation is never automatically retried or replayed
 
 The completed V1/V2 implementation history and acceptance evidence remain available through [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), [`v2/STATUS.md`](v2/STATUS.md), [`v2/acceptance/`](v2/acceptance/), and [`archive/`](archive/). This file intentionally focuses on work that is still relevant after the V2 closeout.
 
-## Released baseline: `0.4.x`; next planned feature minor: `0.5.0`
+## Released baseline: `0.4.x`; active release candidate: `0.5.0`
 
-`v0.4.0` is the released Recovery, Identity & Semantic Authorization baseline. #227 physical Windows Hello acceptance passed on 2026-09-19. The next planned feature minor is **`v0.5.0` — Least-privilege Workspace**; #139 signed-token dogfood and #228 physical Linux FIDO2 remain separate support-claim gates.
+`v0.4.0` is the latest published Recovery, Identity & Semantic Authorization baseline. #227 physical Windows Hello acceptance passed on 2026-09-19. The **`v0.5.0` — Least-privilege Workspace** candidate has completed #323 guided-recovery expiry/re-review hardening and is now at the final #314 schema/config/readiness/upgrade release-integration acceptance gate before publication; #139 signed-token dogfood and #228 physical Linux FIDO2 remain separate support-claim gates.
 
 The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Its accepted support boundary is recorded in the release-scope and status documents.
 
@@ -83,15 +83,15 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 
 ## Post-v0.4 productization sequence
 
-`v0.4.0` is the released Recovery, Identity & Semantic Authorization baseline. Post-v0.4 work continues moving the project from a security-focused source release toward an installable, operable product without weakening the execution-safety boundary. Minor numbers below are the current working sequence, not calendar promises: a minor is cut only when its admitted public-contract scope and evidence are complete.
+`v0.4.0` is the latest published Recovery, Identity & Semantic Authorization baseline. #227 physical Windows Hello acceptance passed on 2026-09-19. The **`v0.5.0` — Least-privilege Workspace** candidate now has its schema/config/readiness/upgrade integration complete under #314 and remains unpublished until the dedicated release step; #139 signed-token dogfood and #228 physical Linux FIDO2 remain separate support-claim gates.
 
 The working sequence is:
 
 - **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance passed on 2026-09-19. #139 and #228 remain non-blocking support-claim gates, with signed-token and Linux online-recovery claims withheld until their evidence exists.
-- **`0.5.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through a bounded owner-scoped ephemeral ref/data lifecycle (#313), ranged/deterministic filesystem observation (#105), retrievable truncated process/shell output (#83), atomic workspace mutation under explicitly separate writable roots (#107), and an explicit schema/config/readiness/upgrade release-integration gate (#314).
+- **`0.5.0` — Least-privilege Workspace:** reduce reliance on Dangerous shell authority through a bounded owner-scoped ephemeral ref/data lifecycle (#313), ranged/deterministic filesystem observation (#105), retrievable truncated process/shell output (#83), atomic workspace mutation under explicitly separate writable roots (#107), the production-dogfood execution-budget fix (#319), guided-recovery challenge-expiry/re-review hardening (#323), and an explicit schema/config/readiness/upgrade release-integration gate (#314).
 - **`0.6.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106), separately sandboxed Playwright/E2E execution (#114), and optional Linux cgroup-v2 execution containment (#267), informed by completed #96 rather than by background-shell escape compatibility.
 
-For `0.5.0`, the intended implementation order is **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #314 release integration/acceptance**. #105 may use a stateless bounded range contract where that is safer than a ref, but any stateful continuation must reuse the reviewed bounded lifecycle rather than create a second ad-hoc store. Workspace writable roots remain operator/device configuration while the exact mutation capability is granted per principal; `0.5.0` does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
+For `0.5.0`, the release sequence is **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance**. #313/#105/#83/#107/#319/#323 are complete; only the final #314 gate remains before publication. The integrated candidate pins control schema 10, capability schema 6, registry schema 8, and Hub-Agent schema 6; mixed versions fail closed. Workspace writable roots remain operator/device configuration while the exact mutation capability is granted per principal; `0.5.0` does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
 
 The minor numbers are working release boundaries, not calendar promises. A feature can be compiled into an artifact while its optional platform/provider support claim remains withheld pending explicit acceptance; the release notes must make that distinction visible. If implementation evidence later requires another split or defer, preserve the safety boundary rather than the numbering.
 
@@ -165,7 +165,7 @@ This queue records the practical result of continued Handoff integration and phy
 The repository's open issues are classified by the revised release sequence so work cannot silently fall out of roadmap visibility. Milestones are ordering/admission guidance; an optional support-claim acceptance issue may remain open after the base artifact is released if that support claim is explicitly withheld.
 
 - **`0.4.0 — released baseline`:** #221 / PR #271 is merged and green; #227 physical Windows Hello acceptance passed on 2026-09-19. #139 signed-token dogfood and #228 physical Linux FIDO2 acceptance remain deferred support-claim gates; #217 remains open for parity.
-- **`0.5.0 — Least-privilege Workspace`:** #313 owns the bounded owner-scoped ephemeral ref/data foundation; #105 adds ranged/deterministic filesystem observation; #83 adds bounded retrievable process/shell output; #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority; #314 owns schema/config/readiness/upgrade/release integration and final acceptance.
+- **`0.5.0 — Least-privilege Workspace`:** #313 owns the bounded owner-scoped ephemeral ref/data foundation; #105 adds ranged/deterministic filesystem observation; #83 adds bounded retrievable process/shell output; #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority; #319 closes the production-dogfood execution-budget mismatch; #323 hardens guided recovery across challenge expiry/generation rollover while preserving fresh Human selection and no replay; #314 owns the final schema/config/readiness/upgrade/release integration and acceptance after #323.
 - **`0.6.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle, #114 adds separately sandboxed Playwright/E2E execution, and #267 owns optional Linux cgroup-v2 containment.
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation, #275 hosted Handoff architecture with #276 pin adoption / #277 hosted operator-routing implementation, and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.
 - **Upstream-blocked V1 compatibility:** #14 and #15 remain blocked on upstream Cua and are not active CUMG release blockers.

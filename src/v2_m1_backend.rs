@@ -145,7 +145,7 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn effective_execution_budget_ms(tool_timeout: Duration) -> u64 {
+pub(crate) fn effective_execution_budget_ms(tool_timeout: Duration) -> u64 {
     let total_ms = duration_millis_saturating(tool_timeout);
     let reserve_ms = (total_ms / EXECUTION_BUDGET_RESERVE_DIVISOR)
         .max(EXECUTION_BUDGET_MIN_RESERVE_MS)
@@ -169,6 +169,10 @@ fn type_text_required_budget_ms(text: &str, delay_ms: u16) -> u64 {
     scalar_count
         .saturating_mul(per_scalar_ms)
         .saturating_add(TYPE_TEXT_FIXED_DRAIN_MS)
+}
+
+pub(crate) fn minimum_paced_type_text_budget_ms() -> u64 {
+    type_text_required_budget_ms("x", TYPE_TEXT_DEFAULT_DELAY_MS)
 }
 
 fn semantic_execution_budget_ms(command: &DeviceCommand) -> Option<u64> {

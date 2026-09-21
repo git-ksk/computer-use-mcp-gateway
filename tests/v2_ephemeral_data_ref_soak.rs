@@ -24,6 +24,11 @@ fn temp_parent() -> PathBuf {
         rand::random::<u64>()
     ));
     fs::create_dir_all(&path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     path
 }
 

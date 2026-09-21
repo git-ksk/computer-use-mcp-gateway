@@ -51,6 +51,8 @@ class CandidateIdentity:
     package_version: str
     source_commit: str
     hub_agent_schema_version: int
+    control_schema_version: int
+    capability_schema_version: int
     files: dict[str, str]
 
     def as_dict(self) -> dict[str, object]:
@@ -58,6 +60,8 @@ class CandidateIdentity:
             "package_version": self.package_version,
             "source_commit": self.source_commit,
             "hub_agent_schema_version": self.hub_agent_schema_version,
+            "control_schema_version": self.control_schema_version,
+            "capability_schema_version": self.capability_schema_version,
             "files": dict(sorted(self.files.items())),
         }
 
@@ -168,6 +172,8 @@ def verify_candidate(bundle_dir: Path) -> CandidateIdentity:
         package_version=str(manifest["package_version"]),
         source_commit=str(manifest["source_commit"]),
         hub_agent_schema_version=int(manifest["hub_agent_schema_version"]),
+        control_schema_version=int(manifest["control_schema_version"]),
+        capability_schema_version=int(manifest["capability_schema_version"]),
         files=files,
     )
 
@@ -224,11 +230,50 @@ def validate_required_flags(config: ReviewedConfig, required: set[str]) -> None:
         raise UpgradeError(f"candidate_{config.component}_missing_required_flag")
 
 
+def argument_values(config: ReviewedConfig, flag: str) -> list[str]:
+    values: list[str] = []
+    arguments = config.arguments
+    for index, item in enumerate(arguments):
+        if item == flag:
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("--"):
+                raise UpgradeError(f"candidate_{config.component}_flag_value_missing")
+            values.append(arguments[index + 1])
+    return values
+
+
+def validate_agent_workspace_config(agent: ReviewedConfig, data_root: Path) -> None:
+    ephemeral = argument_values(agent, "--ephemeral-data-parent")
+    if len(ephemeral) != 1:
+        raise UpgradeError("candidate_agent_ephemeral_parent_required")
+    ephemeral_path = Path(ephemeral[0]).resolve(strict=False)
+    ephemeral_root = (data_root / "v2-windows-shell" / "ephemeral").resolve(strict=False)
+    state_root = (data_root / "v2-windows-shell" / "state").resolve(strict=False)
+    backup_root = (data_root / "backup").resolve(strict=False)
+    if not is_relative_to(ephemeral_path, ephemeral_root):
+        raise UpgradeError("candidate_agent_ephemeral_parent_outside_reviewed_root")
+    if is_relative_to(ephemeral_path, state_root) or is_relative_to(ephemeral_path, backup_root):
+        raise UpgradeError("candidate_agent_ephemeral_parent_inside_authoritative_tree")
+
+    modes = argument_values(agent, "--workspace-mutation-mode")
+    if len(modes) != 1 or modes[0] not in {"disabled", "enabled"}:
+        raise UpgradeError("candidate_agent_workspace_mutation_mode_invalid")
+    write_roots = argument_values(agent, "--allowed-write-root")
+    denied = argument_values(agent, "--denied-write-subpath")
+    if modes[0] == "disabled" and (write_roots or denied):
+        raise UpgradeError("candidate_agent_workspace_mutation_disabled_with_policy")
+    if modes[0] == "enabled" and not write_roots:
+        raise UpgradeError("candidate_agent_workspace_mutation_enabled_without_root")
+    for raw in (*write_roots, *denied):
+        if not Path(raw).is_absolute():
+            raise UpgradeError("candidate_agent_workspace_mutation_path_not_absolute")
+
+
 def preflight_configs(bundle_dir: Path, data_root: Path, hub_path: Path, agent_path: Path) -> tuple[ReviewedConfig, ReviewedConfig]:
     hub = load_reviewed_config(hub_path, "hub", data_root)
     agent = load_reviewed_config(agent_path, "agent", data_root)
     validate_required_flags(hub, required_flags_from_help(bundle_dir / "bin" / "v2_hub.exe"))
     validate_required_flags(agent, required_flags_from_help(bundle_dir / "bin" / "v2_agent.exe"))
+    validate_agent_workspace_config(agent, data_root)
     return hub, agent
 
 

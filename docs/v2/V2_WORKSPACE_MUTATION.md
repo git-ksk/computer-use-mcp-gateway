@@ -53,7 +53,7 @@ The mutation payload is not copied into durable recovery. If result delivery is 
 
 ## Release integration
 
-Issue #107 intentionally does not complete the v0.5 release integration. Issue #314 owns:
+Issue #107 intentionally left the v0.5 release integration to #314. #314 now completes:
 
 - final control/capability/Hub-Agent schema review and version bumps
 - mixed-version fail-closed behavior

@@ -4,7 +4,7 @@
 
 CUMG は Semantic Versioning を採用し、pre-1.0 policy を明示します。
 
-現在の released line は **0.4.x** です。`v0.4.0` は released Recovery, Identity & Semantic Authorization baselineで、`v0.3.0` は immutable な V2 Production Hardening / Operational Readiness tag として維持します。
+現在の released line は **0.4.x** です。crate / release candidate は **0.5.0**（Least-privilege Workspace）で、v0.5.0 Release を作成するまでは `v0.4.0` が最新 published tag です。
 
 ## Version format
 
@@ -50,12 +50,12 @@ compatibility を維持すること自体が vulnerability を残す security em
 
 ## Schema version は独立管理
 
-project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。
+project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。v0.5 release candidate は `CONTROL_SCHEMA_VERSION = 10`、capability schema `6`、`DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`、`HUB_AGENT_SCHEMA_VERSION = 6` を pin し、mixed live version は fail closed です。
 
 - `CONTROL_SCHEMA_VERSION` は live control-schema compatibility boundary が変わるときに変更;
 - capability-advertisement schema version は live advertisement boundary が変わるときに変更;
 - `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION` と `GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION` は persisted structure を独立に versioning し、future `CONTROL_SCHEMA_VERSION` bump だけを理由に変更しない。persisted structure 自体が変わる場合だけ bump する;
-- historical v0.2.x checkpoint は当時の control schema number を persisted registry / grant-ledger tag に流用していた。runtime restore が support するのは review 済みの v0.2.0 以降の lineage のみで、registry は `2/capability 2`、`3/capability 3`、`4..=7/capability 4`、grant-ledger は `2..=7`。prototype tag `1`、unknown/future tag、不可能な control/capability pairing は fail closed;
+- historical v0.2.x checkpoint は当時の control schema number を persisted registry / grant-ledger tag に流用していた。runtime restore が support するのは review 済みの v0.2.0 以降の lineage のみで、registry は `2/capability 2`、`3/capability 3`、`4..=6/capability 4`、`7/capability 5`、current `8/capability 6`。grant-ledger tag は独立にversioningします。prototype tag `1`、unknown/future tag、不可能な control/capability pairing は fail closed;
 - migration 時に historical capability advertisement を live authority へ昇格させない。Hub は historical pairing を検証し、device identity / generation を restore した上で device を offline にし、dispatch 前に current live schema の fresh Agent advertisement を要求する;
 - crate release だけを理由に schema version を自動 increment しない;
 - schema change から算術的に crate version を決めず、public compatibility impact に応じて PATCH/MINOR rule を使う。
@@ -101,9 +101,9 @@ feature count は 1.0 gate ではありません。product boundary を先に変
 
 `v0.4.0` GitHub Release は **source-only** です。verified CI archive は release-candidate evidence のままで official binary Release asset にはせず、supported distribution へ暗黙昇格させません。
 
-`Release Candidate Artifacts` workflow は引き続き Linux / macOS / Windows の bounded native candidate を build します。manifest schema v2 は package version、exact CUMG source commit、Hub/Agent application-schema version、platform/architecture、exact allowlisted file、size、SHA-256 identity を記録します。Linux / Windows candidate は distribution evidence のままです。
+`Release Candidate Artifacts` workflow は引き続き Linux / macOS / Windows の bounded native candidate を build します。manifest schema v3 は package version、exact CUMG source commit、exact Hub/Agent・control・capability schema version、platform/architecture、exact allowlisted file、size、SHA-256 identity を記録します。Linux / Windows candidate は distribution evidence のままです。
 
-macOS single-Mac candidate はさらに #237 install-capable profile を実装します。exact reviewed `mcp-execution-handoff` commit を bind し、`v2_recover` / Secure Enclave helper、bounded install/upgrade support file、LaunchAgent template、separately manifested self-contained Handoff runtime payload を含みます。checksum drift、unexpected/missing file、unsafe path、symlink、inner/outer commit mismatch、production dependency 不足は fresh verification で fail closed です。artifact manifest は distribution evidence に限定し、installed schema-3 `runtime-manifest.json` が `v2_doctor` の runtime identity として authoritative です。
+macOS single-Mac candidate はさらに #237 install-capable profile を実装します。exact reviewed `mcp-execution-handoff` commit を bind し、`v2_recover` / Secure Enclave helper、bounded install/upgrade support file、LaunchAgent template、separately manifested self-contained Handoff runtime payload を含みます。checksum drift、unexpected/missing file、unsafe path、symlink、inner/outer commit mismatch、production dependency 不足は fresh verification で fail closed です。artifact manifest は distribution evidence に限定し、installed schema-4 `runtime-manifest.json` は exact Hub/Agent・control・capability schema version と source/package/binary identity を bind し、`v2_doctor` が検証します。
 
 supported clean single-Mac install では CUMG/Handoff source checkout は不要です。ただし deployment trust/secrets、stable device/resource/proxy identity、Cua、Node.js、operator-selected Apple code-signing identity は別途 provision します。activation 前に installer は verified artifact bytes を private staging へ copy し、TCC-sensitive local executable/helper に既存の stable Team-ID signing boundary を適用します。CI candidate を Apple-notarized public installer とは claim しません。
 
