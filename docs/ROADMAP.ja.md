@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-21 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が最新 published baseline、`v0.5.0` Least-privilege Workspace は integration 完了済み release candidate で publication 待ちです。**
+2026-09-21 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が最新 published baseline、`v0.5.0` Least-privilege Workspace は active release candidate で、final #314 acceptance 前の release item として #323 guided-recovery expiry/re-review hardening を追加しました。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,9 +34,9 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Released baseline: `0.4.x`; completed release candidate: `0.5.0`
+## Released baseline: `0.4.x`; active release candidate: `0.5.0`
 
-`v0.4.0` は最新 published Recovery, Identity & Semantic Authorization baseline です。#227 physical Windows Hello acceptance は 2026-09-19 に PASS しました。**`v0.5.0` — Least-privilege Workspace** candidate は #314 で schema/config/readiness/upgrade integration まで完了しており、dedicated release step までは未publishです。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate として残ります。
+`v0.4.0` は最新 published Recovery, Identity & Semantic Authorization baseline です。#227 physical Windows Hello acceptance は 2026-09-19 に PASS しました。**`v0.5.0` — Least-privilege Workspace** candidate は #314 で workspace/schema/config integration を組み上げていますが、#323 guided-recovery expiry/re-review hardening を release item として追加し、#323 完了後に final #314 acceptance と publication へ進みます。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate として残ります。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -88,10 +88,10 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 現在の作業順:
 
 - **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance は 2026-09-19 に PASS 済み。#139 と #228 は non-blocking support-claim gate として残し、signed-token / Linux online-recovery claim は evidence まで保留します。
-- **`0.5.0` — Least-privilege Workspace:** #313 bounded owner-scoped ephemeral ref/data lifecycle、#105 ranged/deterministic filesystem observation、#83 retrievable truncated process/shell output、#107 explicit writable root配下のatomic workspace mutation、#314 schema/config/readiness/upgrade release integrationでDangerous shell authorityへの依存を減らす。
+- **`0.5.0` — Least-privilege Workspace:** #313 bounded owner-scoped ephemeral ref/data lifecycle、#105 ranged/deterministic filesystem observation、#83 retrievable truncated process/shell output、#107 explicit writable root配下のatomic workspace mutation、#319 production-dogfood execution-budget fix、#323 guided-recovery challenge-expiry/re-review hardening、#314 schema/config/readiness/upgrade release integrationでDangerous shell authorityへの依存を減らす。
 - **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
-`0.5.0` は **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #314 release integration/acceptance** の順で実装完了しました。integrated candidate は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
+`0.5.0` の release sequence は **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance** です。#313/#105/#83/#107/#319 は完了済みで、publication 前に #323 と final #314 gate が残ります。integrated candidate は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
 
 minor numberはworking release boundaryでありcalendar promiseではありません。optional platform/providerのsupport claimはexplicit acceptanceまで保留できます。implementation evidenceがsplit/deferを要求する場合はnumberingよりsafety boundaryを優先します。
 
@@ -165,7 +165,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 open issue はrevised release sequenceで分類し、roadmap visibilityからsilentに落ちないようにします。milestoneはordering/admission guidanceです。optional support-claim acceptanceは、そのsupport claimを明示的に保留する限りbase artifact release後もOPENのままにできます。
 
 - **`0.4.0 — released baseline`:** #221 / PR #271 は merge 済み・green で、#227 physical Windows Hello acceptance は 2026-09-19 に PASS 済みです。#139 signed-token dogfood と #228 physical Linux FIDO2 acceptance は deferred support-claim gate で、#217 は parity 用に OPEN 維持します。
-- **`0.5.0 — Least-privilege Workspace`:** #313 bounded owner-scoped ephemeral ref/data foundation、#105 ranged/deterministic filesystem observation、#83 bounded retrievable process/shell output、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation、#314 で schema/config/readiness/upgrade/release integration と final acceptance を完了。
+- **`0.5.0 — Least-privilege Workspace`:** #313 bounded owner-scoped ephemeral ref/data foundation、#105 ranged/deterministic filesystem observation、#83 bounded retrievable process/shell output、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation、#319 production-dogfood execution-budget mismatch 修正、#323 challenge expiry / generation rollover を跨ぐ guided recovery hardening（fresh Human selection / no replay 維持）、#314 が #323 後の final schema/config/readiness/upgrade/release integration と acceptance を担当。
 - **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
 - **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation、#275 hosted Handoff architecture（#276 pin adoption / #277 hosted operator-routing implementation）、#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
 - **Upstream-blocked V1 compatibility:** #14/#15はupstream Cua blockedのままでactive CUMG release blockerではない。
