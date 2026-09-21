@@ -17,6 +17,12 @@ Least-privilege Workspace release candidate. `v0.4.0` remains the latest publish
 - impossible paced input is rejected before backend dispatch as terminal/retry-safe; a real post-dispatch backend timeout remains `Indeterminate`, quarantines the device, and is never automatically retried or replayed (#319);
 - the Hub-Agent schema bump to 6 covers the signed payload-free `IndeterminateAck` / backend-timeout cause evidence added after v0.4.0 without turning that evidence into completion or replay authority.
 
+### Guided recovery lifecycle
+
+- guided recovery plan schema **v3** makes the interactive Human review challenge-scoped: expiry or exact binding/generation rollover invalidates the old prompt and stale selection context, requires a fresh signed review plus a fresh Human choice, and never carries an unsigned historical assertion across challenges (#323);
+- pre-auth stale review explicitly reports that user-presence authentication did not start and leaves authorization unpublished, quarantine retained, and the old operation unreplayed; challenge identity is re-checked immediately before signing and before authorization publication;
+- terminal guided recovery still requires the exact durable Hub acknowledgement and now makes recovery completion, exact quarantine clearance, effectful-execution readiness, normal recovery mode, and `old_operation_replayed=false` explicit.
+
 ### Packaging, upgrade, and runtime identity
 
 - release-manifest schema **v3** records exact Hub-Agent/control/capability schemas, package/source identity, platform/architecture, and closed file digests;

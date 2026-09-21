@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-21 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が最新 published baseline、`v0.5.0` Least-privilege Workspace は active release candidate で、final #314 acceptance 前の release item として #323 guided-recovery expiry/re-review hardening を追加しました。**
+2026-09-21 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が最新 published baseline、`v0.5.0` Least-privilege Workspace は #323 guided-recovery expiry/re-review hardening を完了し、final #314 release-integration acceptance gate に進んでいます。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -36,7 +36,7 @@ completion provable?
 
 ## Released baseline: `0.4.x`; active release candidate: `0.5.0`
 
-`v0.4.0` は最新 published Recovery, Identity & Semantic Authorization baseline です。#227 physical Windows Hello acceptance は 2026-09-19 に PASS しました。**`v0.5.0` — Least-privilege Workspace** candidate は #314 で workspace/schema/config integration を組み上げていますが、#323 guided-recovery expiry/re-review hardening を release item として追加し、#323 完了後に final #314 acceptance と publication へ進みます。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate として残ります。
+`v0.4.0` は最新 published Recovery, Identity & Semantic Authorization baseline です。#227 physical Windows Hello acceptance は 2026-09-19 に PASS しました。**`v0.5.0` — Least-privilege Workspace** candidate は #323 guided-recovery expiry/re-review hardening を完了し、publication 前の final #314 schema/config/readiness/upgrade release-integration acceptance gate に進んでいます。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate として残ります。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -91,7 +91,7 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 - **`0.5.0` — Least-privilege Workspace:** #313 bounded owner-scoped ephemeral ref/data lifecycle、#105 ranged/deterministic filesystem observation、#83 retrievable truncated process/shell output、#107 explicit writable root配下のatomic workspace mutation、#319 production-dogfood execution-budget fix、#323 guided-recovery challenge-expiry/re-review hardening、#314 schema/config/readiness/upgrade release integrationでDangerous shell authorityへの依存を減らす。
 - **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
-`0.5.0` の release sequence は **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance** です。#313/#105/#83/#107/#319 は完了済みで、publication 前に #323 と final #314 gate が残ります。integrated candidate は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
+`0.5.0` の release sequence は **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance** です。#313/#105/#83/#107/#319/#323 は完了済みで、publication 前に残るのは final #314 gate だけです。integrated candidate は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
 
 minor numberはworking release boundaryでありcalendar promiseではありません。optional platform/providerのsupport claimはexplicit acceptanceまで保留できます。implementation evidenceがsplit/deferを要求する場合はnumberingよりsafety boundaryを優先します。
 
