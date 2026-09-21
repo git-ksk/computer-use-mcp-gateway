@@ -1833,15 +1833,12 @@ mod linux_cgroup_acceptance_tests {
         root
     }
 
-    fn cgroup_populated(root: &Path) -> bool {
-        fs::read_to_string(root.join("cgroup.events"))
+    fn child_cgroup_count(root: &Path) -> usize {
+        fs::read_dir(root)
             .unwrap()
-            .lines()
-            .find_map(|line| {
-                let mut fields = line.split_ascii_whitespace();
-                (fields.next() == Some("populated")).then(|| fields.next() == Some("1"))
-            })
-            .unwrap_or(true)
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .count()
     }
 
     fn pid_alive(pid: &str) -> bool {
@@ -1883,7 +1880,7 @@ mod linux_cgroup_acceptance_tests {
             !pid_alive(pid.trim()),
             "setsid descendant survived cgroup cleanup"
         );
-        assert!(!cgroup_populated(&cgroup_root));
+        assert_eq!(child_cgroup_count(&cgroup_root), 0);
 
         let race_ready = work.join("race.ready");
         let race_shell = ShellRequest {
@@ -1900,16 +1897,19 @@ mod linux_cgroup_acceptance_tests {
             .execute_shell(&race_shell, &ProcessCancellation::default())
             .unwrap();
         assert_eq!(output.exit_code, Some(0));
-        assert!(
-            !cgroup_populated(&cgroup_root),
-            "fork-race left the delegated cgroup tree populated"
+        assert_eq!(
+            child_cgroup_count(&cgroup_root),
+            0,
+            "fork-race left an operation cgroup behind"
         );
 
         let parent_procs = cgroup_root.parent().unwrap().join("cgroup.procs");
+        let agent_pid = std::process::id();
         let denied_shell = ShellRequest {
             command: format!(
-                "if echo $$ > {} 2>/dev/null; then exit 41; else exit 0; fi",
-                parent_procs.display()
+                "if echo $$ > {} 2>/dev/null; then exit 41; fi;                  if echo $$ > /proc/{agent_pid}/root{}/cgroup.procs 2>/dev/null; then exit 42; fi;                  if /bin/mkdir /sys/fs/cgroup/escape 2>/dev/null; then exit 43; fi;                  exit 0",
+                parent_procs.display(),
+                cgroup_root.display(),
             ),
             cwd: work.to_string_lossy().into_owned(),
             env: vec![],
@@ -1919,29 +1919,7 @@ mod linux_cgroup_acceptance_tests {
             .execute_shell(&denied_shell, &ProcessCancellation::default())
             .unwrap();
         assert_eq!(output.exit_code, Some(0));
-
-        let migrated_pid = work.join("migrated.pid");
-        let migration_shell = ShellRequest {
-            command: format!(
-                "/usr/bin/setsid /bin/sh -c 'echo $$ > {}/cgroup.procs; echo $$ > {}; exec /bin/sleep 30' >/dev/null 2>&1 & while [ ! -s {} ]; do /bin/sleep 0.01; done",
-                cgroup_root.display(),
-                migrated_pid.display(),
-                migrated_pid.display()
-            ),
-            cwd: work.to_string_lossy().into_owned(),
-            env: vec![],
-            timeout_ms: 5_000,
-        };
-        let output = executor
-            .execute_shell(&migration_shell, &ProcessCancellation::default())
-            .unwrap();
-        assert_eq!(output.exit_code, Some(0));
-        let pid = fs::read_to_string(&migrated_pid).unwrap();
-        assert!(
-            !pid_alive(pid.trim()),
-            "within-delegation migration invalidated terminal proof"
-        );
-        assert!(!cgroup_populated(&cgroup_root));
+        assert_eq!(child_cgroup_count(&cgroup_root), 0);
 
         fs::remove_dir_all(work).unwrap();
     }

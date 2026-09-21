@@ -9,51 +9,62 @@ The backend is enabled only by an explicit operator setting:
 - `CUMG_V2_LINUX_CGROUP_V2_ROOT=/absolute/cgroup/path`, or
 - `--linux-cgroup-v2-root /absolute/cgroup/path`.
 
-Omission means the existing truthful Unix process-group behavior remains in use. There is no auto-detection fallback and no claim that a cgroup-v2 mount alone grants CUMG authority.
+Omission keeps the existing truthful Unix process-group behavior. CUMG never infers stronger authority from cgroup-v2 mount presence alone.
 
-When configured, Agent startup refuses the stronger backend unless all of the following hold:
+When configured, Agent startup refuses the backend unless all of the following hold:
 
 - the Agent is non-root;
-- the path is absolute, canonical, non-symlink, and on a cgroup-v2 filesystem;
-- the cgroup is an empty `domain` cgroup with no child cgroups;
-- `cgroup.procs` and `cgroup.kill` are writable to the Agent;
-- the Agent can create a child cgroup and write its `cgroup.procs` / `cgroup.kill`;
-- the parent cgroup's `cgroup.procs` is not writable to the Agent.
+- the host exposes one normal cgroup-v2 mount at `/sys/fs/cgroup`;
+- the configured path is absolute, canonical, non-symlink, and a `domain` cgroup;
+- the **Agent process is already a member of that configured cgroup**;
+- the configured cgroup has no child cgroups at startup;
+- its directory and `cgroup.procs` support delegated operation-child creation/migration;
+- a fresh child exposes writable `cgroup.procs` and `cgroup.kill`;
+- the configured cgroup's parent `cgroup.procs` is not writable to the Agent;
+- unprivileged user namespaces plus cgroup and mount namespaces are available;
+- a startup probe can enter a child cgroup, establish the private cgroup view, exec, and clean the child cgroup completely.
 
-The final check is deliberate. Linux cgroup-v2 delegation containment prevents a non-root delegatee from migrating a process outside the delegated subtree when it lacks write authority to the common ancestor's `cgroup.procs`. CUMG rejects broader migration authority rather than advertising the stronger guarantee.
+The placement rule is important. Linux cgroup-v2 delegation requires write authority to the common ancestor when migrating a process. Therefore a non-root Agent cannot safely pull a process from outside the delegated subtree while simultaneously proving that it cannot push the process back outside. The service manager/operator must place the Agent into the delegated root before CUMG starts.
 
 ## Execution contract
 
-The configured subtree is dedicated to CUMG process/shell containment and is serialized to one bounded operation at a time.
+The configured root belongs to the Agent service. Bounded process/shell execution is serialized to one operation cgroup at a time.
 
 For each operation CUMG:
 
 1. creates a fresh child cgroup;
-2. pre-opens that child's `cgroup.procs`;
-3. in the post-fork/pre-exec hook writes `0` through that already-open descriptor;
-4. only then allows the requested executable or fixed shell to exec.
+2. pre-opens that child cgroup's `cgroup.procs`;
+3. forks;
+4. in the post-fork/pre-exec hook, writes `0` through the pre-opened descriptor so the child enters the operation cgroup;
+5. before any requested code executes, creates a new user namespace, cgroup namespace, and mount namespace;
+6. installs one-to-one UID/GID mappings for the current Agent identity;
+7. makes mount propagation private and mounts a new **read-only cgroup2 view** at `/sys/fs/cgroup`, rooted by the new cgroup namespace at the operation cgroup;
+8. sets `no_new_privs`;
+9. only then execs the requested executable or fixed shell.
 
-User code therefore does not execute before entering the cgroup domain. The existing Unix process-group wrapper remains in place as a compatible inner lifecycle primitive.
+The operation therefore starts inside the cgroup before effectful user code runs. The private cgroup namespace plus private read-only cgroup mount prevents same-UID command code from reaching the Agent's outer cgroup hierarchy or migrating back to the Agent root. The existing Unix process-group wrapper remains as an inner lifecycle primitive.
 
 On cancellation, timeout, setup failure after spawn, and ordinary top-level completion, CUMG:
 
-1. writes `1` to the dedicated root `cgroup.kill`;
-2. waits until the root `cgroup.events` reports `populated 0`;
-3. removes descendant cgroup directories before releasing the subtree.
+1. writes `1` to the exact operation cgroup's `cgroup.kill`;
+2. waits until that operation root's `cgroup.events` reports `populated 0`;
+3. removes descendant cgroups, then removes the operation cgroup itself.
 
-Root-level kill is intentional. A same-UID workload may migrate between cgroups inside its delegated subtree, but that does not escape the root-level termination domain. Migration outside the delegation boundary must remain denied. Kernel `cgroup.kill` also covers concurrent forks and is protected against migrations.
+This exact operation-root kill covers descendants that call `setsid()`, concurrent fork races, and descendants that create or move within cgroups below the private operation root.
 
 If terminal proof fails after spawn, the operation remains outcome-unproven and follows the existing Indeterminate/no-replay/quarantine path. The backend is poisoned for further use rather than silently falling back to process groups.
 
 ## Deployment requirements
 
-The cgroup root is infrastructure supplied by the operator or service manager. CUMG does not mount cgroup2, create host-global delegation, elevate privileges, or repair a bad delegation.
+The service manager/operator owns provisioning. CUMG does not mount the host cgroup hierarchy, create host-global delegation, elevate privileges, or move the Agent into its delegation.
 
-A generic `Delegate=yes` on the same systemd unit is not sufficient by itself: the Agent must not live inside the subtree that CUMG will kill, and the configured subtree's parent migration authority must remain unavailable to the Agent. Provision a separate, dedicated, initially empty execution subtree whose parent is still controlled by the service manager or root.
+A suitable deployment must place the Agent process into a dedicated delegated cgroup before launching the Agent binary, then grant only that cgroup to the Agent. The parent migration boundary stays service-manager/root controlled.
 
-Containerized Agents have the same requirements. A writable cgroup namespace view is not enough unless the configured subtree is the reviewed delegation boundary and the parent migration path is inaccessible. Read-only or partial cgroup mounts make the stronger backend unavailable.
+The kernel must permit unprivileged user namespaces because CUMG uses a child user namespace only to create the child-owned cgroup and mount namespaces needed to hide the outer cgroup hierarchy. If host policy disables unprivileged user namespaces, the stronger backend is unavailable and configured startup fails closed.
 
-The backend is process-lifecycle containment only. It does not restrict filesystem, network, credentials, syscalls, or executable authority and is not a sandbox.
+Containerized/namespaced deployments are not assumed equivalent. The current implementation deliberately requires the reviewed single `/sys/fs/cgroup` mount layout and otherwise refuses stronger mode.
+
+The backend remains process-lifecycle containment, not a general sandbox. It does not isolate network, ordinary filesystem access, credentials, or arbitrary syscalls. The namespace setup is only part of proving the cgroup execution boundary. It also means set-user-ID privilege gain is not available inside this optional backend because `no_new_privs` is set.
 
 ## Scope
 
@@ -65,15 +76,17 @@ The backend is process-lifecycle containment only. It does not restrict filesyst
 
 ## Acceptance
 
-Linux CI provisions both a writable delegated root and an unwritable control root. The real kernel tests prove:
+Linux CI provisions a writable delegated root and an unwritable control root, then places the test process into the writable root using the privileged test harness before dropping back to the normal runner identity. Real-kernel tests prove:
 
 - a `setsid()`-detached descendant is gone when the operation returns;
-- a fork race leaves recursive `populated 0`;
-- migration across the delegation boundary fails;
-- migration inside the dedicated root cannot evade root-level termination;
-- an unwritable cgroup-v2 subtree is explicitly unavailable.
+- a fork race leaves no operation cgroup behind;
+- migration toward the parent hierarchy is denied;
+- reaching the outer hierarchy through another process's `/proc/<pid>/root` is denied;
+- the private cgroup mount is read-only to command code;
+- an unwritable cgroup-v2 root is explicitly unavailable.
 
 References:
 
 - Linux kernel cgroup v2 documentation: <https://docs.kernel.org/admin-guide/cgroup-v2.html>
 - `cgroup_namespaces(7)`: <https://man7.org/linux/man-pages/man7/cgroup_namespaces.7.html>
+- `user_namespaces(7)`: <https://man7.org/linux/man-pages/man7/user_namespaces.7.html>

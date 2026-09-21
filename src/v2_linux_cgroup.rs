@@ -1,10 +1,13 @@
 //! Optional Linux cgroup-v2 containment for bounded process/shell execution.
 //!
-//! The stronger backend is opt-in and requires an explicitly delegated, dedicated,
-//! empty cgroup-v2 subtree. It never infers authority from the cgroup mount alone.
-//! The configured subtree is serialized: one bounded process/shell operation owns
-//! it at a time, and terminal proof is cgroup.kill followed by cgroup.events
-//! reporting populated 0 for the whole tree.
+//! The stronger backend is opt-in. A service manager or operator must place
+//! the Agent itself in an explicitly delegated cgroup-v2 root before startup.
+//! Each bounded process/shell operation is moved into a fresh child cgroup
+//! before exec and then receives a private user+cgroup+mount namespace view
+//! whose cgroup2 mount is rooted at that operation cgroup and read-only.
+//! This prevents same-UID command code from migrating back to the Agent root.
+//! Terminal proof is cgroup.kill plus cgroup.events populated=0 for the exact
+//! operation subtree.
 
 use std::fmt;
 use std::fs::File;
@@ -23,6 +26,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
+const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+#[cfg(target_os = "linux")]
 const MAX_OPERATION_CGROUPS: usize = 4096;
 #[cfg(target_os = "linux")]
 const TERMINATION_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,11 +38,14 @@ const TERMINATION_POLL: Duration = Duration::from_millis(10);
 pub enum LinuxCgroupError {
     UnsupportedPlatform,
     RootMustBeCanonicalAbsolute,
-    RootMustBeDedicatedEmpty,
+    RootMustBeDedicated,
     NotCgroupV2,
     NotDomainCgroup,
     DelegationUnavailable,
     DelegationTooBroad,
+    AgentOutsideDelegatedRoot,
+    MountLayoutUnsupported,
+    NamespaceIsolationUnavailable,
     BackendPoisoned,
     Io(io::Error),
 }
@@ -47,11 +55,14 @@ impl LinuxCgroupError {
         match self {
             Self::UnsupportedPlatform => "linux_cgroup_unsupported_platform",
             Self::RootMustBeCanonicalAbsolute => "linux_cgroup_root_invalid",
-            Self::RootMustBeDedicatedEmpty => "linux_cgroup_root_not_empty",
+            Self::RootMustBeDedicated => "linux_cgroup_root_not_dedicated",
             Self::NotCgroupV2 => "linux_cgroup_not_v2",
             Self::NotDomainCgroup => "linux_cgroup_not_domain",
             Self::DelegationUnavailable => "linux_cgroup_delegation_unavailable",
             Self::DelegationTooBroad => "linux_cgroup_delegation_too_broad",
+            Self::AgentOutsideDelegatedRoot => "linux_cgroup_agent_outside_delegation",
+            Self::MountLayoutUnsupported => "linux_cgroup_mount_layout_unsupported",
+            Self::NamespaceIsolationUnavailable => "linux_cgroup_namespace_isolation_unavailable",
             Self::BackendPoisoned => "linux_cgroup_backend_poisoned",
             Self::Io(_) => "linux_cgroup_io",
         }
@@ -92,12 +103,14 @@ impl LinuxCgroupV2Containment {
         #[cfg(target_os = "linux")]
         {
             validate_root(&root)?;
-            Ok(Self {
+            let containment = Self {
                 root,
                 serial: Mutex::new(()),
                 sequence: AtomicU64::new(1),
                 poisoned: AtomicBool::new(false),
-            })
+            };
+            containment.probe_namespace_isolation()?;
+            Ok(containment)
         }
     }
 
@@ -119,9 +132,10 @@ impl LinuxCgroupV2Containment {
             if self.poisoned.load(Ordering::SeqCst) {
                 return Err(LinuxCgroupError::BackendPoisoned);
             }
-            if !cgroup_tree_empty(&self.root)? || has_child_cgroups(&self.root)? {
+            ensure_current_process_in_root(&self.root)?;
+            if has_child_cgroups(&self.root)? {
                 self.poisoned.store(true, Ordering::SeqCst);
-                return Err(LinuxCgroupError::RootMustBeDedicatedEmpty);
+                return Err(LinuxCgroupError::RootMustBeDedicated);
             }
 
             let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
@@ -139,7 +153,11 @@ impl LinuxCgroupV2Containment {
                     return Err(LinuxCgroupError::Io(error));
                 }
             };
-            if !operation_root.join("cgroup.kill").is_file() {
+            if OpenOptions::new()
+                .write(true)
+                .open(operation_root.join("cgroup.kill"))
+                .is_err()
+            {
                 let _ = fs::remove_dir(&operation_root);
                 return Err(LinuxCgroupError::DelegationUnavailable);
             }
@@ -147,10 +165,33 @@ impl LinuxCgroupV2Containment {
             Ok(LinuxCgroupOperation {
                 owner: self,
                 _serial: serial,
+                operation_root,
                 procs,
                 active: true,
             })
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_namespace_isolation(&self) -> Result<(), LinuxCgroupError> {
+        let mut operation = self.prepare_operation()?;
+        let mut command = Command::new("/bin/true");
+        command.env_clear();
+        operation.configure_command(&mut command)?;
+        let status = match command.status() {
+            Ok(status) => status,
+            Err(_) => {
+                let _ = operation.spawn_failed_cleanup();
+                return Err(LinuxCgroupError::NamespaceIsolationUnavailable);
+            }
+        };
+        operation
+            .terminate_and_prove_empty()
+            .map_err(|_| LinuxCgroupError::NamespaceIsolationUnavailable)?;
+        if !status.success() {
+            return Err(LinuxCgroupError::NamespaceIsolationUnavailable);
+        }
+        Ok(())
     }
 
     fn poison(&self) {
@@ -162,6 +203,7 @@ impl LinuxCgroupV2Containment {
 pub(crate) struct LinuxCgroupOperation<'a> {
     owner: &'a LinuxCgroupV2Containment,
     _serial: MutexGuard<'a, ()>,
+    operation_root: PathBuf,
     procs: File,
     active: bool,
 }
@@ -180,24 +222,16 @@ impl LinuxCgroupOperation<'_> {
             use std::os::unix::process::CommandExt;
 
             let procs = self.procs.try_clone().map_err(LinuxCgroupError::Io)?;
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            let uid_map = format!("{uid} {uid} 1\n").into_bytes();
+            let gid_map = format!("{gid} {gid} 1\n").into_bytes();
+
             unsafe {
                 command.pre_exec(move || {
-                    let bytes = b"0\n";
-                    let written = libc::write(
-                        procs.as_raw_fd(),
-                        bytes.as_ptr().cast::<libc::c_void>(),
-                        bytes.len(),
-                    );
-                    if written == isize::try_from(bytes.len()).unwrap_or(-1) {
-                        Ok(())
-                    } else if written < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "partial cgroup.procs write",
-                        ))
-                    }
+                    write_all_raw_fd(procs.as_raw_fd(), b"0\n")?;
+                    establish_private_cgroup_view(&uid_map, &gid_map)?;
+                    Ok(())
                 });
             }
             Ok(())
@@ -215,13 +249,11 @@ impl LinuxCgroupOperation<'_> {
             if !self.active {
                 return Ok(());
             }
-            if let Err(error) = write_cgroup_kill(&self.owner.root)
-                .and_then(|()| wait_cgroup_tree_empty(&self.owner.root))
+            if let Err(error) = write_cgroup_kill(&self.operation_root)
+                .and_then(|()| wait_cgroup_tree_empty(&self.operation_root))
+                .and_then(|()| remove_descendant_cgroups(&self.operation_root))
+                .and_then(|()| fs::remove_dir(&self.operation_root).map_err(LinuxCgroupError::Io))
             {
-                self.owner.poison();
-                return Err(error);
-            }
-            if let Err(error) = remove_descendant_cgroups(&self.owner.root) {
                 self.owner.poison();
                 return Err(error);
             }
@@ -266,6 +298,8 @@ fn validate_root(root: &Path) -> Result<(), LinuxCgroupError> {
         return Err(LinuxCgroupError::RootMustBeCanonicalAbsolute);
     }
 
+    validate_mount_layout()?;
+
     let c_path = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| LinuxCgroupError::RootMustBeCanonicalAbsolute)?;
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
@@ -281,7 +315,6 @@ fn validate_root(root: &Path) -> Result<(), LinuxCgroupError> {
         "cgroup.controllers",
         "cgroup.events",
         "cgroup.procs",
-        "cgroup.kill",
         "cgroup.type",
     ] {
         if !root.join(required).is_file() {
@@ -292,17 +325,10 @@ fn validate_root(root: &Path) -> Result<(), LinuxCgroupError> {
     if cgroup_type.trim() != "domain" {
         return Err(LinuxCgroupError::NotDomainCgroup);
     }
-    if !cgroup_tree_empty(root)? || has_child_cgroups(root)? {
-        return Err(LinuxCgroupError::RootMustBeDedicatedEmpty);
-    }
 
     OpenOptions::new()
         .write(true)
         .open(root.join("cgroup.procs"))
-        .map_err(|_| LinuxCgroupError::DelegationUnavailable)?;
-    OpenOptions::new()
-        .write(true)
-        .open(root.join("cgroup.kill"))
         .map_err(|_| LinuxCgroupError::DelegationUnavailable)?;
 
     let parent = root
@@ -314,6 +340,11 @@ fn validate_root(root: &Path) -> Result<(), LinuxCgroupError> {
         .is_ok()
     {
         return Err(LinuxCgroupError::DelegationTooBroad);
+    }
+
+    ensure_current_process_in_root(root)?;
+    if has_child_cgroups(root)? {
+        return Err(LinuxCgroupError::RootMustBeDedicated);
     }
 
     let probe = root.join(format!(
@@ -344,6 +375,145 @@ fn validate_root(root: &Path) -> Result<(), LinuxCgroupError> {
         return Err(error);
     }
     remove_result.map_err(LinuxCgroupError::Io)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_mount_layout() -> Result<(), LinuxCgroupError> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").map_err(LinuxCgroupError::Io)?;
+    let mut cgroup2 = Vec::new();
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut after_fields = after.split_ascii_whitespace();
+        if after_fields.next() != Some("cgroup2") {
+            continue;
+        }
+        let fields = before.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() < 5 {
+            return Err(LinuxCgroupError::MountLayoutUnsupported);
+        }
+        cgroup2.push((fields[3], fields[4]));
+    }
+    if cgroup2.as_slice() != [("/", CGROUP_MOUNT)] {
+        return Err(LinuxCgroupError::MountLayoutUnsupported);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_current_process_in_root(root: &Path) -> Result<(), LinuxCgroupError> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup").map_err(LinuxCgroupError::Io)?;
+    let relative = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or(LinuxCgroupError::NotCgroupV2)?;
+    let expected = if relative == "/" {
+        PathBuf::from(CGROUP_MOUNT)
+    } else {
+        Path::new(CGROUP_MOUNT).join(relative.trim_start_matches('/'))
+    };
+    let expected = fs::canonicalize(expected).map_err(LinuxCgroupError::Io)?;
+    if expected != root {
+        return Err(LinuxCgroupError::AgentOutsideDelegatedRoot);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_raw_fd(fd: libc::c_int, bytes: &[u8]) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written = unsafe {
+            libc::write(
+                fd,
+                bytes[offset..].as_ptr().cast::<libc::c_void>(),
+                bytes.len() - offset,
+            )
+        };
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if written == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
+        offset += usize::try_from(written).map_err(|_| io::Error::other("invalid write result"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_proc_control(path: *const libc::c_char, bytes: &[u8], optional: bool) -> io::Result<()> {
+    let fd = unsafe { libc::open(path, libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if optional && error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    let result = write_all_raw_fd(fd, bytes);
+    unsafe {
+        libc::close(fd);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn establish_private_cgroup_view(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+    const SETGROUPS: &[u8] = b"/proc/self/setgroups\0";
+    const UID_MAP: &[u8] = b"/proc/self/uid_map\0";
+    const GID_MAP: &[u8] = b"/proc/self/gid_map\0";
+    const CGROUP_TARGET: &[u8] = b"/sys/fs/cgroup\0";
+    const CGROUP_SOURCE: &[u8] = b"none\0";
+    const CGROUP_FSTYPE: &[u8] = b"cgroup2\0";
+    const ROOT: &[u8] = b"/\0";
+
+    let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWCGROUP | libc::CLONE_NEWNS;
+    if unsafe { libc::unshare(flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    write_proc_control(SETGROUPS.as_ptr().cast::<libc::c_char>(), b"deny\n", true)?;
+    write_proc_control(UID_MAP.as_ptr().cast::<libc::c_char>(), uid_map, false)?;
+    write_proc_control(GID_MAP.as_ptr().cast::<libc::c_char>(), gid_map, false)?;
+
+    let private_flags = libc::MS_REC | libc::MS_PRIVATE;
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            ROOT.as_ptr().cast::<libc::c_char>(),
+            std::ptr::null(),
+            private_flags,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let cgroup_flags = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    if unsafe {
+        libc::mount(
+            CGROUP_SOURCE.as_ptr().cast::<libc::c_char>(),
+            CGROUP_TARGET.as_ptr().cast::<libc::c_char>(),
+            CGROUP_FSTYPE.as_ptr().cast::<libc::c_char>(),
+            cgroup_flags,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
