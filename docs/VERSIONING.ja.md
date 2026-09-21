@@ -42,6 +42,8 @@ meaningful public-contract expansion、または deliberate incompatible pre-1.0
 
 roadmap phase、PR count、elapsed time、documentation milestone だけでは minor version を上げません。
 
+以前のrelease artifactにimplementationが含まれていても、advertised support contractから意図的にwithholdしていたprovider/platform capabilityは、後からacceptanceが完了しても過去releaseへ遡及してsupportedにはしません。その新しいsupport boundaryのadvertiseはpublic-contract expansionなので、次の適切なMINOR release（またはそれ以降）でshipし、older releaseのclaimは変更しません。
+
 ## 1.0 より前の breaking change
 
 pre-1.0 breaking change は patch ではなく minor release で行います。`CHANGELOG.md` に明記し、user が configuration / integration behavior を変更する必要がある場合は migration guidance を提供し、relevant compatibility/schema/security docs を更新します。

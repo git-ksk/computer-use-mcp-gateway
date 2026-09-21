@@ -42,6 +42,8 @@ Typical minor changes:
 
 Roadmap phase, PR count, elapsed time, or documentation milestone alone is not a reason to increment the minor version.
 
+A provider/platform capability that was compiled in an older release but intentionally withheld from the advertised support contract does **not** become retroactively supported when later acceptance succeeds. Advertising that new support boundary is a public-contract expansion and therefore ships in the next appropriate MINOR release (or later), with the older release claim left unchanged.
+
 ## Breaking changes before 1.0
 
 A pre-1.0 breaking change ships in a minor release, never a patch release. It must be called out in `CHANGELOG.md`, include migration guidance when users must change configuration/integration behavior, and update relevant compatibility/schema/security docs.

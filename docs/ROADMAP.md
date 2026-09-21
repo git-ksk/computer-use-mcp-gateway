@@ -36,7 +36,7 @@ The completed V1/V2 implementation history and acceptance evidence remain availa
 
 ## Released baseline: `0.5.x`; next planned feature minor: `0.6.0`
 
-`v0.5.0` is the released **Least-privilege Workspace** baseline. Its release scope completed #313/#105/#83/#107/#319/#323 plus the final #314 schema/config/readiness/upgrade integration gate; #308 adds Windows npm/CSPRNG recurrence coverage without changing runtime authority. The next planned feature minor is **`v0.6.0` — Managed Developer Execution**. Remaining acceptance for #139/#217/#228 is tracked **after `v0.5.0`** in the separate **Post-v0.5 — Support Claim Expansion** milestone.
+`v0.5.0` is the released **Least-privilege Workspace** baseline. Its release scope completed #313/#105/#83/#107/#319/#323 plus the final #314 schema/config/readiness/upgrade integration gate; #308 adds Windows npm/CSPRNG recurrence coverage without changing runtime authority. The next planned feature minor is **`v0.6.0` — Managed Developer Execution**. Remaining acceptance for #139/#217/#228 is tracked on the **`v0.6.x — Support Claim Expansion`** track. Their implementations have older history, but a newly advertised provider/platform support claim belongs to the v0.6 release line or a later minor; it never retroactively changes the `v0.4.0`/`v0.5.0` support contract.
 
 The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Its accepted support boundary is recorded in the release-scope and status documents.
 
@@ -83,7 +83,7 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 
 ## Post-v0.5 delivery sequence
 
-v0.5.0 is the released and frozen **Least-privilege Workspace** baseline. There is no planned 0.5.1 train: open a patch release only for a concrete regression, security issue, or release/packaging defect that actually requires changing the released runtime. Remaining #139/#217/#228 acceptance is ordered **after v0.5.0** in the unnumbered Post-v0.5 Support Claim Expansion track; it does not reopen either released minor.
+v0.5.0 is the released and frozen **Least-privilege Workspace** baseline. There is no planned 0.5.1 train: open a patch release only for a concrete regression, security issue, or release/packaging defect that actually requires changing the released runtime. Remaining #139/#217/#228 acceptance is assigned to the non-blocking **v0.6.x Support Claim Expansion** track. If acceptance is complete before the v0.6.0 release freeze, the corresponding support claim may ship in v0.6.0; otherwise it remains explicitly withheld and is carried to a later v0.6.x or later minor release. It never reopens an older released minor.
 
 The next numbered feature minor is **v0.6.0 — Managed Developer Execution**. Keep its feature boundary intentionally small and do not absorb unrelated hosted, recovery-research, or operator-UX work merely because it is open.
 
@@ -178,7 +178,7 @@ This queue records the practical result of continued Handoff integration and phy
 
 Every OPEN issue must appear in one of the buckets below or in another explicit roadmap section. The inventory describes admission and ordering; it does not imply that every open issue belongs to the next release.
 
-- **Post-v0.5 — Support Claim Expansion:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance are ordered after the released `v0.5.0` baseline. Their implementations have older history, but the remaining work is future acceptance/evidence. They do not reopen `0.4.0`/`0.5.0` and do not block `v0.6.0` unless explicitly admitted.
+- **`v0.6.x — Support Claim Expansion` (non-blocking for v0.6.0):** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance. These can widen the v0.6 support contract when their evidence is complete. Acceptance complete before the v0.6.0 freeze may be included in v0.6.0; otherwise the claim stays withheld and moves forward explicitly. Older releases are never re-labeled as supporting the provider/platform after the fact.
 - **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E, with #267 optional Linux cgroup-v2 containment allowed to proceed in parallel once the containment contract is stable; #335 is the required final integration/release gate.
 - **Operational usability / inspectability, unnumbered:** #304 exposes the existing unified privacy-bounded runtime status as one read-only MCP/Gateway call; #295 adds bounded human-readable --version identity. These are useful cross-cutting product improvements but are not v0.6.0 blockers unless explicitly admitted.
 - **Recovery evidence hardening, unnumbered:** #289 preserves privacy-bounded target identity for ambiguous application operations; #290 extends #124 self-reconciliation with exact durable backend receipts and depends on the reviewed target/evidence boundary. Keep both fail-closed and outside v0.6.0 until a deliberate release admission decision.
@@ -194,7 +194,7 @@ The Cua authorization/product-boundary research in #219 is completed by [v2/V2_A
 
 ### `0.4.0` identity and semantic-authorization component
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) has implementation history in the integrated `0.4.0` baseline: provider-neutral signed-token verification reduces a verified external identity to the existing `AuthenticatedClientPrincipal`, while exact principal/device/capability authorization remains unchanged. Its still-open physical signed-token dogfood is not unfinished `0.4.0` work; it is tracked after `v0.5.0` in the Post-v0.5 Support Claim Expansion milestone.
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) has implementation history in the integrated `0.4.0` baseline: provider-neutral signed-token verification reduces a verified external identity to the existing `AuthenticatedClientPrincipal`, while exact principal/device/capability authorization remains unchanged. Its still-open physical signed-token dogfood is not unfinished `0.4.0` work; it is tracked on the `v0.6.x — Support Claim Expansion` milestone and becomes an advertised support claim only in a v0.6 release or later.
 
 ```text
 external OAuth/OIDC identity provider
