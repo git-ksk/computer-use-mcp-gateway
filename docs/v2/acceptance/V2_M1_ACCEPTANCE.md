@@ -119,6 +119,25 @@ CUMG_V2_CUA_COMMAND="$HOME/.local/bin/cua-driver" \
 
 The TLS lifecycle fixture additionally generates local throwaway certificate pairs, proves valid-pair install modes/regular-file behavior, and requires a mismatched key to fail without replacing the deployed key. The `v2_keyctl` fixture generates/rotates throwaway Hub/device/grant material outside the repository and verifies 0600 private-key modes.
 
+## Temporary acceptance fixture lifecycle
+
+Repository-owned acceptance HTTP fixtures use `scripts/v2_acceptance_fixture_guard.py`.
+The guard defaults to loopback-only binding and requires an explicit `--allow-lan` acknowledgement
+before starting a LAN-reachable fixture. It records an owner-private registry entry containing the
+exact PID, process group, process start marker, and command fingerprint.
+
+Acceptance preflight may run `python3 scripts/v2_acceptance_fixture_guard.py check`. A live registered
+fixture is reported as stale without dumping its argv or unrelated process details. Cleanup uses
+`python3 scripts/v2_acceptance_fixture_guard.py cleanup`; it sends signals only after the current
+process identity still matches the recorded PID/process-group/start/fingerprint tuple. It never kills
+by port or executable name. Dead records are pruned automatically, while PID reuse or identity drift
+fails closed and requires operator inspection.
+
+The Issue #47 browser acceptance uses this guard for its local HTTP fixture and performs a stale check
+before starting. Normal exit, test failure, SIGINT, and SIGTERM all run exact registered cleanup. If
+an acceptance runner itself is forcibly killed and leaves the fixture behind, the next preflight
+detects the still-live registry entry and can safely clean it before continuing.
+
 ## Accepted residuals / non-claims
 
 The following are deliberate post-M1 or deployment boundaries, not hidden blockers:

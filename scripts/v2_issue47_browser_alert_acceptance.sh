@@ -22,6 +22,7 @@ if [[ ! -x "$CUMG_V2_ISSUE47_CHROME_COMMAND" ]]; then
 fi
 
 root="$(mktemp -d "${TMPDIR:-/private/tmp}/cumg-issue47.XXXXXX")"
+fixture_guard="scripts/v2_acceptance_fixture_guard.py"
 http_pid=""
 chrome_pid=""
 cleanup() {
@@ -31,11 +32,23 @@ cleanup() {
   pkill -TERM -f -- "--user-data-dir=$root/profile" 2>/dev/null || true
   sleep 0.2
   pkill -KILL -f -- "--user-data-dir=$root/profile" 2>/dev/null || true
-  if [[ -n "$http_pid" ]]; then kill "$http_pid" 2>/dev/null || true; fi
+  if [[ -n "$http_pid" ]]; then python3 "$fixture_guard" cleanup --pid "$http_pid" >/dev/null 2>&1 || true; fi
   rm -rf "$root" 2>/dev/null || true
   return 0
 }
 trap cleanup EXIT INT TERM
+set +e
+python3 "$fixture_guard" check
+fixture_check_status=$?
+set -e
+if [[ "$fixture_check_status" -eq 1 ]]; then
+  echo "Cleaning stale registered CUMG acceptance fixture(s) before browser acceptance." >&2
+  python3 "$fixture_guard" cleanup
+elif [[ "$fixture_check_status" -ne 0 ]]; then
+  echo "Acceptance fixture registry could not be verified safely." >&2
+  exit "$fixture_check_status"
+fi
+
 mkdir -p "$root/profile" "$root/www"
 cat > "$root/www/index.html" <<'HTML'
 <!doctype html><meta charset="utf-8"><title>CUMG issue47</title>
@@ -56,8 +69,7 @@ print(*ports)
 PY
 )
 
-python3 -m http.server "$http_port" --bind 127.0.0.1 --directory "$root/www" >"$root/http.log" 2>&1 &
-http_pid=$!
+http_pid="$(python3 "$fixture_guard" start-http --directory "$root/www" --bind 127.0.0.1 --port "$http_port" --log "$root/http.log")"
 "$CUMG_V2_ISSUE47_CHROME_COMMAND" \
   --user-data-dir="$root/profile" \
   --remote-debugging-port="$devtools_port" \
