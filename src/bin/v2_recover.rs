@@ -16,9 +16,11 @@ use computer_use_mcp_gateway::{
     v2_execution_safety::RetirementPolicy,
     v2_guided_recovery::{
         GuidedRecoveryDisposition, GuidedRecoveryPlan, GuidedRecoveryPostDisposition,
-        classify_guided_recovery_post_status, compose_guided_recovery_plan,
+        GuidedRecoveryReviewLifecycle, classify_guided_recovery_post_status,
+        classify_guided_recovery_review_lifecycle, compose_guided_recovery_plan,
         decision_name as guided_decision_name, revalidate_guided_current_state_acceptance,
         revalidate_guided_human_historical_selection, revalidate_guided_recovery_selection,
+        same_guided_recovery_challenge_binding,
     },
     v2_incident_brief::{build_incident_brief_read_only, render_incident_brief_text},
     v2_m0_execution::IndeterminateResolution,
@@ -34,7 +36,7 @@ use computer_use_mcp_gateway::{
 use std::fs::OpenOptions;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(name = "cumg-v2-recover")]
@@ -411,6 +413,44 @@ impl GuidedRecoverySelection {
     }
 }
 
+const GUIDED_PROMPT_POLL_INTERVAL_MS: u64 = 1_000;
+const GUIDED_FRESH_REVIEW_WAIT_MS: u64 = 30_000;
+const GUIDED_FRESH_REVIEW_POLL_MS: u64 = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidedPromptRefreshReason {
+    Expired,
+    BindingChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidedPromptOutcome {
+    Selected(GuidedRecoverySelection),
+    Cancelled,
+    Refresh(GuidedPromptRefreshReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidedParsedInput {
+    Selected(GuidedRecoverySelection),
+    Cancelled,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuidedPromptInput {
+    Line(String),
+    Tick,
+    Eof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuidedReviewLineOutcome {
+    Line(String),
+    Eof,
+    Refresh(GuidedPromptRefreshReason),
+}
+
 #[derive(Debug)]
 struct GuidedRecoveryArgs {
     hub_state_dir: PathBuf,
@@ -439,6 +479,7 @@ struct PostRecoveryStatus {
     primary_reason: String,
     quarantine: String,
     recovery_mode: String,
+    effectful_execution: String,
     handoff: String,
     mutation_authority: String,
     runtime: String,
@@ -765,9 +806,220 @@ fn load_guided_review(args: &GuidedRecoveryArgs) -> Result<GuidedRecoveryReview>
     })
 }
 
+fn guided_review_lifecycle(
+    args: &GuidedRecoveryArgs,
+    reviewed: &GuidedRecoveryReview,
+) -> Result<GuidedRecoveryReviewLifecycle> {
+    let current = load_challenge(&args.agent_state_dir)
+        .context("failed to read recovery challenge while Human review was active")?;
+    Ok(classify_guided_recovery_review_lifecycle(
+        &reviewed.challenge,
+        current.as_ref(),
+        now_ms()?,
+    ))
+}
+
+const fn guided_refresh_reason(
+    lifecycle: GuidedRecoveryReviewLifecycle,
+) -> Option<GuidedPromptRefreshReason> {
+    match lifecycle {
+        GuidedRecoveryReviewLifecycle::Expired => Some(GuidedPromptRefreshReason::Expired),
+        GuidedRecoveryReviewLifecycle::BindingChanged => {
+            Some(GuidedPromptRefreshReason::BindingChanged)
+        }
+        GuidedRecoveryReviewLifecycle::Current { .. } => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_guided_challenge_current_for_authorization(
+    state_dir: &Path,
+    challenge: &RecoveryChallenge,
+) -> Result<()> {
+    let current = load_challenge(state_dir)
+        .context("failed to re-read recovery challenge before guided authorization")?;
+    match classify_guided_recovery_review_lifecycle(challenge, current.as_ref(), now_ms()?) {
+        GuidedRecoveryReviewLifecycle::Current { .. } => Ok(()),
+        GuidedRecoveryReviewLifecycle::Expired => {
+            anyhow::bail!("guided recovery review expired before authorization publication")
+        }
+        GuidedRecoveryReviewLifecycle::BindingChanged => {
+            anyhow::bail!("guided recovery binding changed before authorization publication")
+        }
+    }
+}
+
+fn print_guided_review_window(reviewed: &GuidedRecoveryReview) -> Result<()> {
+    let now = now_ms()?;
+    let remaining_ms = reviewed.challenge.expires_at_ms.saturating_sub(now);
+    let remaining_seconds = remaining_ms.saturating_add(999) / 1_000;
+    println!(
+        "  review_expires_at_ms={}",
+        reviewed.challenge.expires_at_ms
+    );
+    println!("  review_remaining_seconds={remaining_seconds}");
+    println!(
+        "  review_policy=fresh_review_and_fresh_human_selection_required_after_expiry_or_binding_change"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_guided_prompt_input(timeout_ms: u64) -> Result<GuidedPromptInput> {
+    let timeout_ms = i32::try_from(timeout_ms.min(i32::MAX as u64)).unwrap_or(i32::MAX);
+    let mut descriptor = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result == 0 {
+        return Ok(GuidedPromptInput::Tick);
+    }
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(GuidedPromptInput::Tick);
+        }
+        return Err(error).context("failed while waiting for guided-recovery Human input");
+    }
+    if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        anyhow::bail!("guided-recovery Human input became unavailable");
+    }
+    if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+        return Ok(GuidedPromptInput::Tick);
+    }
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input)? == 0 {
+        Ok(GuidedPromptInput::Eof)
+    } else {
+        Ok(GuidedPromptInput::Line(input))
+    }
+}
+
+#[cfg(not(unix))]
+fn read_guided_prompt_input(_timeout_ms: u64) -> Result<GuidedPromptInput> {
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input)? == 0 {
+        Ok(GuidedPromptInput::Eof)
+    } else {
+        Ok(GuidedPromptInput::Line(input))
+    }
+}
+
+fn read_guided_review_line(
+    args: &GuidedRecoveryArgs,
+    reviewed: &GuidedRecoveryReview,
+    prompt: &str,
+) -> Result<GuidedReviewLineOutcome> {
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    loop {
+        let lifecycle = guided_review_lifecycle(args, reviewed)?;
+        if let Some(reason) = guided_refresh_reason(lifecycle) {
+            println!();
+            return Ok(GuidedReviewLineOutcome::Refresh(reason));
+        }
+        let remaining_ms = match lifecycle {
+            GuidedRecoveryReviewLifecycle::Current { remaining_ms } => remaining_ms,
+            GuidedRecoveryReviewLifecycle::Expired
+            | GuidedRecoveryReviewLifecycle::BindingChanged => unreachable!(),
+        };
+        let timeout_ms = remaining_ms.clamp(1, GUIDED_PROMPT_POLL_INTERVAL_MS);
+        match read_guided_prompt_input(timeout_ms)? {
+            GuidedPromptInput::Tick => continue,
+            GuidedPromptInput::Eof => return Ok(GuidedReviewLineOutcome::Eof),
+            GuidedPromptInput::Line(input) => {
+                let after_input = guided_review_lifecycle(args, reviewed)?;
+                if let Some(reason) = guided_refresh_reason(after_input) {
+                    return Ok(GuidedReviewLineOutcome::Refresh(reason));
+                }
+                return Ok(GuidedReviewLineOutcome::Line(input));
+            }
+        }
+    }
+}
+
+fn parse_authoritative_guided_input(
+    supported_decisions: &[ReconciliationSupportedDecision],
+    input: &str,
+) -> GuidedParsedInput {
+    let input = input.trim();
+    if matches!(input, "0" | "q" | "quit" | "cancel") {
+        return GuidedParsedInput::Cancelled;
+    }
+    let Ok(index) = input.parse::<usize>() else {
+        return GuidedParsedInput::Invalid;
+    };
+    index
+        .checked_sub(1)
+        .and_then(|offset| supported_decisions.get(offset).copied())
+        .map(GuidedRecoverySelection::Authoritative)
+        .map(GuidedParsedInput::Selected)
+        .unwrap_or(GuidedParsedInput::Invalid)
+}
+
+fn parse_human_historical_guided_input(
+    current_state_policy: Option<RetirementPolicy>,
+    input: &str,
+) -> GuidedParsedInput {
+    match input.trim() {
+        "0" | "q" | "quit" | "cancel" => GuidedParsedInput::Cancelled,
+        "1" => GuidedParsedInput::Selected(GuidedRecoverySelection::HumanHistorical(
+            ReconciliationSupportedDecision::ConfirmedCompleted,
+        )),
+        "2" => GuidedParsedInput::Selected(GuidedRecoverySelection::HumanHistorical(
+            ReconciliationSupportedDecision::ConfirmedNotExecuted,
+        )),
+        "3" if current_state_policy.is_some() => current_state_policy
+            .map(GuidedRecoverySelection::CurrentStateAccepted)
+            .map(GuidedParsedInput::Selected)
+            .unwrap_or(GuidedParsedInput::Invalid),
+        _ => GuidedParsedInput::Invalid,
+    }
+}
+
+fn print_guided_pre_auth_refresh(reason: GuidedPromptRefreshReason) {
+    let reason = match reason {
+        GuidedPromptRefreshReason::Expired => "challenge_expired",
+        GuidedPromptRefreshReason::BindingChanged => "challenge_binding_changed",
+    };
+    println!("guided_outcome=re_review_required");
+    println!("review_refresh_reason={reason}");
+    println!("human_selection=discarded");
+    println!("user_presence_authentication=not_started");
+    println!("authorization=not_published");
+    println!("durable_completion=not_verified");
+    println!("quarantine=retained");
+    println!("old_operation_replayed=false");
+}
+
+fn wait_for_refreshed_guided_review(
+    args: &GuidedRecoveryArgs,
+    previous: &GuidedRecoveryReview,
+) -> Result<GuidedRecoveryReview> {
+    let deadline = now_ms()?.saturating_add(GUIDED_FRESH_REVIEW_WAIT_MS);
+    println!("review_refresh=waiting_for_fresh_signed_challenge");
+    loop {
+        if now_ms()? >= deadline {
+            anyhow::bail!(
+                "fresh recovery review did not arrive within the bounded refresh window; quarantine remains unchanged; re-run guide"
+            );
+        }
+        if let Ok(candidate) = load_guided_review(args) {
+            if !same_guided_recovery_challenge_binding(&previous.challenge, &candidate.challenge) {
+                println!("review_refresh=fresh_review_loaded");
+                return Ok(candidate);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(GUIDED_FRESH_REVIEW_POLL_MS));
+    }
+}
+
 fn prompt_authoritative_guided_decision(
-    plan: &GuidedRecoveryPlan,
-) -> Result<Option<GuidedRecoverySelection>> {
+    args: &GuidedRecoveryArgs,
+    reviewed: &GuidedRecoveryReview,
+) -> Result<GuidedPromptOutcome> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
         anyhow::bail!(
@@ -776,43 +1028,43 @@ fn prompt_authoritative_guided_decision(
     }
     println!("\nHuman decision required");
     println!("  0) Keep quarantine / cancel");
-    for (index, decision) in plan.supported_decisions.iter().enumerate() {
+    for (index, decision) in reviewed.plan.supported_decisions.iter().enumerate() {
         println!("  {}) {}", index + 1, guided_decision_name(*decision));
     }
     loop {
-        print!("Select a CUMG-supported decision: ");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        if stdin.read_line(&mut input)? == 0 {
-            return Ok(None);
+        match read_guided_review_line(args, reviewed, "Select a CUMG-supported decision: ")? {
+            GuidedReviewLineOutcome::Eof => return Ok(GuidedPromptOutcome::Cancelled),
+            GuidedReviewLineOutcome::Refresh(reason) => {
+                return Ok(GuidedPromptOutcome::Refresh(reason));
+            }
+            GuidedReviewLineOutcome::Line(input) => {
+                match parse_authoritative_guided_input(&reviewed.plan.supported_decisions, &input) {
+                    GuidedParsedInput::Selected(selection) => {
+                        return Ok(GuidedPromptOutcome::Selected(selection));
+                    }
+                    GuidedParsedInput::Cancelled => return Ok(GuidedPromptOutcome::Cancelled),
+                    GuidedParsedInput::Invalid => {
+                        println!(
+                            "Invalid selection; choose one listed number or 0 to keep quarantine."
+                        );
+                    }
+                }
+            }
         }
-        let input = input.trim();
-        if matches!(input, "0" | "q" | "quit" | "cancel") {
-            return Ok(None);
-        }
-        let Ok(index) = input.parse::<usize>() else {
-            println!("Invalid selection; choose one listed number or 0 to keep quarantine.");
-            continue;
-        };
-        if let Some(decision) = index
-            .checked_sub(1)
-            .and_then(|offset| plan.supported_decisions.get(offset))
-        {
-            return Ok(Some(GuidedRecoverySelection::Authoritative(*decision)));
-        }
-        println!("Unsupported selection; the authoritative decision set was not widened.");
     }
 }
 
 fn prompt_human_historical_assertion(
-    plan: &GuidedRecoveryPlan,
-) -> Result<Option<GuidedRecoverySelection>> {
+    args: &GuidedRecoveryArgs,
+    reviewed: &GuidedRecoveryReview,
+) -> Result<GuidedPromptOutcome> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
         anyhow::bail!(
             "Human historical assertion requires an interactive Human terminal; use --json for read-only planning"
         );
     }
+    let plan = &reviewed.plan;
     if !plan.human_historical_assertion.available
         || plan.human_historical_assertion.automatic_selection_allowed
         || !plan.supported_decisions.is_empty()
@@ -833,32 +1085,30 @@ fn prompt_human_historical_assertion(
         );
     }
     loop {
-        print!("Select a Human historical assertion: ");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        if stdin.read_line(&mut input)? == 0 {
-            return Ok(None);
-        }
-        match input.trim() {
-            "0" | "q" | "quit" | "cancel" => return Ok(None),
-            "1" => {
-                return Ok(Some(GuidedRecoverySelection::HumanHistorical(
-                    ReconciliationSupportedDecision::ConfirmedCompleted,
-                )));
+        match read_guided_review_line(args, reviewed, "Select a Human historical assertion: ")? {
+            GuidedReviewLineOutcome::Eof => return Ok(GuidedPromptOutcome::Cancelled),
+            GuidedReviewLineOutcome::Refresh(reason) => {
+                return Ok(GuidedPromptOutcome::Refresh(reason));
             }
-            "2" => {
-                return Ok(Some(GuidedRecoverySelection::HumanHistorical(
-                    ReconciliationSupportedDecision::ConfirmedNotExecuted,
-                )));
+            GuidedReviewLineOutcome::Line(input) => {
+                match parse_human_historical_guided_input(
+                    plan.current_state_acceptance
+                        .available
+                        .then_some(plan.current_state_acceptance.policy)
+                        .flatten(),
+                    &input,
+                ) {
+                    GuidedParsedInput::Selected(selection) => {
+                        return Ok(GuidedPromptOutcome::Selected(selection));
+                    }
+                    GuidedParsedInput::Cancelled => return Ok(GuidedPromptOutcome::Cancelled),
+                    GuidedParsedInput::Invalid => {
+                        println!(
+                            "Invalid selection; choose a listed option or 0 to keep quarantine."
+                        );
+                    }
+                }
             }
-            "3" if plan.current_state_acceptance.available => {
-                let policy = plan
-                    .current_state_acceptance
-                    .policy
-                    .context("guided current-state policy is missing")?;
-                return Ok(Some(GuidedRecoverySelection::CurrentStateAccepted(policy)));
-            }
-            _ => println!("Invalid selection; choose a listed option or 0 to keep quarantine."),
         }
     }
 }
@@ -917,191 +1167,262 @@ fn guide(args: GuidedRecoveryArgs) -> Result<()> {
             args.wait_secs,
         );
     }
-    let reviewed = load_guided_review(&args)?;
+    let mut reviewed = load_guided_review(&args)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&reviewed.plan)?);
         return Ok(());
     }
 
-    println!("{}", render_incident_brief_text(&reviewed.brief));
-    println!("\nGuided recovery");
-    println!("  operation_id={}", reviewed.plan.operation.operation_id);
-    println!("  device_id={}", reviewed.plan.operation.device_id);
-    println!(
-        "  original_generation={}",
-        reviewed.plan.operation.original_generation
-    );
-    println!(
-        "  current_generation={}",
-        reviewed
-            .plan
-            .operation
-            .current_generation
-            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
-    );
-    println!(
-        "  old_operation_replayed={}",
-        reviewed.plan.old_operation_replayed
-    );
+    loop {
+        println!("{}", render_incident_brief_text(&reviewed.brief));
+        println!("\nGuided recovery");
+        println!("  operation_id={}", reviewed.plan.operation.operation_id);
+        println!("  device_id={}", reviewed.plan.operation.device_id);
+        println!(
+            "  original_generation={}",
+            reviewed.plan.operation.original_generation
+        );
+        println!(
+            "  current_generation={}",
+            reviewed
+                .plan
+                .operation
+                .current_generation
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+        );
+        println!(
+            "  old_operation_replayed={}",
+            reviewed.plan.old_operation_replayed
+        );
+        print_guided_review_window(&reviewed)?;
 
-    let selected = match reviewed.plan.disposition {
-        GuidedRecoveryDisposition::KeepQuarantine => {
-            if reviewed.plan.human_historical_assertion.available {
-                prompt_human_historical_assertion(&reviewed.plan)?
-            } else {
-                None
+        let prompt_outcome = match reviewed.plan.disposition {
+            GuidedRecoveryDisposition::KeepQuarantine => {
+                if reviewed.plan.human_historical_assertion.available {
+                    prompt_human_historical_assertion(&args, &reviewed)?
+                } else {
+                    GuidedPromptOutcome::Cancelled
+                }
             }
+            GuidedRecoveryDisposition::Reinspect => {
+                print_guided_pre_auth_refresh(GuidedPromptRefreshReason::BindingChanged);
+                reviewed = wait_for_refreshed_guided_review(&args, &reviewed)?;
+                continue;
+            }
+            GuidedRecoveryDisposition::HumanSelectionRequired => {
+                prompt_authoritative_guided_decision(&args, &reviewed)?
+            }
+        };
+
+        let selected = match prompt_outcome {
+            GuidedPromptOutcome::Selected(selected) => selected,
+            GuidedPromptOutcome::Cancelled => {
+                println!("guided_outcome=keep_quarantine");
+                println!("human_selection=unknown_or_cancelled");
+                println!("authorization=not_published");
+                println!("durable_completion=not_verified");
+                println!("quarantine=retained");
+                println!("old_operation_replayed=false");
+                return Ok(());
+            }
+            GuidedPromptOutcome::Refresh(reason) => {
+                print_guided_pre_auth_refresh(reason);
+                reviewed = wait_for_refreshed_guided_review(&args, &reviewed)?;
+                continue;
+            }
+        };
+
+        if let Some(reason) = guided_refresh_reason(guided_review_lifecycle(&args, &reviewed)?) {
+            print_guided_pre_auth_refresh(reason);
+            reviewed = wait_for_refreshed_guided_review(&args, &reviewed)?;
+            continue;
         }
-        GuidedRecoveryDisposition::Reinspect => {
+
+        // Re-inspect the exact challenge and #233 brief after Human review. The
+        // helper samples the signed challenge both before and after the brief
+        // read, so generation/fingerprint/nonce changes fail before signing.
+        let fresh = match load_guided_review(&args) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                if let Ok(lifecycle) = guided_review_lifecycle(&args, &reviewed) {
+                    if let Some(reason) = guided_refresh_reason(lifecycle) {
+                        print_guided_pre_auth_refresh(reason);
+                        reviewed = wait_for_refreshed_guided_review(&args, &reviewed)?;
+                        continue;
+                    }
+                }
+                return Err(error).context(
+                    "guided recovery could not re-inspect the selected review before user-presence authentication",
+                );
+            }
+        };
+        let revalidation = match selected {
+            GuidedRecoverySelection::Authoritative(decision) => {
+                revalidate_guided_recovery_selection(&reviewed.plan, &fresh.plan, decision)
+            }
+            GuidedRecoverySelection::HumanHistorical(decision) => {
+                revalidate_guided_human_historical_selection(&reviewed.plan, &fresh.plan, decision)
+            }
+            GuidedRecoverySelection::CurrentStateAccepted(policy) => {
+                revalidate_guided_current_state_acceptance(&reviewed.plan, &fresh.plan, policy)
+            }
+        };
+        if let Err(error) = revalidation {
             println!("guided_outcome=re_review_required");
-            println!("authorization=not_published");
-            println!("durable_completion=not_verified");
-            anyhow::bail!("exact recovery binding does not match the reviewed quarantine");
-        }
-        GuidedRecoveryDisposition::HumanSelectionRequired => {
-            prompt_authoritative_guided_decision(&reviewed.plan)?
-        }
-    };
-
-    let Some(selected) = selected else {
-        println!("guided_outcome=keep_quarantine");
-        println!("human_selection=unknown_or_cancelled");
-        println!("authorization=not_published");
-        println!("durable_completion=not_verified");
-        return Ok(());
-    };
-
-    // Re-inspect the exact challenge and #233 brief after Human review. The
-    // helper below samples the signed challenge both before and after the brief
-    // read, so generation/fingerprint/nonce changes fail before signing.
-    let fresh = load_guided_review(&args)?;
-    let revalidation = match selected {
-        GuidedRecoverySelection::Authoritative(decision) => {
-            revalidate_guided_recovery_selection(&reviewed.plan, &fresh.plan, decision)
-        }
-        GuidedRecoverySelection::HumanHistorical(decision) => {
-            revalidate_guided_human_historical_selection(&reviewed.plan, &fresh.plan, decision)
-        }
-        GuidedRecoverySelection::CurrentStateAccepted(policy) => {
-            revalidate_guided_current_state_acceptance(&reviewed.plan, &fresh.plan, policy)
-        }
-    };
-    if let Err(error) = revalidation {
-        println!("guided_outcome=re_review_required");
-        println!("authorization=not_published");
-        println!("durable_completion=not_verified");
-        anyhow::bail!("reviewed recovery state became stale before signing: {error:?}");
-    }
-
-    let key_file = args
-        .key_file
-        .as_deref()
-        .context("--key-file is required for interactive guided recovery")?;
-    let secure_enclave_helper = args
-        .secure_enclave_helper
-        .as_deref()
-        .context("--secure-enclave-helper is required for interactive guided recovery")?;
-
-    let expected = match publish_guided_authorization(
-        &args.agent_state_dir,
-        key_file,
-        secure_enclave_helper,
-        &fresh.challenge,
-        selected,
-    ) {
-        Ok(expected) => expected,
-        Err(error) => {
-            println!("guided_outcome=authorization_not_completed");
+            println!("review_refresh_reason=incident_or_binding_changed");
+            println!("human_selection=discarded");
+            println!("user_presence_authentication=not_started");
             println!("authorization=not_published");
             println!("durable_completion=not_verified");
             println!("quarantine=retained");
-            return Err(error);
+            println!("old_operation_replayed=false");
+            println!("revalidation_detail={error:?}");
+            reviewed = fresh;
+            continue;
         }
-    };
 
-    println!("request_id={}", expected.request_id);
-    println!("operation_id={}", expected.operation_id);
-    println!("authorization=published");
-    let _resolved = match wait_for_completion_verified(
-        &args.agent_state_dir,
-        &args.hub_public_key_file,
-        &expected,
-        args.wait_secs,
-    ) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            println!("durable_completion=not_verified");
-            println!("guided_outcome=durable_completion_incomplete");
-            return Err(error);
+        if let Some(reason) = guided_refresh_reason(guided_review_lifecycle(&args, &fresh)?) {
+            print_guided_pre_auth_refresh(reason);
+            reviewed = wait_for_refreshed_guided_review(&args, &fresh)?;
+            continue;
         }
-    };
-    println!("durable_completion=verified");
-    println!("old_operation_replayed=false");
 
-    let exact_quarantine_cleared = exact_quarantine_cleared(&args.hub_state_dir, &expected)?;
-    println!("exact_quarantine_cleared={exact_quarantine_cleared}");
+        let key_file = args
+            .key_file
+            .as_deref()
+            .context("--key-file is required for interactive guided recovery")?;
+        let secure_enclave_helper = args
+            .secure_enclave_helper
+            .as_deref()
+            .context("--secure-enclave-helper is required for interactive guided recovery")?;
 
-    let post_status = match run_post_recovery_status(&args) {
-        Ok(status) => status,
-        Err(error) => {
-            println!("post_recovery_status=unavailable");
-            println!("recovery_outcome=durably_verified_post_verification_unavailable");
-            return Err(error);
-        }
-    };
-    println!(
-        "post_recovery_status={}",
-        operator_overall_name(post_status.overall)
-    );
-    println!("post_recovery_reason={}", post_status.primary_reason);
-    println!("post_recovery_quarantine={}", post_status.quarantine);
-    println!("post_recovery_recovery_mode={}", post_status.recovery_mode);
-    println!("post_recovery_handoff={}", post_status.handoff);
-    println!(
-        "post_recovery_mutation_authority={}",
-        post_status.mutation_authority
-    );
-    println!("post_recovery_runtime={}", post_status.runtime);
+        let expected = match publish_guided_authorization(
+            &args.agent_state_dir,
+            key_file,
+            secure_enclave_helper,
+            &fresh.challenge,
+            selected,
+        ) {
+            Ok(expected) => expected,
+            Err(error) => {
+                println!("guided_outcome=authorization_not_completed");
+                println!("authorization=not_published");
+                println!("durable_completion=not_verified");
+                println!("quarantine=retained");
+                println!("old_operation_replayed=false");
+                return Err(error);
+            }
+        };
 
-    if matches!(
-        selected,
-        GuidedRecoverySelection::CurrentStateAccepted(
-            RetirementPolicy::AcknowledgedUnknownPointerClickV1
-        )
-    ) {
-        if !exact_quarantine_cleared {
-            anyhow::bail!("current-state acceptance was acknowledged but quarantine did not clear");
-        }
-        if post_status.recovery_mode != "mutation_resume_required" {
-            anyhow::bail!(
-                "PointerClick current-state acceptance did not enter the required mutation-resume barrier"
-            );
-        }
-        println!("recovery_outcome=mutation_resume_required");
-        println!("next_action=rerun_guide_or_resume_mutations");
-        return Ok(());
-    }
+        println!("request_id={}", expected.request_id);
+        println!("operation_id={}", expected.operation_id);
+        println!("authorization=published");
+        let _resolved = match wait_for_completion_verified(
+            &args.agent_state_dir,
+            &args.hub_public_key_file,
+            &expected,
+            args.wait_secs,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                println!("durable_completion=not_verified");
+                println!("guided_outcome=durable_completion_incomplete");
+                return Err(error);
+            }
+        };
+        println!("durable_completion=verified");
+        println!("old_operation_replayed=false");
 
-    let disposition = classify_guided_recovery_post_status(
-        true,
-        exact_quarantine_cleared,
-        post_status.recovery_mode == "normal",
-        post_status.overall,
-    );
-    match disposition {
-        GuidedRecoveryPostDisposition::VerifiedHealthy => {
-            println!("recovery_outcome=verified_healthy");
-            Ok(())
-        }
-        GuidedRecoveryPostDisposition::VerifiedWithUnrelatedStatusProblem => {
-            println!("recovery_outcome=verified_with_unrelated_status_problem");
-            Ok(())
-        }
-        GuidedRecoveryPostDisposition::VerificationIncomplete => {
-            println!("recovery_outcome=post_recovery_verification_incomplete");
-            anyhow::bail!(
-                "durable acknowledgement was verified but the exact quarantine did not clear as expected"
+        let exact_quarantine_cleared = exact_quarantine_cleared(&args.hub_state_dir, &expected)?;
+        println!("exact_quarantine_cleared={exact_quarantine_cleared}");
+
+        let post_status = match run_post_recovery_status(&args) {
+            Ok(status) => status,
+            Err(error) => {
+                println!("post_recovery_status=unavailable");
+                println!("recovery_outcome=durably_verified_post_verification_unavailable");
+                return Err(error);
+            }
+        };
+        println!(
+            "post_recovery_status={}",
+            operator_overall_name(post_status.overall)
+        );
+        println!("post_recovery_reason={}", post_status.primary_reason);
+        println!("post_recovery_quarantine={}", post_status.quarantine);
+        println!("post_recovery_recovery_mode={}", post_status.recovery_mode);
+        println!(
+            "post_recovery_effectful_execution={}",
+            post_status.effectful_execution
+        );
+        println!("post_recovery_handoff={}", post_status.handoff);
+        println!(
+            "post_recovery_mutation_authority={}",
+            post_status.mutation_authority
+        );
+        println!("post_recovery_runtime={}", post_status.runtime);
+
+        if matches!(
+            selected,
+            GuidedRecoverySelection::CurrentStateAccepted(
+                RetirementPolicy::AcknowledgedUnknownPointerClickV1
             )
+        ) {
+            if !exact_quarantine_cleared {
+                anyhow::bail!(
+                    "current-state acceptance was acknowledged but quarantine did not clear"
+                );
+            }
+            if post_status.recovery_mode != "mutation_resume_required" {
+                anyhow::bail!(
+                    "PointerClick current-state acceptance did not enter the required mutation-resume barrier"
+                );
+            }
+            println!("recovery_complete=true");
+            println!("effectful_execution_ready=false");
+            println!("recovery_mode_normal=false");
+            println!("recovery_outcome=mutation_resume_required");
+            println!("next_action=rerun_guide_or_resume_mutations");
+            return Ok(());
+        }
+
+        let disposition = classify_guided_recovery_post_status(
+            true,
+            exact_quarantine_cleared,
+            post_status.recovery_mode == "normal",
+            post_status.overall,
+        );
+        match disposition {
+            GuidedRecoveryPostDisposition::VerifiedHealthy => {
+                println!("recovery_complete=true");
+                println!(
+                    "effectful_execution_ready={}",
+                    post_status.effectful_execution == "ready"
+                );
+                println!("recovery_mode_normal=true");
+                println!("recovery_outcome=verified_healthy");
+                return Ok(());
+            }
+            GuidedRecoveryPostDisposition::VerifiedWithUnrelatedStatusProblem => {
+                println!("recovery_complete=true");
+                println!(
+                    "effectful_execution_ready={}",
+                    post_status.effectful_execution == "ready"
+                );
+                println!(
+                    "recovery_mode_normal={}",
+                    post_status.recovery_mode == "normal"
+                );
+                println!("recovery_outcome=verified_with_unrelated_status_problem");
+                return Ok(());
+            }
+            GuidedRecoveryPostDisposition::VerificationIncomplete => {
+                println!("recovery_complete=false");
+                println!("recovery_outcome=post_recovery_verification_incomplete");
+                anyhow::bail!(
+                    "durable acknowledgement was verified but the exact quarantine did not clear as expected"
+                )
+            }
         }
     }
 }
@@ -1173,12 +1494,20 @@ fn publish_guided_authorization(
             RecoveryAuditAssessment::Inconclusive => "inconclusive",
         }
     );
-    println!("user_presence=required");
     let key = MacRecoveryKey::load(secure_enclave_helper, key_file)
         .context("recovery key is not provisioned")?;
+    if let Err(error) = ensure_guided_challenge_current_for_authorization(state_dir, challenge) {
+        println!("user_presence_authentication=not_started");
+        return Err(error);
+    }
+    println!("user_presence=required");
     let authorization = key
         .sign_authorization(authorization)
         .context("OS user-presence approval was not completed")?;
+    if let Err(error) = ensure_guided_challenge_current_for_authorization(state_dir, challenge) {
+        println!("user_presence_authentication=completed_but_review_stale");
+        return Err(error);
+    }
     store_authorization(state_dir, &authorization)
         .context("failed to publish recovery authorization to Agent")?;
     Ok(ExpectedRecoveryCompletion {
@@ -1429,6 +1758,7 @@ fn run_post_recovery_status(args: &GuidedRecoveryArgs) -> Result<PostRecoverySta
         primary_reason: string_at(&["primary_reason"])?,
         quarantine: string_at(&["recovery", "quarantine"])?,
         recovery_mode: string_at(&["recovery", "recovery_mode"])?,
+        effectful_execution: string_at(&["lanes", "effectful_execution"])?,
         handoff: string_at(&["handoff", "status"])?,
         mutation_authority: string_at(&["mutation_authority", "status"])?,
         runtime: string_at(&["runtime", "verification"])?,
@@ -1944,5 +2274,57 @@ mod completion_wait_tests {
         assert_eq!(resolved.phase, RecoveryPhase::MutationResume);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod guided_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_never_becomes_a_guided_recovery_selection() {
+        let supported = [
+            ReconciliationSupportedDecision::ConfirmedCompleted,
+            ReconciliationSupportedDecision::ConfirmedNotExecuted,
+        ];
+        for input in ["0", "q", "quit", "cancel"] {
+            assert_eq!(
+                parse_authoritative_guided_input(&supported, input),
+                GuidedParsedInput::Cancelled
+            );
+            assert_eq!(
+                parse_human_historical_guided_input(None, input),
+                GuidedParsedInput::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn human_historical_input_requires_an_explicit_fresh_choice() {
+        assert_eq!(
+            parse_human_historical_guided_input(None, "1"),
+            GuidedParsedInput::Selected(GuidedRecoverySelection::HumanHistorical(
+                ReconciliationSupportedDecision::ConfirmedCompleted
+            ))
+        );
+        assert_eq!(
+            parse_human_historical_guided_input(None, "2"),
+            GuidedParsedInput::Selected(GuidedRecoverySelection::HumanHistorical(
+                ReconciliationSupportedDecision::ConfirmedNotExecuted
+            ))
+        );
+        assert_eq!(
+            parse_human_historical_guided_input(None, "3"),
+            GuidedParsedInput::Invalid
+        );
+        assert_eq!(
+            parse_human_historical_guided_input(
+                Some(RetirementPolicy::AcknowledgedUnknownPointerClickV1),
+                "3",
+            ),
+            GuidedParsedInput::Selected(GuidedRecoverySelection::CurrentStateAccepted(
+                RetirementPolicy::AcknowledgedUnknownPointerClickV1
+            ))
+        );
     }
 }
