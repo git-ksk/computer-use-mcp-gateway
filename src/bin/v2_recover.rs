@@ -831,6 +831,7 @@ const fn guided_refresh_reason(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn ensure_guided_challenge_current_for_authorization(
     state_dir: &Path,
     challenge: &RecoveryChallenge,
