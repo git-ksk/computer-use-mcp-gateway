@@ -110,6 +110,7 @@ jobs:
         run: |
           cargo test --locked --lib windows_shell_node_crypto_initializes_with_minimal_systemroot_inheritance
           cargo test --locked --lib windows_shell_npm_starts_repeatedly_with_minimal_systemroot_inheritance
+          cargo test --locked --lib windows_shell_contains_child_csprng_failure_without_poisoning_executor
 
       - name: Install Cua runtime dependencies (Linux)
         if: runner.os == 'Linux'
