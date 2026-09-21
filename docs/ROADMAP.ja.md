@@ -81,19 +81,33 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 これらを満たすまでは V1 を narrow / regression-only に保ち、新しい capability は追加しません。
 
-## Post-v0.5 の製品化シーケンス
+## Post-v0.5 の開発シーケンス
 
-`v0.5.0` は #314 integration と #308 Windows npm/CSPRNG recurrence guard を完了した released Least-privilege Workspace baseline です。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate のままです。
+v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です。現時点で 0.5.1 release train は予定しません。released runtime の変更が本当に必要な regression、security issue、release/packaging defect が出た場合だけ patch release を開きます。#139/#217/#228 の deferred support-claim gate は v0.5.0 feature scope を再オープンしません。
 
-現在の作業順:
+次の numbered feature minor は **v0.6.0 — Managed Developer Execution** です。feature boundary は意図的に小さく保ち、OPEN だからという理由だけで unrelated hosted / recovery research / operator UX work を吸収しません。
 
-- **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance は 2026-09-19 に PASS 済み。#139 と #228 は non-blocking support-claim gate として残し、signed-token / Linux online-recovery claim は evidence まで保留します。
-- **`0.5.0` — released Least-privilege Workspace baseline:** #313 bounded owner-scoped ephemeral refs、#105 ranged/deterministic filesystem observation、#83 bounded retrievable output、#107 explicit writable root 配下の atomic workspace mutation、#319 execution-budget hardening、#323 guided-recovery expiry/re-review、#314 release integration、#308/#326 Windows npm/CSPRNG recurrence guard を含みます。
-- **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
+### v0.6.0 working order
 
-`0.5.0` の release sequence **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance** は完了済みです。released baseline は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
+1. **#106 — managed long-running jobs を foundation とする。** separately authorized な job lifecycle、owner/device binding、bounded output、expiry/concurrency、proven stop semantics を先に定義します。nohup、setsid、generic shell escape で persistent work を復活させません。
+2. **#114 — sandboxed Playwright/E2E は #106 の lifecycle が安定してから積む。** lifecycle/output/process-containment primitive は適切な範囲で再利用しますが、browser profile、filesystem、environment、artifact、network の制約は独立した sandbox boundary なので Playwright authority は分離したままにします。
+3. **#267 — optional Linux cgroup-v2 containment は platform hardening。** lifecycle/containment boundary が安定すれば並行開発できます。reviewed delegation がある Linux だけ descendant cleanup guarantee を強化し、Playwright sandbox 全体の代替にはせず、macOS/portable-Unix の truthful claim も変更しません。
+4. **#335 — final integration / acceptance gate で release を閉じる。** schema/capability/config change、artifact identity、v0.5.0 からの upgrade/rollback、physical dogfood、EN/JA docs、platform support claim、standing PRODUCT_READINESS.md checklist を統合確認してから v0.6.0 complete とします。
 
-minor numberはworking release boundaryでありcalendar promiseではありません。optional platform/providerのsupport claimはexplicit acceptanceまで保留できます。implementation evidenceがsplit/deferを要求する場合はnumberingよりsafety boundaryを優先します。
+#106/#114/#267 のいずれかを evidence に基づいて defer する場合は、#335 と support boundary を明示的に更新します。milestone に残したまま、欠けた guarantee を含むように見える release を silent に ship しません。
+
+| v0.6.0 track | Issue | Role |
+| --- | --- | --- |
+| Managed job lifecycle | #106 | Core foundation。最初の implementation dependency |
+| Sandboxed Playwright/E2E | #114 | Dedicated developer-test capability。stable managed lifecycle に依存 |
+| Linux cgroup-v2 containment | #267 | Optional platform hardening。Linux-only の stronger cleanup guarantee |
+| Release integration / acceptance | #335 | schema、artifact、upgrade/rollback、dogfood、docs、support claim を閉じる required final gate |
+
+次の work は **default では v0.6.0 に admit しません**: Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、general operator/consumer ergonomics (#295/#304)。これらは下記で visibility を維持し、bounded な理由を伴う explicit roadmap/milestone change がある場合だけ admit します。
+
+released v0.5.0 baseline は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、v0.5.0 は per-principal path/root isolation を support claim しません。
+
+minor number は working release boundary であり calendar promise ではありません。implementation が artifact に含まれていても、optional platform/provider support claim は explicit acceptance まで保留します。
 
 ### 横断 Product Readiness track
 
@@ -162,17 +176,21 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 
 ### 現在の open issue inventory
 
-open issue はrevised release sequenceで分類し、roadmap visibilityからsilentに落ちないようにします。milestoneはordering/admission guidanceです。optional support-claim acceptanceは、そのsupport claimを明示的に保留する限りbase artifact release後もOPENのままにできます。
+すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
-- **`0.4.0 — released baseline`:** #221 / PR #271 は merge 済み・green で、#227 physical Windows Hello acceptance は 2026-09-19 に PASS 済みです。#139 signed-token dogfood と #228 physical Linux FIDO2 acceptance は deferred support-claim gate で、#217 は parity 用に OPEN 維持します。
-- **`0.5.0 — Least-privilege Workspace`:** #313 bounded owner-scoped ephemeral ref/data foundation、#105 ranged/deterministic filesystem observation、#83 bounded retrievable process/shell output、#107 unrestricted shell authorityを継承しないbounded atomic workspace mutation、#319 production-dogfood execution-budget mismatch 修正、#323 challenge expiry / generation rollover を跨ぐ guided recovery hardening（fresh Human selection / no replay 維持）、#314 が #323 後の final schema/config/readiness/upgrade/release integration と acceptance を担当。
-- **`0.6.0 — Managed Developer Execution`:** #106 explicit managed-job lifecycle、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containment。
-- **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation、#275 hosted Handoff architecture（#276 pin adoption / #277 hosted operator-routing implementation）、#222 second-real-backend semantic neutralityは、prerequisite/evidenceがrelease admissionを正当化するまでnumbered release gate外に置く。
-- **Upstream-blocked V1 compatibility:** #14/#15はupstream Cua blockedのままでactive CUMG release blockerではない。
+- **Released-baseline support-claim gate:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance は、すでに released の 0.4.0 baseline に対して OPEN を維持します。evidence 後に advertised support claim を広げることはできますが、0.4.0 を再オープンせず、0.6.0 も block しません。
+- **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E の順とし、#267 optional Linux cgroup-v2 containment は containment contract が安定した後に並行可能です。#335 が required final integration / release gate です。
+- **Operational usability / inspectability、unnumbered:** #304 は existing unified privacy-bounded runtime status を read-only MCP/Gateway 1 call として公開し、#295 は bounded human-readable --version identity を追加します。有用な cross-cutting product improvement ですが、explicit に admit しない限り v0.6.0 blocker にはしません。
+- **Recovery evidence hardening、unnumbered:** #289 は ambiguous application operation の privacy-bounded target identity を保持し、#290 は #124 self-reconciliation を exact durable backend receipt へ拡張します。reviewed target/evidence boundary に依存するため、deliberate release admission decision までは fail-closed のまま v0.6.0 外に置きます。
+- **Hosted deployment、future independent track:** #215 が Cloud Run support gate、#275 が Agent-owned Handoff topology、#276 が reviewed Handoff consumer boundary adoption、#277 が hosted operator routing、#282 が closed one-port ingress、#283 が durable Hub state / writer-epoch fencing、#284 が replacement / partition / physical-Handoff acceptance gate です。implementation / acceptance chain が完了するまで Hosted support は NO-GO のままです。
+- **Backend semantic-neutrality evidence:** #222 は second real computer-use backend で同じ GUI semantics を証明する evidence-driven work で、numbered release gate 外に置きます。
+- **Upstream-blocked V1 compatibility:** #14/#15 は upstream Cua blocked のままで active CUMG release blocker ではありません。
 
-open issueがこのinventoryまたは別のexplicit roadmap sectionに現れない場合はroadmap staleとして、release closeout前に修正します。
+Hosted sequencing も明示します。#276/#277 が reviewed Handoff dependency、interface が安定すれば #282/#283 は並行可能、#284 が deployment acceptance を閉じます。#215 を NO-GO から変更するのはその evidence が揃った後だけです。
 
-Cua authorization/product-boundary research #219 は [`v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md`](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md) で完了し、admitしたfollow-upは#221と#222です。
+OPEN issue がこの inventory または別の explicit roadmap section に現れない場合は roadmap stale として、release closeout 前に修正します。
+
+Cua authorization/product-boundary research #219 は [v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.ja.md) で完了し、admitした follow-up は #221/#222 です。
 
 ### `0.4.0` identity / semantic-authorization component
 

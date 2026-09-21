@@ -81,19 +81,33 @@ Retiring V1 is now a valid future simplification candidate, but removal must be 
 
 Until those conditions are met, keep V1 narrow and regression-only; do not expand it with new capabilities.
 
-## Post-v0.5 productization sequence
+## Post-v0.5 delivery sequence
 
-`v0.5.0` is the released Least-privilege Workspace baseline after #314 integration and the #308 Windows npm/CSPRNG recurrence guard. #139 signed-token dogfood and #228 physical Linux FIDO2 remain separate support-claim gates.
+v0.5.0 is the released and frozen **Least-privilege Workspace** baseline. There is no planned 0.5.1 train: open a patch release only for a concrete regression, security issue, or release/packaging defect that actually requires changing the released runtime. Deferred support-claim gates such as #139/#217/#228 do not reopen the v0.5.0 feature scope.
 
-The working sequence is:
+The next numbered feature minor is **v0.6.0 — Managed Developer Execution**. Keep its feature boundary intentionally small and do not absorb unrelated hosted, recovery-research, or operator-UX work merely because it is open.
 
-- **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance passed on 2026-09-19. #139 and #228 remain non-blocking support-claim gates, with signed-token and Linux online-recovery claims withheld until their evidence exists.
-- **`0.5.0` — released Least-privilege Workspace baseline:** reduces reliance on Dangerous shell authority through a bounded owner-scoped ephemeral ref/data lifecycle (#313), ranged/deterministic filesystem observation (#105), retrievable truncated process/shell output (#83), atomic workspace mutation under explicitly separate writable roots (#107), the production-dogfood execution-budget fix (#319), guided-recovery challenge-expiry/re-review hardening (#323), the explicit schema/config/readiness/upgrade release-integration gate (#314), and the Windows npm/CSPRNG recurrence guard (#308/#326).
-- **`0.6.0` — Managed Developer Execution:** add explicitly managed long-running jobs (#106), separately sandboxed Playwright/E2E execution (#114), and optional Linux cgroup-v2 execution containment (#267), informed by completed #96 rather than by background-shell escape compatibility.
+### v0.6.0 working order
 
-For `0.5.0`, the release sequence **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance** is complete. The released baseline pins control schema 10, capability schema 6, registry schema 8, and Hub-Agent schema 6; mixed versions fail closed. Workspace writable roots remain operator/device configuration while the exact mutation capability is granted per principal; `0.5.0` does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
+1. **#106 — managed long-running jobs is the foundation.** Define the separately authorized job lifecycle, owner/device binding, bounded output, expiry/concurrency, and proven stop semantics first. Do not reintroduce persistent work through nohup, setsid, or generic shell escape.
+2. **#114 — sandboxed Playwright/E2E builds on the managed lifecycle after #106 stabilizes.** Reuse lifecycle/output/process-containment primitives where they fit, but keep Playwright authority separate because browser profile, filesystem, environment, artifact, and network constraints form a distinct sandbox boundary.
+3. **#267 — optional Linux cgroup-v2 containment is platform hardening.** It may develop in parallel once the lifecycle/containment boundary is stable. It strengthens Linux descendant cleanup only when reviewed delegation exists; it is not a complete Playwright sandbox and does not change the truthful macOS/portable-Unix claim.
+4. **#335 — final integration and acceptance gate closes the release.** Reconcile schema/capability/config changes, artifact identity, v0.5.0 upgrade/rollback, physical dogfood, EN/JA docs, platform support claims, and the standing PRODUCT_READINESS.md checklist before declaring v0.6.0 complete.
 
-The minor numbers are working release boundaries, not calendar promises. A feature can be compiled into an artifact while its optional platform/provider support claim remains withheld pending explicit acceptance; the release notes must make that distinction visible. If implementation evidence later requires another split or defer, preserve the safety boundary rather than the numbering.
+If evidence forces one of #106/#114/#267 to defer, update #335 and the support boundary explicitly. Do not silently keep the issue in the milestone while shipping a release that implies the missing guarantee.
+
+| v0.6.0 track | Issue | Role |
+| --- | --- | --- |
+| Managed job lifecycle | #106 | Core foundation; first implementation dependency |
+| Sandboxed Playwright/E2E | #114 | Dedicated developer-test capability; depends on a stable managed lifecycle |
+| Linux cgroup-v2 containment | #267 | Optional platform hardening; stronger Linux-only cleanup guarantee |
+| Release integration / acceptance | #335 | Required final gate across schemas, artifacts, upgrade/rollback, dogfood, docs, and support claims |
+
+The following work is **not admitted to v0.6.0 by default**: Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and general operator/consumer ergonomics (#295/#304). Those tracks remain visible below and can be admitted only by an explicit roadmap/milestone change with a bounded reason.
+
+The released v0.5.0 baseline pins control schema 10, capability schema 6, registry schema 8, and Hub-Agent schema 6; mixed versions fail closed. Workspace writable roots remain operator/device configuration while exact mutation capability is granted per principal. v0.5.0 does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
+
+Minor numbers are working release boundaries, not calendar promises. Optional platform/provider support claims remain withheld until explicit acceptance even when implementation is compiled into an artifact.
 
 ### Cross-cutting Product Readiness track
 
@@ -162,17 +176,21 @@ This queue records the practical result of continued Handoff integration and phy
 
 ### Current open issue inventory
 
-The repository's open issues are classified by the revised release sequence so work cannot silently fall out of roadmap visibility. Milestones are ordering/admission guidance; an optional support-claim acceptance issue may remain open after the base artifact is released if that support claim is explicitly withheld.
+Every OPEN issue must appear in one of the buckets below or in another explicit roadmap section. The inventory describes admission and ordering; it does not imply that every open issue belongs to the next release.
 
-- **`0.4.0 — released baseline`:** #221 / PR #271 is merged and green; #227 physical Windows Hello acceptance passed on 2026-09-19. #139 signed-token dogfood and #228 physical Linux FIDO2 acceptance remain deferred support-claim gates; #217 remains open for parity.
-- **`0.5.0 — Least-privilege Workspace`:** #313 owns the bounded owner-scoped ephemeral ref/data foundation; #105 adds ranged/deterministic filesystem observation; #83 adds bounded retrievable process/shell output; #107 adds bounded atomic workspace mutation without inheriting unrestricted shell authority; #319 closes the production-dogfood execution-budget mismatch; #323 hardens guided recovery across challenge expiry/generation rollover while preserving fresh Human selection and no replay; #314 owns the final schema/config/readiness/upgrade/release integration and acceptance after #323.
-- **`0.6.0 — Managed Developer Execution`:** #106 adds explicit managed-job lifecycle, #114 adds separately sandboxed Playwright/E2E execution, and #267 owns optional Linux cgroup-v2 containment.
-- **Future / evidence-driven:** #215 hosted Cloud Run Hub implementation, #275 hosted Handoff architecture with #276 pin adoption / #277 hosted operator-routing implementation, and #222 second-real-backend semantic neutrality remain intentionally outside a numbered release gate until their prerequisites/evidence justify admission.
+- **Released-baseline support-claim gates:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance remain open against the already released 0.4.0 baseline. They can widen an advertised support claim after evidence, but they do not reopen 0.4.0 or block 0.6.0.
+- **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E, with #267 optional Linux cgroup-v2 containment allowed to proceed in parallel once the containment contract is stable; #335 is the required final integration/release gate.
+- **Operational usability / inspectability, unnumbered:** #304 exposes the existing unified privacy-bounded runtime status as one read-only MCP/Gateway call; #295 adds bounded human-readable --version identity. These are useful cross-cutting product improvements but are not v0.6.0 blockers unless explicitly admitted.
+- **Recovery evidence hardening, unnumbered:** #289 preserves privacy-bounded target identity for ambiguous application operations; #290 extends #124 self-reconciliation with exact durable backend receipts and depends on the reviewed target/evidence boundary. Keep both fail-closed and outside v0.6.0 until a deliberate release admission decision.
+- **Hosted deployment, future independent track:** #215 remains the Cloud Run support gate; #275 defines the Agent-owned Handoff topology; #276 adopts the reviewed Handoff consumer boundary; #277 provides hosted operator routing; #282 composes the closed one-port ingress while #283 adds durable Hub state/writer-epoch fencing; #284 is the replacement/partition/physical-Handoff acceptance gate. Hosted support remains NO-GO until the implementation and acceptance chain is complete.
+- **Backend semantic-neutrality evidence:** #222 proves the same GUI semantics with a second real computer-use backend and remains evidence-driven outside a numbered release gate.
 - **Upstream-blocked V1 compatibility:** #14 and #15 remain blocked on upstream Cua and are not active CUMG release blockers.
 
-If an open issue is not represented here or in another explicit roadmap section, treat the roadmap as stale and correct it before declaring release closeout.
+Hosted sequencing is intentionally explicit: #276/#277 provide the reviewed Handoff dependency, #282 and #283 can progress in parallel once their interfaces are stable, and #284 closes deployment acceptance. #215 moves from NO-GO only after that evidence exists.
 
-The Cua authorization/product-boundary research in #219 is completed by [`v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.md`](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.md); its admitted follow-ups are #221 and #222.
+If an OPEN issue is not represented here or in another explicit roadmap section, treat the roadmap as stale and correct it before declaring release closeout.
+
+The Cua authorization/product-boundary research in #219 is completed by [v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.md](v2/V2_AUTHORIZATION_CAPABILITY_REVIEW.md); its admitted follow-ups are #221 and #222.
 
 ### `0.4.0` identity and semantic-authorization component
 
