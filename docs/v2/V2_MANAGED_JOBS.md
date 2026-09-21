@@ -32,7 +32,7 @@ Managed jobs reuse the structured-process policy and supervised process-control 
 - macOS and other Unix platforms: a dedicated process group.
 - Windows: a Job Object.
 
-This is a lifecycle guarantee, not a filesystem or network sandbox. Deliberate escape from the Unix process group remains unsupported. Stronger Linux cgroup-v2 containment is reserved for #267 and must not be inferred from this feature.
+This is a lifecycle guarantee, not a filesystem or network sandbox. Deliberate escape from the Unix process group remains unsupported for managed jobs. The optional Linux cgroup-v2 backend implemented by #267 applies to bounded `execute_process` / `shell` operations only; managed-job cgroup integration is not part of the current contract.
 
 ## Ambiguous termination and recovery
 

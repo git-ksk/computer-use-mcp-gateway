@@ -92,6 +92,9 @@ struct Config {
         value_delimiter = ','
     )]
     denied_write_subpaths: Vec<PathBuf>,
+    /// Optional dedicated delegated Linux cgroup-v2 subtree for stronger process/shell cleanup.
+    #[arg(long, env = "CUMG_V2_LINUX_CGROUP_V2_ROOT")]
+    linux_cgroup_v2_root: Option<PathBuf>,
     /// Optional local container runtime used only for sandboxed Playwright tests.
     #[arg(long, env = "CUMG_V2_PLAYWRIGHT_RUNTIME")]
     playwright_runtime: Option<PathBuf>,
@@ -313,6 +316,16 @@ async fn main() -> Result<()> {
     };
     let mut agent =
         AgentService::new(config, material).context("invalid V2 Agent configuration")?;
+    if let Some(root) = args.linux_cgroup_v2_root {
+        agent = agent
+            .with_linux_cgroup_v2(root)
+            .context("failed to configure Linux cgroup-v2 containment")?;
+        info!(
+            event = "v2_agent_linux_cgroup_v2_configured",
+            outcome = "ready",
+            "optional Linux cgroup-v2 process containment configured"
+        );
+    }
     if let Some(playwright) = playwright {
         agent = agent
             .with_playwright_sandbox(playwright)

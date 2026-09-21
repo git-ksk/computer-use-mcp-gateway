@@ -7,6 +7,7 @@
 //! The crate-private shell path deliberately invokes a fixed OS shell for the
 //! separately-authorized `Shell` capability while reusing process supervision.
 
+use crate::v2_linux_cgroup::{LinuxCgroupError, LinuxCgroupOperation, LinuxCgroupV2Containment};
 use crate::v2_m0::{ProcessEnvVar, ProcessOutput, ProcessRequest, ShellRequest};
 use crate::v2_m0_execution::{AgentExecutionGate, ExecutionError, OperationRef};
 use crate::v2_observability::SafeErrorCode;
@@ -193,6 +194,7 @@ impl ProcessCancellation {
 #[derive(Debug, Clone)]
 pub struct ProcessExecutor {
     policy: ProcessPolicy,
+    linux_cgroup: Option<Arc<LinuxCgroupV2Containment>>,
 }
 
 /// Structured process inside the same supervised process-control domain as ordinary execution.
@@ -228,7 +230,18 @@ struct ProcessLaunch<'a> {
 
 impl ProcessExecutor {
     pub fn new(policy: ProcessPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            linux_cgroup: None,
+        }
+    }
+
+    pub(crate) fn with_linux_cgroup_v2(
+        mut self,
+        containment: Arc<LinuxCgroupV2Containment>,
+    ) -> Self {
+        self.linux_cgroup = Some(containment);
+        self
     }
 
     /// Launch a structured process in the existing supervised process-control domain without waiting for it.
@@ -449,6 +462,19 @@ impl ProcessExecutor {
             command.env(&item.key, &item.value);
         }
 
+        let mut cgroup_operation = match self.linux_cgroup.as_ref() {
+            Some(containment) => {
+                let operation = containment
+                    .prepare_operation()
+                    .map_err(ProcessError::LinuxCgroupUnavailable)?;
+                operation
+                    .configure_command(&mut command)
+                    .map_err(ProcessError::LinuxCgroupUnavailable)?;
+                Some(operation)
+            }
+            None => None,
+        };
+
         let started = Instant::now();
         // Supervise the operation's process-control domain, not just the direct
         // child. On Unix the child becomes a process-group leader; on Windows
@@ -461,18 +487,38 @@ impl ProcessExecutor {
         command.wrap(ProcessGroup::leader());
         #[cfg(windows)]
         command.wrap(JobObject);
-        let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(operation) = cgroup_operation.as_mut()
+                    && operation.spawn_failed_cleanup().is_err()
+                {
+                    return Err(ProcessError::OutcomeUnproven(
+                        ProcessUnprovenStage::Termination,
+                    ));
+                }
+                return Err(ProcessError::Spawn(error));
+            }
+        };
         let stdout = match child.stdout().take() {
             Some(stdout) => stdout,
             None => {
-                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::PipeSetup)?;
+                prove_execution_domain_terminal(
+                    &mut *child,
+                    cgroup_operation.as_mut(),
+                    ProcessUnprovenStage::PipeSetup,
+                )?;
                 return Err(ProcessError::PipeUnavailable);
             }
         };
         let stderr = match child.stderr().take() {
             Some(stderr) => stderr,
             None => {
-                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::PipeSetup)?;
+                prove_execution_domain_terminal(
+                    &mut *child,
+                    cgroup_operation.as_mut(),
+                    ProcessUnprovenStage::PipeSetup,
+                )?;
                 return Err(ProcessError::PipeUnavailable);
             }
         };
@@ -483,7 +529,11 @@ impl ProcessExecutor {
         {
             Ok(reader) => reader,
             Err(error) => {
-                prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::ReaderSetup)?;
+                prove_execution_domain_terminal(
+                    &mut *child,
+                    cgroup_operation.as_mut(),
+                    ProcessUnprovenStage::ReaderSetup,
+                )?;
                 return Err(ProcessError::Io(error));
             }
         };
@@ -493,8 +543,11 @@ impl ProcessExecutor {
         {
             Ok(reader) => reader,
             Err(error) => {
-                match prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::ReaderSetup)
-                {
+                match prove_execution_domain_terminal(
+                    &mut *child,
+                    cgroup_operation.as_mut(),
+                    ProcessUnprovenStage::ReaderSetup,
+                ) {
                     Ok(_) => {
                         let _ = stdout_reader.join();
                         return Err(ProcessError::Io(error));
@@ -510,15 +563,17 @@ impl ProcessExecutor {
         let status = loop {
             if cancellation.is_cancelled() {
                 cancelled = true;
-                break prove_process_domain_terminal(
+                break prove_execution_domain_terminal(
                     &mut *child,
+                    cgroup_operation.as_mut(),
                     ProcessUnprovenStage::Termination,
                 )?;
             }
             if started.elapsed() >= timeout {
                 timed_out = true;
-                break prove_process_domain_terminal(
+                break prove_execution_domain_terminal(
                     &mut *child,
+                    cgroup_operation.as_mut(),
                     ProcessUnprovenStage::Termination,
                 )?;
             }
@@ -528,7 +583,13 @@ impl ProcessExecutor {
                     // once the direct operation reports terminal, best-effort kill
                     // anything still attached to the process group / Job Object.
                     // #102 changes only error paths where terminality is unproven.
-                    let _ = child.start_kill();
+                    if let Some(operation) = cgroup_operation.as_mut() {
+                        operation.terminate_and_prove_empty().map_err(|_| {
+                            ProcessError::OutcomeUnproven(ProcessUnprovenStage::Termination)
+                        })?;
+                    } else {
+                        let _ = child.start_kill();
+                    }
                     break status;
                 }
                 Ok(None) => {}
@@ -536,7 +597,11 @@ impl ProcessExecutor {
                     // Polling failed after spawn. Stop the process domain and only
                     // surface an ordinary I/O failure if termination is proven.
                     // Otherwise the caller-visible outcome must remain unknown.
-                    prove_process_domain_terminal(&mut *child, ProcessUnprovenStage::Poll)?;
+                    prove_execution_domain_terminal(
+                        &mut *child,
+                        cgroup_operation.as_mut(),
+                        ProcessUnprovenStage::Poll,
+                    )?;
                     return Err(ProcessError::Io(error));
                 }
             }
@@ -728,6 +793,22 @@ impl ProcessUnprovenStage {
     }
 }
 
+fn prove_execution_domain_terminal(
+    child: &mut dyn ChildWrapper,
+    cgroup_operation: Option<&mut LinuxCgroupOperation<'_>>,
+    failure_stage: ProcessUnprovenStage,
+) -> Result<std::process::ExitStatus, ProcessError> {
+    if let Some(operation) = cgroup_operation {
+        operation
+            .terminate_and_prove_empty()
+            .map_err(|_| ProcessError::OutcomeUnproven(failure_stage))?;
+        return child
+            .wait()
+            .map_err(|_| ProcessError::OutcomeUnproven(ProcessUnprovenStage::Wait));
+    }
+    prove_process_domain_terminal(child, failure_stage)
+}
+
 pub(crate) fn prove_process_domain_terminal(
     child: &mut dyn ChildWrapper,
     failure_stage: ProcessUnprovenStage,
@@ -856,6 +937,7 @@ pub enum ProcessError {
     PipeUnavailable,
     ReaderPanicked,
     Io(std::io::Error),
+    LinuxCgroupUnavailable(LinuxCgroupError),
     OutcomeUnproven(ProcessUnprovenStage),
     Execution(ExecutionError),
 }
@@ -880,6 +962,7 @@ impl SafeErrorCode for ProcessError {
             Self::PipeUnavailable => "process_pipe_unavailable",
             Self::ReaderPanicked => "process_reader_panicked",
             Self::Io(_) => "process_io",
+            Self::LinuxCgroupUnavailable(_) => "process_linux_cgroup_unavailable",
             Self::OutcomeUnproven(_) => "process_outcome_unproven",
             Self::Execution(_) => "process_execution",
         }
@@ -1727,5 +1810,129 @@ mod tests {
             Err(ProcessError::EnvironmentKeyDenied(key)) if key == "AWS_SECRET_ACCESS_KEY"
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_cgroup_acceptance_tests {
+    use super::*;
+    use crate::v2_linux_cgroup::{LinuxCgroupError, LinuxCgroupV2Containment};
+    use std::sync::Arc;
+
+    fn configured_root(name: &str) -> Option<PathBuf> {
+        std::env::var_os(name).map(PathBuf::from)
+    }
+
+    fn temp_work_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cumg-v2-cgroup-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn child_cgroup_count(root: &Path) -> usize {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .count()
+    }
+
+    fn pid_alive(pid: &str) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", pid])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn linux_cgroup_v2_real_delegation_acceptance() {
+        let Some(cgroup_root) = configured_root("CUMG_TEST_CGROUP_V2_ROOT") else {
+            return;
+        };
+        let work = temp_work_root("acceptance");
+        let containment = Arc::new(LinuxCgroupV2Containment::new(cgroup_root.clone()).unwrap());
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![work.clone()]).unwrap())
+                .with_linux_cgroup_v2(containment);
+
+        let detached_pid = work.join("detached.pid");
+        let shell = ShellRequest {
+            command: format!(
+                "/usr/bin/setsid /bin/sh -c 'echo $$ > {}; exec /bin/sleep 30' >/dev/null 2>&1 & while [ ! -s {} ]; do /bin/sleep 0.01; done",
+                detached_pid.display(),
+                detached_pid.display()
+            ),
+            cwd: work.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        };
+        let output = executor
+            .execute_shell(&shell, &ProcessCancellation::default())
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        let pid = fs::read_to_string(&detached_pid).unwrap();
+        assert!(
+            !pid_alive(pid.trim()),
+            "setsid descendant survived cgroup cleanup"
+        );
+        assert_eq!(child_cgroup_count(&cgroup_root), 0);
+
+        let race_ready = work.join("race.ready");
+        let race_shell = ShellRequest {
+            command: format!(
+                "/usr/bin/setsid /bin/sh -c 'echo ready > {}; i=0; while [ $i -lt 400 ]; do /bin/sleep 30 & i=$((i+1)); done; wait' >/dev/null 2>&1 & while [ ! -s {} ]; do /bin/sleep 0.01; done",
+                race_ready.display(),
+                race_ready.display()
+            ),
+            cwd: work.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        };
+        let output = executor
+            .execute_shell(&race_shell, &ProcessCancellation::default())
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(
+            child_cgroup_count(&cgroup_root),
+            0,
+            "fork-race left an operation cgroup behind"
+        );
+
+        let parent_procs = cgroup_root.parent().unwrap().join("cgroup.procs");
+        let agent_pid = std::process::id();
+        let denied_shell = ShellRequest {
+            command: format!(
+                r#"if [ "$(cat /proc/self/cgroup)" != "0::/" ]; then exit 40; fi;
+if echo $$ > {} 2>/dev/null; then exit 41; fi;
+if echo $$ > /proc/{agent_pid}/root{}/cgroup.procs 2>/dev/null; then exit 42; fi;
+exit 0"#,
+                parent_procs.display(),
+                cgroup_root.display(),
+            ),
+            cwd: work.to_string_lossy().into_owned(),
+            env: vec![],
+            timeout_ms: 5_000,
+        };
+        let output = executor
+            .execute_shell(&denied_shell, &ProcessCancellation::default())
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(child_cgroup_count(&cgroup_root), 0);
+
+        fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn linux_cgroup_v2_unwritable_delegation_is_explicitly_unavailable() {
+        let Some(root) = configured_root("CUMG_TEST_CGROUP_V2_UNWRITABLE_ROOT") else {
+            return;
+        };
+        let error = LinuxCgroupV2Containment::new(root).unwrap_err();
+        assert!(matches!(error, LinuxCgroupError::DelegationUnavailable));
     }
 }

@@ -87,4 +87,4 @@ No released Unix support claim changes from this investigation. The documented c
 
 ## Managed jobs (#106)
 
-Managed jobs reuse this Unix process-group baseline. They do not broaden it into an OS-wide sandbox and do not make deliberate `setsid` or service-manager escape supported. Optional stronger Linux cgroup-v2 containment remains tracked by #267.
+Managed jobs reuse this Unix process-group baseline. They do not broaden it into an OS-wide sandbox and do not make deliberate `setsid` or service-manager escape supported. Issue #267 now provides an optional Linux-only stronger cgroup-v2 backend for bounded `execute_process` / `shell`; see [V2_LINUX_CGROUP_V2_CONTAINMENT.md](V2_LINUX_CGROUP_V2_CONTAINMENT.md). Managed jobs remain on the baseline contract.

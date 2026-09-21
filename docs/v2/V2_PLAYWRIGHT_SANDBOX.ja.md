@@ -108,7 +108,7 @@ default telemetry に raw test path、grep value、workspace/artifact host path�
 sandbox boundary は CUMG host process supervision ではなく configured container runtime が提供します。
 
 - macOS/Windows: selected runtime が内部で VM を使う場合も external provider infrastructure として扱います。
-- Linux: Playwright feature には container isolation 自体が必要です。optional #267 cgroup-v2 containment は host descendant cleanup を強化しますが filesystem/network sandbox ではなく provider の代替ではありません。
+- Linux: Playwright feature には container isolation 自体が必要です。optional Linux cgroup-v2 containment は host descendant cleanup を強化しますが filesystem/network sandbox ではなく provider の代替ではありません。
 - macOS sandbox-exec / SBPL は product contract にしません。
 
 compromised provider runtime、kernel、Agent、workspace dependency について selected reviewed execution provider の guarantee を超える containment は CUMG claim に含めません。

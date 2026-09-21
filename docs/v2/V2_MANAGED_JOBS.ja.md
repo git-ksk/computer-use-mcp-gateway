@@ -62,8 +62,7 @@ managed job は bounded process execution と同じ structured-process policy / 
 - Windows baseline: Job Object
 
 これは lifecycle guarantee であり、filesystem / network sandbox ではありません。
-Unix process group から deliberate に離脱する挙動は unsupported です。
-より強い Linux cgroup-v2 containment は #267 の範囲であり、本機能から推論しません。
+Unix process group から deliberate に離脱する挙動は managed job では引き続き unsupported です。#267 の optional Linux cgroup-v2 backend は bounded `execute_process` / `shell` のみが対象で、managed-job cgroup integration は current contract に含めません。
 
 ## Ambiguous termination
 

@@ -87,4 +87,4 @@ Linux cgroup v2は、CUMG Agentにproperly delegatedなcgroup subtreeが与え�
 
 ## Managed jobs (#106)
 
-managed job もこの Unix process-group baseline を再利用します。OS-wide sandbox へ拡張するものではなく、deliberate `setsid` / service-manager escape を supported にしません。より強い optional Linux cgroup-v2 containment は #267 で追跡します。
+managed job もこの Unix process-group baseline を再利用します。Issue #267 では bounded `execute_process` / `shell` 向けにoptional Linux-only cgroup-v2 backendを実装しました。詳細は [V2_LINUX_CGROUP_V2_CONTAINMENT.ja.md](V2_LINUX_CGROUP_V2_CONTAINMENT.ja.md) を参照してください。managed jobはbaseline contractのままです。
