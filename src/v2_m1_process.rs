@@ -1169,6 +1169,56 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_shell_contains_child_csprng_failure_without_poisoning_executor() {
+        let npm_probe = Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", "npm.cmd --version"])
+            .output();
+        if !npm_probe
+            .as_ref()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let root = temp_root("windows-child-csprng-containment");
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+
+        let crashed_child = executor
+            .execute_shell(
+                &ShellRequest {
+                    command: "set \"SystemRoot=\" && node -e \"require('crypto').randomBytes(4)\""
+                        .into(),
+                    cwd: root.to_string_lossy().into_owned(),
+                    env: vec![],
+                    timeout_ms: 10_000,
+                },
+                &ProcessCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(crashed_child.exit_code, Some(134));
+        assert!(crashed_child.stderr.contains("CSPRNG"));
+        assert!(!crashed_child.timed_out && !crashed_child.cancelled);
+
+        let healthy_follow_up = executor
+            .execute_shell(
+                &ShellRequest {
+                    command: "npm.cmd --version".into(),
+                    cwd: root.to_string_lossy().into_owned(),
+                    env: vec![],
+                    timeout_ms: 10_000,
+                },
+                &ProcessCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(healthy_follow_up.exit_code, Some(0));
+        assert!(!healthy_follow_up.stdout.trim().is_empty());
+        assert!(!healthy_follow_up.timed_out && !healthy_follow_up.cancelled);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_utf16le_stderr_is_decoded_without_nul_garbling() {
         let encoded: Vec<u8> = "Windows PowerShell 日本語\r\n"
             .encode_utf16()
