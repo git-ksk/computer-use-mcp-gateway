@@ -34,8 +34,45 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Provision delegated cgroup-v2 acceptance roots
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(stat -fc %T /sys/fs/cgroup)" == "cgroup2fs" ]] || {
+            echo "GitHub Linux runner is not using cgroup v2" >&2
+            exit 1
+          }
+          rel="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
+          parent="/sys/fs/cgroup$rel"
+          writable="$parent/cumg-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          unwritable="$parent/cumg-ci-unwritable-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          sudo mkdir "$writable" "$unwritable"
+          sudo chown "$(id -u):$(id -g)" \
+            "$writable" \
+            "$writable/cgroup.procs" \
+            "$writable/cgroup.threads" \
+            "$writable/cgroup.subtree_control" \
+            "$writable/cgroup.kill"
+          echo "CUMG_TEST_CGROUP_V2_ROOT=$writable" >> "$GITHUB_ENV"
+          echo "CUMG_TEST_CGROUP_V2_UNWRITABLE_ROOT=$unwritable" >> "$GITHUB_ENV"
+
       - name: Test
         run: cargo test --locked
+
+      - name: Cleanup delegated cgroup-v2 acceptance roots
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set +e
+          for var in CUMG_TEST_CGROUP_V2_ROOT CUMG_TEST_CGROUP_V2_UNWRITABLE_ROOT; do
+            root="${!var:-}"
+            [[ -n "$root" ]] || continue
+            if [[ -e "$root/cgroup.kill" ]]; then
+              echo 1 | sudo tee "$root/cgroup.kill" >/dev/null || true
+            fi
+            sudo find "$root" -depth -type d -exec rmdir {} \; 2>/dev/null || true
+          done
 
       - name: Python harness syntax
         run: python3 -m py_compile scripts/cua_gateway_smoke.py scripts/cua_desktop_e2e.py scripts/mock_cua_mcp_backend.py scripts/mock_mcp_backend.py scripts/v1_quality_gate.py scripts/v1_perf_benchmark.py scripts/v1_conformance.py scripts/v2_acceptance_fixture_guard.py scripts/v2_deferred_cleanup_recovery.py scripts/v2_handoff_runtime_cleanup.py scripts/v2_handoff_runtime_preflight.py scripts/v2_launchd_topology_guard.py scripts/v2_launchd_maintenance_job.py scripts/v2_upgrade_transaction.py scripts/v2_release_candidate.py scripts/v2_windows_upgrade.py scripts/tests/test_v1_quality_gate.py scripts/tests/test_v1_perf_benchmark.py scripts/tests/test_v2_acceptance_fixture_guard.py scripts/tests/test_v2_deferred_cleanup_recovery.py scripts/tests/test_v2_handoff_runtime_cleanup.py scripts/tests/test_v2_handoff_runtime_preflight.py scripts/tests/test_v2_launchd_topology_guard.py scripts/tests/test_v2_launchd_maintenance_job.py scripts/tests/test_v2_upgrade_transaction.py scripts/tests/test_v2_release_candidate.py scripts/tests/test_v2_windows_upgrade.py

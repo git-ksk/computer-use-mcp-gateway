@@ -91,7 +91,7 @@ The next numbered feature minor is **v0.6.0 — Managed Developer Execution**. K
 
 1. **#106 — managed long-running jobs is the foundation.** Define the separately authorized job lifecycle, owner/device binding, bounded output, expiry/concurrency, and proven stop semantics first. Do not reintroduce persistent work through nohup, setsid, or generic shell escape.
 2. **#114 — sandboxed Playwright/E2E builds on the managed lifecycle after #106 stabilizes.** Reuse lifecycle/output/process-containment primitives where they fit, but keep Playwright authority separate because browser profile, filesystem, environment, artifact, and network constraints form a distinct sandbox boundary.
-3. **#267 — optional Linux cgroup-v2 containment is platform hardening.** It may develop in parallel once the lifecycle/containment boundary is stable. It strengthens Linux descendant cleanup only when reviewed delegation exists; it is not a complete Playwright sandbox and does not change the truthful macOS/portable-Unix claim.
+3. **#267 — optional Linux cgroup-v2 containment is implemented platform hardening.** It strengthens bounded process/shell descendant cleanup only with a reviewed dedicated Linux delegation; it is not a Playwright sandbox and does not change the macOS/portable-Unix claim.
 4. **#335 — final integration and acceptance gate closes the release.** Reconcile schema/capability/config changes, artifact identity, v0.5.0 upgrade/rollback, physical dogfood, EN/JA docs, platform support claims, and the standing PRODUCT_READINESS.md checklist before declaring v0.6.0 complete.
 
 If evidence forces one of #106/#114/#267 to defer, update #335 and the support boundary explicitly. Do not silently keep the issue in the milestone while shipping a release that implies the missing guarantee.
@@ -100,7 +100,7 @@ If evidence forces one of #106/#114/#267 to defer, update #335 and the support b
 | --- | --- | --- |
 | Managed job lifecycle | #106 | Core foundation; first implementation dependency |
 | Sandboxed Playwright/E2E | #114 | Dedicated developer-test capability; depends on a stable managed lifecycle |
-| Linux cgroup-v2 containment | #267 | Optional platform hardening; stronger Linux-only cleanup guarantee |
+| Linux cgroup-v2 containment | #267 | Implemented optional platform hardening for bounded process/shell cleanup; Linux-only reviewed delegation |
 | Release integration / acceptance | #335 | Required final gate across schemas, artifacts, upgrade/rollback, dogfood, docs, and support claims |
 
 The following work is **not admitted to v0.6.0 by default**: Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and general operator/consumer ergonomics (#295/#304). Those tracks remain visible below and can be admitted only by an explicit roadmap/milestone change with a bounded reason.

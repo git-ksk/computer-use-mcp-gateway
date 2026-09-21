@@ -27,6 +27,10 @@ impl ShellExecutor {
         }
     }
 
+    pub(crate) fn from_process_executor(process: ProcessExecutor) -> Self {
+        Self { process }
+    }
+
     pub fn execute(
         &self,
         request: &ShellRequest,

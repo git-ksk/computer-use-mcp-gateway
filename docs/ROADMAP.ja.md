@@ -91,7 +91,7 @@ v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です�
 
 1. **#106 — managed long-running jobs を foundation とする。** separately authorized な job lifecycle、owner/device binding、bounded output、expiry/concurrency、proven stop semantics を先に定義します。nohup、setsid、generic shell escape で persistent work を復活させません。
 2. **#114 — sandboxed Playwright/E2E は #106 の lifecycle が安定してから積む。** lifecycle/output/process-containment primitive は適切な範囲で再利用しますが、browser profile、filesystem、environment、artifact、network の制約は独立した sandbox boundary なので Playwright authority は分離したままにします。
-3. **#267 — optional Linux cgroup-v2 containment は platform hardening。** lifecycle/containment boundary が安定すれば並行開発できます。reviewed delegation がある Linux だけ descendant cleanup guarantee を強化し、Playwright sandbox 全体の代替にはせず、macOS/portable-Unix の truthful claim も変更しません。
+3. **#267 — optional Linux cgroup-v2 containment は実装済みplatform hardening。** reviewed dedicated delegationがあるLinuxだけbounded process/shell descendant cleanupを強化し、Playwright sandboxの代替にはせず、macOS/portable-Unix claimも変更しません。
 4. **#335 — final integration / acceptance gate で release を閉じる。** schema/capability/config change、artifact identity、v0.5.0 からの upgrade/rollback、physical dogfood、EN/JA docs、platform support claim、standing PRODUCT_READINESS.md checklist を統合確認してから v0.6.0 complete とします。
 
 #106/#114/#267 のいずれかを evidence に基づいて defer する場合は、#335 と support boundary を明示的に更新します。milestone に残したまま、欠けた guarantee を含むように見える release を silent に ship しません。
@@ -100,7 +100,7 @@ v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です�
 | --- | --- | --- |
 | Managed job lifecycle | #106 | Core foundation。最初の implementation dependency |
 | Sandboxed Playwright/E2E | #114 | Dedicated developer-test capability。stable managed lifecycle に依存 |
-| Linux cgroup-v2 containment | #267 | Optional platform hardening。Linux-only の stronger cleanup guarantee |
+| Linux cgroup-v2 containment | #267 | bounded process/shell cleanup向け実装済みoptional hardening。Linux-only reviewed delegation |
 | Release integration / acceptance | #335 | schema、artifact、upgrade/rollback、dogfood、docs、support claim を閉じる required final gate |
 
 次の work は **default では v0.6.0 に admit しません**: Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、general operator/consumer ergonomics (#295/#304)。これらは下記で visibility を維持し、bounded な理由を伴う explicit roadmap/milestone change がある場合だけ admit します。

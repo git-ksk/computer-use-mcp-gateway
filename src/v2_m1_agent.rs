@@ -19,6 +19,7 @@ use crate::v2_ephemeral_data_refs::{
 use crate::v2_execution_safety::{
     AgentTerminalEvidence, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES, terminal_evidence_for_device_result,
 };
+use crate::v2_linux_cgroup::LinuxCgroupV2Containment;
 use crate::v2_m0::{
     AgentProcessOutputLocator, AgentProcessOutputLocators, CAPABILITY_SCHEMA_VERSION,
     CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CapabilityClass, CommandResultEnvelope,
@@ -420,6 +421,20 @@ impl AgentService {
     pub fn with_handoff_coordinator(mut self, coordinator: Arc<AgentHandoffCoordinator>) -> Self {
         self.handoff = Some(coordinator);
         self
+    }
+
+    pub fn with_linux_cgroup_v2(mut self, root: PathBuf) -> Result<Self, AgentServiceError> {
+        let containment = Arc::new(LinuxCgroupV2Containment::new(root).map_err(|error| {
+            AgentServiceError::Process(ProcessError::LinuxCgroupUnavailable(error))
+        })?);
+        let policy = ProcessPolicy::developer_defaults(self.config.allowed_cwd_roots.clone())
+            .map_err(AgentServiceError::Process)?;
+        self.executor =
+            ProcessExecutor::new(policy.clone()).with_linux_cgroup_v2(containment.clone());
+        self.shell = ShellExecutor::from_process_executor(
+            ProcessExecutor::new(policy).with_linux_cgroup_v2(containment),
+        );
+        Ok(self)
     }
 
     pub fn with_playwright_sandbox(
@@ -2619,6 +2634,7 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
             | ProcessError::ShellUnsupportedPlatform
             | ProcessError::PipeUnavailable
             | ProcessError::ReaderPanicked
+            | ProcessError::LinuxCgroupUnavailable(_)
             | ProcessError::Execution(_),
         )
         | AgentOperationError::Shell(ShellError::Process(
@@ -2627,6 +2643,7 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
             | ProcessError::ShellUnsupportedPlatform
             | ProcessError::PipeUnavailable
             | ProcessError::ReaderPanicked
+            | ProcessError::LinuxCgroupUnavailable(_)
             | ProcessError::Execution(_),
         )) => DeviceErrorCode::InternalFailure,
         AgentOperationError::BrowserUploadStaging(

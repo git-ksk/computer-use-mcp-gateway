@@ -28,6 +28,7 @@ The active specification covers the product boundary, execution safety, process/
 [`v2/V2_EXECUTION_ENVIRONMENT_BOUNDARY.md`](v2/V2_EXECUTION_ENVIRONMENT_BOUNDARY.md) clarifies the provider boundary: CUMG owns uncertainty-aware authority and recovery for a specific stateful desktop, while VM/sandbox/fleet provisioning remains replaceable infrastructure below or outside the core.
 
 [`v2/V2_UNIX_PROCESS_CONTAINMENT.md`](v2/V2_UNIX_PROCESS_CONTAINMENT.md) records the #96 investigation boundary for ordinary Unix process-group cleanup, deliberate session detachment, and platform-specific stronger containment.
+[`v2/V2_LINUX_CGROUP_V2_CONTAINMENT.md`](v2/V2_LINUX_CGROUP_V2_CONTAINMENT.md) defines the optional #267 Linux cgroup-v2 stronger containment contract and deployment boundary.
 
 [`v2/V2_CLOUD_RUN_HUB.md`](v2/V2_CLOUD_RUN_HUB.md) records the #215 hosted-Hub support gate: Cloud Run remains unsupported until durable external state, writer fencing, one-port ingress, hosted stream/shutdown semantics, and physical acceptance are proven.
 
