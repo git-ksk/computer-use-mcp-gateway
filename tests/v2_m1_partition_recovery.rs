@@ -20,7 +20,10 @@ use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 // Partition is created by explicitly aborting the transport. Do not make this
-// recovery/quarantine test depend on hosted-runner sub-second scheduling.
+// recovery/quarantine test depend on hosted-runner sub-second scheduling. Keep
+// the Agent acknowledgement deadline (3x interval) comfortably below the Hub
+// timeout while leaving multi-second scheduling headroom under runner load.
+const E2E_AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const E2E_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -69,7 +72,7 @@ fn agent_config(
         allowed_cwd_roots: vec![cwd],
         state_dir,
         ephemeral_data_parent: None,
-        heartbeat_interval: Duration::from_millis(50),
+        heartbeat_interval: E2E_AGENT_HEARTBEAT_INTERVAL,
         reconnect: ReconnectPolicy {
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(100),
