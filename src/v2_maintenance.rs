@@ -922,7 +922,9 @@ fn capability_target_class(capability: DeviceCapability) -> &'static str {
         | DeviceCapability::Shell
         | DeviceCapability::ReadProcessOutput
         | DeviceCapability::ManagedJobControl
-        | DeviceCapability::ManagedJobObserve => "process",
+        | DeviceCapability::ManagedJobObserve
+        | DeviceCapability::PlaywrightTestControl
+        | DeviceCapability::PlaywrightTestObserve => "process",
         DeviceCapability::ReadFile
         | DeviceCapability::ListDirectory
         | DeviceCapability::WriteWorkspaceFile => "filesystem",
@@ -968,7 +970,8 @@ fn capability_effect_kind(capability: DeviceCapability) -> &'static str {
     match capability {
         DeviceCapability::ExecuteProcess
         | DeviceCapability::Shell
-        | DeviceCapability::ManagedJobControl => "execute",
+        | DeviceCapability::ManagedJobControl
+        | DeviceCapability::PlaywrightTestControl => "execute",
         DeviceCapability::LaunchApplication => "launch",
         DeviceCapability::TerminateApplication => "terminate",
         DeviceCapability::BrowserNavigate => "navigate",

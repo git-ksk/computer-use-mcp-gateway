@@ -105,7 +105,7 @@ v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です�
 
 次の work は **default では v0.6.0 に admit しません**: Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、general operator/consumer ergonomics (#295/#304)。これらは下記で visibility を維持し、bounded な理由を伴う explicit roadmap/milestone change がある場合だけ admit します。
 
-released v0.5.0 baseline は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、v0.5.0 は per-principal path/root isolation を support claim しません。
+released v0.5.0 baseline は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin します。v0.6 development では #106 の historical live pairing が 11/7、#114 により current live control/capability pairing が 12/8 へ進み、registry schema は8、Hub-Agent schema は6のままです。mixed live version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、v0.5.0 は per-principal path/root isolation を support claim しません。
 
 minor number は working release boundary であり calendar promise ではありません。implementation が artifact に含まれていても、optional platform/provider support claim は explicit acceptance まで保留します。
 

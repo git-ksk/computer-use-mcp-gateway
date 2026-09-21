@@ -1231,6 +1231,12 @@ fn map_command(
         | DeviceCommand::ManagedJobStop { .. } => {
             Err(M1BackendError::UnsupportedCommand(command.capability()))
         }
+        DeviceCommand::PlaywrightTestStart { .. }
+        | DeviceCommand::PlaywrightTestStatus { .. }
+        | DeviceCommand::PlaywrightTestOutput { .. }
+        | DeviceCommand::PlaywrightTestStop { .. } => {
+            Err(M1BackendError::UnsupportedCommand(command.capability()))
+        }
         DeviceCommand::ReadFile { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ReadFile,
         )),
@@ -1375,6 +1381,12 @@ fn normalize_result(
         | DeviceCommand::ManagedJobOutput { .. }
         | DeviceCommand::ManagedJobRenew { .. }
         | DeviceCommand::ManagedJobStop { .. } => {
+            Err(M1BackendError::UnsupportedCommand(command.capability()))
+        }
+        DeviceCommand::PlaywrightTestStart { .. }
+        | DeviceCommand::PlaywrightTestStatus { .. }
+        | DeviceCommand::PlaywrightTestOutput { .. }
+        | DeviceCommand::PlaywrightTestStop { .. } => {
             Err(M1BackendError::UnsupportedCommand(command.capability()))
         }
         DeviceCommand::ReadFile { .. } => Err(M1BackendError::UnsupportedCommand(

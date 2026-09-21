@@ -169,6 +169,16 @@ This review does not admit:
 
 Cua Cloud Fleets, E2B, Daytona, or another provider may be used as downstream execution infrastructure only when a compatible provider/adapter boundary can preserve these semantics.
 
+## Playwright sandbox capability split (#114)
+
+v0.6 Playwright execution adds PlaywrightTestControl as a separate exact Dangerous capability and PlaywrightTestObserve as a separate exact Observe capability. Start/stop require the control capability; status/output require the observe capability. Neither is implied by ExecuteProcess, Shell, ManagedJobControl, ManagedJobObserve, browser authority, cwd/workspace roots, or a class-only grant.
+
+The Hub uses a Playwright-only opaque ref registry with the pwtest_ namespace. Generic job_ refs and Playwright refs are intentionally non-interchangeable; cross-registry lookup fails closed. Provider-specific container names/IDs and Agent-private locators are never northbound authority.
+
+Capability discovery is conditional. The Agent advertises the Playwright capabilities only after a complete runtime/image/workspace configuration validates, the digest-pinned image is inspectable, and owner-scoped startup orphan recovery proves no prior owned provider container remains. An unavailable or partially configured provider removes the capability from the live advertisement rather than widening another capability as a fallback.
+
+See [V2_PLAYWRIGHT_SANDBOX.md](V2_PLAYWRIGHT_SANDBOX.md).
+
 ## References
 
 - Cua permission policies: <https://cua.ai/docs/reference/cua-driver/permission-policies>

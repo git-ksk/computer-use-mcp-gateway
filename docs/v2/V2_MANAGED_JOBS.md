@@ -63,4 +63,6 @@ If a start response is lost after Agent execution, the caller does not receive a
 
 ## Schema compatibility
 
-Issue #106 uses control schema 11 and capability schema 7. Hub-Agent envelope schema remains 6 because the outer signed envelope shape is unchanged; the new typed command/result values are carried inside it. Control and capability mismatches fail closed. Agent checkpoint schema remains 5; the managed-job fail-closed field is additive and defaults safely for historical checkpoints.
+Issue #106 introduced the historical v0.6 development pairing control schema 11 / capability schema 7. Issue #114 advances the current live v0.6 pairing to control schema 12 / capability schema 8 while preserving the #106 managed-job semantics. Hub-Agent envelope schema remains 6 because the outer signed envelope shape is unchanged. Persisted registry schema remains 8; 8/7 is accepted only as a historical pairing whose stale capability advertisement is discarded, while current dispatch requires a fresh 8/8 advertisement. Agent checkpoint schema remains 5; the managed-job fail-closed field is additive and defaults safely for historical checkpoints.
+
+Playwright sandbox jobs reuse lifecycle primitives internally but are not generic managed jobs northbound: they use separate exact capabilities and a separate pwtest_ ref registry. ManagedJobControl / ManagedJobObserve cannot operate a Playwright test.

@@ -1021,7 +1021,7 @@ mod tests {
             .unwrap();
 
         let current = HubPersistentState::capture(&registry, &execution);
-        for (legacy_registry_schema, legacy_capability_schema) in [(2, 2), (5, 4), (8, 6)] {
+        for (legacy_registry_schema, legacy_capability_schema) in [(2, 2), (5, 4), (8, 6), (8, 7)] {
             let mut fixture = current.clone();
             fixture.registry.schema_version = legacy_registry_schema;
             fixture.registry.devices[0]

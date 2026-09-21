@@ -101,6 +101,14 @@ provider の adapter が CUMG operation state machine に必要な evidence を�
 
 この条件を満たせば、physical endpoint、native backend、managed cloud desktop のいずれも同じ CUMG execution-safety layer の下に置けます。
 
+## Playwright sandbox provider (#114)
+
+v0.6 Playwright runner は product boundary の変更ではなく provider seam の具体例です。CUMG が所有するのは typed Playwright authority、request validation、opaque-ref ownership、lifecycle ambiguity handling、artifact metadata boundary、no-replay semantics です。actual container/VM isolation primitive は operator-selected Docker/Podman-compatible runtime が所有します。
+
+CUMG は runtime の provision、daemon start、image pull、VM pool 構築を行わず、macOS sandbox-exec / SBPL を product contract にしません。macOS / Windows の container runtime が内部で VM を使う場合も、その infrastructure は external です。Linux でも optional #267 cgroup-v2 host-process containment を併用できますが、Playwright claim には container isolation 自体が必要です。
+
+initial profile は network none のみを support します。project-local web server は同一 container 内で起動して loopback を利用できます。external-origin networking は execution provider が CUMG より下で reviewed network policy を enforce できるまで defer し、URL/CLI filtering はその代替にしません。
+
 ## Competitive and design implication
 
 CUMG は「policy engine がある」「agent computer がある」こと自体を競争軸にしません。これらは既に多くの隣接実装が存在する領域です。

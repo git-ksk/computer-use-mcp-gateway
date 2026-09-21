@@ -53,12 +53,17 @@ use crate::{
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_filesystem::DEFAULT_MAX_FILE_BYTES,
-    v2_m1_hub::{HubCommandError, HubHandle, HubManagedJobOutputRead},
+    v2_m1_hub::{HubCommandError, HubHandle, HubManagedJobOutputRead, HubPlaywrightTestOutputRead},
     v2_m1_workspace_mutation::{
         DEFAULT_MAX_WORKSPACE_PATH_BYTES, DEFAULT_MAX_WORKSPACE_WRITE_BYTES, sha256_hex,
     },
     v2_managed_job::{
         MAX_MANAGED_JOB_LEASE_MS, MAX_MANAGED_JOB_LIFETIME_MS, MAX_MANAGED_JOB_OUTPUT_READ_BYTES,
+    },
+    v2_playwright_sandbox::{
+        MAX_PLAYWRIGHT_GREP_BYTES, MAX_PLAYWRIGHT_OUTPUT_READ_BYTES, MAX_PLAYWRIGHT_PROJECT_BYTES,
+        MAX_PLAYWRIGHT_TEST_LIFETIME_MS, MAX_PLAYWRIGHT_TEST_PATH_BYTES, MAX_PLAYWRIGHT_TEST_PATHS,
+        MAX_PLAYWRIGHT_WORKERS, PlaywrightTestRequest,
     },
     v2_semantic_constraints::{SemanticConstraintError, SemanticConstraintPolicy},
 };
@@ -122,6 +127,10 @@ const TOOL_MANAGED_JOB_STATUS: &str = "managed_job_status";
 const TOOL_MANAGED_JOB_OUTPUT: &str = "managed_job_output";
 const TOOL_MANAGED_JOB_RENEW: &str = "managed_job_renew";
 const TOOL_MANAGED_JOB_STOP: &str = "managed_job_stop";
+const TOOL_PLAYWRIGHT_TEST_START: &str = "playwright_test_start";
+const TOOL_PLAYWRIGHT_TEST_STATUS: &str = "playwright_test_status";
+const TOOL_PLAYWRIGHT_TEST_OUTPUT: &str = "playwright_test_output";
+const TOOL_PLAYWRIGHT_TEST_STOP: &str = "playwright_test_stop";
 const TOOL_GET_OPERATION: &str = "get_operation";
 const TOOL_READ_FILE: &str = "read_file";
 const TOOL_LIST_DIRECTORY: &str = "list_directory";
@@ -3141,6 +3150,191 @@ impl ServerHandler for V2NorthboundMcp {
             };
         }
 
+        if matches!(
+            request.name.as_ref(),
+            TOOL_PLAYWRIGHT_TEST_START
+                | TOOL_PLAYWRIGHT_TEST_STATUS
+                | TOOL_PLAYWRIGHT_TEST_OUTPUT
+                | TOOL_PLAYWRIGHT_TEST_STOP
+        ) {
+            let owner = OperationOwner::from_principal(&auth.principal);
+            let metadata = OperationAdmissionMetadata {
+                audit,
+                ..OperationAdmissionMetadata::empty()
+            };
+            let effectful = matches!(
+                request.name.as_ref(),
+                TOOL_PLAYWRIGHT_TEST_START | TOOL_PLAYWRIGHT_TEST_STOP
+            );
+            let response: Result<Value, McpError> = match request.name.as_ref() {
+                TOOL_PLAYWRIGHT_TEST_START => {
+                    let args: PlaywrightTestStartArgs = parse_arguments(arguments)?;
+                    if args.hard_lifetime_ms == 0
+                        || args.hard_lifetime_ms > MAX_PLAYWRIGHT_TEST_LIFETIME_MS
+                    {
+                        return Err(McpError::invalid_params(
+                            "hard_lifetime_ms exceeds the Playwright sandbox lifetime limit",
+                            None,
+                        ));
+                    }
+                    if args.test_paths.is_empty()
+                        || args.test_paths.len() > MAX_PLAYWRIGHT_TEST_PATHS
+                    {
+                        return Err(McpError::invalid_params(
+                            "test_paths count is outside the Playwright sandbox limit",
+                            None,
+                        ));
+                    }
+                    if args
+                        .workers
+                        .is_some_and(|workers| workers == 0 || workers > MAX_PLAYWRIGHT_WORKERS)
+                    {
+                        return Err(McpError::invalid_params(
+                            "workers exceeds the Playwright sandbox limit",
+                            None,
+                        ));
+                    }
+                    let request = PlaywrightTestRequest {
+                        workspace: args.workspace,
+                        test_paths: args.test_paths,
+                        project: args.project,
+                        grep: args.grep,
+                        workers: args.workers,
+                        hard_lifetime_ms: args.hard_lifetime_ms,
+                    };
+                    self.hub
+                        .playwright_test_start_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            request,
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "playwright_test_started",
+                                "operation_id": result.operation_id,
+                                "test_ref": result.test_ref,
+                                "status": result.status,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                TOOL_PLAYWRIGHT_TEST_STATUS => {
+                    let args: PlaywrightTestRefArgs = parse_arguments(arguments)?;
+                    if args.test_ref.is_empty() || args.test_ref.len() > 128 {
+                        return Err(McpError::invalid_params("Invalid test_ref", None));
+                    }
+                    self.hub
+                        .playwright_test_status_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            &args.test_ref,
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "playwright_test_status",
+                                "status": result.status,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                TOOL_PLAYWRIGHT_TEST_OUTPUT => {
+                    let args: PlaywrightTestOutputArgs = parse_arguments(arguments)?;
+                    if args.test_ref.is_empty() || args.test_ref.len() > 128 {
+                        return Err(McpError::invalid_params("Invalid test_ref", None));
+                    }
+                    let max_bytes = args.max_bytes.unwrap_or(
+                        u64::try_from(MAX_PLAYWRIGHT_OUTPUT_READ_BYTES).map_err(|_| {
+                            McpError::internal_error("Playwright output limit unavailable", None)
+                        })?,
+                    );
+                    if max_bytes == 0
+                        || max_bytes
+                            > u64::try_from(MAX_PLAYWRIGHT_OUTPUT_READ_BYTES).map_err(|_| {
+                                McpError::internal_error(
+                                    "Playwright output limit unavailable",
+                                    None,
+                                )
+                            })?
+                    {
+                        return Err(McpError::invalid_params(
+                            "max_bytes exceeds the Playwright output range limit",
+                            None,
+                        ));
+                    }
+                    let stream = parse_managed_job_stream(&args.stream)?;
+                    self.hub
+                        .playwright_test_output_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            &args.test_ref,
+                            HubPlaywrightTestOutputRead {
+                                stream,
+                                offset: args.offset,
+                                max_bytes,
+                            },
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "playwright_test_output",
+                                "stream": result.stream,
+                                "bytes_base64": STANDARD.encode(&result.range.bytes),
+                                "requested_offset": result.range.requested_offset,
+                                "earliest_available_offset": result.range.earliest_available_offset,
+                                "next_offset": result.range.next_offset,
+                                "total_bytes": result.range.total_bytes,
+                                "eof": result.range.eof,
+                                "gap_before_range": result.range.gap_before_range,
+                                "history_truncated": result.range.history_truncated,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                TOOL_PLAYWRIGHT_TEST_STOP => {
+                    let args: PlaywrightTestRefArgs = parse_arguments(arguments)?;
+                    if args.test_ref.is_empty() || args.test_ref.len() > 128 {
+                        return Err(McpError::invalid_params("Invalid test_ref", None));
+                    }
+                    self.hub
+                        .playwright_test_stop_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            &args.test_ref,
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "playwright_test_stopped",
+                                "operation_id": result.operation_id,
+                                "status": result.status,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                _ => unreachable!(),
+            };
+            return match response {
+                Ok(payload) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                    payload.to_string(),
+                )])
+                .into()),
+                Err(error) => {
+                    let error = if effectful {
+                        mcp_error_with_operation_id(error, &operation_id)
+                    } else {
+                        error
+                    };
+                    Ok(execution_error_response(error))
+                }
+            };
+        }
+
         if request.name.as_ref() == TOOL_READ_PROCESS_OUTPUT {
             let args: ReadProcessOutputArgs = parse_arguments(arguments)?;
             let max_bytes = args.max_bytes.unwrap_or(8 * 1024);
@@ -4384,6 +4578,12 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_MANAGED_JOB_STATUS | TOOL_MANAGED_JOB_OUTPUT => {
             Some(DeviceCapability::ManagedJobObserve)
         }
+        TOOL_PLAYWRIGHT_TEST_START | TOOL_PLAYWRIGHT_TEST_STOP => {
+            Some(DeviceCapability::PlaywrightTestControl)
+        }
+        TOOL_PLAYWRIGHT_TEST_STATUS | TOOL_PLAYWRIGHT_TEST_OUTPUT => {
+            Some(DeviceCapability::PlaywrightTestObserve)
+        }
         TOOL_READ_FILE => Some(DeviceCapability::ReadFile),
         TOOL_LIST_DIRECTORY => Some(DeviceCapability::ListDirectory),
         TOOL_WRITE_WORKSPACE_FILE => Some(DeviceCapability::WriteWorkspaceFile),
@@ -4806,6 +5006,99 @@ fn all_tools() -> Vec<Tool> {
                     ),
                 ],
                 &["job_ref"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_PLAYWRIGHT_TEST_START,
+            "Start a sandboxed Playwright test run through a separately authorized container-runtime provider. The sandbox uses network none, an ephemeral browser/home context, a read-only approved workspace, a private artifact mount, fixed Playwright argv, and no inherited Agent environment. No shell/runtime argument passthrough is accepted.",
+            object_schema(
+                vec![
+                    ("operation_id", operation_id_schema()),
+                    ("workspace", string_schema()),
+                    (
+                        "test_paths",
+                        json!({
+                            "type":"array",
+                            "minItems":1,
+                            "maxItems":MAX_PLAYWRIGHT_TEST_PATHS,
+                            "items":{
+                                "type":"string",
+                                "minLength":1,
+                                "maxLength":MAX_PLAYWRIGHT_TEST_PATH_BYTES
+                            }
+                        }),
+                    ),
+                    (
+                        "project",
+                        json!({"type":"string","minLength":1,"maxLength":MAX_PLAYWRIGHT_PROJECT_BYTES}),
+                    ),
+                    (
+                        "grep",
+                        json!({"type":"string","minLength":1,"maxLength":MAX_PLAYWRIGHT_GREP_BYTES}),
+                    ),
+                    (
+                        "workers",
+                        bounded_positive_integer_schema(u64::from(MAX_PLAYWRIGHT_WORKERS)),
+                    ),
+                    (
+                        "hard_lifetime_ms",
+                        bounded_positive_integer_schema(MAX_PLAYWRIGHT_TEST_LIFETIME_MS),
+                    ),
+                ],
+                &["workspace", "test_paths", "hard_lifetime_ms"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_PLAYWRIGHT_TEST_STATUS,
+            "Read owner-scoped status and bounded artifact metadata for one opaque sandboxed Playwright test reference.",
+            object_schema(
+                vec![(
+                    "test_ref",
+                    json!({"type":"string","minLength":1,"maxLength":128}),
+                )],
+                &["test_ref"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_PLAYWRIGHT_TEST_OUTPUT,
+            "Read a bounded stdout/stderr range from one sandboxed Playwright test. The host artifact path and private Agent locator are never exposed.",
+            object_schema(
+                vec![
+                    (
+                        "test_ref",
+                        json!({"type":"string","minLength":1,"maxLength":128}),
+                    ),
+                    (
+                        "stream",
+                        json!({"type":"string","enum":["stdout","stderr"]}),
+                    ),
+                    ("offset", json!({"type":"integer","minimum":0})),
+                    (
+                        "max_bytes",
+                        bounded_positive_integer_schema(
+                            MAX_PLAYWRIGHT_OUTPUT_READ_BYTES as u64,
+                        ),
+                    ),
+                ],
+                &["test_ref", "stream"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_PLAYWRIGHT_TEST_STOP,
+            "Request termination of one sandboxed Playwright test. Success is returned only after the supervised container-runtime process is proven terminal; ambiguous termination follows the existing Indeterminate/no-replay safety path.",
+            object_schema(
+                vec![
+                    ("operation_id", operation_id_schema()),
+                    (
+                        "test_ref",
+                        json!({"type":"string","minLength":1,"maxLength":128}),
+                    ),
+                ],
+                &["test_ref"],
             ),
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
@@ -6354,6 +6647,37 @@ struct ManagedJobRenewArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PlaywrightTestStartArgs {
+    workspace: String,
+    test_paths: Vec<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    grep: Option<String>,
+    #[serde(default)]
+    workers: Option<u16>,
+    hard_lifetime_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaywrightTestRefArgs {
+    test_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaywrightTestOutputArgs {
+    test_ref: String,
+    stream: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileArgs {
     path: String,
     #[serde(default)]
@@ -7732,6 +8056,22 @@ mod tests {
             (TOOL_MANAGED_JOB_OUTPUT, DeviceCapability::ManagedJobObserve),
             (TOOL_MANAGED_JOB_RENEW, DeviceCapability::ManagedJobControl),
             (TOOL_MANAGED_JOB_STOP, DeviceCapability::ManagedJobControl),
+            (
+                TOOL_PLAYWRIGHT_TEST_START,
+                DeviceCapability::PlaywrightTestControl,
+            ),
+            (
+                TOOL_PLAYWRIGHT_TEST_STATUS,
+                DeviceCapability::PlaywrightTestObserve,
+            ),
+            (
+                TOOL_PLAYWRIGHT_TEST_OUTPUT,
+                DeviceCapability::PlaywrightTestObserve,
+            ),
+            (
+                TOOL_PLAYWRIGHT_TEST_STOP,
+                DeviceCapability::PlaywrightTestControl,
+            ),
             (TOOL_READ_FILE, DeviceCapability::ReadFile),
             (TOOL_LIST_DIRECTORY, DeviceCapability::ListDirectory),
             (
@@ -7790,6 +8130,8 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert_eq!(names.len(), mappings.len() + 3);
+        let unique_names = names.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_names.len(), names.len(), "duplicate MCP tool name");
         assert!(names.contains(&TOOL_OPEN_INTERACTION_CONTEXT.to_owned()));
         assert!(names.contains(&TOOL_CLOSE_INTERACTION_CONTEXT.to_owned()));
         assert!(names.contains(&TOOL_GET_OPERATION.to_owned()));

@@ -200,6 +200,14 @@ impl BackendAdapter for CuaCliAdapter {
                     command.capability(),
                 ));
             }
+            DeviceCommand::PlaywrightTestStart { .. }
+            | DeviceCommand::PlaywrightTestStatus { .. }
+            | DeviceCommand::PlaywrightTestOutput { .. }
+            | DeviceCommand::PlaywrightTestStop { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    command.capability(),
+                ));
+            }
             DeviceCommand::ReadFile { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::ReadFile,
