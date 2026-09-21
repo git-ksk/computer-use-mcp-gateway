@@ -14,15 +14,15 @@ Issue #267 では bounded な `execute_process` / `shell` に対して、Linux�
 設定時は次を満たさなければAgent startupを拒否します。
 
 - Agentはnon-root
-- hostは通常のcgroup-v2 mountを `/sys/fs/cgroup` に1つだけ公開
+- hostはkernel `nsdelegate` option付きの通常cgroup-v2 mountを `/sys/fs/cgroup` に1つだけ公開
 - configured pathはabsolute / canonical / non-symlinkの `domain` cgroup
 - **Agent process自身がそのconfigured cgroupのmember**
 - startup時にchild cgroupが存在しない
 - configured cgroup directory / `cgroup.procs` でoperation childを作成・移動可能
 - fresh childの `cgroup.procs` / `cgroup.kill` がwrite可能
 - configured cgroupのparent `cgroup.procs` はAgentからwrite不可
-- unprivileged user namespace、cgroup namespace、mount namespaceが利用可能
-- startup probeでchild cgroupへのentry、private cgroup view構築、exec、完全cleanupまで成功
+- unprivileged user namespace、cgroup namespaceが利用可能
+- startup probeでchild cgroupへのentry、user+cgroup namespace boundary構築、exec、完全cleanupまで成功
 
 Agent自身の事前配置は必須です。Linux cgroup v2 delegationではprocess migration時にsource/destinationのcommon ancestorへwrite authorityが必要です。したがってnon-root Agentがdelegated subtree外からchildを引き込みつつ、同時にoutside migration不可も証明することはできません。service manager/operatorがAgent起動前にdelegated rootへ配置します。
 
@@ -36,13 +36,12 @@ configured rootはAgent serviceが所属するdedicated rootです。bounded pro
 2. childの `cgroup.procs` をpre-open
 3. fork
 4. post-fork / pre-exec hookでopen済みfdへ `0` をwriteし、childをoperation cgroupへ移動
-5. requested codeを実行する前にnew user namespace / cgroup namespace / mount namespaceを作成
+5. requested codeを実行する前にnew user namespace / cgroup namespaceを作成
 6. current Agent identityのUID/GIDを1対1 mapping
-7. mount propagationをprivate化し、new cgroup namespaceのroot＝operation cgroupとなる **read-only cgroup2 view** を `/sys/fs/cgroup` へmount
-8. `no_new_privs` を設定
-9. その後だけrequested executable / fixed shellをexec
+7. `no_new_privs` を設定
+8. その後だけrequested executable / fixed shellをexec
 
-effectful user codeはoperation cgroupへ入る前には実行されません。private cgroup namespace + private read-only cgroup mountにより、同一UIDのcommand codeからouter Agent cgroup hierarchyへ戻るmigration pathを閉じます。既存Unix process-group wrapperもinner lifecycle primitiveとして維持します。
+effectful user codeはoperation cgroupへ入る前には実行されません。host cgroup-v2 mountに `nsdelegate` を必須化するため、new cgroup namespace自体がkernel-enforced delegation boundaryとなり、sourceまたはdestinationがoperation namespace外のmigrationは拒否されます。既存Unix process-group wrapperもinner lifecycle primitiveとして維持します。これはprocess containment boundaryであり、outer cgroup hierarchyをfilesystem contentとして不可視化するclaimはしません。
 
 cancel / timeout / spawn後setup failure / top-level normal completionでは:
 
@@ -60,9 +59,9 @@ service manager/operatorがprovisionします。CUMG自身はhost cgroup hierarc
 
 Agent binary起動前にservice managerがAgent processをdedicated delegated cgroupへ配置し、そのcgroupだけをAgentへdelegateしてください。parent migration boundaryはservice manager/root管理のままにします。
 
-child側のouter cgroup hierarchyを隠すため、kernel policyでunprivileged user namespaceが利用可能である必要があります。host policyで無効ならstronger backendはunavailableとなり、明示設定時はstartup fail-closedです。
+`nsdelegate` migration boundary用のchild cgroup namespaceを作るため、kernel policyでunprivileged user namespaceが利用可能である必要があります。host policyで無効ならstronger backendはunavailableとなり、明示設定時はstartup fail-closedです。
 
-container / namespaced deploymentを自動的に同等とは扱いません。current implementationはreview済みのsingle `/sys/fs/cgroup` mount layoutを要求し、それ以外ではstronger modeを拒否します。
+container / namespaced deploymentを自動的に同等とは扱いません。current implementationはreview済みのsingle `/sys/fs/cgroup` cgroup-v2 mount layoutと `nsdelegate` を要求し、それ以外ではstronger modeを拒否します。
 
 これはprocess lifecycle containmentでありgeneral sandboxではありません。network、通常filesystem access、credential、arbitrary syscallまでは隔離しません。namespace setupはcgroup execution boundaryを証明するためだけです。また `no_new_privs` を設定するため、このoptional backend内ではset-user-IDによるprivilege gainは利用できません。
 
@@ -81,8 +80,7 @@ Linux CIでwritable delegated rootとunwritable control rootをprovisionし、pr
 - `setsid()` detached descendantがoperation return時に消えている
 - fork race後にoperation cgroupが残らない
 - parent hierarchyへのmigrationが失敗
-- 別processの `/proc/<pid>/root` 経由でもouter hierarchyへ到達できない
-- private cgroup mountはcommand codeからread-only
+- 別processの `/proc/<pid>/root` 経由でouter hierarchy pathが見えてもnamespace delegation boundaryによりmigrationできない
 - unwritable cgroup-v2 rootは明示的unavailable
 
 References:

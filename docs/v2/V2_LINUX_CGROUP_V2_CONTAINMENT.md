@@ -14,15 +14,15 @@ Omission keeps the existing truthful Unix process-group behavior. CUMG never inf
 When configured, Agent startup refuses the backend unless all of the following hold:
 
 - the Agent is non-root;
-- the host exposes one normal cgroup-v2 mount at `/sys/fs/cgroup`;
+- the host exposes one normal cgroup-v2 mount at `/sys/fs/cgroup` with the kernel `nsdelegate` option;
 - the configured path is absolute, canonical, non-symlink, and a `domain` cgroup;
 - the **Agent process is already a member of that configured cgroup**;
 - the configured cgroup has no child cgroups at startup;
 - its directory and `cgroup.procs` support delegated operation-child creation/migration;
 - a fresh child exposes writable `cgroup.procs` and `cgroup.kill`;
 - the configured cgroup's parent `cgroup.procs` is not writable to the Agent;
-- unprivileged user namespaces plus cgroup and mount namespaces are available;
-- a startup probe can enter a child cgroup, establish the private cgroup view, exec, and clean the child cgroup completely.
+- unprivileged user namespaces plus cgroup namespaces are available;
+- a startup probe can enter a child cgroup, establish the user+cgroup namespace boundary, exec, and clean the child cgroup completely.
 
 The placement rule is important. Linux cgroup-v2 delegation requires write authority to the common ancestor when migrating a process. Therefore a non-root Agent cannot safely pull a process from outside the delegated subtree while simultaneously proving that it cannot push the process back outside. The service manager/operator must place the Agent into the delegated root before CUMG starts.
 
@@ -36,13 +36,12 @@ For each operation CUMG:
 2. pre-opens that child cgroup's `cgroup.procs`;
 3. forks;
 4. in the post-fork/pre-exec hook, writes `0` through the pre-opened descriptor so the child enters the operation cgroup;
-5. before any requested code executes, creates a new user namespace, cgroup namespace, and mount namespace;
+5. before any requested code executes, creates a new user namespace and cgroup namespace;
 6. installs one-to-one UID/GID mappings for the current Agent identity;
-7. makes mount propagation private and mounts a new **read-only cgroup2 view** at `/sys/fs/cgroup`, rooted by the new cgroup namespace at the operation cgroup;
-8. sets `no_new_privs`;
-9. only then execs the requested executable or fixed shell.
+7. sets `no_new_privs`;
+8. only then execs the requested executable or fixed shell.
 
-The operation therefore starts inside the cgroup before effectful user code runs. The private cgroup namespace plus private read-only cgroup mount prevents same-UID command code from reaching the Agent's outer cgroup hierarchy or migrating back to the Agent root. The existing Unix process-group wrapper remains as an inner lifecycle primitive.
+The operation therefore starts inside the cgroup before effectful user code runs. Because the host cgroup-v2 mount is required to use `nsdelegate`, the new cgroup namespace becomes a kernel-enforced delegation boundary: migrations whose source or destination is outside the operation namespace are rejected. The existing Unix process-group wrapper remains as an inner lifecycle primitive. This boundary is about process containment; CUMG does not claim that the outer cgroup hierarchy is hidden as filesystem content.
 
 On cancellation, timeout, setup failure after spawn, and ordinary top-level completion, CUMG:
 
@@ -60,9 +59,9 @@ The service manager/operator owns provisioning. CUMG does not mount the host cgr
 
 A suitable deployment must place the Agent process into a dedicated delegated cgroup before launching the Agent binary, then grant only that cgroup to the Agent. The parent migration boundary stays service-manager/root controlled.
 
-The kernel must permit unprivileged user namespaces because CUMG uses a child user namespace only to create the child-owned cgroup and mount namespaces needed to hide the outer cgroup hierarchy. If host policy disables unprivileged user namespaces, the stronger backend is unavailable and configured startup fails closed.
+The kernel must permit unprivileged user namespaces because CUMG uses a child user namespace only to create the child-owned cgroup namespace needed for the `nsdelegate` migration boundary. If host policy disables unprivileged user namespaces, the stronger backend is unavailable and configured startup fails closed.
 
-Containerized/namespaced deployments are not assumed equivalent. The current implementation deliberately requires the reviewed single `/sys/fs/cgroup` mount layout and otherwise refuses stronger mode.
+Containerized/namespaced deployments are not assumed equivalent. The current implementation deliberately requires the reviewed single `/sys/fs/cgroup` cgroup-v2 mount layout with `nsdelegate` and otherwise refuses stronger mode.
 
 The backend remains process-lifecycle containment, not a general sandbox. It does not isolate network, ordinary filesystem access, credentials, or arbitrary syscalls. The namespace setup is only part of proving the cgroup execution boundary. It also means set-user-ID privilege gain is not available inside this optional backend because `no_new_privs` is set.
 
@@ -81,8 +80,7 @@ Linux CI provisions a writable delegated root and an unwritable control root, th
 - a `setsid()`-detached descendant is gone when the operation returns;
 - a fork race leaves no operation cgroup behind;
 - migration toward the parent hierarchy is denied;
-- reaching the outer hierarchy through another process's `/proc/<pid>/root` is denied;
-- the private cgroup mount is read-only to command code;
+- migration through an outer-hierarchy path exposed via another process's `/proc/<pid>/root` is denied by the namespace delegation boundary;
 - an unwritable cgroup-v2 root is explicitly unavailable.
 
 References:

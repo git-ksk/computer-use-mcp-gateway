@@ -3,9 +3,9 @@
 //! The stronger backend is opt-in. A service manager or operator must place
 //! the Agent itself in an explicitly delegated cgroup-v2 root before startup.
 //! Each bounded process/shell operation is moved into a fresh child cgroup
-//! before exec and then receives a private user+cgroup+mount namespace view
-//! whose cgroup2 mount is rooted at that operation cgroup and read-only.
-//! This prevents same-UID command code from migrating back to the Agent root.
+//! before exec and then receives a private user+cgroup namespace. The host
+//! cgroup-v2 mount must use nsdelegate, making that cgroup namespace an
+//! authoritative migration boundary even though this is not a filesystem sandbox.
 //! Terminal proof is cgroup.kill plus cgroup.events populated=0 for the exact
 //! operation subtree.
 
@@ -230,7 +230,7 @@ impl LinuxCgroupOperation<'_> {
             unsafe {
                 command.pre_exec(move || {
                     write_all_raw_fd(procs.as_raw_fd(), b"0\n")?;
-                    establish_private_cgroup_view(&uid_map, &gid_map)?;
+                    establish_cgroup_namespace_boundary(&uid_map, &gid_map)?;
                     Ok(())
                 });
             }
@@ -390,13 +390,22 @@ fn validate_mount_layout() -> Result<(), LinuxCgroupError> {
         if after_fields.next() != Some("cgroup2") {
             continue;
         }
+        let _source = after_fields
+            .next()
+            .ok_or(LinuxCgroupError::MountLayoutUnsupported)?;
+        let super_options = after_fields
+            .next()
+            .ok_or(LinuxCgroupError::MountLayoutUnsupported)?;
         let fields = before.split_ascii_whitespace().collect::<Vec<_>>();
         if fields.len() < 5 {
             return Err(LinuxCgroupError::MountLayoutUnsupported);
         }
-        cgroup2.push((fields[3], fields[4]));
+        let nsdelegate = super_options
+            .split(',')
+            .any(|option| option == "nsdelegate");
+        cgroup2.push((fields[3], fields[4], nsdelegate));
     }
-    if cgroup2.as_slice() != [("/", CGROUP_MOUNT)] {
+    if cgroup2.as_slice() != [("/", CGROUP_MOUNT, true)] {
         return Err(LinuxCgroupError::MountLayoutUnsupported);
     }
     Ok(())
@@ -465,16 +474,17 @@ fn write_proc_control(path: *const libc::c_char, bytes: &[u8], optional: bool) -
 }
 
 #[cfg(target_os = "linux")]
-fn establish_private_cgroup_view(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+fn establish_cgroup_namespace_boundary(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
     const SETGROUPS: &[u8] = b"/proc/self/setgroups\0";
     const UID_MAP: &[u8] = b"/proc/self/uid_map\0";
     const GID_MAP: &[u8] = b"/proc/self/gid_map\0";
-    const CGROUP_TARGET: &[u8] = b"/sys/fs/cgroup\0";
-    const CGROUP_SOURCE: &[u8] = b"none\0";
-    const CGROUP_FSTYPE: &[u8] = b"cgroup2\0";
-    const ROOT: &[u8] = b"/\0";
 
-    let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWCGROUP | libc::CLONE_NEWNS;
+    // Creating the user namespace in the same call guarantees it is created
+    // first, giving this child CAP_SYS_ADMIN over the new cgroup namespace
+    // without any host-global capability. The host cgroup2 mount is validated
+    // with nsdelegate, so the new cgroup namespace itself becomes a kernel-
+    // enforced migration boundary for this operation.
+    let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWCGROUP;
     if unsafe { libc::unshare(flags) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -482,34 +492,6 @@ fn establish_private_cgroup_view(uid_map: &[u8], gid_map: &[u8]) -> io::Result<(
     write_proc_control(SETGROUPS.as_ptr().cast::<libc::c_char>(), b"deny\n", true)?;
     write_proc_control(UID_MAP.as_ptr().cast::<libc::c_char>(), uid_map, false)?;
     write_proc_control(GID_MAP.as_ptr().cast::<libc::c_char>(), gid_map, false)?;
-
-    let private_flags = libc::MS_REC | libc::MS_PRIVATE;
-    if unsafe {
-        libc::mount(
-            std::ptr::null(),
-            ROOT.as_ptr().cast::<libc::c_char>(),
-            std::ptr::null(),
-            private_flags,
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-
-    let cgroup_flags = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
-    if unsafe {
-        libc::mount(
-            CGROUP_SOURCE.as_ptr().cast::<libc::c_char>(),
-            CGROUP_TARGET.as_ptr().cast::<libc::c_char>(),
-            CGROUP_FSTYPE.as_ptr().cast::<libc::c_char>(),
-            cgroup_flags,
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
 
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
