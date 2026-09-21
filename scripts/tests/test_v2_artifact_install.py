@@ -100,12 +100,14 @@ class ArtifactInstallTests(unittest.TestCase):
     @staticmethod
     def manifest():
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "package_version": "0.3.0",
             "source_commit": ArtifactInstallTests.CUMG,
             "platform": "macos",
             "architecture": "arm64",
-            "hub_agent_schema_version": 5,
+            "hub_agent_schema_version": 6,
+            "control_schema_version": 10,
+            "capability_schema_version": 6,
             "paired_handoff_commit": ArtifactInstallTests.HANDOFF,
             "install_profile": "single-mac-artifact-v1",
             "files": [],
@@ -191,10 +193,35 @@ class ArtifactInstallTests(unittest.TestCase):
         installed = self.root / "installed"
         self.assertTrue((installed / "runtime-manifest.json").is_file())
         runtime_manifest = json.loads((installed / "runtime-manifest.json").read_text())
+        self.assertEqual(
+            set(runtime_manifest),
+            {
+                "schema_version",
+                "hub_agent_schema_version",
+                "control_schema_version",
+                "capability_schema_version",
+                "source_commit",
+                "package_version",
+                "binaries",
+            },
+        )
+        self.assertEqual(runtime_manifest["schema_version"], 4)
         self.assertEqual(runtime_manifest["source_commit"], self.CUMG)
-        self.assertEqual(runtime_manifest["hub_agent_schema_version"], 5)
+        self.assertEqual(runtime_manifest["hub_agent_schema_version"], 6)
+        self.assertEqual(runtime_manifest["control_schema_version"], 10)
+        self.assertEqual(runtime_manifest["capability_schema_version"], 6)
         self.assertEqual({x["name"] for x in runtime_manifest["binaries"]}, set(mod.RUNTIME_BINARIES))
         self.assertTrue((installed / "mutation-authority").is_dir())
+        ephemeral_parent = self.root / "run" / "agent-ephemeral"
+        self.assertTrue(ephemeral_parent.is_dir())
+        self.assertEqual(ephemeral_parent.stat().st_mode & 0o777, 0o700)
+        agent_plist = (
+            self.root / "LaunchAgents" / mod.PLISTS["com.github.git-ksk.cumg-v2-agent"]
+        ).read_text(encoding="utf-8")
+        self.assertIn(str(ephemeral_parent), agent_plist)
+        self.assertIn("CUMG_V2_WORKSPACE_MUTATION_MODE", agent_plist)
+        self.assertIn("<string>disabled</string>", agent_plist)
+        self.assertNotIn("CUMG_V2_ALLOWED_WRITE_ROOTS", agent_plist)
         for filename in mod.PLISTS.values():
             plist_text = (self.root / "LaunchAgents" / filename).read_text(encoding="utf-8")
             for secret_name in mod.SECRET_FILES:

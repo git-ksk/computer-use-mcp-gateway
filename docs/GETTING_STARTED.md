@@ -250,7 +250,11 @@ The desktop runs a separate outbound Agent:
 cargo run --locked --bin v2_agent -- --help
 ```
 
-Configure the Hub endpoint/domain, stable device ID, device secret, Hub/grant public keys, TLS root, state directory, process/shell cwd roots, and the separate read-only filesystem roots. `CUMG_V2_ALLOWED_CWD_ROOTS` governs only process/shell working directories; `CUMG_V2_ALLOWED_FILE_ROOTS` governs only `ReadFile`/`ListDirectory`. There is no implicit cwd-to-file fallback. On upgrade from an older configuration, explicitly copy the old cwd root list into the new file-root setting if identical read behavior is required, verify startup, then narrow file roots independently. Missing/empty file roots fail Agent startup rather than silently broadening read authority. To use Cua for the GUI capabilities, configure:
+Configure the Hub endpoint/domain, stable device ID, device secret, Hub/grant public keys, TLS root, state directory, process/shell cwd roots, and the separate read-only filesystem roots. `CUMG_V2_ALLOWED_CWD_ROOTS` governs only process/shell working directories; `CUMG_V2_ALLOWED_FILE_ROOTS` governs only `ReadFile`/`ListDirectory`. There is no implicit cwd-to-file fallback. On upgrade from an older configuration, explicitly copy the old cwd root list into the new file-root setting if identical read behavior is required, verify startup, then narrow file roots independently. Missing/empty file roots fail Agent startup rather than silently broadening read authority.
+
+For the v0.5 workspace boundary, set `CUMG_V2_EPHEMERAL_DATA_PARENT` to a dedicated private parent outside authoritative state/rollback trees and set `CUMG_V2_WORKSPACE_MUTATION_MODE=disabled` unless mutation is deliberately enabled. Enabling mutation requires at least one explicit `CUMG_V2_ALLOWED_WRITE_ROOTS`; optional `CUMG_V2_DENIED_WRITE_SUBPATHS` remains deny-wins. Cwd roots and read-only file roots never fall back into write authority. The reviewed packaged profiles carry an explicit ephemeral parent and explicit disabled mutation default. Retained ephemeral bytes are non-authoritative and are not rollback assets.
+
+To use Cua for the GUI capabilities, configure:
 
 ```text
 CUMG_V2_CUA_COMMAND=cua-driver
@@ -258,7 +262,7 @@ CUMG_V2_CUA_ARGS=mcp
 CUMG_V2_CUA_BACKEND_VERSION=0.19.3
 ```
 
-Cua stays behind the Agent over MCP stdio. Set `CUMG_V2_CUA_BACKEND_VERSION` to the exact reviewed compatibility target in production. When set to a concrete value, the Agent verifies the Cua MCP handshake `serverInfo.version` on every connection and reconnect and fails closed on drift. The `external` default is an explicit unpinned mode for custom deployments, not the recommended production setting for the reviewed Cua path. On macOS, keep the Agent/Cua in the logged-in user session and do not bypass TCC prompts or move GUI automation into a headless system daemon.
+The reviewed packaged Cua tool timeout is 30 seconds; duration-bearing commands use a conservative 24-second effective execution budget. `v2_doctor` reports an execution-budget error when the configured timeout cannot support the minimum paced-input contract. This does not widen unrelated capability deadlines.\n\nCua stays behind the Agent over MCP stdio. Set `CUMG_V2_CUA_BACKEND_VERSION` to the exact reviewed compatibility target in production. When set to a concrete value, the Agent verifies the Cua MCP handshake `serverInfo.version` on every connection and reconnect and fails closed on drift. The `external` default is an explicit unpinned mode for custom deployments, not the recommended production setting for the reviewed Cua path. On macOS, keep the Agent/Cua in the logged-in user session and do not bypass TCC prompts or move GUI automation into a headless system daemon.
 
 ## 9. Verify before remote exposure
 

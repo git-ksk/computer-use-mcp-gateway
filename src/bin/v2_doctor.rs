@@ -37,6 +37,8 @@ struct Args {
     cua_command: Option<PathBuf>,
     #[arg(long)]
     expected_cua_version: Option<String>,
+    #[arg(long, env = "CUMG_V2_CUA_TOOL_TIMEOUT_SECS", default_value_t = 30)]
+    cua_tool_timeout_secs: u64,
     #[arg(long, env = "CUMG_MUTATION_AUTHORITY_DIR")]
     mutation_authority_dir: Option<PathBuf>,
     /// Optional private local Handoff control socket. Status is queried read-only and locator/IDs are omitted.
@@ -98,6 +100,7 @@ fn main() -> ExitCode {
             .cua_command
             .or_else(|| Some(home.join(".local/bin/cua-driver"))),
         expected_cua_version: args.expected_cua_version,
+        cua_tool_timeout_secs: args.cua_tool_timeout_secs,
         mutation_authority_dir: args
             .mutation_authority_dir
             .or_else(|| Some(root.join("mutation-authority"))),
@@ -119,11 +122,12 @@ fn main() -> ExitCode {
     } else {
         println!("CUMG_V2_DOCTOR overall={}", report.overall);
         println!(
-            "READINESS device={} control_plane={} computer_use_observation={} filesystem_observation={} effectful_execution={} browser_effectful_execution={}",
+            "READINESS device={} control_plane={} computer_use_observation={} filesystem_observation={} workspace_mutation={} effectful_execution={} browser_effectful_execution={}",
             report.readiness.device,
             report.readiness.lanes.control_plane.as_str(),
             report.readiness.lanes.computer_use_observation.as_str(),
             report.readiness.lanes.filesystem_observation.as_str(),
+            report.readiness.lanes.workspace_mutation.as_str(),
             report.readiness.lanes.effectful_execution.as_str(),
             report.readiness.lanes.browser_effectful_execution.as_str()
         );

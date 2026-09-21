@@ -29,7 +29,7 @@ That restart behavior is intentional. Durable get_operation must not persist a l
 
 Resource exhaustion fails closed. It never raises the ordinary inline output/file limits or widens filesystem/process authority.
 
-On Windows and the other packaged profiles, deployment creates a dedicated ephemeral root outside the authoritative Agent state/rollback tree and inherits the reviewed ACL/permission boundary from its parent. The v0.5 release-integration gate (#314) owns the exact path, ACL/permission preflight, and backup exclusion rather than defining a second independent authority model here.
+On Windows and the other packaged profiles, deployment creates a dedicated ephemeral root outside the authoritative Agent state/rollback tree and inherits the reviewed ACL/permission boundary from its parent. The v0.5 release-integration gate (#314) completes the exact packaged path, ACL/permission preflight, and backup exclusion without defining a second independent authority model here.
 
 ## Privacy and observability
 
@@ -51,7 +51,7 @@ When one stream exceeds that inline cap and a dedicated Agent ephemeral-data par
 - offsets and lengths are raw-byte offsets over the retained prefix, and northbound bytes are base64 encoded so UTF-16 or invalid UTF-8 output cannot make offsets ambiguous;
 - `complete=true` means the retained prefix contains the complete stream; `complete=false` means the stream exceeded the 4 MiB retention ceiling and later bytes are intentionally unavailable.
 
-If the dedicated ephemeral-data parent is not configured, process/shell execution remains available with the existing 16 KiB inline result and no live output refs. #314 owns packaged path selection, readiness/permission preflight, and upgrade/schema integration.
+If the dedicated ephemeral-data parent is not configured, process/shell execution remains available with the existing 16 KiB inline result and no live output refs. #314 completes packaged path selection, readiness/permission preflight, and upgrade/schema integration; retained bytes remain non-authoritative and outside rollback assets.
 
 Durable `get_operation` persists only the existing bounded inline process/shell result. It never persists a live public ref, Agent locator, or retained extended-output bytes.
 

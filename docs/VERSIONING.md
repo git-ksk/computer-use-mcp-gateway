@@ -4,7 +4,7 @@
 
 CUMG uses Semantic Versioning with an explicit pre-1.0 policy.
 
-Current released line: **0.4.x**. `v0.4.0` is the released Recovery, Identity & Semantic Authorization baseline; `v0.3.0` remains the immutable V2 Production Hardening / Operational Readiness tag.
+Current released line: **0.4.x**. The crate/release candidate is **0.5.0** (Least-privilege Workspace); `v0.4.0` remains the latest published tag until the v0.5.0 release is created.
 
 ## Version shape
 
@@ -50,12 +50,12 @@ Security emergency changes may break compatibility when preserving compatibility
 
 ## Schema versions are independent
 
-Project/crate versions, wire protocol schemas, capability-advertisement schemas, and durable-state schemas serve different purposes.
+Project/crate versions, wire protocol schemas, capability-advertisement schemas, and durable-state schemas serve different purposes. The v0.5 release candidate pins `CONTROL_SCHEMA_VERSION = 10`, capability schema `6`, `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`, and `HUB_AGENT_SCHEMA_VERSION = 6`; mixed live versions fail closed.
 
 - `CONTROL_SCHEMA_VERSION` changes when the live control-schema compatibility boundary changes.
 - capability-advertisement schema version changes when that live advertisement boundary changes.
 - `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION` and `GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION` version their persisted structures independently; a future `CONTROL_SCHEMA_VERSION` bump must not change them unless the persisted structure itself changes.
-- historical v0.2.x checkpoints used the then-current control schema number as the persisted registry/grant-ledger tag. Runtime restore supports only the explicitly reviewed v0.2.0-and-later lineage: registry `2/capability 2`, `3/capability 3`, `4..=7/capability 4`, and grant-ledger tags `2..=7`. Prototype tag `1`, unknown/future tags, and impossible control/capability pairings fail closed.
+- historical v0.2.x checkpoints used the then-current control schema number as the persisted registry/grant-ledger tag. Runtime restore supports only the explicitly reviewed v0.2.0-and-later lineage: registry `2/capability 2`, `3/capability 3`, `4..=6/capability 4`, `7/capability 5`, and current `8/capability 6`; grant-ledger tags remain independently versioned. Prototype tag `1`, unknown/future tags, and impossible control/capability pairings fail closed.
 - historical capability advertisements are not promoted into live authority during migration. The Hub validates the historical pairing, restores device identity/generation, marks the device offline, and requires a fresh Agent advertisement using the current live schema before dispatch.
 - a crate release does not automatically increment any schema.
 - a schema change does not determine the crate version arithmetically; use PATCH/MINOR based on public compatibility impact.
@@ -101,9 +101,9 @@ Before 1.0, only the **latest released minor line** is actively supported. Older
 
 The `v0.4.0` GitHub Release is **source-only**, matching the pre-1.0 publication boundary. Verified CI archives remain release-candidate evidence and are not official binary Release assets; they are never silently promoted into a supported distribution.
 
-The `Release Candidate Artifacts` workflow still builds bounded native candidates on Linux, macOS, and Windows. Manifest schema v2 records the package version, exact CUMG source commit, Hub/Agent application-schema version, platform/architecture, exact allowlisted files, sizes, and SHA-256 identities. Linux and Windows candidates remain distribution evidence only.
+The `Release Candidate Artifacts` workflow still builds bounded native candidates on Linux, macOS, and Windows. Manifest schema v3 records the package version, exact CUMG source commit, exact Hub/Agent, control, and capability schema versions, platform/architecture, exact allowlisted files, sizes, and SHA-256 identities. Linux and Windows candidates remain distribution evidence only.
 
-The macOS single-Mac candidate additionally implements the #237 install-capable profile. It binds an exact reviewed `mcp-execution-handoff` commit, includes `v2_recover` plus the Secure Enclave helper, ships bounded install/upgrade support files and LaunchAgent templates, and embeds a separately manifested self-contained Handoff runtime payload. Fresh verification fails closed on checksum drift, unexpected/missing files, unsafe paths, symlinks, inner/outer commit mismatch, or incomplete production dependencies. The artifact manifest remains distribution evidence; the installed schema-3 `runtime-manifest.json` remains the runtime identity checked by `v2_doctor`.
+The macOS single-Mac candidate additionally implements the #237 install-capable profile. It binds an exact reviewed `mcp-execution-handoff` commit, includes `v2_recover` plus the Secure Enclave helper, ships bounded install/upgrade support files and LaunchAgent templates, and embeds a separately manifested self-contained Handoff runtime payload. Fresh verification fails closed on checksum drift, unexpected/missing files, unsafe paths, symlinks, inner/outer commit mismatch, or incomplete production dependencies. The artifact manifest remains distribution evidence; the installed schema-4 `runtime-manifest.json` binds the exact Hub/Agent, control, and capability schema versions plus source/package/binary identities checked by `v2_doctor`.
 
 A supported clean single-Mac installation means no CUMG/Handoff source checkout is required. Deployment trust/secrets, stable device/resource/proxy identity, Cua, Node.js, and the operator-selected Apple code-signing identity remain separately provisioned inputs. Before activation the installer copies verified artifact bytes into private staging and applies the existing stable Team-ID code-signing boundary to TCC-sensitive local executables/helpers; CI candidates are not claimed to be Apple-notarized public installers.
 

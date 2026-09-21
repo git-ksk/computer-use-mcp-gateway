@@ -212,6 +212,8 @@ Agent-native process/shell の definite な validation / spawn failure は、raw
 
 v0.5 workspace foundation は public ephemeral-ref authorization を Hub-side に置き、Agent-private staging には bounded な opaque-locator data だけを保持します。public ref と Agent locator は別の short-lived / non-authoritative value であり、どちらも capability authorization、operation settlement、quarantine clear、durable recovery truth にはなりません。Agent restart で invalid になり得ることを仕様とします。[V2_EPHEMERAL_DATA_REFS.ja.md](V2_EPHEMERAL_DATA_REFS.ja.md) を参照してください。
 
+workspace mutation は独立した exact `WriteWorkspaceFile` authority です。packaged v0.5 config の default は disabled で、enabled は explicit writable root を必須とし、optional deny subpath は deny-wins です。process cwd root / read-only filesystem root が fallback で write root になることはありません。mutation dispatch 後の outcome を証明できない場合は `Indeterminate` のまま device を quarantine で fence し、automatic retry/replay は行いません。normal diagnostics に requested path、configured write/deny path、file content は出しません。
+
 ## Browser transfer data boundary
 
 Browser transfer は意図的に filesystem access より narrow です。upload northbound traffic は bounded byte と path-safe logical name を運び、context/generation/revision-bound one-shot ref を mint します。その backend value は Agent-private staging handle です。Agent は hardened state directory 配下に実 file を作り、symlink/directory/replacement/size violation を拒否し、southbound Cua call 直前に canonical regular file であることを再度 prove します。raw host path は northbound caller から受け取らず、返しもしません。

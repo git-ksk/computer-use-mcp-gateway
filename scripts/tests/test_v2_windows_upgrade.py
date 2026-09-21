@@ -85,7 +85,7 @@ class WindowsUpgradeTests(unittest.TestCase):
             payload = f"new-{name}\n".encode()
             (self.bundle / "bin" / name).write_bytes(payload)
             files[name] = hashlib.sha256(payload).hexdigest()
-        self.identity = mod.CandidateIdentity("0.4.0", self.COMMIT, 6, files)
+        self.identity = mod.CandidateIdentity("0.5.0", self.COMMIT, 6, 10, 6, files)
 
         # The old fixture deliberately has no tls_check to prove rollback removes
         # files that did not exist before the attempted upgrade.
@@ -134,6 +134,11 @@ class WindowsUpgradeTests(unittest.TestCase):
                 "--state-dir", str(self.state_dir / "agent"),
                 "--allowed-cwd-root", str(self.root),
             ]
+            if new:
+                args += [
+                    "--ephemeral-data-parent", str(self.data_root / "v2-windows-shell" / "ephemeral" / "agent"),
+                    "--workspace-mutation-mode", "disabled",
+                ]
             if new and include_file_root:
                 args += ["--allowed-file-root", str(self.root)]
         value = {
@@ -184,6 +189,84 @@ class WindowsUpgradeTests(unittest.TestCase):
         with self.assertRaisesRegex(mod.UpgradeError, "candidate_agent_missing_allowed_file_root"):
             mod.validate_required_flags(config, {"--hub-endpoint", "--allowed-cwd-root", "--allowed-file-root"})
 
+    def test_v05_agent_config_requires_dedicated_ephemeral_parent_and_explicit_mutation_mode(self):
+        config = mod.load_reviewed_config(self.candidate_agent, "agent", self.data_root)
+        mod.validate_agent_workspace_config(config, self.data_root)
+
+        missing = self.candidate_dir / "agent-missing-ephemeral.json"
+        self._write_config(missing, "agent", new=True)
+        value = json.loads(missing.read_text())
+        args = value["arguments"]
+        index = args.index("--ephemeral-data-parent")
+        del args[index:index + 2]
+        missing.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(mod.UpgradeError, "candidate_agent_ephemeral_parent_required"):
+            mod.validate_agent_workspace_config(
+                mod.load_reviewed_config(missing, "agent", self.data_root), self.data_root
+            )
+
+        widened = self.candidate_dir / "agent-disabled-with-root.json"
+        self._write_config(widened, "agent", new=True)
+        value = json.loads(widened.read_text())
+        value["arguments"] += ["--allowed-write-root", str(self.root)]
+        widened.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(mod.UpgradeError, "candidate_agent_workspace_mutation_disabled_with_policy"):
+            mod.validate_agent_workspace_config(
+                mod.load_reviewed_config(widened, "agent", self.data_root), self.data_root
+            )
+
+    def test_v05_agent_workspace_mutation_enabled_requires_absolute_write_root(self):
+        enabled = self.candidate_dir / "agent-enabled.json"
+        self._write_config(enabled, "agent", new=True)
+        value = json.loads(enabled.read_text())
+        args = value["arguments"]
+        mode_index = args.index("--workspace-mutation-mode") + 1
+        args[mode_index] = "enabled"
+        args += ["--allowed-write-root", str(self.root / "reviewed-workspace")]
+        enabled.write_text(json.dumps(value), encoding="utf-8")
+        mod.validate_agent_workspace_config(
+            mod.load_reviewed_config(enabled, "agent", self.data_root), self.data_root
+        )
+
+        missing_root = self.candidate_dir / "agent-enabled-no-root.json"
+        self._write_config(missing_root, "agent", new=True)
+        value = json.loads(missing_root.read_text())
+        args = value["arguments"]
+        args[args.index("--workspace-mutation-mode") + 1] = "enabled"
+        missing_root.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(mod.UpgradeError, "candidate_agent_workspace_mutation_enabled_without_root"):
+            mod.validate_agent_workspace_config(
+                mod.load_reviewed_config(missing_root, "agent", self.data_root), self.data_root
+            )
+
+        relative_root = self.candidate_dir / "agent-enabled-relative-root.json"
+        self._write_config(relative_root, "agent", new=True)
+        value = json.loads(relative_root.read_text())
+        args = value["arguments"]
+        args[args.index("--workspace-mutation-mode") + 1] = "enabled"
+        args += ["--allowed-write-root", "relative/workspace"]
+        relative_root.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(mod.UpgradeError, "candidate_agent_workspace_mutation_path_not_absolute"):
+            mod.validate_agent_workspace_config(
+                mod.load_reviewed_config(relative_root, "agent", self.data_root), self.data_root
+            )
+
+    def test_rollback_backup_excludes_ephemeral_tree(self):
+        ephemeral = self.data_root / "v2-windows-shell" / "ephemeral" / "agent"
+        ephemeral.mkdir(parents=True, exist_ok=True)
+        (ephemeral / "payload.bin").write_bytes(b"NON-AUTHORITATIVE")
+
+        controller = FakeController(fail_hub_once=True)
+        with self.assertRaisesRegex(mod.UpgradeError, "forced_hub_activation_failure"):
+            self.perform(controller)
+
+        status = json.loads(mod.status_path(self.data_root).read_text())
+        rollback = self.data_root / "backup" / status["rollback_asset"]
+        self.assertTrue(rollback.is_dir())
+        self.assertFalse((rollback / "ephemeral").exists())
+        self.assertFalse(any(path.name == "payload.bin" for path in rollback.rglob("*")))
+        self.assertEqual((ephemeral / "payload.bin").read_bytes(), b"NON-AUTHORITATIVE")
+
     def test_successful_upgrade_replaces_complete_reviewed_windows_set(self):
         controller = FakeController()
         record = self.perform(controller)
@@ -197,6 +280,9 @@ class WindowsUpgradeTests(unittest.TestCase):
         self.assertEqual((self.trust_dir / "trust-sentinel").read_text(), "TRUST-MUST-STAY")
         status = json.loads(mod.status_path(self.data_root).read_text())
         self.assertEqual(status["candidate"]["source_commit"], self.COMMIT)
+        self.assertEqual(status["candidate"]["hub_agent_schema_version"], 6)
+        self.assertEqual(status["candidate"]["control_schema_version"], 10)
+        self.assertEqual(status["candidate"]["capability_schema_version"], 6)
         self.assertEqual(status["result"], "upgraded")
 
     def test_forced_hub_health_failure_rolls_back_binaries_and_config(self):

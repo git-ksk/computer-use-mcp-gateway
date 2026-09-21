@@ -58,4 +58,4 @@ Calculator does not reliably expose its displayed digits as AX label/value text 
 
 ## Release-boundary note
 
-#319 introduces an additional signed Hub-Agent outer wire variant for payload-free timeout cause evidence. The final HUB_AGENT_SCHEMA_VERSION bump, mixed-version fail-closed coverage, readiness/config integration, packaged configuration, and v0.5 release candidate acceptance remain owned by #314.
+#319 introduces an additional signed Hub-Agent outer wire variant for payload-free timeout cause evidence. #314 completes the HUB_AGENT_SCHEMA_VERSION = 6 bump, mixed-version fail-closed coverage, readiness/config integration, packaged configuration, and v0.5 release-candidate acceptance.

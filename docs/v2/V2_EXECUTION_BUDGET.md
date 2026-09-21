@@ -68,7 +68,7 @@ A Cua timeout after dispatch does not prove whether the OS-side effect occurred.
 
 When that signed acknowledgement reaches the Hub, the durable quarantine reason remains backend_timed_out instead of being degraded to a later generic connection_lost. If the acknowledgement itself is lost, ordinary connection-loss handling remains the conservative fallback.
 
-Because this adds an outer Hub-Agent wire variant, #314 owns the final HUB_AGENT_SCHEMA_VERSION compatibility bump and mixed-version release acceptance.
+Because this adds an outer Hub-Agent wire variant, #314 completes the integration with HUB_AGENT_SCHEMA_VERSION = 6 and fail-closed mixed-version release acceptance.
 
 ## Release acceptance
 

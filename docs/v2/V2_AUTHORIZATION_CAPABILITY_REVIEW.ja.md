@@ -52,6 +52,10 @@ CUMG には、1つの policy engine に潰してはいけない authority separa
 
 ordinary MCP execution path は command dispatch 前に exact capability authorization を実施します。tool discovery は filtered view に過ぎず、authorization として扱いません。Handoff admission は additional authority gate であり exact capability authorization の代替ではありません。
 
+### v0.5 workspace capability boundary
+
+v0.5 workspace surface は exact authorization と live advertisement の intersection を維持します。`ReadProcessOutput` と bounded filesystem observation は exact Observe capability、`WriteWorkspaceFile` は独立した exact Dangerous capability であり、class-only Dangerous permission、Shell、cwd root、read root から推論しません。Agent は explicit mutation mode と explicit write executor/root policy がある場合だけ mutation を advertise します。quarantine は workspace mutation を fence しますが、独立して安全な read-only observation は利用可能なままにできます。
+
 ## Adopt / adapt / reject
 
 | Reference concept | Decision | CUMG disposition |

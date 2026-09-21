@@ -20,7 +20,7 @@ import tempfile
 import zipfile
 
 MANIFEST_NAME = "release-artifact-manifest.json"
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024
@@ -172,6 +172,8 @@ def write_manifest(
     platform_name: str,
     architecture: str,
     hub_agent_schema_version: int,
+    control_schema_version: int,
+    capability_schema_version: int,
     paired_handoff_commit: str | None,
     records: list[dict[str, object]],
 ) -> None:
@@ -182,6 +184,8 @@ def write_manifest(
         "platform": platform_name,
         "architecture": architecture,
         "hub_agent_schema_version": hub_agent_schema_version,
+        "control_schema_version": control_schema_version,
+        "capability_schema_version": capability_schema_version,
         "paired_handoff_commit": paired_handoff_commit,
         "install_profile": INSTALL_PROFILE if platform_name == "macos" else None,
         "files": records,
@@ -256,8 +260,15 @@ def build_candidate(args: argparse.Namespace) -> Path:
     package_version = validate_package_version(args.package_version)
     source_commit = validate_source_commit(args.source_commit)
     hub_agent_schema_version = int(args.hub_agent_schema_version)
-    if not 1 <= hub_agent_schema_version <= 65535:
-        raise CandidateError("Hub/Agent schema version is invalid")
+    control_schema_version = int(args.control_schema_version)
+    capability_schema_version = int(args.capability_schema_version)
+    for label, value in (
+        ("Hub/Agent", hub_agent_schema_version),
+        ("control", control_schema_version),
+        ("capability", capability_schema_version),
+    ):
+        if not 1 <= value <= 65535:
+            raise CandidateError(f"{label} schema version is invalid")
     paired_handoff_commit = None
     payload_dir = None
     if platform_name == "macos":
@@ -326,6 +337,8 @@ def build_candidate(args: argparse.Namespace) -> Path:
             platform_name,
             architecture,
             hub_agent_schema_version,
+            control_schema_version,
+            capability_schema_version,
             paired_handoff_commit,
             records,
         )
@@ -364,6 +377,8 @@ def load_manifest(bundle_root: Path) -> dict[str, object]:
         "platform",
         "architecture",
         "hub_agent_schema_version",
+        "control_schema_version",
+        "capability_schema_version",
         "paired_handoff_commit",
         "install_profile",
         "files",
@@ -384,9 +399,14 @@ def verify_bundle_dir(bundle_root: Path) -> dict[str, object]:
     source_commit = validate_source_commit(str(manifest["source_commit"]))
     platform_name = normalized_platform(str(manifest["platform"]))
     architecture = normalized_architecture(str(manifest["architecture"]))
-    schema_value = manifest["hub_agent_schema_version"]
-    if not isinstance(schema_value, int) or isinstance(schema_value, bool) or not 1 <= schema_value <= 65535:
-        raise CandidateError("manifest Hub/Agent schema version is invalid")
+    for key, label in (
+        ("hub_agent_schema_version", "Hub/Agent"),
+        ("control_schema_version", "control"),
+        ("capability_schema_version", "capability"),
+    ):
+        schema_value = manifest[key]
+        if not isinstance(schema_value, int) or isinstance(schema_value, bool) or not 1 <= schema_value <= 65535:
+            raise CandidateError(f"manifest {label} schema version is invalid")
     paired = manifest["paired_handoff_commit"]
     profile = manifest["install_profile"]
     if platform_name == "macos":
@@ -636,6 +656,8 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--platform", required=True)
     build.add_argument("--architecture", required=True)
     build.add_argument("--hub-agent-schema-version", required=True, type=int)
+    build.add_argument("--control-schema-version", required=True, type=int)
+    build.add_argument("--capability-schema-version", required=True, type=int)
     build.add_argument("--paired-handoff-commit")
     build.add_argument("--payload-dir")
 

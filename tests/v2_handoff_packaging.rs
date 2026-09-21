@@ -83,7 +83,9 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(upgrade.contains("handoff_runtime_dependencies_install_or_symlink_validation_failed"));
     assert!(upgrade.contains("handoff_not_idle_or_status_unavailable"));
     assert!(upgrade.contains("hub_agent_schema_version"));
-    assert!(upgrade.contains("\"schema_version\": 3"));
+    assert!(upgrade.contains("control_schema_version"));
+    assert!(upgrade.contains("capability_schema_version"));
+    assert!(upgrade.contains("\"schema_version\": 4"));
     assert!(upgrade.contains("--handoff-control-socket"));
     assert!(upgrade.contains("v2_handoff_runtime_cleanup.py"));
     assert!(upgrade.contains("--health-confirmed"));
@@ -205,4 +207,47 @@ fn quarantine_recovery_upgrade_preserves_exact_unknown_pointer_click_without_wea
     let recovery_ok = upgrade.find("RECOVERY_UPGRADE_OK").unwrap();
     let normal_cleanup = upgrade.find("--health-confirmed").unwrap();
     assert!(recovery_ok < normal_cleanup);
+}
+
+#[test]
+fn v05_packaging_keeps_workspace_mutation_explicit_and_ephemeral_state_non_authoritative() {
+    let single_mac =
+        include_str!("../packaging/launchd/single-mac/com.github.git-ksk.cumg-v2-agent.plist");
+    let generic_macos = include_str!("../packaging/launchd/com.github.git-ksk.cumg-v2-agent.plist");
+    let linux = include_str!("../packaging/systemd/agent.env.example");
+    let windows = include_str!("../packaging/windows/agent.config.example.json");
+    let upgrade = include_str!("../scripts/v2-single-mac-upgrade.sh");
+
+    for profile in [single_mac, generic_macos, linux, windows] {
+        assert!(
+            profile.contains("EPHEMERAL_DATA_PARENT") || profile.contains("ephemeral-data-parent")
+        );
+        assert!(
+            profile.contains("WORKSPACE_MUTATION_MODE")
+                || profile.contains("workspace-mutation-mode")
+        );
+        assert!(profile.contains("disabled"));
+    }
+    assert!(single_mac.contains("@RUN_ROOT@/agent-ephemeral"));
+    assert!(generic_macos.contains("Library/Caches/cumg-v2-agent/ephemeral"));
+    assert!(linux.contains(".cache/cumg-v2-agent/ephemeral"));
+    assert!(linux.contains("CUMG_V2_ALLOWED_WRITE_ROOTS"));
+    assert!(windows.contains(r#"v2-windows-shell\\ephemeral\\agent"#));
+    assert!(!windows.contains("--allowed-write-root"));
+
+    assert!(upgrade.contains("workspace_mutation_mode_missing_with_existing_policy"));
+    assert!(upgrade.contains("workspace_mutation_disabled_with_policy"));
+    assert!(upgrade.contains("workspace_mutation_enabled_without_write_root"));
+    assert!(upgrade.contains("workspace_mutation_policy_invalid"));
+    assert!(upgrade.contains("agent_ephemeral_data_parent_inside_authoritative_tree"));
+    assert!(upgrade.contains("agent_ephemeral_data_parent_unsafe"));
+    assert!(upgrade.contains(r#"chmod 700 "$EPHEMERAL_DATA_PARENT""#));
+    assert!(upgrade.contains("CUMG_V2_WORKSPACE_MUTATION_MODE -string \"disabled\""));
+
+    // Rollback captures only durable state/config/runtime. Ephemeral data remains outside ROOT
+    // and is never copied into rollback or restored as authority evidence.
+    assert!(upgrade.contains(r#"cp -R "$HUB_STATE" "$ROLLBACK/state/hub""#));
+    assert!(upgrade.contains(r#"cp -R "$AGENT_STATE" "$ROLLBACK/state/agent""#));
+    assert!(!upgrade.contains(r#"cp -R "$EPHEMERAL_DATA_PARENT""#));
+    assert!(!upgrade.contains(r#"cp -p "$EPHEMERAL_DATA_PARENT""#));
 }

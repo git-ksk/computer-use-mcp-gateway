@@ -109,7 +109,7 @@ A successful upgrade performs this sequence:
 4. create a private rollback bundle containing old binaries/configuration, the Handoff env file, helper copies, and a self-contained old Handoff generation including its runtime dependencies; an archive missing those dependencies remains an external-runtime reference and must not permit cleanup of that runtime; authoritative Hub/Agent state is copied only after drain;
 5. signal Hub first to close admission and drain, then unload Hub/Agent/signer, boot out and disable alternate known Hub/Agent labels without deleting their plists, and re-check stopped quarantine state;
 6. while stopped, atomically retarget the private Handoff env and Agent plist to the staged generation, then atomically replace the paired CUMG binaries;
-7. write `runtime-manifest.json` schema 3 with the merged CUMG source commit, exact Hub/Agent application-schema version, package version, and binary SHA-256 identities;
+7. write `runtime-manifest.json` schema 4 with the merged CUMG source commit, exact Hub/Agent, control, and capability schema versions, package version, and binary SHA-256 identities;
 8. start signer -> Hub -> Agent, re-check that no conflicting known launchd family is active, and run `v2_doctor`, including the read-only Handoff status check;
 9. only after doctor is healthy, prune eligible unreferenced `runtime-*` code directories. Active runtime, legacy externally referenced rollback runtime, a bounded recent set, and any unsafe/symlink-bearing candidate are protected/refused. Checkpoint/key/env/audit/control/rollback data are outside the cleanup candidate set.
 
@@ -145,7 +145,7 @@ JSON schema v1 is the stable machine-readable contract. It reports overall opera
 
 `v2_status` is composition only. A `ready` lane does not authorize another lane; the command cannot resolve quarantine, switch mutation authority, resume/cancel Handoff, retry/resume an upgrade, or replay an operation. `review_incident` means use the #233 incident-brief flow, `complete_recovery` means the existing explicit Handoff/recovery flow, `inspect_upgrade` means `v2_maint upgrade-status`, and configuration/backend codes lead to `v2_doctor` or the backend diagnostics. Unknown or mismatched evidence fails closed as `unknown`, `unavailable`, or `action_required`, never healthy-by-default.
 
-The runtime section also reports three read-only compatibility signals before an incident: `runtime_pairing=compatible|skewed|unknown`, `operator_tooling=compatible|stale|unavailable|unknown`, and `checkpoint_reader_compatibility=compatible|incompatible|unknown`. Runtime pairing is derived from the owner-private schema-3 manifest, exact SHA-256 identities for the installed Hub/Agent/operator binaries, and (for directly invoked `v2_status` / `v2_doctor`) the digest of the executable actually running. The checkpoint reader check inspects only bounded schema metadata from the authoritative Hub checkpoint and never mutates it. A skewed/stale set, a reader that is explicitly too old for the checkpoint, or unknown pairing evidence routes `v2_status` to `next_action=inspect_upgrade`; inspect the durable upgrade status and restore a reviewed version-paired runtime before attempting authority-bearing recovery. Do not copy a newer `v2_maint` from a source checkout onto an older install as an ad-hoc repair.
+The runtime section also reports three read-only compatibility signals before an incident: `runtime_pairing=compatible|skewed|unknown`, `operator_tooling=compatible|stale|unavailable|unknown`, and `checkpoint_reader_compatibility=compatible|incompatible|unknown`. Runtime pairing is derived from the owner-private schema-4 manifest, exact SHA-256 identities for the installed Hub/Agent/operator binaries, and (for directly invoked `v2_status` / `v2_doctor`) the digest of the executable actually running. The checkpoint reader check inspects only bounded schema metadata from the authoritative Hub checkpoint and never mutates it. A skewed/stale set, a reader that is explicitly too old for the checkpoint, or unknown pairing evidence routes `v2_status` to `next_action=inspect_upgrade`; inspect the durable upgrade status and restore a reviewed version-paired runtime before attempting authority-bearing recovery. Do not copy a newer `v2_maint` from a source checkout onto an older install as an ad-hoc repair.
 
 For the macOS online-recovery provider, `recovery.key_readiness` additionally reports `ready`, `unprovisioned`, `sealed_key_missing`, `hub_verifier_missing`, `public_key_mismatch`, `helper_unavailable`, or `readiness_unknown` (`unsupported` on other platforms). The check is strictly read-only: it never creates/rotates a key and never invokes the signing/user-presence operation. If the local sealed representation exists, it runs only the exact runtime-manifest-verified installed `v2_recovery_enclave_helper public` operation and compares the resulting public key locally with the Hub verifier. `unprovisioned` remains compatible with normal/offline operation but exposes `recovery.key_next_action=provision_recovery`; partial provisioning or helper failure degrades status with the same remediation, while a public-key mismatch is action-required. Use the explicit `v2_recover init-key` provisioning flow and reviewed public-verifier transfer; diagnostics never auto-repair trust.
 
@@ -163,7 +163,7 @@ When the doctor itself is launched through the live single-Mac Agent using `exec
 
 For the standard profile it checks:
 
-- runtime manifest schema 3, exact Hub/Agent application-schema version, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, `v2_status`, `v2_recover`, `v2_recovery_enclave_helper`, and `v2_grant_signer`;
+- runtime manifest schema 4, exact Hub/Agent, control, and capability schema versions, source commit, and exact SHA-256 identity of `v2_hub`, `v2_agent`, `v2_maint`, `v2_doctor`, `v2_status`, `v2_recover`, `v2_recovery_enclave_helper`, and `v2_grant_signer`;
 - authoritative Hub checkpoint readability and current registry/capability schema;
 - macOS online-recovery readiness: local sealed-key presence, exact manifest-verified helper availability, and local public-key equality with the Hub verifier without a user-presence prompt;
 - exactly one enrolled single-Mac device and current generation;
@@ -193,7 +193,7 @@ Before declaring a single-Mac upgrade healthy, require all of the following:
 - `v2_doctor` reports `overall=healthy`;
 - a fresh authenticated Agent generation is present after restart;
 - live quarantine remains zero;
-- the schema-3 runtime manifest verifies every installed paired binary and the exact Hub/Agent application schema;
+- the schema-4 runtime manifest verifies every installed paired binary and the exact Hub/Agent, control, and capability schemas;
 - Handoff reports idle with no recovery/resume/fault;
 - a harmless northbound semantic smoke reaches a durable terminal `Completed` state;
 - the old binary/state rollback pair remains retained until the operator-selected bake period completes.

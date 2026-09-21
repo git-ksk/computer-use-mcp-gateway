@@ -210,6 +210,8 @@ Definite Agent-native process/shell validation or spawn failures do not need raw
 
 The v0.5 workspace foundation keeps public ephemeral-ref authorization Hub-side and stores only bounded opaque-locator data in Agent-private staging. Public refs and Agent locators are distinct, short-lived, non-authoritative values: neither can authorize a capability, settle an operation, clear quarantine, or become durable recovery truth. Agent restart may invalidate them by design. See [V2_EPHEMERAL_DATA_REFS.md](V2_EPHEMERAL_DATA_REFS.md).
 
+Workspace mutation is a separate exact `WriteWorkspaceFile` authority. Packaged v0.5 configuration defaults it to disabled; enabled mode requires explicit writable roots and optional deny subpaths remain deny-wins. Process cwd roots and read-only filesystem roots never become write roots by fallback. Once a mutation is dispatched, an unproven outcome remains `Indeterminate`, fences the device through quarantine, and is never automatically retried or replayed. Normal diagnostics do not expose requested paths, configured write/deny paths, or file content.
+
 ## Browser transfer data boundary
 
 Browser transfer is intentionally narrower than filesystem access. Upload northbound traffic carries bounded bytes and a path-safe logical name; it mints a context/generation/revision-bound one-shot ref whose backend value is an Agent-private staging handle. The Agent creates the actual file beneath its hardened state directory, rejects symlink/directory/replacement/size violations, and re-proves a canonical regular file immediately before the southbound Cua call. Raw host paths are never accepted from or returned to the northbound caller.

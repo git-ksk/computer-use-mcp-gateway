@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use computer_use_mcp_gateway::{
     mutation_authority::{MutationAuthorityGate, MutationAuthorityRole},
     v2_agent_handoff::AgentHandoffCoordinator,
@@ -14,6 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum WorkspaceMutationMode {
+    Disabled,
+    Enabled,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "cumg-v2-agent")]
@@ -63,6 +69,14 @@ struct Config {
         required = true
     )]
     allowed_file_roots: Vec<PathBuf>,
+    /// Explicit operator intent for bounded workspace mutation. Disabled never infers authority.
+    #[arg(
+        long,
+        env = "CUMG_V2_WORKSPACE_MUTATION_MODE",
+        value_enum,
+        default_value = "disabled"
+    )]
+    workspace_mutation_mode: WorkspaceMutationMode,
     /// Effectful writable workspace roots. No implicit fallback to read/cwd roots.
     #[arg(
         long = "allowed-write-root",
@@ -122,6 +136,21 @@ struct Config {
 async fn main() -> Result<()> {
     let _observability = computer_use_mcp_gateway::v2_observability::init("cumg-v2-agent")?;
     let args = Config::parse();
+    match args.workspace_mutation_mode {
+        WorkspaceMutationMode::Disabled
+            if !args.allowed_write_roots.is_empty() || !args.denied_write_subpaths.is_empty() =>
+        {
+            anyhow::bail!(
+                "workspace mutation is disabled but writable roots/deny subpaths were configured"
+            );
+        }
+        WorkspaceMutationMode::Enabled if args.allowed_write_roots.is_empty() => {
+            anyhow::bail!(
+                "workspace mutation is enabled but no explicit allowed write root was configured"
+            );
+        }
+        _ => {}
+    }
     let mut material = load_agent_material(
         &args.device_secret_file,
         &args.hub_public_key_file,

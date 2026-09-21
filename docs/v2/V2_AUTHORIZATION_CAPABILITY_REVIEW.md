@@ -52,6 +52,10 @@ CUMG already separates authorities that must not be collapsed into one policy en
 
 The ordinary MCP execution path performs exact capability authorization before command dispatch. Tool discovery is only a filtered view and is never relied on as authorization. Handoff admission is an additional authority gate, not a replacement for exact capability authorization.
 
+### v0.5 workspace capability boundary
+
+The v0.5 workspace surface keeps exact authorization and live advertisement intersected. `ReadProcessOutput` and bounded filesystem observation remain exact Observe capabilities; `WriteWorkspaceFile` is a distinct exact Dangerous capability and is never inferred from class-only Dangerous permission, Shell, cwd roots, or read roots. The Agent advertises mutation only when explicit mutation mode and an explicit write executor/root policy are present. Quarantine fences workspace mutation while independently safe read-only observation may remain available.
+
 ## Adopt / adapt / reject
 
 | Reference concept | Decision | CUMG disposition |

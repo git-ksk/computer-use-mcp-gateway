@@ -26,9 +26,10 @@ Current restore separates persisted-state schema from the live `CONTROL_SCHEMA_V
 
 - Hub registry tag 2 with capability schema 2;
 - Hub registry tag 3 with capability schema 3;
-- Hub registry tags 4 through 7 with capability schema 4;
-- current Hub registry tag 7 with capability schema 5 through the normal current-schema restore path;
-- Agent grant-ledger tags 2 through 7.
+- Hub registry tags 4 through 6 with capability schema 4;
+- released v0.4 registry tag 7 with capability schema 5;
+- current v0.5 registry tag 8 with capability schema 6 through the normal current-schema restore path;
+- Agent grant-ledger tags remain independently versioned.
 
 Prototype tag 1, unknown/future tags, malformed state, and impossible registry/capability pairings still fail closed. This compatibility path applies only to trusted local durable checkpoints; it does **not** make old live control messages, grants, commands, or capability advertisements valid on the current wire boundary.
 

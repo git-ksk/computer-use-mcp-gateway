@@ -456,7 +456,7 @@ impl AgentService {
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-            revision: 5,
+            revision: 6,
             supported,
         }
     }

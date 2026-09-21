@@ -25,7 +25,9 @@ class ReleaseCandidateTests(unittest.TestCase):
     COMMIT = "a" * 40
     VERSION = "0.3.0"
     HANDOFF_COMMIT = "b" * 40
-    HUB_AGENT_SCHEMA = 5
+    HUB_AGENT_SCHEMA = 6
+    CONTROL_SCHEMA = 10
+    CAPABILITY_SCHEMA = 6
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cumg-release-candidate-")
@@ -66,6 +68,8 @@ class ReleaseCandidateTests(unittest.TestCase):
                 platform=platform_name,
                 architecture="test-arch",
                 hub_agent_schema_version=self.HUB_AGENT_SCHEMA,
+                control_schema_version=self.CONTROL_SCHEMA,
+                capability_schema_version=self.CAPABILITY_SCHEMA,
                 paired_handoff_commit=self.HANDOFF_COMMIT if platform_name == "macos" else None,
                 payload_dir=str(self.make_payload_dir()) if platform_name == "macos" else None,
             )
@@ -90,6 +94,22 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_macos_candidate_round_trip_has_exact_allowlist(self):
         bundle = self.extract("macos")
         manifest = mod.verify_bundle_dir(bundle)
+        self.assertEqual(
+            set(manifest),
+            {
+                "schema_version",
+                "package_version",
+                "source_commit",
+                "platform",
+                "architecture",
+                "hub_agent_schema_version",
+                "control_schema_version",
+                "capability_schema_version",
+                "paired_handoff_commit",
+                "install_profile",
+                "files",
+            },
+        )
         self.assertEqual(manifest["source_commit"], self.COMMIT)
         self.assertEqual(
             {record["path"] for record in manifest["files"]},
@@ -97,6 +117,8 @@ class ReleaseCandidateTests(unittest.TestCase):
         )
         self.assertEqual(manifest["paired_handoff_commit"], self.HANDOFF_COMMIT)
         self.assertEqual(manifest["hub_agent_schema_version"], self.HUB_AGENT_SCHEMA)
+        self.assertEqual(manifest["control_schema_version"], self.CONTROL_SCHEMA)
+        self.assertEqual(manifest["capability_schema_version"], self.CAPABILITY_SCHEMA)
         self.assertEqual(manifest["install_profile"], mod.INSTALL_PROFILE)
         self.assertIn("bin/v2_doctor", mod.expected_binary_paths("macos"))
         self.assertIn("bin/v2_status", mod.expected_binary_paths("macos"))
@@ -147,6 +169,8 @@ class ReleaseCandidateTests(unittest.TestCase):
                     platform="linux",
                     architecture="x64",
                     hub_agent_schema_version=self.HUB_AGENT_SCHEMA,
+                control_schema_version=self.CONTROL_SCHEMA,
+                capability_schema_version=self.CAPABILITY_SCHEMA,
                     paired_handoff_commit=None,
                     payload_dir=None,
                 )
@@ -170,6 +194,8 @@ class ReleaseCandidateTests(unittest.TestCase):
                     platform="linux",
                     architecture="x64",
                     hub_agent_schema_version=self.HUB_AGENT_SCHEMA,
+                control_schema_version=self.CONTROL_SCHEMA,
+                capability_schema_version=self.CAPABILITY_SCHEMA,
                     paired_handoff_commit=None,
                     payload_dir=None,
                 )

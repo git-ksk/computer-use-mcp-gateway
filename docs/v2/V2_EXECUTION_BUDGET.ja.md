@@ -68,7 +68,7 @@ dispatch後のCua timeoutだけではOS側effectが起きたか証明できま�
 
 ackがHubへ届いた場合、durable quarantine reasonは後続disconnectでgeneric connection_lostへ劣化せずbackend_timed_outを保持します。ack自体が失われた場合は、従来のconnection-loss処理がconservative fallbackです。
 
-この変更はHub-Agent outer wire variantを追加するため、最終HUB_AGENT_SCHEMA_VERSION compatibility bumpとmixed-version release acceptanceは#314で行います。
+この変更はHub-Agent outer wire variantを追加するため、#314 で HUB_AGENT_SCHEMA_VERSION = 6 への統合と mixed-version fail-closed release acceptance を完了しました。
 
 ## Release acceptance
 
