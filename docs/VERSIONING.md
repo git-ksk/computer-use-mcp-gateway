@@ -4,7 +4,7 @@
 
 CUMG uses Semantic Versioning with an explicit pre-1.0 policy.
 
-Current released line: **0.4.x**. The crate/release candidate is **0.5.0** (Least-privilege Workspace); `v0.4.0` remains the latest published tag until the v0.5.0 release is created.
+Current released line: **0.5.x**. `v0.5.0` is the released Least-privilege Workspace baseline.
 
 ## Version shape
 
@@ -50,7 +50,7 @@ Security emergency changes may break compatibility when preserving compatibility
 
 ## Schema versions are independent
 
-Project/crate versions, wire protocol schemas, capability-advertisement schemas, and durable-state schemas serve different purposes. The v0.5 release candidate pins `CONTROL_SCHEMA_VERSION = 10`, capability schema `6`, `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`, and `HUB_AGENT_SCHEMA_VERSION = 6`; mixed live versions fail closed.
+Project/crate versions, wire protocol schemas, capability-advertisement schemas, and durable-state schemas serve different purposes. The v0.5 released baseline pins `CONTROL_SCHEMA_VERSION = 10`, capability schema `6`, `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`, and `HUB_AGENT_SCHEMA_VERSION = 6`; mixed live versions fail closed.
 
 - `CONTROL_SCHEMA_VERSION` changes when the live control-schema compatibility boundary changes.
 - capability-advertisement schema version changes when that live advertisement boundary changes.
@@ -99,7 +99,7 @@ Before 1.0, only the **latest released minor line** is actively supported. Older
 
 ## Release-candidate artifacts
 
-The `v0.4.0` GitHub Release is **source-only**, matching the pre-1.0 publication boundary. Verified CI archives remain release-candidate evidence and are not official binary Release assets; they are never silently promoted into a supported distribution.
+The `v0.5.0` GitHub Release is **source-only**, matching the pre-1.0 publication boundary. Verified CI archives remain release evidence and are not official binary Release assets; they are never silently promoted into a supported distribution.
 
 The `Release Candidate Artifacts` workflow still builds bounded native candidates on Linux, macOS, and Windows. Manifest schema v3 records the package version, exact CUMG source commit, exact Hub/Agent, control, and capability schema versions, platform/architecture, exact allowlisted files, sizes, and SHA-256 identities. Linux and Windows candidates remain distribution evidence only.
 

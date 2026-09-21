@@ -4,7 +4,7 @@
 
 `computer-use-mcp-gateway`（CUMG）は、ポリシー制御された computer use のための Rust 製 MCP ゲートウェイです。推奨される V2 ランタイムでは、リモートから到達可能な **Hub** とデスクトップ側の **Agent** を分離し、生のバックエンドツール名や識別子を northbound 契約に含めるのではなく、境界が明確でバックエンド非依存のセマンティック capability を公開します。
 
-> **ランタイム状況:** V2 Hub + Agent が推奨される開発・実行経路です。crate は `v0.5.0` Least-privilege Workspace release candidate として準備済みで、release publication までは `v0.4.0` が最新 published tag です。V1 は回帰試験・参照用途および既存の本番運用向けに `v1_gateway` として引き続き利用できます。
+> **ランタイム状況:** V2 Hub + Agent が推奨される開発・実行経路です。`v0.5.0` Least-privilege Workspace が現在の released baseline です。V1 は回帰試験・参照用途および既存の本番運用向けに `v1_gateway` として引き続き利用できます。
 
 ## 概要
 

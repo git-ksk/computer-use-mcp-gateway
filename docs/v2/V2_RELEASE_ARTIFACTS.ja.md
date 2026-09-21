@@ -12,11 +12,11 @@
 | Linux Hub / Agent | reviewed native candidate evidence | 既存 source / service packaging。official binary installer claim はまだしない |
 | Windows desktop Agent | reviewed native candidate evidence | 既存 source / Task Scheduler profile。official binary installer claim はまだしない |
 
-CI artifact は自動的に official GitHub Release asset にはなりません。`v0.4.0` GitHub Release は source-only で、verified archive は release-candidate evidence のまま official binary asset としては添付しません。将来 reviewed artifact を昇格する場合も required supply-chain evidence を含む documented release procedure を通し、CI success だけで tag / published asset を作りません。
+CI artifact は自動的に official GitHub Release asset にはなりません。`v0.5.0` GitHub Release は source-only で、verified archive は release evidence のまま official binary asset としては添付しません。将来 reviewed artifact を昇格する場合も required supply-chain evidence を含む documented release procedure を通し、CI success だけで tag / published asset を作りません。
 
 ## macOS artifact identity
 
-macOS bundle は CUMG / Handoff source code について self-contained です。`release-artifact-manifest.json` schema v2 は package version、exact CUMG commit、Hub/Agent application schema、platform/architecture、exact `mcp-execution-handoff` commit、`single-mac-artifact-v1` profile、全 allowlisted file の size / SHA-256 を記録します。
+macOS bundle は CUMG / Handoff source code について self-contained です。`release-artifact-manifest.json` schema v3 は package version、exact CUMG commit、exact Hub-Agent / control / capability schema version、platform/architecture、Handoff を含む profile では exact `mcp-execution-handoff` commit、適用対象では `single-mac-artifact-v1` profile、全 allowlisted file の size / SHA-256 を記録します。
 
 bundle には paired Hub/Agent/maintenance/operator binaries、`v2_recover`、macOS Secure Enclave helper、single-Mac LaunchAgent template、bounded install/upgrade tooling、self-contained Handoff runtime payload を含めます。Handoff payload は同じ CUMG commit と reviewed Handoff commit を結ぶ inner manifest を持ち、runtime file をすべて hash します。unexpected file、unsafe path、symlink、production dependency 欠落、digest drift、commit mismatch は fail closed です。
 
