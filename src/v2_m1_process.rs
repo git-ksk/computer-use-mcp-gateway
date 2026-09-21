@@ -1126,6 +1126,49 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_shell_npm_starts_repeatedly_with_minimal_systemroot_inheritance() {
+        let npm_probe = Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", "npm.cmd --version"])
+            .output();
+        if !npm_probe
+            .as_ref()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let root = temp_root("windows-npm-csprng");
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+
+        for attempt in 1..=3 {
+            let output = executor
+                .execute_shell(
+                    &ShellRequest {
+                        command: "npm.cmd --version".into(),
+                        cwd: root.to_string_lossy().into_owned(),
+                        env: vec![],
+                        timeout_ms: 10_000,
+                    },
+                    &ProcessCancellation::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                output.exit_code,
+                Some(0),
+                "npm startup failed on attempt {attempt}: {}",
+                output.stderr
+            );
+            assert!(
+                !output.stdout.trim().is_empty(),
+                "npm emitted no version on attempt {attempt}"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_utf16le_stderr_is_decoded_without_nul_garbling() {
         let encoded: Vec<u8> = "Windows PowerShell 日本語\r\n"
             .encode_utf16()
