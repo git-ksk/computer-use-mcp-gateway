@@ -4,7 +4,7 @@
 
 CUMG は Semantic Versioning を採用し、pre-1.0 policy を明示します。
 
-現在の released line は **0.4.x** です。crate / release candidate は **0.5.0**（Least-privilege Workspace）で、v0.5.0 Release を作成するまでは `v0.4.0` が最新 published tag です。
+現在の released line は **0.5.x** です。`v0.5.0` が released Least-privilege Workspace baseline です。
 
 ## Version format
 
@@ -50,7 +50,7 @@ compatibility を維持すること自体が vulnerability を残す security em
 
 ## Schema version は独立管理
 
-project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。v0.5 release candidate は `CONTROL_SCHEMA_VERSION = 10`、capability schema `6`、`DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`、`HUB_AGENT_SCHEMA_VERSION = 6` を pin し、mixed live version は fail closed です。
+project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。v0.5 released baseline は `CONTROL_SCHEMA_VERSION = 10`、capability schema `6`、`DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8`、`HUB_AGENT_SCHEMA_VERSION = 6` を pin し、mixed live version は fail closed です。
 
 - `CONTROL_SCHEMA_VERSION` は live control-schema compatibility boundary が変わるときに変更;
 - capability-advertisement schema version は live advertisement boundary が変わるときに変更;
@@ -99,7 +99,7 @@ feature count は 1.0 gate ではありません。product boundary を先に変
 
 ## Release-candidate artifact
 
-`v0.4.0` GitHub Release は **source-only** です。verified CI archive は release-candidate evidence のままで official binary Release asset にはせず、supported distribution へ暗黙昇格させません。
+`v0.5.0` GitHub Release は **source-only** です。verified CI archive は release evidence のままで official binary Release asset にはせず、supported distribution へ暗黙昇格させません。
 
 `Release Candidate Artifacts` workflow は引き続き Linux / macOS / Windows の bounded native candidate を build します。manifest schema v3 は package version、exact CUMG source commit、exact Hub/Agent・control・capability schema version、platform/architecture、exact allowlisted file、size、SHA-256 identity を記録します。Linux / Windows candidate は distribution evidence のままです。
 

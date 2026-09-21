@@ -1,8 +1,8 @@
 # Changelog
 
-## v0.5.0 — release candidate (unreleased)
+## v0.5.0 — 2026-09-21
 
-Least-privilege Workspace release candidate. `v0.4.0` remains the latest published tag until the dedicated v0.5.0 release publication step is completed.
+Least-privilege Workspace release. This release adds bounded workspace observation/mutation, retrievable truncated output, private ephemeral continuation data, execution-budget hardening, and challenge-scoped guided recovery without widening shell authority or weakening `Indeterminate` quarantine/no-replay semantics.
 
 ### Workspace and least privilege
 
@@ -35,7 +35,10 @@ Least-privilege Workspace release candidate. `v0.4.0` remains the latest publish
 
 - macOS physical Cua acceptance for the execution-budget hardening was already completed under #319;
 - Linux/Windows release-candidate, packaging, upgrade, and capability-advertisement checks are automated evidence and are not represented as new physical Cua smoke results;
-- `Indeterminate`, quarantine, no-auto-replay, payload/path/text-free diagnostics, exact capability authorization, and mixed-version fail-closed behavior remain unchanged security invariants.
+- #308 Windows npm/CSPRNG recurrence was not reproducible on the affected SKDT runtime during release recheck; live Gateway `node`, repeated `npm --version`, `npm run typecheck`, and Node crypto all passed without Agent restart/duplication, and PR #326 adds an exact Windows CI recurrence guard through the cleared-environment `ProcessExecutor` path while the historical transient root cause remains open for follow-up;
+- the GitHub Release remains source-only unless reviewed binary assets, SBOM/license inventory, and provenance/attestation are explicitly attached; CI archives remain release evidence rather than official binary installers;
+- `Indeterminate`, quarantine, no-auto-replay, payload/path/text-free diagnostics, exact capability authorization, and mixed-version fail-closed behavior remain unchanged security invariants;
+- the dedicated release/v0.5.0 PR reruns the standing Product Readiness gates against the exact release commit before the immutable tag/source-only GitHub pre-release is created.
 
 
 ## v0.4.0 — 2026-09-19

@@ -12,17 +12,17 @@ This document defines the post-#237 distribution boundary. Release artifacts imp
 | Linux Hub / Agent | reviewed native candidate evidence | existing source/service packaging; no official binary installer claim yet |
 | Windows desktop Agent | reviewed native candidate evidence | existing source/Task Scheduler profile; no official binary installer claim yet |
 
-A CI artifact is not automatically an official GitHub Release asset. The `v0.4.0` GitHub Release is source-only; its verified archives remain release-candidate evidence and are not attached as official binary assets. A later release may promote a reviewed artifact only through the documented release procedure with the required supply-chain evidence; tags and published assets are never inferred from CI success.
+A CI artifact is not automatically an official GitHub Release asset. The `v0.5.0` GitHub Release is source-only; its verified archives remain release evidence and are not attached as official binary assets. A later release may promote a reviewed artifact only through the documented release procedure with the required supply-chain evidence; tags and published assets are never inferred from CI success.
 
 ## macOS artifact identity
 
-The macOS bundle is self-contained for CUMG/Handoff source code. `release-artifact-manifest.json` schema v2 records:
+The macOS bundle is self-contained for CUMG/Handoff source code. `release-artifact-manifest.json` schema v3 records:
 
 - package version and exact 40-hex CUMG source commit;
-- exact Hub/Agent application-schema version;
+- exact Hub-Agent, control, and capability schema versions;
 - platform and architecture;
-- exact paired `mcp-execution-handoff` source commit;
-- the closed `single-mac-artifact-v1` install profile;
+- exact paired `mcp-execution-handoff` source commit where the profile includes Handoff;
+- the closed `single-mac-artifact-v1` install profile where applicable;
 - exact size and SHA-256 for every allowlisted file.
 
 The bundle includes the paired Hub/Agent/maintenance/operator binaries, `v2_recover`, the macOS Secure Enclave helper, the single-Mac LaunchAgent templates, bounded install/upgrade tooling, and a self-contained Handoff runtime payload. The Handoff payload has a second manifest binding the same CUMG commit to the exact reviewed Handoff commit and hashing every runtime file. Unexpected files, unsafe paths, symlinks, missing production dependencies, digest drift, or commit mismatch fail verification.

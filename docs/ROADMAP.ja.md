@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-21 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.4.0` が最新 published baseline、`v0.5.0` Least-privilege Workspace は #323 guided-recovery expiry/re-review hardening を完了し、final #314 release-integration acceptance gate に進んでいます。**
+2026-09-21 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.5.0` Least-privilege Workspace が released baseline、`v0.6.0` Managed Developer Execution が次の planned feature minor です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,9 +34,9 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Released baseline: `0.4.x`; active release candidate: `0.5.0`
+## Released baseline: `0.5.x`; next planned feature minor: `0.6.0`
 
-`v0.4.0` は最新 published Recovery, Identity & Semantic Authorization baseline です。#227 physical Windows Hello acceptance は 2026-09-19 に PASS しました。**`v0.5.0` — Least-privilege Workspace** candidate は #323 guided-recovery expiry/re-review hardening を完了し、publication 前の final #314 schema/config/readiness/upgrade release-integration acceptance gate に進んでいます。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate として残ります。
+`v0.5.0` が released **Least-privilege Workspace** baseline です。#313/#105/#83/#107/#319/#323 と final #314 schema/config/readiness/upgrade integration gate を完了し、#308 では runtime authority を変えず Windows npm/CSPRNG recurrence coverage を追加しました。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate のままです。次の planned feature minor は **`v0.6.0` — Managed Developer Execution** です。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -81,17 +81,17 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 これらを満たすまでは V1 を narrow / regression-only に保ち、新しい capability は追加しません。
 
-## Post-v0.4 の製品化シーケンス
+## Post-v0.5 の製品化シーケンス
 
-`v0.4.0` は最新 published Recovery, Identity & Semantic Authorization baseline です。#227 physical Windows Hello acceptance は 2026-09-19 に PASS しました。**`v0.5.0` — Least-privilege Workspace** candidate は #314 で schema/config/readiness/upgrade integration まで完了しており、dedicated release step までは未publishです。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate として残ります。
+`v0.5.0` は #314 integration と #308 Windows npm/CSPRNG recurrence guard を完了した released Least-privilege Workspace baseline です。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate のままです。
 
 現在の作業順:
 
 - **`0.4.0` — released Recovery, Identity & Semantic Authorization baseline:** #227 physical Windows Hello acceptance は 2026-09-19 に PASS 済み。#139 と #228 は non-blocking support-claim gate として残し、signed-token / Linux online-recovery claim は evidence まで保留します。
-- **`0.5.0` — Least-privilege Workspace:** #313 bounded owner-scoped ephemeral ref/data lifecycle、#105 ranged/deterministic filesystem observation、#83 retrievable truncated process/shell output、#107 explicit writable root配下のatomic workspace mutation、#319 production-dogfood execution-budget fix、#323 guided-recovery challenge-expiry/re-review hardening、#314 schema/config/readiness/upgrade release integrationでDangerous shell authorityへの依存を減らす。
+- **`0.5.0` — released Least-privilege Workspace baseline:** #313 bounded owner-scoped ephemeral refs、#105 ranged/deterministic filesystem observation、#83 bounded retrievable output、#107 explicit writable root 配下の atomic workspace mutation、#319 execution-budget hardening、#323 guided-recovery expiry/re-review、#314 release integration、#308/#326 Windows npm/CSPRNG recurrence guard を含みます。
 - **`0.6.0` — Managed Developer Execution:** #106 explicitly managed long-running job、#114 separately sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 containmentを追加する。
 
-`0.5.0` の release sequence は **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance** です。#313/#105/#83/#107/#319/#323 は完了済みで、publication 前に残るのは final #314 gate だけです。integrated candidate は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
+`0.5.0` の release sequence **#313 foundation -> #105 bounded observation -> #83 retrievable output -> #107 bounded mutation -> #319 execution-budget hardening -> #323 guided-recovery expiry/re-review hardening -> #314 final release integration/acceptance** は完了済みです。released baseline は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin し、mixed version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、`0.5.0` は per-principal path/root isolation を support claim しません。
 
 minor numberはworking release boundaryでありcalendar promiseではありません。optional platform/providerのsupport claimはexplicit acceptanceまで保留できます。implementation evidenceがsplit/deferを要求する場合はnumberingよりsafety boundaryを優先します。
 
@@ -99,7 +99,7 @@ minor numberはworking release boundaryでありcalendar promiseではありま�
 
 初回 umbrella [#213](https://github.com/git-ksk/computer-use-mcp-gateway/issues/213) は完了済みです。future release preparation は恒久 [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) checklist を使い、gate が actionable gap を見つけた場合は narrower issue に分割します。
 
-source-tree dogfood で capability が動くだけでは製品化完了とはしません。Post-v0.4 の各 milestone は次の product-level foundation を改善または維持します。
+source-tree dogfood で capability が動くだけでは製品化完了とはしません。Post-v0.5 の各 milestone は次の product-level foundation を改善または維持します。
 
 1. **Distribution / release integrity.** Source release は引き続き有効ですが、installable product path は最終的に reviewed な platform 別 artifact、deterministic checksum、provenance / attestation、SBOM と third-party license / notice inventory、適用可能な platform signing / notarization を提供します。release artifact に credential / private endpoint を含めません。source checkout だけでなく clean-machine artifact install smoke で user が受け取る実物を検証します。
 2. **Install / upgrade / rollback.** 初回 install、Hub / Agent / maintenance / helper の coordinated upgrade、durable-state migration、rollback の supported path を明示します。version-paired component と checkpoint compatibility を明確にし、incompatible mixed version は silent rolling compatibility を試さず fail closed します。durable / wire state を変更する release は previous supported minor からの upgrade と safe rollback boundary を証明します。
