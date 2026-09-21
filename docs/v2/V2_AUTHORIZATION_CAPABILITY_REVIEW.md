@@ -177,3 +177,7 @@ Cua Cloud Fleets, E2B, Daytona, or another provider may be used as downstream ex
 - CUMG positioning: [`V2_POSITIONING.md`](V2_POSITIONING.md)
 - Execution-environment boundary: [`V2_EXECUTION_ENVIRONMENT_BOUNDARY.md`](V2_EXECUTION_ENVIRONMENT_BOUNDARY.md)
 - Threat model: [`V2_THREAT_MODEL.md`](V2_THREAT_MODEL.md)
+
+## Managed-job capability split (#106)
+
+v0.6 managed jobs add `ManagedJobControl` as a separate exact Dangerous capability and `ManagedJobObserve` as a separate exact Observe capability. Neither is implied by `ExecuteProcess`, `Shell`, cwd roots, filesystem roots, or a class-only grant. Every lease renewal passes through fresh exact northbound authorization. See [V2_MANAGED_JOBS.md](V2_MANAGED_JOBS.md).

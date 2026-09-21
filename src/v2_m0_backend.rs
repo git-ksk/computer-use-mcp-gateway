@@ -191,6 +191,15 @@ impl BackendAdapter for CuaCliAdapter {
                     DeviceCapability::ReadProcessOutput,
                 ));
             }
+            DeviceCommand::ManagedJobStart { .. }
+            | DeviceCommand::ManagedJobStatus { .. }
+            | DeviceCommand::ManagedJobOutput { .. }
+            | DeviceCommand::ManagedJobRenew { .. }
+            | DeviceCommand::ManagedJobStop { .. } => {
+                return Err(BackendAdapterError::UnsupportedCommand(
+                    command.capability(),
+                ));
+            }
             DeviceCommand::ReadFile { .. } => {
                 return Err(BackendAdapterError::UnsupportedCommand(
                     DeviceCapability::ReadFile,

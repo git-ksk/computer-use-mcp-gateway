@@ -46,16 +46,19 @@ use crate::{
         DeviceResult, InputDeliveryMode, InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES,
         MAX_KEYBOARD_MODIFIERS, MAX_MENU_PATH_SEGMENTS, MAX_MENU_SEGMENT_BYTES,
         MAX_TYPE_TEXT_BYTES, MAX_UI_ELEMENTS, MAX_UI_PREDICATES, MAX_UI_QUERY_BYTES, PointerButton,
-        PointerTarget, ProcessEnvVar, ProcessRequest, ScrollDirection, ScrollGranularity,
-        ScrollTarget, ShellRequest, UiElementAction, UiPredicate, UiRect, UiRole,
-        WorkspaceWritePath, WorkspaceWritePayload, WorkspaceWritePrecondition,
+        PointerTarget, ProcessEnvVar, ProcessOutputStream, ProcessRequest, ScrollDirection,
+        ScrollGranularity, ScrollTarget, ShellRequest, UiElementAction, UiPredicate, UiRect,
+        UiRole, WorkspaceWritePath, WorkspaceWritePayload, WorkspaceWritePrecondition,
     },
     v2_m0_execution::HubOperationState,
     v2_m0_trust::{AuthenticatedClientPrincipal, ClientAuthorizationPolicy, TrustError},
     v2_m1_filesystem::DEFAULT_MAX_FILE_BYTES,
-    v2_m1_hub::{HubCommandError, HubHandle},
+    v2_m1_hub::{HubCommandError, HubHandle, HubManagedJobOutputRead},
     v2_m1_workspace_mutation::{
         DEFAULT_MAX_WORKSPACE_PATH_BYTES, DEFAULT_MAX_WORKSPACE_WRITE_BYTES, sha256_hex,
+    },
+    v2_managed_job::{
+        MAX_MANAGED_JOB_LEASE_MS, MAX_MANAGED_JOB_LIFETIME_MS, MAX_MANAGED_JOB_OUTPUT_READ_BYTES,
     },
     v2_semantic_constraints::{SemanticConstraintError, SemanticConstraintPolicy},
 };
@@ -114,6 +117,11 @@ const TOOL_TYPE_TEXT: &str = "type_text";
 const TOOL_EXECUTE_PROCESS: &str = "execute_process";
 const TOOL_SHELL: &str = "shell";
 const TOOL_READ_PROCESS_OUTPUT: &str = "read_process_output";
+const TOOL_MANAGED_JOB_START: &str = "managed_job_start";
+const TOOL_MANAGED_JOB_STATUS: &str = "managed_job_status";
+const TOOL_MANAGED_JOB_OUTPUT: &str = "managed_job_output";
+const TOOL_MANAGED_JOB_RENEW: &str = "managed_job_renew";
+const TOOL_MANAGED_JOB_STOP: &str = "managed_job_stop";
 const TOOL_GET_OPERATION: &str = "get_operation";
 const TOOL_READ_FILE: &str = "read_file";
 const TOOL_LIST_DIRECTORY: &str = "list_directory";
@@ -2936,6 +2944,203 @@ impl ServerHandler for V2NorthboundMcp {
             context.client_info(),
         );
 
+        if matches!(
+            request.name.as_ref(),
+            TOOL_MANAGED_JOB_START
+                | TOOL_MANAGED_JOB_STATUS
+                | TOOL_MANAGED_JOB_OUTPUT
+                | TOOL_MANAGED_JOB_RENEW
+                | TOOL_MANAGED_JOB_STOP
+        ) {
+            let owner = OperationOwner::from_principal(&auth.principal);
+            let metadata = OperationAdmissionMetadata {
+                audit,
+                ..OperationAdmissionMetadata::empty()
+            };
+            let effectful = matches!(
+                request.name.as_ref(),
+                TOOL_MANAGED_JOB_START | TOOL_MANAGED_JOB_RENEW | TOOL_MANAGED_JOB_STOP
+            );
+            let response: Result<Value, McpError> = match request.name.as_ref() {
+                TOOL_MANAGED_JOB_START => {
+                    let args: ManagedJobStartArgs = parse_arguments(arguments)?;
+                    if args.hard_lifetime_ms == 0
+                        || args.hard_lifetime_ms > MAX_MANAGED_JOB_LIFETIME_MS
+                    {
+                        return Err(McpError::invalid_params(
+                            "hard_lifetime_ms exceeds the managed-job lifetime limit",
+                            None,
+                        ));
+                    }
+                    let request = ProcessRequest {
+                        program: args.program,
+                        args: args.args,
+                        cwd: args.cwd,
+                        env: env_map(args.env),
+                        timeout_ms: args.hard_lifetime_ms,
+                    };
+                    self.hub
+                        .managed_job_start_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            request,
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "managed_job_started",
+                                "operation_id": result.operation_id,
+                                "job_ref": result.job_ref,
+                                "status": result.status,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                TOOL_MANAGED_JOB_STATUS => {
+                    let args: ManagedJobRefArgs = parse_arguments(arguments)?;
+                    if args.job_ref.is_empty() || args.job_ref.len() > 128 {
+                        return Err(McpError::invalid_params("Invalid job_ref", None));
+                    }
+                    self.hub
+                        .managed_job_status_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            &args.job_ref,
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "managed_job_status",
+                                "status": result.status,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                TOOL_MANAGED_JOB_OUTPUT => {
+                    let args: ManagedJobOutputArgs = parse_arguments(arguments)?;
+                    if args.job_ref.is_empty() || args.job_ref.len() > 128 {
+                        return Err(McpError::invalid_params("Invalid job_ref", None));
+                    }
+                    let max_bytes = args.max_bytes.unwrap_or(
+                        u64::try_from(MAX_MANAGED_JOB_OUTPUT_READ_BYTES).map_err(|_| {
+                            McpError::internal_error("Managed-job output limit unavailable", None)
+                        })?,
+                    );
+                    if max_bytes == 0
+                        || max_bytes
+                            > u64::try_from(MAX_MANAGED_JOB_OUTPUT_READ_BYTES).map_err(|_| {
+                                McpError::internal_error(
+                                    "Managed-job output limit unavailable",
+                                    None,
+                                )
+                            })?
+                    {
+                        return Err(McpError::invalid_params(
+                            "max_bytes exceeds the managed-job output range limit",
+                            None,
+                        ));
+                    }
+                    let stream = parse_managed_job_stream(&args.stream)?;
+                    self.hub
+                        .managed_job_output_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            &args.job_ref,
+                            HubManagedJobOutputRead {
+                                stream,
+                                offset: args.offset,
+                                max_bytes,
+                            },
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "managed_job_output",
+                                "stream": result.stream,
+                                "bytes_base64": STANDARD.encode(&result.range.bytes),
+                                "requested_offset": result.range.requested_offset,
+                                "earliest_available_offset": result.range.earliest_available_offset,
+                                "next_offset": result.range.next_offset,
+                                "total_bytes": result.range.total_bytes,
+                                "eof": result.range.eof,
+                                "gap_before_range": result.range.gap_before_range,
+                                "history_truncated": result.range.history_truncated,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                TOOL_MANAGED_JOB_RENEW => {
+                    let args: ManagedJobRenewArgs = parse_arguments(arguments)?;
+                    if args.job_ref.is_empty() || args.job_ref.len() > 128 {
+                        return Err(McpError::invalid_params("Invalid job_ref", None));
+                    }
+                    if args.lease_ms == 0 || args.lease_ms > MAX_MANAGED_JOB_LEASE_MS {
+                        return Err(McpError::invalid_params(
+                            "lease_ms exceeds the managed-job lease limit",
+                            None,
+                        ));
+                    }
+                    self.hub
+                        .managed_job_renew_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            &args.job_ref,
+                            args.lease_ms,
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "managed_job_renewed",
+                                "operation_id": result.operation_id,
+                                "status": result.status,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                TOOL_MANAGED_JOB_STOP => {
+                    let args: ManagedJobRefArgs = parse_arguments(arguments)?;
+                    if args.job_ref.is_empty() || args.job_ref.len() > 128 {
+                        return Err(McpError::invalid_params("Invalid job_ref", None));
+                    }
+                    self.hub
+                        .managed_job_stop_as_with_id_and_metadata(
+                            owner,
+                            operation_id.clone(),
+                            &args.job_ref,
+                            metadata,
+                        )
+                        .await
+                        .map(|result| {
+                            json!({
+                                "type": "managed_job_stopped",
+                                "operation_id": result.operation_id,
+                                "status": result.status,
+                            })
+                        })
+                        .map_err(hub_error_to_mcp)
+                }
+                _ => unreachable!(),
+            };
+            return match response {
+                Ok(payload) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                    payload.to_string(),
+                )])
+                .into()),
+                Err(error) => {
+                    let error = if effectful {
+                        mcp_error_with_operation_id(error, &operation_id)
+                    } else {
+                        error
+                    };
+                    Ok(execution_error_response(error))
+                }
+            };
+        }
+
         if request.name.as_ref() == TOOL_READ_PROCESS_OUTPUT {
             let args: ReadProcessOutputArgs = parse_arguments(arguments)?;
             let max_bytes = args.max_bytes.unwrap_or(8 * 1024);
@@ -4173,6 +4378,12 @@ fn tool_capability(name: &str) -> Option<DeviceCapability> {
         TOOL_EXECUTE_PROCESS => Some(DeviceCapability::ExecuteProcess),
         TOOL_SHELL => Some(DeviceCapability::Shell),
         TOOL_READ_PROCESS_OUTPUT => Some(DeviceCapability::ReadProcessOutput),
+        TOOL_MANAGED_JOB_START | TOOL_MANAGED_JOB_RENEW | TOOL_MANAGED_JOB_STOP => {
+            Some(DeviceCapability::ManagedJobControl)
+        }
+        TOOL_MANAGED_JOB_STATUS | TOOL_MANAGED_JOB_OUTPUT => {
+            Some(DeviceCapability::ManagedJobObserve)
+        }
         TOOL_READ_FILE => Some(DeviceCapability::ReadFile),
         TOOL_LIST_DIRECTORY => Some(DeviceCapability::ListDirectory),
         TOOL_WRITE_WORKSPACE_FILE => Some(DeviceCapability::WriteWorkspaceFile),
@@ -4508,6 +4719,96 @@ fn all_tools() -> Vec<Tool> {
             ),
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_MANAGED_JOB_START,
+            "Start an explicitly managed long-running developer process from structured argv only. This is separate Dangerous authority from execute_process/shell, has a hard lifetime plus renewable lease, and never accepts free-form shell text. Supply operation_id so lost responses can be inspected without replay.",
+            object_schema(
+                vec![
+                    ("operation_id", operation_id_schema()),
+                    ("program", string_schema()),
+                    ("args", array_schema(string_schema())),
+                    ("cwd", string_schema()),
+                    ("env", string_map_schema()),
+                    (
+                        "hard_lifetime_ms",
+                        bounded_positive_integer_schema(MAX_MANAGED_JOB_LIFETIME_MS),
+                    ),
+                ],
+                &["program", "cwd", "hard_lifetime_ms"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_MANAGED_JOB_STATUS,
+            "Read owner-scoped status for one opaque managed-job reference. The reference is bound to the authenticated principal and exact Agent session fence.",
+            object_schema(
+                vec![(
+                    "job_ref",
+                    json!({"type":"string","minLength":1,"maxLength":128}),
+                )],
+                &["job_ref"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_MANAGED_JOB_OUTPUT,
+            "Read a bounded stdout/stderr range from one owner-scoped managed job. Output is returned inline as base64 with explicit absolute offsets and truncation/gap metadata.",
+            object_schema(
+                vec![
+                    (
+                        "job_ref",
+                        json!({"type":"string","minLength":1,"maxLength":128}),
+                    ),
+                    (
+                        "stream",
+                        json!({"type":"string","enum":["stdout","stderr"]}),
+                    ),
+                    ("offset", json!({"type":"integer","minimum":0})),
+                    (
+                        "max_bytes",
+                        bounded_positive_integer_schema(
+                            MAX_MANAGED_JOB_OUTPUT_READ_BYTES as u64,
+                        ),
+                    ),
+                ],
+                &["job_ref", "stream"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true)),
+        Tool::new(
+            TOOL_MANAGED_JOB_RENEW,
+            "Renew the short-lived control lease for an existing managed job after a fresh exact Dangerous-capability authorization. Renewal never extends the job beyond its original hard lifetime.",
+            object_schema(
+                vec![
+                    ("operation_id", operation_id_schema()),
+                    (
+                        "job_ref",
+                        json!({"type":"string","minLength":1,"maxLength":128}),
+                    ),
+                    (
+                        "lease_ms",
+                        bounded_positive_integer_schema(MAX_MANAGED_JOB_LEASE_MS),
+                    ),
+                ],
+                &["job_ref", "lease_ms"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
+        Tool::new(
+            TOOL_MANAGED_JOB_STOP,
+            "Request termination of one owner-scoped managed job. Success is returned only after the Agent proves the supervised process domain is terminal; ambiguous termination follows the existing Indeterminate/no-replay path.",
+            object_schema(
+                vec![
+                    ("operation_id", operation_id_schema()),
+                    (
+                        "job_ref",
+                        json!({"type":"string","minLength":1,"maxLength":128}),
+                    ),
+                ],
+                &["job_ref"],
+            ),
+        )
+        .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_EXECUTE_PROCESS,
             "Execute a bounded structured local process. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; this is not a persistent service launcher. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the process.",
@@ -6017,6 +6318,42 @@ struct ReadProcessOutputArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ManagedJobStartArgs {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    hard_lifetime_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedJobRefArgs {
+    job_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedJobOutputArgs {
+    job_ref: String,
+    stream: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedJobRenewArgs {
+    job_ref: String,
+    lease_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileArgs {
     path: String,
     #[serde(default)]
@@ -6090,6 +6427,17 @@ fn capability_supports_operation_recovery(capability: DeviceCapability) -> bool 
 
 fn capability_accepts_audit(capability: DeviceCapability) -> bool {
     capability_supports_operation_recovery(capability)
+}
+
+fn parse_managed_job_stream(value: &str) -> Result<ProcessOutputStream, McpError> {
+    match value {
+        "stdout" => Ok(ProcessOutputStream::Stdout),
+        "stderr" => Ok(ProcessOutputStream::Stderr),
+        _ => Err(McpError::invalid_params(
+            "stream must be stdout or stderr",
+            None,
+        )),
+    }
 }
 
 fn env_map(env: BTreeMap<String, String>) -> Vec<ProcessEnvVar> {
@@ -7379,6 +7727,11 @@ mod tests {
                 TOOL_READ_PROCESS_OUTPUT,
                 DeviceCapability::ReadProcessOutput,
             ),
+            (TOOL_MANAGED_JOB_START, DeviceCapability::ManagedJobControl),
+            (TOOL_MANAGED_JOB_STATUS, DeviceCapability::ManagedJobObserve),
+            (TOOL_MANAGED_JOB_OUTPUT, DeviceCapability::ManagedJobObserve),
+            (TOOL_MANAGED_JOB_RENEW, DeviceCapability::ManagedJobControl),
+            (TOOL_MANAGED_JOB_STOP, DeviceCapability::ManagedJobControl),
             (TOOL_READ_FILE, DeviceCapability::ReadFile),
             (TOOL_LIST_DIRECTORY, DeviceCapability::ListDirectory),
             (

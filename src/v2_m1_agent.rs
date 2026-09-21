@@ -55,6 +55,7 @@ use crate::v2_m1_shell::{ShellError, ShellExecutor};
 use crate::v2_m1_workspace_mutation::{
     WorkspaceMutationError, WorkspaceMutationExecutor, WorkspaceMutationPolicy, sha256_hex,
 };
+use crate::v2_managed_job::{ManagedJobError, ManagedJobLimits, ManagedJobManager};
 use crate::v2_observability::SafeErrorCode;
 use crate::v2_online_recovery::{
     RecoveryAuthorization, RecoveryError, RecoveryPhase, RecoveryResolved, clear_authorization,
@@ -78,6 +79,7 @@ use tonic::Code;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 const GRPC_QUEUE_DEPTH: usize = 8;
+const MANAGED_JOB_SAFETY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn persist_verified_recovery_completion(
     state_dir: &Path,
@@ -212,6 +214,8 @@ pub struct AgentService {
     config: AgentServiceConfig,
     material: AgentProvisionedMaterial,
     executor: ProcessExecutor,
+    managed_jobs: ManagedJobManager,
+    managed_job_fail_closed: bool,
     shell: ShellExecutor,
     filesystem: FilesystemExecutor,
     workspace_mutation: Option<WorkspaceMutationExecutor>,
@@ -284,6 +288,8 @@ impl AgentService {
             ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Process)?,
         );
+        let managed_jobs = ManagedJobManager::new(executor.clone(), ManagedJobLimits::default())
+            .map_err(AgentServiceError::ManagedJob)?;
         let shell = ShellExecutor::new(
             ProcessPolicy::developer_defaults(config.allowed_cwd_roots.clone())
                 .map_err(AgentServiceError::Process)?,
@@ -307,48 +313,51 @@ impl AgentService {
         // Browser transfer staging is created only after that reviewed root exists.
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
             .map_err(AgentServiceError::Persistence)?;
-        let (trusted_hub, grants, execution, terminal_evidence) = match checkpoint
-            .load_latest::<AgentPersistentState>(
-        ) {
-            Ok(state) => {
-                let (device_id, mut trusted_hub, mut grants, execution, terminal_evidence) = state
-                    .restore_with_terminal_evidence()
-                    .map_err(AgentServiceError::Persistence)?;
-                if device_id != config.device_id {
-                    return Err(AgentServiceError::CheckpointIdentityMismatch);
-                }
-                if trusted_hub.verifier() != material.trusted_hub {
-                    let rotation = material
-                        .hub_rotation
-                        .as_ref()
-                        .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
-                    trusted_hub
-                        .apply_rotation(rotation)
-                        .map_err(AgentServiceError::Trust)?;
-                    if trusted_hub.verifier() != material.trusted_hub {
-                        return Err(AgentServiceError::CheckpointTrustMismatch);
+        let (trusted_hub, grants, execution, terminal_evidence, managed_job_fail_closed) =
+            match checkpoint.load_latest::<AgentPersistentState>() {
+                Ok(state) => {
+                    let restored = state
+                        .restore_with_runtime_safety()
+                        .map_err(AgentServiceError::Persistence)?;
+                    if restored.device_id != config.device_id {
+                        return Err(AgentServiceError::CheckpointIdentityMismatch);
                     }
+                    let mut trusted_hub = restored.trusted_hub;
+                    let mut grants = restored.grant_ledger;
+                    if trusted_hub.verifier() != material.trusted_hub {
+                        let rotation = material
+                            .hub_rotation
+                            .as_ref()
+                            .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
+                        trusted_hub
+                            .apply_rotation(rotation)
+                            .map_err(AgentServiceError::Trust)?;
+                        if trusted_hub.verifier() != material.trusted_hub {
+                            return Err(AgentServiceError::CheckpointTrustMismatch);
+                        }
+                    }
+                    reconcile_grant_verifiers(&mut grants, &material);
+                    (
+                        trusted_hub,
+                        grants,
+                        restored.execution,
+                        restored.terminal_evidence.into_iter().collect(),
+                        restored.managed_job_fail_closed,
+                    )
                 }
-                reconcile_grant_verifiers(&mut grants, &material);
-                (
-                    trusted_hub,
-                    grants,
-                    execution,
-                    terminal_evidence.into_iter().collect(),
-                )
-            }
-            Err(PersistenceError::NoCheckpoint) => {
-                let mut grants = GrantLedger::new(material.grant_verifier);
-                reconcile_grant_verifiers(&mut grants, &material);
-                (
-                    TrustedHubIdentity::new(material.trusted_hub),
-                    grants,
-                    AgentExecutionGate::default(),
-                    VecDeque::new(),
-                )
-            }
-            Err(error) => return Err(AgentServiceError::Persistence(error)),
-        };
+                Err(PersistenceError::NoCheckpoint) => {
+                    let mut grants = GrantLedger::new(material.grant_verifier);
+                    reconcile_grant_verifiers(&mut grants, &material);
+                    (
+                        TrustedHubIdentity::new(material.trusted_hub),
+                        grants,
+                        AgentExecutionGate::default(),
+                        VecDeque::new(),
+                        false,
+                    )
+                }
+                Err(error) => return Err(AgentServiceError::Persistence(error)),
+            };
         let ephemeral_data = match config.ephemeral_data_parent.as_deref() {
             Some(parent) => Some(Arc::new(StdMutex::new(
                 AgentEphemeralDataStore::new(parent, AgentEphemeralDataLimits::default())
@@ -382,6 +391,8 @@ impl AgentService {
             config,
             material,
             executor,
+            managed_jobs,
+            managed_job_fail_closed,
             shell,
             filesystem,
             workspace_mutation,
@@ -408,12 +419,13 @@ impl AgentService {
 
     fn persist_state(&self) -> Result<(), AgentServiceError> {
         let terminal_evidence: Vec<_> = self.terminal_evidence.iter().cloned().collect();
-        let state = AgentPersistentState::capture_with_terminal_evidence(
+        let state = AgentPersistentState::capture_with_runtime_safety(
             self.config.device_id.clone(),
             &self.trusted_hub,
             &self.grants,
             &self.execution,
             &terminal_evidence,
+            self.managed_job_fail_closed,
         )
         .map_err(|error| {
             record_agent_persistence_failure(&self.config.device_id, &error);
@@ -430,6 +442,8 @@ impl AgentService {
         let mut supported = vec![
             DeviceCapability::ExecuteProcess,
             DeviceCapability::Shell,
+            DeviceCapability::ManagedJobControl,
+            DeviceCapability::ManagedJobObserve,
             DeviceCapability::ReadFile,
             DeviceCapability::ListDirectory,
         ];
@@ -456,7 +470,7 @@ impl AgentService {
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-            revision: 6,
+            revision: 7,
             supported,
         }
     }
@@ -663,6 +677,17 @@ impl AgentService {
             generation: accepted.device_generation,
             capabilities: hello.capabilities.clone(),
         };
+        if self.managed_job_fail_closed {
+            tracing::error!(
+                event = "v2_managed_job_fail_closed",
+                device_id = %session.device_id,
+                generation = session.generation,
+                outcome = "refused",
+                error_code = "managed_job_fail_closed",
+                "persisted managed-job termination ambiguity blocks Agent work"
+            );
+            return Err(AgentServiceError::ManagedJobFailClosed);
+        }
         self.execution
             .prepare_generation(session.generation)
             .map_err(AgentServiceError::Execution)?;
@@ -691,16 +716,35 @@ impl AgentService {
             .map_err(AgentServiceError::OnlineRecovery)?;
         let trusted_clock = TrustedSessionClock::new(accepted.hub_time_ms);
 
-        self.run_session_loop(
-            inbound,
-            outbound_tx,
-            hello,
-            challenge,
-            session,
-            trusted_clock,
-            shutdown,
-        )
-        .await
+        let session_result = self
+            .run_session_loop(
+                inbound,
+                outbound_tx,
+                hello,
+                challenge,
+                session,
+                trusted_clock,
+                shutdown,
+            )
+            .await;
+
+        let managed_jobs = self.managed_jobs.clone();
+        let cleanup = tokio::task::spawn_blocking(move || managed_jobs.shutdown_all())
+            .await
+            .map_err(|_| AgentServiceError::ManagedJobFailClosed)?;
+        if let Err(error) = cleanup {
+            self.managed_job_fail_closed = true;
+            self.persist_state()?;
+            tracing::error!(
+                event = "v2_managed_job_cleanup_indeterminate",
+                device_id = %self.config.device_id,
+                outcome = "fail_closed",
+                error_code = error.safe_error_code(),
+                "managed-job cleanup could not prove terminality; persisted fail-closed state"
+            );
+            return Err(AgentServiceError::ManagedJobFailClosed);
+        }
+        session_result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -716,6 +760,8 @@ impl AgentService {
     ) -> Result<SessionExit, AgentServiceError> {
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut managed_job_safety_poll = tokio::time::interval(MANAGED_JOB_SAFETY_POLL_INTERVAL);
+        managed_job_safety_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The immediate first tick establishes liveness as soon as authentication finishes.
         let mut heartbeat_sequence = 0_u64;
         let mut pending_heartbeat: Option<(u64, Instant)> = None;
@@ -744,6 +790,25 @@ impl AgentService {
                         .await?;
                         self.persist_state()?;
                         return Ok(SessionExit::Shutdown);
+                    }
+                }
+                _ = managed_job_safety_poll.tick() => {
+                    if self
+                        .managed_jobs
+                        .has_indeterminate_termination()
+                        .map_err(AgentServiceError::ManagedJob)?
+                    {
+                        self.managed_job_fail_closed = true;
+                        self.persist_state()?;
+                        tracing::error!(
+                            event = "v2_managed_job_async_indeterminate",
+                            device_id = %session.device_id,
+                            generation = session.generation,
+                            outcome = "fail_closed",
+                            error_code = "managed_job_fail_closed",
+                            "managed-job expiry/cleanup lost terminal proof; refusing further Agent work"
+                        );
+                        return Err(AgentServiceError::ManagedJobFailClosed);
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -1543,6 +1608,114 @@ impl AgentService {
                                     });
                                     ActiveCancellation::None
                                 }
+                                DeviceCommand::ManagedJobStart { request } => {
+                                    let managed_jobs = self.managed_jobs.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            managed_jobs.start(&request).map(|(agent_locator, status)| {
+                                                DeviceResult::ManagedJobStarted {
+                                                    agent_locator,
+                                                    status,
+                                                }
+                                            })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: managed_job_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::ManagedJobStatus { locator } => {
+                                    let managed_jobs = self.managed_jobs.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            managed_jobs
+                                                .status(&locator)
+                                                .map(|status| DeviceResult::ManagedJobStatus { status })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: managed_job_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::ManagedJobOutput {
+                                    locator,
+                                    stream,
+                                    offset,
+                                    max_bytes,
+                                } => {
+                                    let managed_jobs = self.managed_jobs.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let max_bytes = usize::try_from(max_bytes)
+                                                .map_err(|_| ManagedJobError::InvalidRead)?;
+                                            managed_jobs
+                                                .output(&locator, stream, offset, max_bytes)
+                                                .map(|range| DeviceResult::ManagedJobOutput {
+                                                    stream,
+                                                    range,
+                                                })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: managed_job_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::ManagedJobRenew { locator, lease_ms } => {
+                                    let managed_jobs = self.managed_jobs.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            managed_jobs
+                                                .renew(&locator, lease_ms)
+                                                .map(|status| DeviceResult::ManagedJobRenewed { status })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: managed_job_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::ManagedJobStop { locator } => {
+                                    let managed_jobs = self.managed_jobs.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            managed_jobs
+                                                .stop(&locator)
+                                                .map(|status| DeviceResult::ManagedJobStopped { status })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: managed_job_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
                                 DeviceCommand::StageBrowserUploadFile {
                                     context_id,
                                     file_name,
@@ -1956,6 +2129,23 @@ fn process_operation_outcome(
     }
 }
 
+fn managed_job_operation_outcome(
+    result: Result<Result<DeviceResult, ManagedJobError>, tokio::task::JoinError>,
+) -> AgentOperationOutcome {
+    match result {
+        Ok(Ok(result)) => AgentOperationOutcome::Result(Ok(result)),
+        Ok(Err(error)) => match error.outcome_unproven_stage() {
+            Some(stage) => AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
+            ),
+            None => AgentOperationOutcome::Result(Err(AgentOperationError::ManagedJob(error))),
+        },
+        Err(_) => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::ProcessOutcomeUnproven(ProcessUnprovenStage::Worker),
+        ),
+    }
+}
+
 fn shell_operation_outcome(
     result: Result<Result<DeviceResult, ShellError>, tokio::task::JoinError>,
 ) -> AgentOperationOutcome {
@@ -1993,6 +2183,7 @@ fn workspace_mutation_operation_outcome(
 #[derive(Debug)]
 pub enum AgentOperationError {
     Process(ProcessError),
+    ManagedJob(ManagedJobError),
     Shell(ShellError),
     Filesystem(FilesystemError),
     WorkspaceMutation(WorkspaceMutationError),
@@ -2119,6 +2310,7 @@ fn ephemeral_data_error_code(error: &AgentEphemeralDataError) -> DeviceErrorCode
 fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
     match error {
         AgentOperationError::Process(error) => error.safe_error_code(),
+        AgentOperationError::ManagedJob(error) => error.safe_error_code(),
         AgentOperationError::Shell(error) => error.safe_error_code(),
         AgentOperationError::Filesystem(error) => error.safe_error_code(),
         AgentOperationError::WorkspaceMutation(error) => error.safe_error_code(),
@@ -2131,6 +2323,7 @@ fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
 
 fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
     match error {
+        AgentOperationError::ManagedJob(error) => managed_job_error_code(error),
         AgentOperationError::WorkspaceMutation(WorkspaceMutationError::PreconditionFailed) => {
             DeviceErrorCode::WorkspacePreconditionFailed
         }
@@ -2262,6 +2455,50 @@ fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
         AgentOperationError::Backend(_) | AgentOperationError::WorkerPanicked => {
             DeviceErrorCode::InternalFailure
         }
+    }
+}
+
+fn managed_job_error_code(error: &ManagedJobError) -> DeviceErrorCode {
+    match error {
+        ManagedJobError::UnknownJob => DeviceErrorCode::NotFound,
+        ManagedJobError::CapacityExceeded => DeviceErrorCode::ExecutionBudgetExceeded,
+        ManagedJobError::InvalidLifetime
+        | ManagedJobError::InvalidLease
+        | ManagedJobError::InvalidRead
+        | ManagedJobError::InvalidLimits
+        | ManagedJobError::TerminalJob => DeviceErrorCode::InvalidRequest,
+        ManagedJobError::LockPoisoned | ManagedJobError::ThreadSpawn(_) => {
+            DeviceErrorCode::InternalFailure
+        }
+        ManagedJobError::Process(ProcessError::WorkingDirectoryDenied) => {
+            DeviceErrorCode::WorkingDirectoryDenied
+        }
+        ManagedJobError::Process(ProcessError::WorkingDirectoryNotDirectory) => {
+            DeviceErrorCode::WorkingDirectoryInvalid
+        }
+        ManagedJobError::Process(ProcessError::InvalidTimeout) => DeviceErrorCode::InvalidTimeout,
+        ManagedJobError::Process(ProcessError::InvalidProgram) => DeviceErrorCode::InvalidProgram,
+        ManagedJobError::Process(ProcessError::ShellProgramDenied) => {
+            DeviceErrorCode::ProgramDenied
+        }
+        ManagedJobError::Process(ProcessError::TooManyArguments) => {
+            DeviceErrorCode::TooManyArguments
+        }
+        ManagedJobError::Process(ProcessError::EnvironmentKeyDenied(_)) => {
+            DeviceErrorCode::EnvironmentKeyDenied
+        }
+        ManagedJobError::Process(ProcessError::InvalidEnvironment) => {
+            DeviceErrorCode::InvalidEnvironment
+        }
+        ManagedJobError::Process(ProcessError::TooManyEnvironmentEntries) => {
+            DeviceErrorCode::TooManyEnvironmentEntries
+        }
+        ManagedJobError::Process(ProcessError::Spawn(_)) => DeviceErrorCode::ProcessSpawnFailed,
+        ManagedJobError::Process(ProcessError::OutcomeUnproven(_)) => {
+            DeviceErrorCode::BackendOutcomeIndeterminate
+        }
+        ManagedJobError::Process(ProcessError::InvalidRequest) => DeviceErrorCode::InvalidRequest,
+        ManagedJobError::Process(_) => DeviceErrorCode::InternalFailure,
     }
 }
 
@@ -2676,6 +2913,8 @@ pub enum AgentServiceError {
     Control(crate::v2_m0::ControlError),
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
+    ManagedJob(ManagedJobError),
+    ManagedJobFailClosed,
     Filesystem(FilesystemError),
     WorkspaceMutationStartup(WorkspaceMutationError),
     EphemeralDataStartup(AgentEphemeralDataError),
@@ -2748,6 +2987,8 @@ impl SafeErrorCode for AgentServiceError {
             Self::Control(_) => "control_error",
             Self::Execution(_) => "execution_error",
             Self::Process(_) => "process_error",
+            Self::ManagedJob(error) => error.safe_error_code(),
+            Self::ManagedJobFailClosed => "managed_job_fail_closed",
             Self::Filesystem(_) => "filesystem_error",
             Self::WorkspaceMutationStartup(error) => error.safe_error_code(),
             Self::EphemeralDataStartup(error) => error.safe_error_code(),

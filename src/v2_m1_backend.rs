@@ -1224,6 +1224,13 @@ fn map_command(
         DeviceCommand::ReadProcessOutput { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ReadProcessOutput,
         )),
+        DeviceCommand::ManagedJobStart { .. }
+        | DeviceCommand::ManagedJobStatus { .. }
+        | DeviceCommand::ManagedJobOutput { .. }
+        | DeviceCommand::ManagedJobRenew { .. }
+        | DeviceCommand::ManagedJobStop { .. } => {
+            Err(M1BackendError::UnsupportedCommand(command.capability()))
+        }
         DeviceCommand::ReadFile { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ReadFile,
         )),
@@ -1363,6 +1370,13 @@ fn normalize_result(
         DeviceCommand::ReadProcessOutput { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ReadProcessOutput,
         )),
+        DeviceCommand::ManagedJobStart { .. }
+        | DeviceCommand::ManagedJobStatus { .. }
+        | DeviceCommand::ManagedJobOutput { .. }
+        | DeviceCommand::ManagedJobRenew { .. }
+        | DeviceCommand::ManagedJobStop { .. } => {
+            Err(M1BackendError::UnsupportedCommand(command.capability()))
+        }
         DeviceCommand::ReadFile { .. } => Err(M1BackendError::UnsupportedCommand(
             DeviceCapability::ReadFile,
         )),

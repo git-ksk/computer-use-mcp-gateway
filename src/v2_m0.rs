@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 10;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 6;
+pub const CONTROL_SCHEMA_VERSION: u16 = 11;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 7;
 /// First dedicated persisted registry schema. The numeric value intentionally
 /// matches the last historical control schema that was written into this field,
 /// so current rollback binaries can still read newly persisted checkpoints.
@@ -57,6 +57,8 @@ pub enum DeviceCapability {
     ExecuteProcess,
     Shell,
     ReadProcessOutput,
+    ManagedJobControl,
+    ManagedJobObserve,
     ReadFile,
     ListDirectory,
     WriteWorkspaceFile,
@@ -114,6 +116,7 @@ impl DeviceCapability {
             | Self::ScreenGeometry
             | Self::Screenshot
             | Self::ReadProcessOutput
+            | Self::ManagedJobObserve
             | Self::ReadFile
             | Self::ListDirectory
             | Self::ListWindows
@@ -147,6 +150,7 @@ impl DeviceCapability {
             // dangerous capabilities rather than generic browser authority.
             Self::ExecuteProcess
             | Self::Shell
+            | Self::ManagedJobControl
             | Self::TerminateApplication
             | Self::BrowserUploadFile
             | Self::BrowserDownload
@@ -610,6 +614,25 @@ pub enum DeviceCommand {
         offset: u64,
         max_bytes: u64,
     },
+    ManagedJobStart {
+        request: ProcessRequest,
+    },
+    ManagedJobStatus {
+        locator: String,
+    },
+    ManagedJobOutput {
+        locator: String,
+        stream: ProcessOutputStream,
+        offset: u64,
+        max_bytes: u64,
+    },
+    ManagedJobRenew {
+        locator: String,
+        lease_ms: u64,
+    },
+    ManagedJobStop {
+        locator: String,
+    },
     ReadFile {
         path: String,
         #[serde(default)]
@@ -767,6 +790,12 @@ impl DeviceCommand {
             Self::ExecuteProcess { .. } => DeviceCapability::ExecuteProcess,
             Self::Shell { .. } => DeviceCapability::Shell,
             Self::ReadProcessOutput { .. } => DeviceCapability::ReadProcessOutput,
+            Self::ManagedJobStart { .. }
+            | Self::ManagedJobRenew { .. }
+            | Self::ManagedJobStop { .. } => DeviceCapability::ManagedJobControl,
+            Self::ManagedJobStatus { .. } | Self::ManagedJobOutput { .. } => {
+                DeviceCapability::ManagedJobObserve
+            }
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
             Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
             Self::WriteWorkspaceFile { .. } => DeviceCapability::WriteWorkspaceFile,
@@ -812,6 +841,8 @@ impl DeviceCommand {
                 | Self::Screenshot
                 | Self::ScreenshotContextual { .. }
                 | Self::ReadProcessOutput { .. }
+                | Self::ManagedJobStatus { .. }
+                | Self::ManagedJobOutput { .. }
                 | Self::ReadFile { .. }
                 | Self::ListDirectory { .. }
                 | Self::ListWindows { .. }
@@ -1021,6 +1052,7 @@ impl DeviceRegistry {
             3 => 3,
             4..=6 => 4,
             7 => 5, // released v0.4.0
+            8 => 6, // released v0.5.0; same persisted registry shape, older live capability schema
             got => return Err(ControlError::UnsupportedControlSchema { got }),
         };
         for device in &snapshot.devices {
@@ -1789,6 +1821,23 @@ pub enum DeviceResult {
         output_refs: Option<Box<ProcessOutputRefs>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_output_locators: Option<Box<AgentProcessOutputLocators>>,
+    },
+    ManagedJobStarted {
+        agent_locator: String,
+        status: crate::v2_managed_job::ManagedJobStatus,
+    },
+    ManagedJobStatus {
+        status: crate::v2_managed_job::ManagedJobStatus,
+    },
+    ManagedJobOutput {
+        stream: ProcessOutputStream,
+        range: crate::v2_managed_job::ManagedJobOutputRange,
+    },
+    ManagedJobRenewed {
+        status: crate::v2_managed_job::ManagedJobStatus,
+    },
+    ManagedJobStopped {
+        status: crate::v2_managed_job::ManagedJobStatus,
     },
     Shell {
         output: ProcessOutput,
@@ -3146,7 +3195,7 @@ mod tests {
         let current = registry.snapshot();
 
         for (legacy_schema, legacy_capability_schema) in
-            [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4), (7, 5)]
+            [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4), (7, 5), (8, 6)]
         {
             let mut legacy = current.clone();
             legacy.schema_version = legacy_schema;
