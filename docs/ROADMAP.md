@@ -36,7 +36,7 @@ The completed V1/V2 implementation history and acceptance evidence remain availa
 
 ## Released baseline: `0.5.x`; next planned feature minor: `0.6.0`
 
-`v0.5.0` is the released **Least-privilege Workspace** baseline. Its release scope completed #313/#105/#83/#107/#319/#323 plus the final #314 schema/config/readiness/upgrade integration gate; #308 adds Windows npm/CSPRNG recurrence coverage without changing runtime authority. #139 signed-token dogfood and #228 physical Linux FIDO2 remain separate support-claim gates. The next planned feature minor is **`v0.6.0` — Managed Developer Execution**.
+`v0.5.0` is the released **Least-privilege Workspace** baseline. Its release scope completed #313/#105/#83/#107/#319/#323 plus the final #314 schema/config/readiness/upgrade integration gate; #308 adds Windows npm/CSPRNG recurrence coverage without changing runtime authority. The next planned feature minor is **`v0.6.0` — Managed Developer Execution**. Remaining acceptance for #139/#217/#228 is tracked **after `v0.5.0`** in the separate **Post-v0.5 — Support Claim Expansion** milestone.
 
 The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Its accepted support boundary is recorded in the release-scope and status documents.
 
@@ -61,8 +61,8 @@ The release closeout followed this order:
 
 1. **#221 merged/verified** via PR #271 with full regression/CI and EN/JA normative documentation.
 2. **`0.4.0` release closeout passed** against the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate: version/durable-schema compatibility, source-free candidate artifacts, clean install/upgrade/rollback, doctor/status, recovery/no-replay, dependency/CodeQL, docs, and release notes.
-3. **Complete #139 signed-token dogfood before advertising generic signed-token identity as release-supported.** The implementation may be present in the artifact while that explicit support claim remains acceptance-gated.
-4. **#227 physical Windows acceptance is complete and shipped in `v0.4.0`.** The 2026-09-19 trusted interactive-desktop run passed cancel -> approve -> exact durable resolution -> restart/no-replay. **#228 support remains deferred**, keeping Linux online recovery explicitly unsupported until physical Linux + real UV-capable FIDO2 acceptance exists. #217 remains open for parity.
+3. **#139 implementation is part of the released historical baseline; its remaining signed-token dogfood is post-v0.5 acceptance work.** Do not advertise the provider-specific support claim until that evidence exists.
+4. **#227 physical Windows acceptance is complete and shipped in `v0.4.0`.** The 2026-09-19 trusted interactive-desktop run passed cancel -> approve -> exact durable resolution -> restart/no-replay. Remaining #217/#228 parity/Linux evidence is tracked after `v0.5.0` and does not reopen `v0.4.0`.
 5. **Do not pull #215 implementation into the release gate.** The Cloud Run design is useful evidence already on `main`, but hosted Hub support remains NO-GO until its separate durable-state/fencing/ingress/acceptance contract is implemented.
 
 This is a release-scope consolidation, not a weakening of acceptance. The artifact may contain implementation whose **support claim is narrower than its compiled surface**; release notes and status docs must state those boundaries explicitly.
@@ -83,7 +83,7 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 
 ## Post-v0.5 delivery sequence
 
-v0.5.0 is the released and frozen **Least-privilege Workspace** baseline. There is no planned 0.5.1 train: open a patch release only for a concrete regression, security issue, or release/packaging defect that actually requires changing the released runtime. Deferred support-claim gates such as #139/#217/#228 do not reopen the v0.5.0 feature scope.
+v0.5.0 is the released and frozen **Least-privilege Workspace** baseline. There is no planned 0.5.1 train: open a patch release only for a concrete regression, security issue, or release/packaging defect that actually requires changing the released runtime. Remaining #139/#217/#228 acceptance is ordered **after v0.5.0** in the unnumbered Post-v0.5 Support Claim Expansion track; it does not reopen either released minor.
 
 The next numbered feature minor is **v0.6.0 — Managed Developer Execution**. Keep its feature boundary intentionally small and do not absorb unrelated hosted, recovery-research, or operator-UX work merely because it is open.
 
@@ -178,7 +178,7 @@ This queue records the practical result of continued Handoff integration and phy
 
 Every OPEN issue must appear in one of the buckets below or in another explicit roadmap section. The inventory describes admission and ordering; it does not imply that every open issue belongs to the next release.
 
-- **Released-baseline support-claim gates:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance remain open against the already released 0.4.0 baseline. They can widen an advertised support claim after evidence, but they do not reopen 0.4.0 or block 0.6.0.
+- **Post-v0.5 — Support Claim Expansion:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance are ordered after the released `v0.5.0` baseline. Their implementations have older history, but the remaining work is future acceptance/evidence. They do not reopen `0.4.0`/`0.5.0` and do not block `v0.6.0` unless explicitly admitted.
 - **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E, with #267 optional Linux cgroup-v2 containment allowed to proceed in parallel once the containment contract is stable; #335 is the required final integration/release gate.
 - **Operational usability / inspectability, unnumbered:** #304 exposes the existing unified privacy-bounded runtime status as one read-only MCP/Gateway call; #295 adds bounded human-readable --version identity. These are useful cross-cutting product improvements but are not v0.6.0 blockers unless explicitly admitted.
 - **Recovery evidence hardening, unnumbered:** #289 preserves privacy-bounded target identity for ambiguous application operations; #290 extends #124 self-reconciliation with exact durable backend receipts and depends on the reviewed target/evidence boundary. Keep both fail-closed and outside v0.6.0 until a deliberate release admission decision.
@@ -194,7 +194,7 @@ The Cua authorization/product-boundary research in #219 is completed by [v2/V2_A
 
 ### `0.4.0` identity and semantic-authorization component
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) is now part of the integrated `0.4.0` candidate rather than a separate `0.5.0` release. Its implementation is merged: provider-neutral signed-token verification reduces a verified external identity to the existing `AuthenticatedClientPrincipal`, while exact principal/device/capability authorization remains unchanged. Physical signed-token dogfood remains the final #139 support-claim acceptance item.
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) has implementation history in the integrated `0.4.0` baseline: provider-neutral signed-token verification reduces a verified external identity to the existing `AuthenticatedClientPrincipal`, while exact principal/device/capability authorization remains unchanged. Its still-open physical signed-token dogfood is not unfinished `0.4.0` work; it is tracked after `v0.5.0` in the Post-v0.5 Support Claim Expansion milestone.
 
 ```text
 external OAuth/OIDC identity provider
