@@ -103,7 +103,19 @@ If evidence forces one of #106/#114/#267 to defer, update #335 and the support b
 | Linux cgroup-v2 containment | #267 | Implemented optional platform hardening for bounded process/shell cleanup; Linux-only reviewed delegation |
 | Release integration / acceptance | #335 | Required final gate across schemas, artifacts, upgrade/rollback, dogfood, docs, and support claims |
 
-The following work is **not admitted to v0.6.0 by default**: Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and general operator/consumer ergonomics (#295/#304). Those tracks remain visible below and can be admitted only by an explicit roadmap/milestone change with a bounded reason.
+The following work is **not admitted to v0.6.0 by default**: Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and agent/operator ergonomics (#295/#304/#342). Those tracks remain outside the v0.6.0 release gate unless explicitly admitted with a bounded reason.
+
+### Planned post-v0.6 feature minor: v0.7.0 — Agent-facing Operational Ergonomics
+
+After v0.6.0 Managed Developer Execution closes, the next planned feature minor is **v0.7.0 — Agent-facing Operational Ergonomics**. This train improves how MCP/agent consumers inspect and correctly use the existing CUMG safety model; it must not add a second authorization/recovery authority or weaken quarantine/no-auto-replay semantics.
+
+| v0.7.0 track | Issue | Role |
+| --- | --- | --- |
+| Unified agent-facing runtime status | #304 | Expose the existing privacy-bounded status model through one read-only MCP/Gateway call |
+| Bounded runtime/package identity | #295 | Make installed package/source identity directly inspectable without repository archaeology |
+| Caller-retained operation-ID generation contract | #342 | Make fresh CSPRNG 128-bit `operation_id` generation explicit to MCP/agent consumers while preserving replay rejection and recovery semantics |
+
+The v0.7.0 boundary is intentionally ergonomic/operational. It may improve schema descriptions, read-only inspection, documentation, and safe client helpers, but it does not authorize heuristic recovery, automatic replay, or broader effectful capability.
 
 The released v0.5.0 baseline pins control schema 10, capability schema 6, registry schema 8, and Hub-Agent schema 6. During v0.6 development #106 used the historical 11/7 live pairing; #114 advances the current live control/capability pairing to 12/8 while registry schema remains 8 and Hub-Agent schema remains 6. Mixed live versions fail closed. Workspace writable roots remain operator/device configuration while exact mutation capability is granted per principal. v0.5.0 does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
 
@@ -180,7 +192,7 @@ Every OPEN issue must appear in one of the buckets below or in another explicit 
 
 - **`v0.6.x — Support Claim Expansion` (non-blocking for v0.6.0):** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance. These can widen the v0.6 support contract when their evidence is complete. Acceptance complete before the v0.6.0 freeze may be included in v0.6.0; otherwise the claim stays withheld and moves forward explicitly. Older releases are never re-labeled as supporting the provider/platform after the fact.
 - **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E, with #267 optional Linux cgroup-v2 containment allowed to proceed in parallel once the containment contract is stable; #335 is the required final integration/release gate.
-- **Operational usability / inspectability, unnumbered:** #304 exposes the existing unified privacy-bounded runtime status as one read-only MCP/Gateway call; #295 adds bounded human-readable --version identity. These are useful cross-cutting product improvements but are not v0.6.0 blockers unless explicitly admitted.
+- **v0.7.0 — Agent-facing Operational Ergonomics:** #304 exposes the existing unified privacy-bounded runtime status as one read-only MCP/Gateway call; #295 adds bounded human-readable --version identity; #342 makes the fresh CSPRNG 128-bit caller-retained `operation_id` generation contract explicit to MCP/agent consumers. These are planned after v0.6.0 and do not block its release.
 - **Recovery evidence hardening, unnumbered:** #289 preserves privacy-bounded target identity for ambiguous application operations; #290 extends #124 self-reconciliation with exact durable backend receipts and depends on the reviewed target/evidence boundary. Keep both fail-closed and outside v0.6.0 until a deliberate release admission decision.
 - **Hosted deployment, future independent track:** #215 remains the Cloud Run support gate; #275 defines the Agent-owned Handoff topology; #276 adopts the reviewed Handoff consumer boundary; #277 provides hosted operator routing; #282 composes the closed one-port ingress while #283 adds durable Hub state/writer-epoch fencing; #284 is the replacement/partition/physical-Handoff acceptance gate. Hosted support remains NO-GO until the implementation and acceptance chain is complete.
 - **Backend semantic-neutrality evidence:** #222 proves the same GUI semantics with a second real computer-use backend and remains evidence-driven outside a numbered release gate.
