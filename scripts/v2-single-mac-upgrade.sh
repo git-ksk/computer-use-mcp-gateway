@@ -1440,6 +1440,10 @@ if ! python3 "$SUPPORT_ROOT/v2_handoff_runtime_cleanup.py" \
   --rollback-root "$ROOT/rollback" \
   --runtime-manifest "$ROOT/runtime-manifest.json" \
   --expected-source-commit "$HEAD" \
+  --expected-package-version "$PACKAGE_VERSION" \
+  --expected-hub-agent-schema-version "$HUB_AGENT_SCHEMA_VERSION" \
+  --expected-control-schema-version "$CONTROL_SCHEMA_VERSION" \
+  --expected-capability-schema-version "$CAPABILITY_SCHEMA_VERSION" \
   --keep-recent 2 \
   --health-confirmed \
   --apply; then

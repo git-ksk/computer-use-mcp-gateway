@@ -220,11 +220,27 @@ def validate_runtime_tree(runtime: Path, handoff_dir: Path) -> None:
             _ = stat
 
 
-def verify_health_manifest(path: Path, expected_source_commit: str) -> None:
+def verify_health_manifest(
+    path: Path,
+    expected_source_commit: str,
+    expected_package_version: str,
+    expected_hub_agent_schema_version: int,
+    expected_control_schema_version: int,
+    expected_capability_schema_version: int,
+) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", expected_source_commit):
         raise CleanupRefusal("invalid_expected_source_commit")
+    if not expected_package_version or len(expected_package_version) > 64:
+        raise CleanupRefusal("invalid_expected_package_version")
+    expected_schemas = (
+        expected_hub_agent_schema_version,
+        expected_control_schema_version,
+        expected_capability_schema_version,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in expected_schemas):
+        raise CleanupRefusal("invalid_expected_schema_version")
     try:
-        stat = path.lstat()
+        path.lstat()
         if path.is_symlink() or not path.is_file():
             raise CleanupRefusal("unsafe_runtime_manifest")
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -233,10 +249,12 @@ def verify_health_manifest(path: Path, expected_source_commit: str) -> None:
     except Exception as exc:
         raise CleanupRefusal("runtime_manifest_unreadable") from exc
     if (
-        manifest.get("schema_version") != 3
+        manifest.get("schema_version") != 4
         or manifest.get("source_commit") != expected_source_commit
-        or not isinstance(manifest.get("hub_agent_schema_version"), int)
-        or manifest.get("hub_agent_schema_version", 0) <= 0
+        or manifest.get("package_version") != expected_package_version
+        or manifest.get("hub_agent_schema_version") != expected_hub_agent_schema_version
+        or manifest.get("control_schema_version") != expected_control_schema_version
+        or manifest.get("capability_schema_version") != expected_capability_schema_version
     ):
         raise CleanupRefusal("runtime_manifest_not_paired")
 
@@ -245,7 +263,14 @@ def cleanup(args: argparse.Namespace) -> tuple[int, int, int]:
     install_root = Path(args.install_root)
     handoff_dir = install_root / "v2" / "handoff"
     lstat_directory(handoff_dir)
-    verify_health_manifest(Path(args.runtime_manifest), args.expected_source_commit)
+    verify_health_manifest(
+        Path(args.runtime_manifest),
+        args.expected_source_commit,
+        args.expected_package_version,
+        args.expected_hub_agent_schema_version,
+        args.expected_control_schema_version,
+        args.expected_capability_schema_version,
+    )
     if args.apply and not args.health_confirmed:
         raise CleanupRefusal("health_confirmation_required")
 
@@ -279,6 +304,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rollback-root", required=True)
     p.add_argument("--runtime-manifest", required=True)
     p.add_argument("--expected-source-commit", required=True)
+    p.add_argument("--expected-package-version", required=True)
+    p.add_argument("--expected-hub-agent-schema-version", required=True, type=int)
+    p.add_argument("--expected-control-schema-version", required=True, type=int)
+    p.add_argument("--expected-capability-schema-version", required=True, type=int)
     p.add_argument("--keep-recent", type=int, default=2)
     p.add_argument("--health-confirmed", action="store_true")
     p.add_argument("--apply", action="store_true")

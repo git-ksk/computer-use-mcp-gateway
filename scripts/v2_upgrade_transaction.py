@@ -236,6 +236,60 @@ def complete(path: pathlib.Path) -> dict[str, Any]:
     record["failure_reason"] = None; record["operator_action"] = None
     record["updated_at_ms"] = max(_now_ms(), record["updated_at_ms"])
     _validate_record(record); _atomic_write(path, record); return record
+
+
+def inspect_deferred_cleanup(
+    path: pathlib.Path, *, expected_cumg_source_commit: str, expected_runtime_generation: str
+) -> dict[str, Any]:
+    _validate_commit(expected_cumg_source_commit, "cumg_source_commit")
+    _validate_token(expected_runtime_generation, "runtime_generation")
+    record = _read(path)
+    if (
+        record["status"] != "operator_action_required"
+        or record["phase"] != "cleanup"
+        or record["failure_reason"] != "cleanup_safety_refusal"
+        or record["operator_action"] != "inspect_upgrade_status"
+    ):
+        raise TransactionError("not_deferred_cleanup_failure")
+    if (
+        record["cumg_source_commit"] != expected_cumg_source_commit
+        or record["runtime_generation"] != expected_runtime_generation
+    ):
+        raise TransactionError("deferred_cleanup_identity_mismatch")
+    completion = record["completion"]
+    if completion["cleanup_completed"] or any(
+        not completion[flag] for flag in COMPLETION_FLAGS if flag != "cleanup_completed"
+    ):
+        raise TransactionError("deferred_cleanup_completion_contract_mismatch")
+    if record["rollback_asset"] is None:
+        raise TransactionError("deferred_cleanup_rollback_missing")
+    authority = record["mutation_authority"]
+    if authority["owner"] != "v2" or authority["epoch"] is None:
+        raise TransactionError("deferred_cleanup_authority_mismatch")
+    return record
+
+
+def complete_deferred_cleanup(
+    path: pathlib.Path, *, expected_transaction_id: str, expected_cumg_source_commit: str,
+    expected_runtime_generation: str
+) -> dict[str, Any]:
+    _validate_token(expected_transaction_id, "transaction_id")
+    record = inspect_deferred_cleanup(
+        path,
+        expected_cumg_source_commit=expected_cumg_source_commit,
+        expected_runtime_generation=expected_runtime_generation,
+    )
+    if record["transaction_id"] != expected_transaction_id:
+        raise TransactionError("deferred_cleanup_transaction_changed")
+    record["completion"]["cleanup_completed"] = True
+    record["status"] = "completed"
+    record["phase"] = "completed"
+    record["failure_reason"] = None
+    record["operator_action"] = None
+    record["updated_at_ms"] = max(_now_ms(), record["updated_at_ms"])
+    _validate_record(record)
+    _atomic_write(path, record)
+    return record
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-file", type=pathlib.Path, required=True)

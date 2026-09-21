@@ -60,6 +60,61 @@ class UpgradeTransactionTests(unittest.TestCase):
             self.assertEqual(record["failure_reason"], "doctor_failed")
             self.assertFalse(any(record["completion"].values()))
         finally: temp.cleanup()
+    def test_deferred_cleanup_can_complete_only_exact_cleanup_failure(self):
+        temp, path = self.fixture()
+        try:
+            record = mod.start(path, CUMG, HANDOFF, "upgrade-cleanup")
+            flags = tuple(flag for flag in mod.COMPLETION_FLAGS if flag != "cleanup_completed")
+            mod.advance(
+                path, phase="cleanup", runtime_generation="runtime-a-b",
+                rollback_asset="runtime-upgrade-test", mutation_owner="v2", mutation_epoch=2,
+                flags=flags,
+            )
+            mod.fail(
+                path, status="operator_action_required", reason="cleanup_safety_refusal",
+                operator_action="inspect_upgrade_status",
+            )
+            inspected = mod.inspect_deferred_cleanup(
+                path, expected_cumg_source_commit=CUMG, expected_runtime_generation="runtime-a-b"
+            )
+            self.assertEqual(inspected["transaction_id"], "upgrade-cleanup")
+            completed = mod.complete_deferred_cleanup(
+                path, expected_transaction_id="upgrade-cleanup",
+                expected_cumg_source_commit=CUMG, expected_runtime_generation="runtime-a-b",
+            )
+            self.assertEqual(completed["status"], "completed")
+            self.assertTrue(all(completed["completion"].values()))
+        finally:
+            temp.cleanup()
+
+    def test_deferred_cleanup_refuses_identity_or_incomplete_prior_gates(self):
+        temp, path = self.fixture()
+        try:
+            mod.start(path, CUMG, HANDOFF, "upgrade-cleanup")
+            flags = tuple(
+                flag for flag in mod.COMPLETION_FLAGS
+                if flag not in {"cleanup_completed", "doctor_healthy"}
+            )
+            mod.advance(
+                path, phase="cleanup", runtime_generation="runtime-a-b",
+                rollback_asset="runtime-upgrade-test", mutation_owner="v2", mutation_epoch=2,
+                flags=flags,
+            )
+            mod.fail(
+                path, status="operator_action_required", reason="cleanup_safety_refusal",
+                operator_action="inspect_upgrade_status",
+            )
+            with self.assertRaisesRegex(mod.TransactionError, "deferred_cleanup_completion_contract_mismatch"):
+                mod.inspect_deferred_cleanup(
+                    path, expected_cumg_source_commit=CUMG, expected_runtime_generation="runtime-a-b"
+                )
+            with self.assertRaisesRegex(mod.TransactionError, "deferred_cleanup_identity_mismatch"):
+                mod.inspect_deferred_cleanup(
+                    path, expected_cumg_source_commit=CUMG, expected_runtime_generation="runtime-other"
+                )
+        finally:
+            temp.cleanup()
+
     def test_group_writable_record_is_rejected(self):
         temp, path = self.fixture()
         try:
