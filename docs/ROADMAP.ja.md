@@ -36,7 +36,7 @@ completion provable?
 
 ## Released baseline: `0.5.x`; next planned feature minor: `0.6.0`
 
-`v0.5.0` が released **Least-privilege Workspace** baseline です。#313/#105/#83/#107/#319/#323 と final #314 schema/config/readiness/upgrade integration gate を完了し、#308 では runtime authority を変えず Windows npm/CSPRNG recurrence coverage を追加しました。#139 signed-token dogfood と #228 physical Linux FIDO2 は別の support-claim gate のままです。次の planned feature minor は **`v0.6.0` — Managed Developer Execution** です。
+`v0.5.0` が released **Least-privilege Workspace** baseline です。#313/#105/#83/#107/#319/#323 と final #314 schema/config/readiness/upgrade integration gate を完了し、#308 では runtime authority を変えず Windows npm/CSPRNG recurrence coverage を追加しました。次の planned feature minor は **`v0.6.0` — Managed Developer Execution** です。#139/#217/#228 の remaining acceptance は **`v0.5.0` より後ろ**の **Post-v0.5 — Support Claim Expansion** milestone で別追跡します。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -61,8 +61,8 @@ release closeout は次の順で完了しました。
 
 1. **#221 / PR #271をmerge/verify済み**。typed backend-neutral semantic constraint boundary、full regression/CI、EN/JA normative docsを完了。
 2. standing [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateで **`0.4.0` release closeoutを完了済み**。version/durable-schema compatibility、source-free candidate artifact、clean install/upgrade/rollback、doctor/status、recovery/no-replay、dependency/CodeQL、docs、release noteを確認しました。
-3. generic signed-token identityをrelease-supportedと表現する前に **#139 signed-token dogfood** を完了する。artifactにimplementationが入っていても、acceptance前はsupport claimを保留できる。
-4. **#227 physical Windows acceptance は完了済み。** 2026-09-19 の trusted interactive-desktop run で cancel -> approve -> exact durable resolution -> restart/no-replay まで PASS しました。**#228 support は defer** し、physical Linux + real UV-capable FIDO2 acceptance まで Linux online recovery は unsupported とします。#217 は parity 用に OPEN 維持します。
+3. **#139 implementation は released historical baseline に含まれ、remaining signed-token dogfood は Post-v0.5 acceptance work。** provider-specific support claim は evidence 完了まで accepted と表現しません。
+4. **#227 physical Windows acceptance は完了済み。** 2026-09-19 の trusted interactive-desktop run で cancel -> approve -> exact durable resolution -> restart/no-replay まで PASS しました。remaining #217/#228 parity/Linux evidence は `v0.5.0` より後ろで追跡し、`v0.4.0` を再オープンしません。
 5. **#215 implementationをrelease gateへ引き込まない。** Cloud Run designはmain上の有用なevidenceだが、hosted Hub supportは別contractのdurable-state/fencing/ingress/acceptanceが実装されるまでNO-GOのままにする。
 
 これはrelease scopeの統合であり、acceptanceの弱体化ではありません。artifactに実装が含まれても、**support claimをcompiled surfaceより狭くする**ことがあり、その境界はrelease note/statusで明示します。
@@ -83,7 +83,7 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 ## Post-v0.5 の開発シーケンス
 
-v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です。現時点で 0.5.1 release train は予定しません。released runtime の変更が本当に必要な regression、security issue、release/packaging defect が出た場合だけ patch release を開きます。#139/#217/#228 の deferred support-claim gate は v0.5.0 feature scope を再オープンしません。
+v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です。現時点で 0.5.1 release train は予定しません。released runtime の変更が本当に必要な regression、security issue、release/packaging defect が出た場合だけ patch release を開きます。remaining #139/#217/#228 acceptance は **v0.5.0 より後ろ**の unnumbered Post-v0.5 Support Claim Expansion track に置き、released minor を再オープンしません。
 
 次の numbered feature minor は **v0.6.0 — Managed Developer Execution** です。feature boundary は意図的に小さく保ち、OPEN だからという理由だけで unrelated hosted / recovery research / operator UX work を吸収しません。
 
@@ -178,7 +178,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
-- **Released-baseline support-claim gate:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance は、すでに released の 0.4.0 baseline に対して OPEN を維持します。evidence 後に advertised support claim を広げることはできますが、0.4.0 を再オープンせず、0.6.0 も block しません。
+- **Post-v0.5 — Support Claim Expansion:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance は released `v0.5.0` baseline より後ろに配置します。implementation history は以前のreleaseにありますが、remaining work は future acceptance/evidence です。`0.4.0`/`0.5.0` を再オープンせず、explicit に admit しない限り `v0.6.0` も block しません。
 - **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E の順とし、#267 optional Linux cgroup-v2 containment は containment contract が安定した後に並行可能です。#335 が required final integration / release gate です。
 - **Operational usability / inspectability、unnumbered:** #304 は existing unified privacy-bounded runtime status を read-only MCP/Gateway 1 call として公開し、#295 は bounded human-readable --version identity を追加します。有用な cross-cutting product improvement ですが、explicit に admit しない限り v0.6.0 blocker にはしません。
 - **Recovery evidence hardening、unnumbered:** #289 は ambiguous application operation の privacy-bounded target identity を保持し、#290 は #124 self-reconciliation を exact durable backend receipt へ拡張します。reviewed target/evidence boundary に依存するため、deliberate release admission decision までは fail-closed のまま v0.6.0 外に置きます。
@@ -194,7 +194,7 @@ Cua authorization/product-boundary research #219 は [v2/V2_AUTHORIZATION_CAPABI
 
 ### `0.4.0` identity / semantic-authorization component
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) は、別の`0.5.0`ではなくintegrated `0.4.0` candidateへ移します。implementationはmerge済みで、verified external identityを既存`AuthenticatedClientPrincipal`へ落とし込み、exact principal/device/capability authorizationは変更しません。physical signed-token dogfoodが#139の最後のsupport-claim acceptanceです。
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) の implementation history は integrated `0.4.0` baseline にあります。verified external identityを既存`AuthenticatedClientPrincipal`へ落とし込み、exact principal/device/capability authorizationは変更しません。ただし still-open の physical signed-token dogfood は unfinished `0.4.0` work ではなく、`v0.5.0` より後ろの Post-v0.5 Support Claim Expansion milestone で追跡します。
 
 ```text
 external OAuth/OIDC identity provider
