@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.6.0 — 2026-09-22
+
+Managed Developer Execution release. This release adds separately authorized managed developer jobs, a provider-isolated Playwright/E2E capability, and optional reviewed Linux cgroup-v2 process containment while preserving exact authorization, bounded execution, `Indeterminate` quarantine, and permanent no-auto-replay semantics.
+
+### Managed developer execution
+
+- managed jobs use separate `ManagedJobControl` / `ManagedJobObserve` authority, stable opaque `job_` refs, bounded concurrency/output/lease/hard lifetime, explicit renew/status/output/stop, and proven process-domain termination; generic shell/process background escape is not promoted into a supported persistence mechanism (#106);
+- asynchronous managed-job termination ambiguity persists Agent fail-closed state and requires explicit offline operator recovery rather than silently reopening execution;
+- Playwright/E2E uses separate `PlaywrightTestControl` / `PlaywrightTestObserve` authority and `pwtest_` refs; its Docker/Podman-compatible provider is optional and advertised only after complete config, digest-pinned image inspection, and owner-scoped orphan recovery (#114).
+
+### Playwright sandbox boundary
+
+- the fixed provider profile uses direct argv, `--pull=never`, network none, read-only root/workspace, private writable artifacts, dropped capabilities, `no-new-privileges`, fixed non-root `pwuser`, bounded pids/memory/CPU/shm, tmpfs home/tmp, sanitized environment, fixed Playwright binary/reporter/output, and no inherited host Docker/SSH authority;
+- provider-container absence is required before terminal stop/completion/expiry; unproven provider cleanup becomes `Indeterminate`/no-replay rather than terminal success;
+- the Playwright container remains the filesystem/network sandbox boundary. Host process-group or Linux cgroup containment alone is not represented as equivalent isolation.
+
+### Linux process containment hardening
+
+- optional Linux cgroup-v2 containment is enabled only with an explicit reviewed delegated root that already contains the Agent; mount presence alone never grants stronger authority (#267);
+- each bounded process/shell operation enters a fresh operation cgroup before exec, establishes a user+cgroup namespace boundary on an `nsdelegate` cgroup-v2 host mount, and terminates via exact operation `cgroup.kill` plus `populated 0` proof;
+- Linux CI proves deliberate `setsid()` detachment, concurrent fork cleanup, migration containment, and explicit fail-closed behavior when delegation is unavailable; macOS/portable-Unix process-group and Windows Job Object claims are unchanged.
+
+### Compatibility, upgrade, and release identity
+
+- live schemas are control **12**, capability advertisement **8**, persisted device registry **8**, and Hub-Agent transport **6**; historical v0.5.0 is 10/6/8/6 and historical #106 development used 11/7;
+- persisted v0.5 registry/capability state is accepted through the reviewed migration, stale advertisements are discarded, and a fresh current Agent advertisement is required; live mixed old/new control/capability versions fail closed;
+- v0.5.0 -> v0.6.0 is a paired runtime upgrade. Rollback after v0.6 writes current capability state requires the pre-upgrade v0.5 checkpoint and version-paired v0.5 binaries/config rather than asking v0.5 to interpret v0.6 state;
+- optional Playwright/cgroup configuration defaults absent, so upgrade does not silently enable new execution authority.
+
+### Acceptance and support boundary
+
+- #106, #114, and #267 are closed before the final #335 release gate; deterministic CI, CodeQL, dependency review, docs/link checks, Linux/macOS/Windows release-candidate build/verify/smoke, schema migration, and no-replay/recovery regressions remain required on the exact release snapshot;
+- managed-job lifecycle is dogfooded on the trusted physical macOS process-control domain; Linux cgroup-v2 stronger containment is accepted only on the reviewed delegated Linux CI host; Playwright support remains conditional on a successfully probed configured provider;
+- #139 physical signed-token support, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV support remain explicitly withheld/open; hosted Cloud Run/Handoff remains unsupported;
+- the GitHub Release remains source-only unless reviewed binary assets plus required SBOM/license/provenance evidence are attached. CI release-candidate archives remain release evidence, not official binary installers.
+
 ## v0.5.0 — 2026-09-21
 
 Least-privilege Workspace release. This release adds bounded workspace observation/mutation, retrievable truncated output, private ephemeral continuation data, execution-budget hardening, and challenge-scoped guided recovery without widening shell authority or weakening `Indeterminate` quarantine/no-replay semantics.

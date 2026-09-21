@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-21 時点の status: **V1 implementation は closed で legacy/regression surface としてのみ保持し、推奨 runtime は V2、`v0.5.0` Least-privilege Workspace が released baseline、`v0.6.0` Managed Developer Execution が次の planned feature minor です。**
+2026-09-22 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.6.0` Managed Developer Execution が released baseline です。このsnapshotでは次のfeature minorは未割当です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,9 +34,9 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Released baseline: `0.5.x`; next planned feature minor: `0.6.0`
+## Released baseline: `0.6.x`
 
-`v0.5.0` が released **Least-privilege Workspace** baseline です。#313/#105/#83/#107/#319/#323 と final #314 schema/config/readiness/upgrade integration gate を完了し、#308 では runtime authority を変えず Windows npm/CSPRNG recurrence coverage を追加しました。次の planned feature minor は **`v0.6.0` — Managed Developer Execution** です。#139/#217/#228 の remaining acceptance は **`v0.6.x — Support Claim Expansion`** track で別追跡します。implementation history は以前のreleaseにありますが、新しい provider/platform support claim は v0.6 release line またはそれ以降のminorで初めて正式化し、`v0.4.0`/`v0.5.0` のsupport contractへ遡及させません。
+`v0.6.0` が released **Managed Developer Execution** baseline です。#106 managed jobs、#114 sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 hardening、final #335 schema/artifact/upgrade/readiness integrationを完了します。exact release scopeは [`v2/V2_060_RELEASE_SCOPE.ja.md`](v2/V2_060_RELEASE_SCOPE.ja.md) に記録します。#139/#217/#228 のremaining acceptanceはnon-blocking **`v0.6.x — Support Claim Expansion`** trackのままで、older support contractを遡及拡大しません。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -83,7 +83,7 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 ## Post-v0.5 の開発シーケンス
 
-v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です。現時点で 0.5.1 release train は予定しません。released runtime の変更が本当に必要な regression、security issue、release/packaging defect が出た場合だけ patch release を開きます。remaining #139/#217/#228 acceptance は non-blocking の **v0.6.x Support Claim Expansion** track に置きます。v0.6.0 release freezeまでにacceptanceが完了すればそのsupport claimをv0.6.0へ含められ、間に合わなければ明示的にwithholdしたままlater v0.6.xまたはlater minorへ送ります。older released minorは再オープンしません。
+v0.6.0 は released / frozen の **Managed Developer Execution** baseline です。0.6.x patch は compatible regression、security issue、release/packaging defect、または明示的にadmitしたsupport-claim expansionに限ります。#139/#217/#228 は non-blocking の **v0.6.x Support Claim Expansion** track に残し、v0.6.0では明示的にwithholdします。later acceptanceでv0.6.0やolder released minorのsupport contractを遡及拡大しません。
 
 次の numbered feature minor は **v0.6.0 — Managed Developer Execution** です。feature boundary は意図的に小さく保ち、OPEN だからという理由だけで unrelated hosted / recovery research / operator UX work を吸収しません。
 
@@ -105,7 +105,7 @@ v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です�
 
 次の work は **default では v0.6.0 に admit しません**: Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、general operator/consumer ergonomics (#295/#304)。これらは下記で visibility を維持し、bounded な理由を伴う explicit roadmap/milestone change がある場合だけ admit します。
 
-released v0.5.0 baseline は control schema 10、capability schema 6、registry schema 8、Hub-Agent schema 6 を pin します。v0.6 development では #106 の historical live pairing が 11/7、#114 により current live control/capability pairing が 12/8 へ進み、registry schema は8、Hub-Agent schema は6のままです。mixed live version は fail closed です。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。separate reviewed policy model を deliberate に追加しない限り、v0.5.0 は per-principal path/root isolation を support claim しません。
+released v0.6.0 baseline は control schema 12、capability schema 8、registry schema 8、Hub-Agent schema 6 を pin します。released v0.5.0 は 10/6/8/6、historical #106 development は 11/7 でした。mixed live version は fail closed で、persisted v0.5 registry state は reviewed historical pairingだけをmigrationし、stale capability advertisementを捨ててからfresh v0.6 advertisementを要求します。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。
 
 minor number は working release boundary であり calendar promise ではありません。implementation が artifact に含まれていても、optional platform/provider support claim は explicit acceptance まで保留します。
 
