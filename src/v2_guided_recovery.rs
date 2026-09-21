@@ -118,6 +118,47 @@ pub enum GuidedRecoveryRevalidationError {
     DecisionNoLongerSupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidedRecoveryReviewLifecycle {
+    Current { remaining_ms: u64 },
+    Expired,
+    BindingChanged,
+}
+
+pub fn same_guided_recovery_challenge_binding(
+    reviewed: &RecoveryChallenge,
+    current: &RecoveryChallenge,
+) -> bool {
+    reviewed.schema_version == current.schema_version
+        && reviewed.phase == current.phase
+        && reviewed.device_id == current.device_id
+        && reviewed.operation_id == current.operation_id
+        && reviewed.quarantine_generation == current.quarantine_generation
+        && reviewed.current_generation == current.current_generation
+        && reviewed.quarantine_fingerprint == current.quarantine_fingerprint
+        && reviewed.nonce == current.nonce
+        && reviewed.issued_at_ms == current.issued_at_ms
+        && reviewed.expires_at_ms == current.expires_at_ms
+        && reviewed.signature == current.signature
+}
+
+pub fn classify_guided_recovery_review_lifecycle(
+    reviewed: &RecoveryChallenge,
+    current: Option<&RecoveryChallenge>,
+    now_ms: u64,
+) -> GuidedRecoveryReviewLifecycle {
+    if now_ms >= reviewed.expires_at_ms {
+        return GuidedRecoveryReviewLifecycle::Expired;
+    }
+    if !current.is_some_and(|candidate| same_guided_recovery_challenge_binding(reviewed, candidate))
+    {
+        return GuidedRecoveryReviewLifecycle::BindingChanged;
+    }
+    GuidedRecoveryReviewLifecycle::Current {
+        remaining_ms: reviewed.expires_at_ms.saturating_sub(now_ms),
+    }
+}
+
 /// Compose a privacy-bounded plan from an already verified Hub challenge and the
 /// exact #233 incident brief. Observational diagnostics are copied only as a
 /// presence bit; they never create or widen decisions.
@@ -579,6 +620,101 @@ mod tests {
                 ReconciliationSupportedDecision::ConfirmedNotExecuted,
             ),
             Err(GuidedRecoveryRevalidationError::ReinspectRequired)
+        );
+    }
+
+    #[test]
+    fn guided_review_expires_while_waiting_and_requires_re_review() {
+        let reviewed = challenge();
+        assert_eq!(
+            classify_guided_recovery_review_lifecycle(
+                &reviewed,
+                Some(&reviewed),
+                reviewed.expires_at_ms - 1,
+            ),
+            GuidedRecoveryReviewLifecycle::Current { remaining_ms: 1 }
+        );
+        assert_eq!(
+            classify_guided_recovery_review_lifecycle(
+                &reviewed,
+                Some(&reviewed),
+                reviewed.expires_at_ms,
+            ),
+            GuidedRecoveryReviewLifecycle::Expired
+        );
+    }
+
+    #[test]
+    fn guided_review_generation_change_invalidates_old_prompt() {
+        let reviewed = challenge();
+        let mut changed = challenge();
+        changed.current_generation += 1;
+        changed.nonce = [7; 32];
+        changed.issued_at_ms += 1;
+        changed.expires_at_ms += 1;
+        changed.signature = vec![8; 64];
+        assert_eq!(
+            classify_guided_recovery_review_lifecycle(&reviewed, Some(&changed), 100),
+            GuidedRecoveryReviewLifecycle::BindingChanged
+        );
+    }
+
+    #[test]
+    fn selection_expiring_before_signing_cannot_revalidate_or_carry_forward() {
+        let incident = brief(Vec::new());
+        let reviewed_challenge = challenge();
+        let reviewed = compose_guided_recovery_plan(&incident, &reviewed_challenge);
+        assert_eq!(
+            classify_guided_recovery_review_lifecycle(
+                &reviewed_challenge,
+                Some(&reviewed_challenge),
+                reviewed_challenge.expires_at_ms - 1,
+            ),
+            GuidedRecoveryReviewLifecycle::Current { remaining_ms: 1 }
+        );
+
+        let mut refreshed_challenge = challenge();
+        refreshed_challenge.current_generation += 1;
+        refreshed_challenge.nonce = [6; 32];
+        refreshed_challenge.issued_at_ms = reviewed_challenge.expires_at_ms + 1;
+        refreshed_challenge.expires_at_ms = refreshed_challenge.issued_at_ms + 300_000;
+        refreshed_challenge.signature = vec![7; 64];
+        let mut refreshed_incident = incident.clone();
+        refreshed_incident.operation.current_generation =
+            Some(refreshed_challenge.current_generation);
+        let refreshed = compose_guided_recovery_plan(&refreshed_incident, &refreshed_challenge);
+
+        assert_eq!(
+            classify_guided_recovery_review_lifecycle(
+                &reviewed_challenge,
+                Some(&refreshed_challenge),
+                reviewed_challenge.expires_at_ms,
+            ),
+            GuidedRecoveryReviewLifecycle::Expired
+        );
+        assert_eq!(
+            revalidate_guided_human_historical_selection(
+                &reviewed,
+                &refreshed,
+                ReconciliationSupportedDecision::ConfirmedCompleted,
+            ),
+            Err(GuidedRecoveryRevalidationError::ReinspectRequired)
+        );
+    }
+
+    #[test]
+    fn refreshed_review_is_current_only_after_fresh_binding_is_reviewed() {
+        let mut refreshed = challenge();
+        refreshed.current_generation += 1;
+        refreshed.nonce = [10; 32];
+        refreshed.issued_at_ms = 20_000;
+        refreshed.expires_at_ms = 320_000;
+        refreshed.signature = vec![11; 64];
+        assert_eq!(
+            classify_guided_recovery_review_lifecycle(&refreshed, Some(&refreshed), 20_001),
+            GuidedRecoveryReviewLifecycle::Current {
+                remaining_ms: 299_999
+            }
         );
     }
 
