@@ -36,7 +36,7 @@ completion provable?
 
 ## Released baseline: `0.5.x`; next planned feature minor: `0.6.0`
 
-`v0.5.0` が released **Least-privilege Workspace** baseline です。#313/#105/#83/#107/#319/#323 と final #314 schema/config/readiness/upgrade integration gate を完了し、#308 では runtime authority を変えず Windows npm/CSPRNG recurrence coverage を追加しました。次の planned feature minor は **`v0.6.0` — Managed Developer Execution** です。#139/#217/#228 の remaining acceptance は **`v0.5.0` より後ろ**の **Post-v0.5 — Support Claim Expansion** milestone で別追跡します。
+`v0.5.0` が released **Least-privilege Workspace** baseline です。#313/#105/#83/#107/#319/#323 と final #314 schema/config/readiness/upgrade integration gate を完了し、#308 では runtime authority を変えず Windows npm/CSPRNG recurrence coverage を追加しました。次の planned feature minor は **`v0.6.0` — Managed Developer Execution** です。#139/#217/#228 の remaining acceptance は **`v0.6.x — Support Claim Expansion`** track で別追跡します。implementation history は以前のreleaseにありますが、新しい provider/platform support claim は v0.6 release line またはそれ以降のminorで初めて正式化し、`v0.4.0`/`v0.5.0` のsupport contractへ遡及させません。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -83,7 +83,7 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 ## Post-v0.5 の開発シーケンス
 
-v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です。現時点で 0.5.1 release train は予定しません。released runtime の変更が本当に必要な regression、security issue、release/packaging defect が出た場合だけ patch release を開きます。remaining #139/#217/#228 acceptance は **v0.5.0 より後ろ**の unnumbered Post-v0.5 Support Claim Expansion track に置き、released minor を再オープンしません。
+v0.5.0 は released / frozen の **Least-privilege Workspace** baseline です。現時点で 0.5.1 release train は予定しません。released runtime の変更が本当に必要な regression、security issue、release/packaging defect が出た場合だけ patch release を開きます。remaining #139/#217/#228 acceptance は non-blocking の **v0.6.x Support Claim Expansion** track に置きます。v0.6.0 release freezeまでにacceptanceが完了すればそのsupport claimをv0.6.0へ含められ、間に合わなければ明示的にwithholdしたままlater v0.6.xまたはlater minorへ送ります。older released minorは再オープンしません。
 
 次の numbered feature minor は **v0.6.0 — Managed Developer Execution** です。feature boundary は意図的に小さく保ち、OPEN だからという理由だけで unrelated hosted / recovery research / operator UX work を吸収しません。
 
@@ -178,7 +178,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
-- **Post-v0.5 — Support Claim Expansion:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance は released `v0.5.0` baseline より後ろに配置します。implementation history は以前のreleaseにありますが、remaining work は future acceptance/evidence です。`0.4.0`/`0.5.0` を再オープンせず、explicit に admit しない限り `v0.6.0` も block しません。
+- **`v0.6.x — Support Claim Expansion`（v0.6.0にはnon-blocking）:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。evidence完了後にv0.6のsupport contractを広げられます。v0.6.0 freezeまでにacceptanceが完了すればv0.6.0へ含め、間に合わなければclaimをwithholdして明示的に後続へ送ります。older releaseを後からsupported扱いにはしません。
 - **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E の順とし、#267 optional Linux cgroup-v2 containment は containment contract が安定した後に並行可能です。#335 が required final integration / release gate です。
 - **Operational usability / inspectability、unnumbered:** #304 は existing unified privacy-bounded runtime status を read-only MCP/Gateway 1 call として公開し、#295 は bounded human-readable --version identity を追加します。有用な cross-cutting product improvement ですが、explicit に admit しない限り v0.6.0 blocker にはしません。
 - **Recovery evidence hardening、unnumbered:** #289 は ambiguous application operation の privacy-bounded target identity を保持し、#290 は #124 self-reconciliation を exact durable backend receipt へ拡張します。reviewed target/evidence boundary に依存するため、deliberate release admission decision までは fail-closed のまま v0.6.0 外に置きます。
@@ -194,7 +194,7 @@ Cua authorization/product-boundary research #219 は [v2/V2_AUTHORIZATION_CAPABI
 
 ### `0.4.0` identity / semantic-authorization component
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) の implementation history は integrated `0.4.0` baseline にあります。verified external identityを既存`AuthenticatedClientPrincipal`へ落とし込み、exact principal/device/capability authorizationは変更しません。ただし still-open の physical signed-token dogfood は unfinished `0.4.0` work ではなく、`v0.5.0` より後ろの Post-v0.5 Support Claim Expansion milestone で追跡します。
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) の implementation history は integrated `0.4.0` baseline にあります。verified external identityを既存`AuthenticatedClientPrincipal`へ落とし込み、exact principal/device/capability authorizationは変更しません。ただし still-open の physical signed-token dogfood は unfinished `0.4.0` work ではなく、`v0.6.x — Support Claim Expansion` milestone で追跡し、advertised support claim は v0.6 release以降でのみ有効化します。
 
 ```text
 external OAuth/OIDC identity provider
