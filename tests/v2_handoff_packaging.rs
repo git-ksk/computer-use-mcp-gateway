@@ -88,8 +88,14 @@ fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     assert!(upgrade.contains("\"schema_version\": 4"));
     assert!(upgrade.contains("--handoff-control-socket"));
     assert!(upgrade.contains("v2_handoff_runtime_cleanup.py"));
+    assert!(upgrade.contains("--expected-package-version"));
+    assert!(upgrade.contains("--expected-hub-agent-schema-version"));
+    assert!(upgrade.contains("--expected-control-schema-version"));
+    assert!(upgrade.contains("--expected-capability-schema-version"));
     assert!(upgrade.contains("--health-confirmed"));
 
+    assert!(cleanup.contains("manifest.get(\"schema_version\") != 4"));
+    assert!(cleanup.contains("runtime_manifest_not_paired"));
     assert!(cleanup.contains("runtime_candidate_contains_symlink"));
     assert!(cleanup.contains("runtime_candidate_contains_forbidden_material"));
     assert!(cleanup.contains("active_runtime_unresolved"));

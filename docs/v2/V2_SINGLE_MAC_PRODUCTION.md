@@ -94,6 +94,27 @@ v2_maint upgrade-status
 
 `in_progress` means only that the last durable phase was recorded; it is **not** permission to start another upgrade. Check the one-shot launchd job with `scripts/v2_launchd_maintenance_job.py inspect`. If that job is still active, let the same invocation finish. If it is no longer active while the transaction remains `in_progress`, treat the transaction as incomplete and inspect before any new run. `failed_before_install` means the transaction failed before the install boundary; `failed_closed_after_stop` means the operator must assume services may intentionally be stopped and inspect the recorded rollback asset before recovery; `operator_action_required` means an attempted restore/cleanup/status update could not establish a clean automatic conclusion. A new transaction refuses to overwrite an `in_progress`, `failed_closed_after_stop`, or `operator_action_required` record.
 
+A narrowly scoped deferred-cleanup remediation exists for the specific terminal state `operator_action_required / cleanup / cleanup_safety_refusal`. Use it only after `v2_doctor` is healthy, the installed schema-4 runtime manifest verifies the exact package/source/Hub-Agent/control/capability identity, the Handoff status is idle, quarantine remains zero, and the transaction reports every completion gate except `cleanup_completed=true`. First run `scripts/v2_deferred_cleanup_recovery.py` without `--apply`; the plan is read-only and the transaction remains unchanged. If the plan is expected, repeat with `--health-confirmed --apply`. The remediation revalidates the exact active runtime generation and transaction identity, runs the normal fail-closed Handoff runtime cleanup, and only after that cleanup succeeds marks `cleanup_completed` and completes that same transaction. It cannot start/retry an upgrade, change quarantine, transfer mutation authority, restore rollback state, or replay work. Any other failure status/reason, identity mismatch, missing prior completion gate, ambiguous active runtime, or unsafe cleanup candidate is refused.
+
+Example (values must come from the verified installed runtime/release, not from guesswork):
+
+```bash
+ROOT="$HOME/Library/Application Support/computer-use-mcp-gateway"
+python3 scripts/v2_deferred_cleanup_recovery.py \
+  --install-root "$ROOT" \
+  --agent-plist "$HOME/Library/LaunchAgents/com.github.git-ksk.cumg-v2-agent.plist" \
+  --rollback-root "$ROOT/rollback" \
+  --runtime-manifest "$ROOT/runtime-manifest.json" \
+  --transaction-file "$ROOT/v2/maintenance/upgrade-transaction.json" \
+  --expected-source-commit <verified-40-hex-cumg-commit> \
+  --expected-package-version <verified-package-version> \
+  --expected-hub-agent-schema-version <verified-hub-agent-schema> \
+  --expected-control-schema-version <verified-control-schema> \
+  --expected-capability-schema-version <verified-capability-schema> \
+  --keep-recent 2
+# Re-run the same command with --health-confirmed --apply only after reviewing the plan.
+```
+
 Single-Mac maintenance is explicitly one-shot. Do **not** use `launchctl submit` for an upgrade/recovery command: launchd can infer persistence/relaunch behavior from an underspecified submitted job. `scripts/v2_launchd_maintenance_job.py run-upgrade` is the reviewed launchd wrapper for the upgrade helper. It writes an owner-private temporary plist with `RunAtLoad=true` and `KeepAlive=false`, forwards only the closed non-secret environment allowlist needed by the upgrade helper, verifies the job's launchd `runs` count never exceeds one even when the upgrade exits non-zero, and always boots the job out and deletes its temporary plist before returning. It never retries a failed upgrade.
 
 Before any upgrade, both the wrapper and `v2-single-mac-upgrade.sh` inspect the current GUI launchd domain for known current/legacy CUMG maintenance labels. Any loaded job other than the wrapper's exact current label fails preflight with `stale_maintenance_jobs`; an active job is never auto-terminated. Use `scripts/v2_launchd_maintenance_job.py inspect` for privacy-bounded state/runs/last-exit diagnostics. After confirming a stale job is not running, `cleanup-stale` may boot it out and remove only a matching private temporary plist. The cleanup path refuses while any matching maintenance job is active.

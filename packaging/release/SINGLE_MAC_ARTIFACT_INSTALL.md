@@ -63,3 +63,6 @@ python3 install/v2_launchd_maintenance_job.py run-upgrade --artifact-bundle "$PW
 ```
 
 This reuses the durable upgrade transaction, service drain, exact rollback bundle, mutation-authority fences, post-upgrade doctor, Handoff runtime retention, and no-auto-retry behavior of the reviewed upgrade path. The historical source-build mode remains maintainer-only.
+## Deferred cleanup remediation
+
+If an otherwise healthy upgrade ends specifically as `operator_action_required / cleanup / cleanup_safety_refusal`, do not rerun the upgrade or edit the durable transaction by hand. The bundle includes `install/v2_deferred_cleanup_recovery.py`, which first supports a read-only plan and then an explicit `--health-confirmed --apply` path. It accepts only that exact deferred-cleanup terminal state, revalidates the active runtime plus package/source/Hub-Agent/control/capability identity, runs the normal fail-closed Handoff runtime cleanup, and completes the same transaction only after cleanup succeeds. Any other transaction state or identity mismatch is refused. See `docs/v2/V2_SINGLE_MAC_PRODUCTION.md` in the repository for the full operator procedure.

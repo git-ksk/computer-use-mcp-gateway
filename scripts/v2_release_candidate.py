@@ -52,6 +52,7 @@ MACOS_INSTALL_ASSETS = (
     "install/v2_mutation_authority_preflight.py",
     "install/v2_handoff_runtime_preflight.py",
     "install/v2_handoff_runtime_cleanup.py",
+    "install/v2_deferred_cleanup_recovery.py",
     "install/README.md",
     "install/single-mac-profile.example.json",
     "launchd/com.github.git-ksk.cumg-v2-agent.plist",

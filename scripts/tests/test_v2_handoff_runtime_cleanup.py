@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json
 import importlib.util
 import os
 from pathlib import Path
@@ -14,6 +15,10 @@ assert spec.loader is not None
 spec.loader.exec_module(cleanup_module)
 
 COMMIT = "a" * 40
+PACKAGE_VERSION = "0.5.0"
+HUB_AGENT_SCHEMA_VERSION = 6
+CONTROL_SCHEMA_VERSION = 10
+CAPABILITY_SCHEMA_VERSION = 6
 
 
 def write_plist(path: Path, script: Path, env_file: Path) -> None:
@@ -40,7 +45,14 @@ class RuntimeCleanupTests(unittest.TestCase):
         os.chmod(env_file, 0o600)
         manifest = root / "runtime-manifest.json"
         manifest.write_text(
-            '{"schema_version":3,"hub_agent_schema_version":5,"source_commit":"' + COMMIT + '"}',
+            json.dumps({
+                "schema_version": 4,
+                "hub_agent_schema_version": HUB_AGENT_SCHEMA_VERSION,
+                "control_schema_version": CONTROL_SCHEMA_VERSION,
+                "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
+                "source_commit": COMMIT,
+                "package_version": PACKAGE_VERSION,
+            }),
             encoding="utf-8",
         )
         agent_plist = Path(temp.name) / "agent.plist"
@@ -61,6 +73,10 @@ class RuntimeCleanupTests(unittest.TestCase):
             rollback_root=str(rollback),
             runtime_manifest=str(manifest),
             expected_source_commit=COMMIT,
+            expected_package_version=PACKAGE_VERSION,
+            expected_hub_agent_schema_version=HUB_AGENT_SCHEMA_VERSION,
+            expected_control_schema_version=CONTROL_SCHEMA_VERSION,
+            expected_capability_schema_version=CAPABILITY_SCHEMA_VERSION,
             keep_recent=keep_recent,
             health_confirmed=True,
             apply=True,
@@ -110,7 +126,6 @@ class RuntimeCleanupTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(payload)
                 manifest_files.append({"path": relative, "sha256": hashlib.sha256(payload).hexdigest()})
-            import json
             (archived / "runtime-generation-manifest.json").write_text(json.dumps({
                 "schema_version": 1,
                 "archive_complete": True,
@@ -154,7 +169,6 @@ class RuntimeCleanupTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(payload)
                 manifest_files.append({"path": relative, "sha256": hashlib.sha256(payload).hexdigest()})
-            import json
             (archived / "runtime-generation-manifest.json").write_text(json.dumps({
                 "schema_version": 1,
                 "archive_complete": True,
@@ -189,6 +203,36 @@ class RuntimeCleanupTests(unittest.TestCase):
             self.assertTrue(old.exists())
             self.assertTrue(unsafe.exists())
             self.assertEqual(target.read_text(encoding="utf-8"), "do-not-touch")
+
+    def test_schema4_manifest_requires_exact_release_identity(self):
+        temp, root, handoff, rollback, env_file, manifest, agent_plist = self.fixture()
+        with temp:
+            active = self.runtime(handoff, "runtime-aaaaaaa-bbbbbbb", 50)
+            env_file.write_text(f"CUMG_V2_HANDOFF_ROOT={active / 'handoff-root'}\n", encoding="utf-8")
+            os.chmod(env_file, 0o600)
+            write_plist(agent_plist, active / "v2_handoff_runtime.mjs", env_file)
+            base = json.loads(manifest.read_text(encoding="utf-8"))
+            mutations = (
+                ("schema_version", 3),
+                ("schema_version", 5),
+                ("source_commit", "b" * 40),
+                ("package_version", "0.5.1"),
+                ("hub_agent_schema_version", HUB_AGENT_SCHEMA_VERSION + 1),
+                ("control_schema_version", CONTROL_SCHEMA_VERSION + 1),
+                ("capability_schema_version", CAPABILITY_SCHEMA_VERSION + 1),
+            )
+            for key, value in mutations:
+                candidate = dict(base)
+                candidate[key] = value
+                manifest.write_text(json.dumps(candidate), encoding="utf-8")
+                with self.subTest(key=key, value=value):
+                    with self.assertRaisesRegex(cleanup_module.CleanupRefusal, "runtime_manifest_not_paired"):
+                        cleanup_module.cleanup(self.args(root, rollback, manifest, agent_plist))
+            manifest.write_text(json.dumps(base), encoding="utf-8")
+            removed, protected, retained = cleanup_module.cleanup(
+                self.args(root, rollback, manifest, agent_plist, keep_recent=0)
+            )
+            self.assertEqual((removed, protected, retained), (0, 1, 0))
 
     def test_apply_requires_explicit_health_confirmation(self):
         temp, root, handoff, rollback, env_file, manifest, agent_plist = self.fixture()
