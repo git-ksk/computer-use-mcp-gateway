@@ -101,6 +101,14 @@ A provider is compatible only if its adapter can preserve or conservatively map 
 
 This allows a physical endpoint, a native backend, or a managed cloud desktop to sit below the same CUMG execution-safety layer when the evidence semantics are sufficient.
 
+## Playwright sandbox provider (#114)
+
+The v0.6 Playwright runner is an example of the provider seam rather than a change to the product boundary. CUMG owns typed Playwright authority, request validation, opaque-ref ownership, lifecycle ambiguity handling, the artifact metadata boundary, and no-replay semantics. The operator-selected Docker/Podman-compatible runtime owns the actual container/VM isolation primitive.
+
+CUMG therefore does not provision the runtime, start its daemon, pull the image, build a VM pool, or make macOS sandbox-exec / SBPL part of the product contract. On macOS and Windows, a container runtime may itself depend on a VM; that infrastructure remains external. On Linux, container isolation remains required for the Playwright claim even if optional #267 cgroup-v2 host-process containment is also enabled.
+
+The initial profile supports only network none. A project-local web server can run in the same container and use loopback. External-origin networking is deferred until the execution provider can enforce a reviewed network policy below CUMG. URL/CLI filtering is not an acceptable substitute.
+
 ## Competitive and design implication
 
 CUMG should not compete on the claim that it has "a policy engine" or "an agent computer". Those categories have substantial adjacent implementations.

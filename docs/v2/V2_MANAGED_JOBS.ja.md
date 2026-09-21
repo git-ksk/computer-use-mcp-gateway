@@ -102,12 +102,10 @@ job は既発行 lease / hard lifetime により bounded のままです。
 
 ## Schema compatibility
 
-Issue #106 では live control schema を `11`、capability schema を `7` に進めます。
-outer signed envelope shape は変わらないため Hub-Agent envelope schema は `6` のままです。
-control/capability schema mismatch は fail closed します。
+Issue #106 は historical v0.6 development pairing として control schema 11 / capability schema 7 を導入しました。Issue #114 により current live v0.6 pairing は control schema 12 / capability schema 8 へ進みますが、#106 managed-job semantics 自体は維持します。outer signed envelope shape は変わらないため Hub-Agent envelope schema は6のままです。control/capability schema mismatch は fail closed します。
 
-persisted registry shape は引き続き schema `8` です。
-released v0.5 の `registry 8 / capability 6` は historical pairing としてのみ restore でき、stale capability advertisement は捨てられます。
-dispatch 前には current v0.6 capability schema `7` の fresh advertisement が必須です。
+persisted registry shape は引き続き schema 8 です。released v0.5 の 8/6 と historical #106 v0.6 の 8/7 は historical pairing としてのみ restore でき、stale capability advertisement は捨てられます。current dispatch 前には registry 8 / capability 8 の fresh advertisement が必須です。
 
-Agent checkpoint schema は `5` のままで、managed-job fail-closed field は historical checkpoint に対して safe default を持つ additive field です。
+Agent checkpoint schema は5のままで、managed-job fail-closed field は historical checkpoint に対して safe default を持つ additive field です。
+
+Playwright sandbox job は内部で lifecycle primitive を再利用しますが、northbound では generic managed job ではありません。別 exact capability と別 pwtest_ ref registry を使い、ManagedJobControl / ManagedJobObserve では Playwright test を操作できません。

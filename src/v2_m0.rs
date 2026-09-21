@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 11;
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 7;
+pub const CONTROL_SCHEMA_VERSION: u16 = 12;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 8;
 /// First dedicated persisted registry schema. The numeric value intentionally
 /// matches the last historical control schema that was written into this field,
 /// so current rollback binaries can still read newly persisted checkpoints.
@@ -59,6 +59,8 @@ pub enum DeviceCapability {
     ReadProcessOutput,
     ManagedJobControl,
     ManagedJobObserve,
+    PlaywrightTestControl,
+    PlaywrightTestObserve,
     ReadFile,
     ListDirectory,
     WriteWorkspaceFile,
@@ -117,6 +119,7 @@ impl DeviceCapability {
             | Self::Screenshot
             | Self::ReadProcessOutput
             | Self::ManagedJobObserve
+            | Self::PlaywrightTestObserve
             | Self::ReadFile
             | Self::ListDirectory
             | Self::ListWindows
@@ -151,6 +154,7 @@ impl DeviceCapability {
             Self::ExecuteProcess
             | Self::Shell
             | Self::ManagedJobControl
+            | Self::PlaywrightTestControl
             | Self::TerminateApplication
             | Self::BrowserUploadFile
             | Self::BrowserDownload
@@ -633,6 +637,21 @@ pub enum DeviceCommand {
     ManagedJobStop {
         locator: String,
     },
+    PlaywrightTestStart {
+        request: crate::v2_playwright_sandbox::PlaywrightTestRequest,
+    },
+    PlaywrightTestStatus {
+        locator: String,
+    },
+    PlaywrightTestOutput {
+        locator: String,
+        stream: ProcessOutputStream,
+        offset: u64,
+        max_bytes: u64,
+    },
+    PlaywrightTestStop {
+        locator: String,
+    },
     ReadFile {
         path: String,
         #[serde(default)]
@@ -796,6 +815,12 @@ impl DeviceCommand {
             Self::ManagedJobStatus { .. } | Self::ManagedJobOutput { .. } => {
                 DeviceCapability::ManagedJobObserve
             }
+            Self::PlaywrightTestStart { .. } | Self::PlaywrightTestStop { .. } => {
+                DeviceCapability::PlaywrightTestControl
+            }
+            Self::PlaywrightTestStatus { .. } | Self::PlaywrightTestOutput { .. } => {
+                DeviceCapability::PlaywrightTestObserve
+            }
             Self::ReadFile { .. } => DeviceCapability::ReadFile,
             Self::ListDirectory { .. } => DeviceCapability::ListDirectory,
             Self::WriteWorkspaceFile { .. } => DeviceCapability::WriteWorkspaceFile,
@@ -843,6 +868,8 @@ impl DeviceCommand {
                 | Self::ReadProcessOutput { .. }
                 | Self::ManagedJobStatus { .. }
                 | Self::ManagedJobOutput { .. }
+                | Self::PlaywrightTestStatus { .. }
+                | Self::PlaywrightTestOutput { .. }
                 | Self::ReadFile { .. }
                 | Self::ListDirectory { .. }
                 | Self::ListWindows { .. }
@@ -1047,18 +1074,22 @@ impl DeviceRegistry {
         // the pairing before discarding stale capability advertisements so a
         // checkpoint can never be reinterpreted under a different capability
         // schema after upgrade.
-        let expected_capability_schema = match snapshot.schema_version {
-            2 => 2,
-            3 => 3,
-            4..=6 => 4,
-            7 => 5, // released v0.4.0
-            8 => 6, // released v0.5.0; same persisted registry shape, older live capability schema
-            got => return Err(ControlError::UnsupportedControlSchema { got }),
-        };
         for device in &snapshot.devices {
-            if let Some(capabilities) = &device.capabilities
-                && capabilities.capability_schema_version != expected_capability_schema
-            {
+            let Some(capabilities) = &device.capabilities else {
+                continue;
+            };
+            let capability_schema = capabilities.capability_schema_version;
+            let valid_pairing = match snapshot.schema_version {
+                2 => capability_schema == 2,
+                3 => capability_schema == 3,
+                4..=6 => capability_schema == 4,
+                7 => capability_schema == 5, // released v0.4.0
+                // Persisted registry shape stayed at 8 while the live v0.5/v0.6
+                // capability schema advanced. Historical ads are discarded below.
+                8 => matches!(capability_schema, 6 | 7),
+                got => return Err(ControlError::UnsupportedControlSchema { got }),
+            };
+            if !valid_pairing {
                 return Err(ControlError::InvalidRegistrySnapshot);
             }
         }
@@ -1838,6 +1869,20 @@ pub enum DeviceResult {
     },
     ManagedJobStopped {
         status: crate::v2_managed_job::ManagedJobStatus,
+    },
+    PlaywrightTestStarted {
+        agent_locator: String,
+        status: crate::v2_playwright_sandbox::PlaywrightTestStatus,
+    },
+    PlaywrightTestStatus {
+        status: crate::v2_playwright_sandbox::PlaywrightTestStatus,
+    },
+    PlaywrightTestOutput {
+        stream: ProcessOutputStream,
+        range: crate::v2_managed_job::ManagedJobOutputRange,
+    },
+    PlaywrightTestStopped {
+        status: crate::v2_playwright_sandbox::PlaywrightTestStatus,
     },
     Shell {
         output: ProcessOutput,
@@ -3194,9 +3239,16 @@ mod tests {
         registry.connect(&device_id, capabilities(5)).unwrap();
         let current = registry.snapshot();
 
-        for (legacy_schema, legacy_capability_schema) in
-            [(2, 2), (3, 3), (4, 4), (5, 4), (6, 4), (7, 5), (8, 6)]
-        {
+        for (legacy_schema, legacy_capability_schema) in [
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 4),
+            (6, 4),
+            (7, 5),
+            (8, 6),
+            (8, 7),
+        ] {
             let mut legacy = current.clone();
             legacy.schema_version = legacy_schema;
             legacy.devices[0]

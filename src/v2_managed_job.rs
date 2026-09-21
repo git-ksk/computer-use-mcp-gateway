@@ -501,6 +501,20 @@ impl ManagedJobManager {
         Ok(status_from_record(&record))
     }
 
+    pub(crate) fn request_stop(&self, locator: &str) -> Result<(), ManagedJobError> {
+        self.prune_terminal()?;
+        let job = self.lookup(locator)?;
+        let mut record = job
+            .record
+            .lock()
+            .map_err(|_| ManagedJobError::LockPoisoned)?;
+        if !record.state.is_terminal() {
+            record.state = ManagedJobState::StopRequested;
+            record.stop_reason = Some(StopReason::User);
+        }
+        Ok(())
+    }
+
     pub fn stop(&self, locator: &str) -> Result<ManagedJobStatus, ManagedJobError> {
         self.prune_terminal()?;
         let job = self.lookup(locator)?;
@@ -654,10 +668,23 @@ impl ManagedJobManager {
             .lock()
             .map_err(|_| ManagedJobError::LockPoisoned)?
             .prove_terminal(ProcessUnprovenStage::Termination);
-        if let Ok(mut jobs) = self.inner.jobs.lock() {
-            jobs.remove(locator);
+        match proof {
+            Ok(_) => {
+                if let Ok(mut jobs) = self.inner.jobs.lock() {
+                    jobs.remove(locator);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // Retain the record on ambiguous cleanup so Agent safety polling
+                // can durably fail closed instead of losing the only local evidence.
+                if let Ok(mut record) = job.record.lock() {
+                    record.state = ManagedJobState::IndeterminateTermination;
+                    record.terminal_at = Some(Instant::now());
+                }
+                Err(ManagedJobError::Process(error))
+            }
         }
-        proof.map(|_| ()).map_err(ManagedJobError::Process)
     }
 
     fn prune_terminal(&self) -> Result<(), ManagedJobError> {

@@ -56,16 +56,32 @@ struct ManagedJobRefEntry {
 
 pub struct HubManagedJobRefRegistry {
     limits: HubManagedJobRefLimits,
+    prefix: &'static str,
     refs: HashMap<String, ManagedJobRefEntry>,
 }
 
 impl HubManagedJobRefRegistry {
     pub fn new(limits: HubManagedJobRefLimits) -> Result<Self, HubManagedJobRefError> {
-        if limits.max_refs == 0 || limits.max_refs_per_owner == 0 {
+        Self::new_with_prefix(limits, "job_")
+    }
+
+    pub fn new_with_prefix(
+        limits: HubManagedJobRefLimits,
+        prefix: &'static str,
+    ) -> Result<Self, HubManagedJobRefError> {
+        if limits.max_refs == 0
+            || limits.max_refs_per_owner == 0
+            || prefix.is_empty()
+            || prefix.len() > 24
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
             return Err(HubManagedJobRefError::InvalidLimits);
         }
         Ok(Self {
             limits,
+            prefix,
             refs: HashMap::new(),
         })
     }
@@ -100,7 +116,7 @@ impl HubManagedJobRefRegistry {
             return Err(HubManagedJobRefError::OwnerRefLimitExceeded);
         }
         for _ in 0..8 {
-            let public_ref = random_job_ref();
+            let public_ref = random_job_ref(self.prefix);
             if self.refs.contains_key(&public_ref) {
                 continue;
             }
@@ -253,11 +269,11 @@ impl HubManagedJobRefRegistry {
     }
 }
 
-fn random_job_ref() -> String {
+fn random_job_ref(prefix: &str) -> String {
     let mut bytes = [0_u8; 24];
     OsRng.fill_bytes(&mut bytes);
-    let mut value = String::with_capacity(4 + bytes.len() * 2);
-    value.push_str("job_");
+    let mut value = String::with_capacity(prefix.len() + bytes.len() * 2);
+    value.push_str(prefix);
     for byte in bytes {
         let _ = write!(&mut value, "{byte:02x}");
     }
@@ -354,6 +370,32 @@ mod tests {
                 .unwrap()
                 .agent_locator,
             "agent-private"
+        );
+    }
+
+    #[test]
+    fn ref_prefixes_are_domain_separated() {
+        let mut generic = HubManagedJobRefRegistry::new(HubManagedJobRefLimits::default()).unwrap();
+        let mut playwright =
+            HubManagedJobRefRegistry::new_with_prefix(HubManagedJobRefLimits::default(), "pwtest_")
+                .unwrap();
+
+        let generic_ref = generic
+            .reserve(owner("a"), "dev-a", 7, 9, "op-g", 10_000, 1_000)
+            .unwrap();
+        let playwright_ref = playwright
+            .reserve(owner("a"), "dev-a", 7, 9, "op-p", 10_000, 1_000)
+            .unwrap();
+
+        assert!(generic_ref.starts_with("job_"));
+        assert!(playwright_ref.starts_with("pwtest_"));
+        assert_eq!(
+            generic.resolve_owned(&playwright_ref, &owner("a"), "dev-a", 7, 9, 1_001),
+            Err(HubManagedJobRefError::Unavailable)
+        );
+        assert_eq!(
+            playwright.resolve_owned(&generic_ref, &owner("a"), "dev-a", 7, 9, 1_001),
+            Err(HubManagedJobRefError::Unavailable)
         );
     }
 }

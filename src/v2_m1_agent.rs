@@ -67,6 +67,9 @@ use crate::v2_online_recovery::{
 use crate::v2_operator_handoff::{
     VerificationToken, is_exact_verification_candidate, is_phase1_protected_command,
 };
+use crate::v2_playwright_sandbox::{
+    PlaywrightSandboxConfig, PlaywrightSandboxError, PlaywrightSandboxRunner,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::VecDeque;
 use std::fmt;
@@ -215,6 +218,7 @@ pub struct AgentService {
     material: AgentProvisionedMaterial,
     executor: ProcessExecutor,
     managed_jobs: ManagedJobManager,
+    playwright: Option<PlaywrightSandboxRunner>,
     managed_job_fail_closed: bool,
     shell: ShellExecutor,
     filesystem: FilesystemExecutor,
@@ -392,6 +396,7 @@ impl AgentService {
             material,
             executor,
             managed_jobs,
+            playwright: None,
             managed_job_fail_closed,
             shell,
             filesystem,
@@ -415,6 +420,23 @@ impl AgentService {
     pub fn with_handoff_coordinator(mut self, coordinator: Arc<AgentHandoffCoordinator>) -> Self {
         self.handoff = Some(coordinator);
         self
+    }
+
+    pub fn with_playwright_sandbox(
+        mut self,
+        config: PlaywrightSandboxConfig,
+    ) -> Result<Self, AgentServiceError> {
+        let runner =
+            PlaywrightSandboxRunner::new(config, &self.config.state_dir, &self.config.device_id)
+                .map_err(AgentServiceError::PlaywrightSandbox)?;
+        runner
+            .probe_provider()
+            .map_err(AgentServiceError::PlaywrightSandbox)?;
+        runner
+            .recover_provider_orphans()
+            .map_err(AgentServiceError::PlaywrightSandbox)?;
+        self.playwright = Some(runner);
+        Ok(self)
     }
 
     fn persist_state(&self) -> Result<(), AgentServiceError> {
@@ -450,6 +472,10 @@ impl AgentService {
         if self.workspace_mutation.is_some() {
             supported.push(DeviceCapability::WriteWorkspaceFile);
         }
+        if self.playwright.is_some() {
+            supported.push(DeviceCapability::PlaywrightTestControl);
+            supported.push(DeviceCapability::PlaywrightTestObserve);
+        }
         if self.ephemeral_data.is_some() {
             supported.push(DeviceCapability::ReadProcessOutput);
         }
@@ -470,7 +496,7 @@ impl AgentService {
             backend_version: env!("CARGO_PKG_VERSION").into(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-            revision: 7,
+            revision: 8,
             supported,
         }
     }
@@ -729,18 +755,50 @@ impl AgentService {
             .await;
 
         let managed_jobs = self.managed_jobs.clone();
-        let cleanup = tokio::task::spawn_blocking(move || managed_jobs.shutdown_all())
-            .await
-            .map_err(|_| AgentServiceError::ManagedJobFailClosed)?;
-        if let Err(error) = cleanup {
+        let playwright = self.playwright.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            let generic = managed_jobs.shutdown_all();
+            let playwright_jobs = playwright
+                .as_ref()
+                .map(PlaywrightSandboxRunner::shutdown_jobs)
+                .transpose();
+            let artifact_cleanup: Result<Option<()>, PlaywrightSandboxError> =
+                if playwright_jobs.is_ok() {
+                    playwright
+                        .as_ref()
+                        .map(PlaywrightSandboxRunner::cleanup_artifacts)
+                        .transpose()
+                } else {
+                    Ok(None)
+                };
+            (generic, playwright_jobs, artifact_cleanup)
+        })
+        .await
+        .map_err(|_| AgentServiceError::ManagedJobFailClosed)?;
+        let (generic_cleanup, playwright_cleanup, artifact_cleanup) = cleanup;
+        if let Err(error) = &artifact_cleanup {
+            tracing::warn!(
+                event = "v2_playwright_artifact_cleanup_failed",
+                device_id = %self.config.device_id,
+                error_code = error.safe_error_code(),
+                "Playwright artifact cleanup failed after session teardown"
+            );
+        }
+        let termination_cleanup_failed = generic_cleanup.is_err() || playwright_cleanup.is_err();
+        if termination_cleanup_failed {
+            let error_code = if generic_cleanup.is_err() {
+                "managed_job_cleanup_failed"
+            } else {
+                "playwright_cleanup_failed"
+            };
             self.managed_job_fail_closed = true;
             self.persist_state()?;
             tracing::error!(
-                event = "v2_managed_job_cleanup_indeterminate",
+                event = "v2_managed_execution_cleanup_indeterminate",
                 device_id = %self.config.device_id,
                 outcome = "fail_closed",
-                error_code = error.safe_error_code(),
-                "managed-job cleanup could not prove terminality; persisted fail-closed state"
+                error_code,
+                "managed execution cleanup could not be proven safe; persisted fail-closed state"
             );
             return Err(AgentServiceError::ManagedJobFailClosed);
         }
@@ -793,11 +851,17 @@ impl AgentService {
                     }
                 }
                 _ = managed_job_safety_poll.tick() => {
-                    if self
+                    let generic_indeterminate = self
                         .managed_jobs
                         .has_indeterminate_termination()
-                        .map_err(AgentServiceError::ManagedJob)?
-                    {
+                        .map_err(AgentServiceError::ManagedJob)?;
+                    let playwright_indeterminate = match &self.playwright {
+                        Some(playwright) => playwright
+                            .has_indeterminate_termination()
+                            .map_err(AgentServiceError::PlaywrightSandbox)?,
+                        None => false,
+                    };
+                    if generic_indeterminate || playwright_indeterminate {
                         self.managed_job_fail_closed = true;
                         self.persist_state()?;
                         tracing::error!(
@@ -806,7 +870,7 @@ impl AgentService {
                             generation = session.generation,
                             outcome = "fail_closed",
                             error_code = "managed_job_fail_closed",
-                            "managed-job expiry/cleanup lost terminal proof; refusing further Agent work"
+                            "managed execution expiry/cleanup lost terminal proof; refusing further Agent work"
                         );
                         return Err(AgentServiceError::ManagedJobFailClosed);
                     }
@@ -1007,6 +1071,19 @@ impl AgentService {
                                         failure_stage = stage.as_str(),
                                         error_code = "process_outcome_unproven",
                                         "process/shell terminality is unproven after spawn; reconnecting without a terminal result"
+                                    );
+                                    return Ok(SessionExit::Reconnect);
+                                }
+                                AgentIndeterminateCause::PlaywrightProviderOutcomeUnproven => {
+                                    tracing::warn!(
+                                        event = "v2_agent_playwright_provider_indeterminate",
+                                        operation_id = %completion.operation_id,
+                                        device_id = %session.device_id,
+                                        generation = session.generation,
+                                        outcome = "indeterminate",
+                                        indeterminate_reason = "playwright_provider_outcome_unproven",
+                                        error_code = "playwright_sandbox_provider_outcome_unproven",
+                                        "Playwright container terminality is unproven; reconnecting without a terminal result"
                                     );
                                     return Ok(SessionExit::Reconnect);
                                 }
@@ -1716,6 +1793,107 @@ impl AgentService {
                                     });
                                     ActiveCancellation::None
                                 }
+                                DeviceCommand::PlaywrightTestStart { request } => {
+                                    let playwright = self.playwright.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let runner = playwright.ok_or(
+                                                PlaywrightSandboxError::InvalidConfig,
+                                            )?;
+                                            runner.start(&request).map(
+                                                |(agent_locator, status)| {
+                                                    DeviceResult::PlaywrightTestStarted {
+                                                        agent_locator,
+                                                        status,
+                                                    }
+                                                },
+                                            )
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: playwright_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::PlaywrightTestStatus { locator } => {
+                                    let playwright = self.playwright.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let runner = playwright.ok_or(
+                                                PlaywrightSandboxError::InvalidConfig,
+                                            )?;
+                                            runner.status(&locator).map(|status| {
+                                                DeviceResult::PlaywrightTestStatus { status }
+                                            })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: playwright_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::PlaywrightTestOutput {
+                                    locator,
+                                    stream,
+                                    offset,
+                                    max_bytes,
+                                } => {
+                                    let playwright = self.playwright.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let runner = playwright.ok_or(
+                                                PlaywrightSandboxError::InvalidConfig,
+                                            )?;
+                                            runner
+                                                .output(&locator, stream, offset, max_bytes)
+                                                .map(|range| DeviceResult::PlaywrightTestOutput {
+                                                    stream,
+                                                    range,
+                                                })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: playwright_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
+                                DeviceCommand::PlaywrightTestStop { locator } => {
+                                    let playwright = self.playwright.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let runner = playwright.ok_or(
+                                                PlaywrightSandboxError::InvalidConfig,
+                                            )?;
+                                            runner.stop(&locator).map(|status| {
+                                                DeviceResult::PlaywrightTestStopped { status }
+                                            })
+                                        })
+                                        .await;
+                                        let _ = done
+                                            .send(OperationCompletion {
+                                                operation_id: worker_operation_id,
+                                                device_generation: worker_generation,
+                                                outcome: playwright_operation_outcome(result),
+                                            })
+                                            .await;
+                                    });
+                                    ActiveCancellation::None
+                                }
                                 DeviceCommand::StageBrowserUploadFile {
                                     context_id,
                                     file_name,
@@ -2004,6 +2182,7 @@ enum AgentIndeterminateCause {
     CancellationPropagated,
     BackendTimedOut,
     ProcessOutcomeUnproven(ProcessUnprovenStage),
+    PlaywrightProviderOutcomeUnproven,
     WorkspaceMutationOutcomeUnproven,
 }
 
@@ -2146,6 +2325,30 @@ fn managed_job_operation_outcome(
     }
 }
 
+fn playwright_operation_outcome(
+    result: Result<Result<DeviceResult, PlaywrightSandboxError>, tokio::task::JoinError>,
+) -> AgentOperationOutcome {
+    match result {
+        Ok(Ok(result)) => AgentOperationOutcome::Result(Ok(result)),
+        Ok(Err(PlaywrightSandboxError::ProviderOutcomeUnproven)) => {
+            AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::PlaywrightProviderOutcomeUnproven,
+            )
+        }
+        Ok(Err(error)) => match error.outcome_unproven_stage() {
+            Some(stage) => AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::ProcessOutcomeUnproven(stage),
+            ),
+            None => {
+                AgentOperationOutcome::Result(Err(AgentOperationError::PlaywrightSandbox(error)))
+            }
+        },
+        Err(_) => AgentOperationOutcome::Indeterminate(
+            AgentIndeterminateCause::ProcessOutcomeUnproven(ProcessUnprovenStage::Worker),
+        ),
+    }
+}
+
 fn shell_operation_outcome(
     result: Result<Result<DeviceResult, ShellError>, tokio::task::JoinError>,
 ) -> AgentOperationOutcome {
@@ -2184,6 +2387,7 @@ fn workspace_mutation_operation_outcome(
 pub enum AgentOperationError {
     Process(ProcessError),
     ManagedJob(ManagedJobError),
+    PlaywrightSandbox(PlaywrightSandboxError),
     Shell(ShellError),
     Filesystem(FilesystemError),
     WorkspaceMutation(WorkspaceMutationError),
@@ -2311,6 +2515,7 @@ fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
     match error {
         AgentOperationError::Process(error) => error.safe_error_code(),
         AgentOperationError::ManagedJob(error) => error.safe_error_code(),
+        AgentOperationError::PlaywrightSandbox(error) => error.safe_error_code(),
         AgentOperationError::Shell(error) => error.safe_error_code(),
         AgentOperationError::Filesystem(error) => error.safe_error_code(),
         AgentOperationError::WorkspaceMutation(error) => error.safe_error_code(),
@@ -2324,6 +2529,7 @@ fn agent_operation_error_code(error: &AgentOperationError) -> &'static str {
 fn operation_error_code(error: &AgentOperationError) -> DeviceErrorCode {
     match error {
         AgentOperationError::ManagedJob(error) => managed_job_error_code(error),
+        AgentOperationError::PlaywrightSandbox(error) => playwright_error_code(error),
         AgentOperationError::WorkspaceMutation(WorkspaceMutationError::PreconditionFailed) => {
             DeviceErrorCode::WorkspacePreconditionFailed
         }
@@ -2499,6 +2705,36 @@ fn managed_job_error_code(error: &ManagedJobError) -> DeviceErrorCode {
         }
         ManagedJobError::Process(ProcessError::InvalidRequest) => DeviceErrorCode::InvalidRequest,
         ManagedJobError::Process(_) => DeviceErrorCode::InternalFailure,
+    }
+}
+
+fn playwright_error_code(error: &PlaywrightSandboxError) -> DeviceErrorCode {
+    match error {
+        PlaywrightSandboxError::UnknownJob => DeviceErrorCode::NotFound,
+        PlaywrightSandboxError::InvalidWorkspace => DeviceErrorCode::WorkingDirectoryDenied,
+        PlaywrightSandboxError::InvalidRequest
+        | PlaywrightSandboxError::InvalidTestPath
+        | PlaywrightSandboxError::InvalidProject
+        | PlaywrightSandboxError::InvalidGrep
+        | PlaywrightSandboxError::InvalidWorkers
+        | PlaywrightSandboxError::InvalidConfig
+        | PlaywrightSandboxError::InvalidImage => DeviceErrorCode::InvalidRequest,
+        PlaywrightSandboxError::RuntimeUnavailable | PlaywrightSandboxError::ArtifactIo => {
+            DeviceErrorCode::IoFailure
+        }
+        PlaywrightSandboxError::IdentifierCollision
+        | PlaywrightSandboxError::MonitorUnavailable
+        | PlaywrightSandboxError::LockPoisoned => DeviceErrorCode::InternalFailure,
+        PlaywrightSandboxError::ProviderOutcomeUnproven => {
+            DeviceErrorCode::BackendOutcomeIndeterminate
+        }
+        PlaywrightSandboxError::Process(error) => match error {
+            ProcessError::OutcomeUnproven(_) => DeviceErrorCode::BackendOutcomeIndeterminate,
+            ProcessError::Spawn(_) => DeviceErrorCode::ProcessSpawnFailed,
+            ProcessError::Io(_) => DeviceErrorCode::IoFailure,
+            _ => DeviceErrorCode::InvalidRequest,
+        },
+        PlaywrightSandboxError::ManagedJob(error) => managed_job_error_code(error),
     }
 }
 
@@ -2914,6 +3150,7 @@ pub enum AgentServiceError {
     Execution(crate::v2_m0_execution::ExecutionError),
     Process(ProcessError),
     ManagedJob(ManagedJobError),
+    PlaywrightSandbox(PlaywrightSandboxError),
     ManagedJobFailClosed,
     Filesystem(FilesystemError),
     WorkspaceMutationStartup(WorkspaceMutationError),
@@ -2988,6 +3225,7 @@ impl SafeErrorCode for AgentServiceError {
             Self::Execution(_) => "execution_error",
             Self::Process(_) => "process_error",
             Self::ManagedJob(error) => error.safe_error_code(),
+            Self::PlaywrightSandbox(error) => error.safe_error_code(),
             Self::ManagedJobFailClosed => "managed_job_fail_closed",
             Self::Filesystem(_) => "filesystem_error",
             Self::WorkspaceMutationStartup(error) => error.safe_error_code(),
@@ -3142,6 +3380,15 @@ mod tests {
             AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::ProcessOutcomeUnproven(
                 ProcessUnprovenStage::Wait
             ))
+        ));
+
+        let provider_unproven =
+            playwright_operation_outcome(Ok(Err(PlaywrightSandboxError::ProviderOutcomeUnproven)));
+        assert!(matches!(
+            provider_unproven,
+            AgentOperationOutcome::Indeterminate(
+                AgentIndeterminateCause::PlaywrightProviderOutcomeUnproven
+            )
         ));
 
         let shell_unproven = shell_operation_outcome(Ok(Err(ShellError::Process(
@@ -3537,6 +3784,16 @@ mod tests {
                 .contains(&DeviceCapability::Screenshot)
         );
         assert!(capabilities.supported.contains(&DeviceCapability::TypeText));
+        assert!(
+            !capabilities
+                .supported
+                .contains(&DeviceCapability::PlaywrightTestControl)
+        );
+        assert!(
+            !capabilities
+                .supported
+                .contains(&DeviceCapability::PlaywrightTestObserve)
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 

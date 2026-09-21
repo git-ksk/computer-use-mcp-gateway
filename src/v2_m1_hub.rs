@@ -58,6 +58,10 @@ use crate::v2_online_recovery::{
     mutation_resume_barrier_fingerprint, quarantine_fingerprint, recovery_decision_name,
     recovery_phase_name,
 };
+use crate::v2_playwright_sandbox::{
+    MAX_PLAYWRIGHT_OUTPUT_READ_BYTES, MAX_PLAYWRIGHT_TEST_LIFETIME_MS, PlaywrightTestRequest,
+    PlaywrightTestStatus,
+};
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use ed25519_dalek::VerifyingKey;
 use rand::{RngCore, rngs::OsRng};
@@ -192,6 +196,7 @@ struct HubInner {
     recovery_runtime: Mutex<RecoveryRuntimeState>,
     ephemeral_refs: Mutex<HubEphemeralRefRegistry>,
     managed_job_refs: Mutex<HubManagedJobRefRegistry>,
+    playwright_test_refs: Mutex<HubManagedJobRefRegistry>,
 }
 
 #[derive(Clone)]
@@ -286,6 +291,36 @@ pub struct HubManagedJobOutputRead {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubManagedJobOutputResult {
+    pub operation_id: String,
+    pub stream: ProcessOutputStream,
+    pub range: ManagedJobOutputRange,
+    pub receipt: ExecutionReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubPlaywrightTestStartResult {
+    pub operation_id: String,
+    pub test_ref: String,
+    pub status: PlaywrightTestStatus,
+    pub receipt: ExecutionReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubPlaywrightTestStatusResult {
+    pub operation_id: String,
+    pub status: PlaywrightTestStatus,
+    pub receipt: ExecutionReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HubPlaywrightTestOutputRead {
+    pub stream: ProcessOutputStream,
+    pub offset: u64,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubPlaywrightTestOutputResult {
     pub operation_id: String,
     pub stream: ProcessOutputStream,
     pub range: ManagedJobOutputRange,
@@ -489,6 +524,11 @@ impl SingleDeviceHub {
             .map_err(|_| {
                 HubServiceError::InvalidConfig("invalid managed-job ref registry limits")
             })?;
+        let playwright_test_refs =
+            HubManagedJobRefRegistry::new_with_prefix(HubManagedJobRefLimits::default(), "pwtest_")
+                .map_err(|_| {
+                    HubServiceError::InvalidConfig("invalid Playwright ref registry limits")
+                })?;
         let session_slots = Arc::new(Semaphore::new(config.max_agent_sessions));
         let session_rate = crate::v2_limits::SlidingWindowRateLimit::new(
             config.max_agent_session_starts_per_minute,
@@ -515,6 +555,7 @@ impl SingleDeviceHub {
             recovery_runtime: Mutex::new(RecoveryRuntimeState::default()),
             ephemeral_refs: Mutex::new(ephemeral_refs),
             managed_job_refs: Mutex::new(managed_job_refs),
+            playwright_test_refs: Mutex::new(playwright_test_refs),
         });
         let service = Self {
             inner: inner.clone(),
@@ -3286,6 +3327,310 @@ impl HubHandle {
         }
     }
 
+    async fn resolve_playwright_test_ref(
+        &self,
+        owner: &OperationOwner,
+        test_ref: &str,
+    ) -> Result<(String, u64, u64), HubCommandError> {
+        if test_ref.trim().is_empty() {
+            return Err(HubCommandError::Rejected);
+        }
+        let (generation, capability_revision) = self.managed_job_session_fence().await?;
+        let resolved = {
+            let mut refs = self.inner.playwright_test_refs.lock().await;
+            refs.resolve_owned(
+                test_ref,
+                owner,
+                &self.inner.device_id,
+                generation,
+                capability_revision,
+                unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
+            )
+            .map_err(|_| HubCommandError::Rejected)?
+        };
+        Ok((resolved.agent_locator, generation, capability_revision))
+    }
+
+    pub async fn playwright_test_start_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        request: PlaywrightTestRequest,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubPlaywrightTestStartResult, HubCommandError> {
+        if request.hard_lifetime_ms == 0
+            || request.hard_lifetime_ms > MAX_PLAYWRIGHT_TEST_LIFETIME_MS
+        {
+            return Err(HubCommandError::Rejected);
+        }
+        let (generation, capability_revision) = self.managed_job_session_fence().await?;
+        let now_ms = unix_time_ms().map_err(|_| HubCommandError::Rejected)?;
+        let expires_at_ms = now_ms
+            .saturating_add(request.hard_lifetime_ms)
+            .saturating_add(MANAGED_JOB_REF_TERMINAL_RETENTION_MS);
+        let test_ref = self
+            .inner
+            .playwright_test_refs
+            .lock()
+            .await
+            .reserve(
+                owner.clone(),
+                &self.inner.device_id,
+                generation,
+                capability_revision,
+                &operation_id,
+                expires_at_ms,
+                now_ms,
+            )
+            .map_err(|_| HubCommandError::Rejected)?;
+
+        let pending = match self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner.clone(),
+                operation_id.clone(),
+                DeviceCommand::PlaywrightTestStart { request },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.inner
+                    .playwright_test_refs
+                    .lock()
+                    .await
+                    .release_unbound(
+                        &test_ref,
+                        &owner,
+                        &self.inner.device_id,
+                        generation,
+                        capability_revision,
+                    );
+                return Err(error);
+            }
+        };
+        let result = match pending.wait().await {
+            Ok(result) => result,
+            Err(error) => {
+                self.inner
+                    .playwright_test_refs
+                    .lock()
+                    .await
+                    .release_unbound(
+                        &test_ref,
+                        &owner,
+                        &self.inner.device_id,
+                        generation,
+                        capability_revision,
+                    );
+                return Err(error);
+            }
+        };
+        match result.result {
+            DeviceResult::PlaywrightTestStarted {
+                agent_locator,
+                status,
+            } => {
+                if validate_playwright_test_status(&status).is_err()
+                    || agent_locator.is_empty()
+                    || agent_locator.len() > 512
+                {
+                    self.inner
+                        .playwright_test_refs
+                        .lock()
+                        .await
+                        .release_unbound(
+                            &test_ref,
+                            &owner,
+                            &self.inner.device_id,
+                            generation,
+                            capability_revision,
+                        );
+                    return Err(HubCommandError::UnexpectedResult);
+                }
+                let bind_result = self.inner.playwright_test_refs.lock().await.bind(
+                    &test_ref,
+                    &owner,
+                    &self.inner.device_id,
+                    generation,
+                    capability_revision,
+                    &operation_id,
+                    &agent_locator,
+                    unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
+                );
+                if bind_result.is_err() {
+                    self.inner
+                        .playwright_test_refs
+                        .lock()
+                        .await
+                        .release_unbound(
+                            &test_ref,
+                            &owner,
+                            &self.inner.device_id,
+                            generation,
+                            capability_revision,
+                        );
+                    return Err(HubCommandError::Indeterminate);
+                }
+                Ok(HubPlaywrightTestStartResult {
+                    operation_id: result.operation_id,
+                    test_ref,
+                    status,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::Error { code } => {
+                self.inner
+                    .playwright_test_refs
+                    .lock()
+                    .await
+                    .release_unbound(
+                        &test_ref,
+                        &owner,
+                        &self.inner.device_id,
+                        generation,
+                        capability_revision,
+                    );
+                Err(HubCommandError::Remote(code))
+            }
+            _ => {
+                self.inner
+                    .playwright_test_refs
+                    .lock()
+                    .await
+                    .release_unbound(
+                        &test_ref,
+                        &owner,
+                        &self.inner.device_id,
+                        generation,
+                        capability_revision,
+                    );
+                Err(HubCommandError::UnexpectedResult)
+            }
+        }
+    }
+
+    pub async fn playwright_test_status_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        test_ref: &str,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubPlaywrightTestStatusResult, HubCommandError> {
+        let (locator, generation, capability_revision) =
+            self.resolve_playwright_test_ref(&owner, test_ref).await?;
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                operation_id,
+                DeviceCommand::PlaywrightTestStatus { locator },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::PlaywrightTestStatus { status } => {
+                validate_playwright_test_status(&status)?;
+                Ok(HubPlaywrightTestStatusResult {
+                    operation_id: result.operation_id,
+                    status,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
+    pub async fn playwright_test_output_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        test_ref: &str,
+        read: HubPlaywrightTestOutputRead,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubPlaywrightTestOutputResult, HubCommandError> {
+        if read.max_bytes == 0
+            || read.max_bytes
+                > u64::try_from(MAX_PLAYWRIGHT_OUTPUT_READ_BYTES)
+                    .map_err(|_| HubCommandError::Rejected)?
+        {
+            return Err(HubCommandError::Rejected);
+        }
+        let (locator, generation, capability_revision) =
+            self.resolve_playwright_test_ref(&owner, test_ref).await?;
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                operation_id,
+                DeviceCommand::PlaywrightTestOutput {
+                    locator,
+                    stream: read.stream,
+                    offset: read.offset,
+                    max_bytes: read.max_bytes,
+                },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::PlaywrightTestOutput {
+                stream: returned_stream,
+                range,
+            } if returned_stream == read.stream => {
+                validate_managed_job_output(&range, read.offset, read.max_bytes)?;
+                Ok(HubPlaywrightTestOutputResult {
+                    operation_id: result.operation_id,
+                    stream: read.stream,
+                    range,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::PlaywrightTestOutput { .. } => Err(HubCommandError::UnexpectedResult),
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
+    pub async fn playwright_test_stop_as_with_id_and_metadata(
+        &self,
+        owner: OperationOwner,
+        operation_id: String,
+        test_ref: &str,
+        metadata: OperationAdmissionMetadata,
+    ) -> Result<HubPlaywrightTestStatusResult, HubCommandError> {
+        let (locator, generation, capability_revision) =
+            self.resolve_playwright_test_ref(&owner, test_ref).await?;
+        let result = self
+            .start_command_as_with_id_and_metadata_for_session(
+                owner,
+                operation_id,
+                DeviceCommand::PlaywrightTestStop { locator },
+                metadata,
+                (generation, capability_revision),
+            )
+            .await?
+            .wait()
+            .await?;
+        match result.result {
+            DeviceResult::PlaywrightTestStopped { status } => {
+                validate_playwright_test_status(&status)?;
+                Ok(HubPlaywrightTestStatusResult {
+                    operation_id: result.operation_id,
+                    status,
+                    receipt: result.receipt,
+                })
+            }
+            DeviceResult::Error { code } => Err(HubCommandError::Remote(code)),
+            _ => Err(HubCommandError::UnexpectedResult),
+        }
+    }
+
     pub async fn start_command_as_with_id(
         &self,
         owner: OperationOwner,
@@ -4006,6 +4351,14 @@ fn validate_managed_job_status(status: &ManagedJobStatus) -> Result<(), HubComma
     if status.lease_remaining_ms > MAX_MANAGED_JOB_LEASE_MS
         || status.hard_lifetime_remaining_ms > MAX_MANAGED_JOB_LIFETIME_MS
     {
+        return Err(HubCommandError::UnexpectedResult);
+    }
+    Ok(())
+}
+
+fn validate_playwright_test_status(status: &PlaywrightTestStatus) -> Result<(), HubCommandError> {
+    validate_managed_job_status(&status.job)?;
+    if status.artifact_count > 4096 || status.artifact_total_bytes > 512 * 1024 * 1024 {
         return Err(HubCommandError::UnexpectedResult);
     }
     Ok(())

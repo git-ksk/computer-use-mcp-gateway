@@ -105,7 +105,7 @@ If evidence forces one of #106/#114/#267 to defer, update #335 and the support b
 
 The following work is **not admitted to v0.6.0 by default**: Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and general operator/consumer ergonomics (#295/#304). Those tracks remain visible below and can be admitted only by an explicit roadmap/milestone change with a bounded reason.
 
-The released v0.5.0 baseline pins control schema 10, capability schema 6, registry schema 8, and Hub-Agent schema 6; mixed versions fail closed. Workspace writable roots remain operator/device configuration while exact mutation capability is granted per principal. v0.5.0 does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
+The released v0.5.0 baseline pins control schema 10, capability schema 6, registry schema 8, and Hub-Agent schema 6. During v0.6 development #106 used the historical 11/7 live pairing; #114 advances the current live control/capability pairing to 12/8 while registry schema remains 8 and Hub-Agent schema remains 6. Mixed live versions fail closed. Workspace writable roots remain operator/device configuration while exact mutation capability is granted per principal. v0.5.0 does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
 
 Minor numbers are working release boundaries, not calendar promises. Optional platform/provider support claims remain withheld until explicit acceptance even when implementation is compiled into an artifact.
 

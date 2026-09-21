@@ -169,6 +169,16 @@ normal evidence に次の raw content を追加しません。
 
 Cua Cloud Fleets、E2B、Daytona、その他 provider は、compatible provider/adapter boundary で上記 semantics を維持できる場合だけ downstream execution infrastructure として利用できます。
 
+## Playwright sandbox capability split (#114)
+
+v0.6 Playwright execution は PlaywrightTestControl を独立した exact Dangerous capability、PlaywrightTestObserve を独立した exact Observe capability として追加します。start/stop は control capability、status/output は observe capability を必須とします。ExecuteProcess、Shell、ManagedJobControl、ManagedJobObserve、browser authority、cwd/workspace root、class-only grant から推論しません。
+
+Hub は pwtest_ namespace の Playwright 専用 opaque ref registry を使います。generic job_ ref と Playwright ref は意図的に互換性を持たず、cross-registry lookup は fail closed します。provider-specific container name/ID や Agent-private locator を northbound authority にしません。
+
+complete runtime/image/workspace config の validation、digest-pinned image inspect、owner-scoped startup orphan recovery が成功し、過去の owned provider container が残っていないことを証明した後だけ Agent は Playwright capability を advertise します。provider unavailable / partial config の場合、別 capability へ fallback せず live advertisement から Playwright capability を除外します。
+
+[V2_PLAYWRIGHT_SANDBOX.ja.md](V2_PLAYWRIGHT_SANDBOX.ja.md) を参照してください。
+
 ## References
 
 - Cua permission policies: <https://cua.ai/docs/reference/cua-driver/permission-policies>

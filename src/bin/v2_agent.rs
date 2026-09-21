@@ -8,6 +8,7 @@ use computer_use_mcp_gateway::{
     v2_m1_agent::{AgentService, AgentServiceConfig, CuaAgentConfig},
     v2_m1_keys::{load_agent_material, load_trusted_text, load_verifying_key},
     v2_operator_handoff::{ManagedHandoffRuntimeConfig, ManagedOperatorHandoffAuthority},
+    v2_playwright_sandbox::PlaywrightSandboxConfig,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +92,19 @@ struct Config {
         value_delimiter = ','
     )]
     denied_write_subpaths: Vec<PathBuf>,
+    /// Optional local container runtime used only for sandboxed Playwright tests.
+    #[arg(long, env = "CUMG_V2_PLAYWRIGHT_RUNTIME")]
+    playwright_runtime: Option<PathBuf>,
+    /// Immutable digest-pinned Playwright sandbox image.
+    #[arg(long, env = "CUMG_V2_PLAYWRIGHT_IMAGE")]
+    playwright_image: Option<String>,
+    /// Workspace roots separately authorized for sandboxed Playwright execution.
+    #[arg(
+        long = "playwright-workspace-root",
+        env = "CUMG_V2_PLAYWRIGHT_WORKSPACE_ROOTS",
+        value_delimiter = ','
+    )]
+    playwright_workspace_roots: Vec<PathBuf>,
     #[arg(long, env = "CUMG_V2_HEARTBEAT_SECS", default_value_t = 15)]
     heartbeat_secs: u64,
     #[arg(long, env = "CUMG_V2_RECONNECT_INITIAL_MS", default_value_t = 250)]
@@ -132,6 +146,30 @@ struct Config {
     handoff_runtime_timeout_secs: u64,
 }
 
+fn resolve_playwright_sandbox_config(
+    runtime: Option<PathBuf>,
+    image: Option<String>,
+    workspace_roots: Vec<PathBuf>,
+) -> Result<Option<PlaywrightSandboxConfig>> {
+    let any = runtime.is_some() || image.is_some() || !workspace_roots.is_empty();
+    let all = runtime.is_some() && image.is_some() && !workspace_roots.is_empty();
+    anyhow::ensure!(
+        !any || all,
+        "CUMG_V2_PLAYWRIGHT_RUNTIME, CUMG_V2_PLAYWRIGHT_IMAGE, and at least one CUMG_V2_PLAYWRIGHT_WORKSPACE_ROOTS entry must be configured together"
+    );
+    if !all {
+        return Ok(None);
+    }
+    Ok(Some(
+        PlaywrightSandboxConfig::new(
+            runtime.expect("validated Playwright runtime"),
+            image.expect("validated Playwright image"),
+            workspace_roots,
+        )
+        .context("invalid Playwright sandbox provider configuration")?,
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _observability = computer_use_mcp_gateway::v2_observability::init("cumg-v2-agent")?;
@@ -151,6 +189,12 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
+    let playwright = resolve_playwright_sandbox_config(
+        args.playwright_runtime.clone(),
+        args.playwright_image.clone(),
+        args.playwright_workspace_roots.clone(),
+    )?;
+
     let mut material = load_agent_material(
         &args.device_secret_file,
         &args.hub_public_key_file,
@@ -269,6 +313,11 @@ async fn main() -> Result<()> {
     };
     let mut agent =
         AgentService::new(config, material).context("invalid V2 Agent configuration")?;
+    if let Some(playwright) = playwright {
+        agent = agent
+            .with_playwright_sandbox(playwright)
+            .context("failed to configure Playwright sandbox provider")?;
+    }
     if let Some(coordinator) = handoff_runtime.as_ref() {
         agent = agent.with_handoff_coordinator(coordinator.clone());
     }
@@ -286,4 +335,66 @@ async fn main() -> Result<()> {
         runtime.shutdown().await;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cumg-v2-agent-playwright-cli-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn digest_image() -> String {
+        format!("example.invalid/playwright@sha256:{}", "a".repeat(64))
+    }
+
+    #[test]
+    fn playwright_config_is_absent_unless_explicitly_configured() {
+        assert!(
+            resolve_playwright_sandbox_config(None, None, vec![])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn playwright_config_rejects_partial_provider_configuration() {
+        let root = temp_root("partial");
+        assert!(
+            resolve_playwright_sandbox_config(Some(root.join("runtime")), None, vec![]).is_err()
+        );
+        assert!(
+            resolve_playwright_sandbox_config(None, Some(digest_image()), vec![root.clone()])
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn playwright_config_accepts_complete_reviewed_provider_tuple() {
+        let root = temp_root("complete");
+        let workspace = root.join("workspace");
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&runtime, b"provider").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let configured =
+            resolve_playwright_sandbox_config(Some(runtime), Some(digest_image()), vec![workspace])
+                .unwrap();
+        assert!(configured.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
 }

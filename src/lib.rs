@@ -51,6 +51,7 @@ pub mod v2_oidc_jwt;
 pub mod v2_online_recovery;
 pub mod v2_operator_handoff;
 pub mod v2_operator_status;
+pub mod v2_playwright_sandbox;
 pub mod v2_reference_backend;
 pub mod v2_semantic_constraints;
 pub mod v2_state_lock;
