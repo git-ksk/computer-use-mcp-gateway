@@ -1907,7 +1907,10 @@ mod linux_cgroup_acceptance_tests {
         let agent_pid = std::process::id();
         let denied_shell = ShellRequest {
             command: format!(
-                "if [ "$(cat /proc/self/cgroup)" != "0::/" ]; then exit 40; fi;                  if echo $$ > {} 2>/dev/null; then exit 41; fi;                  if echo $$ > /proc/{agent_pid}/root{}/cgroup.procs 2>/dev/null; then exit 42; fi;                  exit 0",
+                r#"if [ "$(cat /proc/self/cgroup)" != "0::/" ]; then exit 40; fi;
+if echo $$ > {} 2>/dev/null; then exit 41; fi;
+if echo $$ > /proc/{agent_pid}/root{}/cgroup.procs 2>/dev/null; then exit 42; fi;
+exit 0"#,
                 parent_procs.display(),
                 cgroup_root.display(),
             ),
