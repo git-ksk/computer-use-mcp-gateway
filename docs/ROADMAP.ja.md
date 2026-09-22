@@ -87,7 +87,7 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 1. **`v0.6.1 — Support Claim Expansion` evidence track** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、final gate #346。open / withheldのままで、v0.6.0やv0.7.0を遡及拡大しません。
 2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence` — released。** #342 / #295 / #304 / #289 / #290 / #347 はcomplete。詳細は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md)。
-3. **`v0.8.0 — Backend Portability Evidence`** — #222で既存CUMGのGUI authority / ambiguity / recovery semanticsを、materially differentなsecond real backendに対して実証します。generic provider / VM / fleet productには拡張しません。
+3. **`v0.8.0 — Backend Portability & Recovery Safety`** — #222で既存CUMGのGUI authority / ambiguity / recovery semanticsをmaterially differentなsecond real backendに対して実証し、#377でHubがpre-delivery non-executionをauthoritativeに証明できる狭いpre-enqueue failureをreplayなしでauto-resolveできるようにします。両方をrequired release gateとします。generic provider / VM / fleet productには拡張せず、quarantine / no-auto-replay semanticsも弱めません。
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
 5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
 
@@ -185,7 +185,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、#346 final support-claim gate。
-- **`v0.8.0 — Backend Portability Evidence`:** #222 second-real-backend semantic-neutrality proof。
+- **`v0.8.0 — Backend Portability & Recovery Safety`:** #222 second-real-backend semantic-neutrality proof、#377 authoritative Hub pre-delivery non-execution auto-reconciliation。
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#284 final replacement / partition / physical-Handoff acceptance。
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。
 

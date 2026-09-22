@@ -87,7 +87,7 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 
 1. **`v0.6.1 — Support Claim Expansion` evidence track** — #139 signed-token physical dogfood, #217 cross-platform recovery parity, #228 physical Linux FIDO2 UV acceptance, and final gate #346. It remains open and withheld; it does not retroactively widen v0.6.0 or v0.7.0.
 2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence` — released.** #342, #295, #304, #289, #290, and #347 are complete; see [`v2/V2_070_RELEASE_SCOPE.md`](v2/V2_070_RELEASE_SCOPE.md).
-3. **`v0.8.0 — Backend Portability Evidence`** — #222 proves the existing CUMG GUI authority/ambiguity/recovery semantics against a second materially different real backend. This remains a portability/evidence release, not a generic provider, VM, or fleet product.
+3. **`v0.8.0 — Backend Portability & Recovery Safety`** — #222 proves the existing CUMG GUI authority/ambiguity/recovery semantics against a second materially different real backend, while #377 adds authoritative Hub pre-delivery non-execution evidence so narrowly provable pre-enqueue failures can auto-resolve without replay. Both are required release gates. This remains a bounded portability/recovery-safety release, not a generic provider, VM, or fleet product, and it does not weaken quarantine/no-auto-replay semantics.
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215, #275, #276, #277, #282, #283, and final acceptance #284. #276/#277 establish the reviewed Handoff dependency and hosted operator route; #282/#283 may then progress in parallel; #284 is the required replacement/partition/physical-Handoff acceptance gate before hosted support can be advertised.
 5. **`v0.10.0 — Legacy V1 Retirement`** — deliberate retirement of `v1_gateway`, including resolution/closure of V1-only upstream-blocked #14/#15. Removal remains conditional on confirming no supported deployment depends on V1 and intentionally migrating or archiving still-valuable regression fixtures.
 
@@ -185,7 +185,7 @@ This queue records the practical result of continued Handoff integration and phy
 Every OPEN issue must appear in one of the buckets below or in another explicit roadmap section. The inventory describes admission and ordering; it does not imply that every open issue belongs to the next release.
 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, #228 physical Linux FIDO2 UV acceptance, and #346 final support-claim gate.
-- **`v0.8.0 — Backend Portability Evidence`:** #222 second-real-backend semantic-neutrality proof.
+- **`v0.8.0 — Backend Portability & Recovery Safety`:** #222 second-real-backend semantic-neutrality proof and #377 authoritative Hub pre-delivery non-execution auto-reconciliation.
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate, #275 Agent-owned Handoff topology, #276 reviewed Handoff consumer adoption, #277 hosted operator routing, #282 closed one-port ingress, #283 durable Hub state/writer-epoch fencing, and #284 final replacement/partition/physical-Handoff acceptance.
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 remain upstream-blocked while V1 exists; this release resolves or closes them as part of deliberate `v1_gateway` retirement rather than expanding V1.
 
