@@ -206,7 +206,7 @@ v2_maint incident-brief \
   --format text
 ```
 
-Those commands are read-only. The low-level `v2_recover status`, `resolve`, and `confirm` commands remain advanced online-recovery primitives for explicit troubleshooting, and `v2_maint resolve` remains the offline authority-bearing break-glass path that requires the Hub to be stopped. None authorizes replay of the quarantined operation; every future effectful action must be admitted with a fresh operation identity.
+Those commands are read-only. For v0.7 application-targeted ambiguity, `incident-brief` is also the only reviewed local diagnostic allowed to reveal the bounded private recovery target captured at admission. Generic `inspect-quarantine` JSON and northbound MCP/status remain target-free. The displayed target is recovery metadata only and must be independently verified before any Human settlement decision. The low-level `v2_recover status`, `resolve`, and `confirm` commands remain advanced online-recovery primitives for explicit troubleshooting, and `v2_maint resolve` remains the offline authority-bearing break-glass path that requires the Hub to be stopped. None authorizes replay of the quarantined operation; every future effectful action must be admitted with a fresh operation identity.
 
 See [`v2/V2_ONLINE_RECOVERY.md`](v2/V2_ONLINE_RECOVERY.md) for the guided online-recovery contract and [`DEPLOYMENT.md`](DEPLOYMENT.md) for the lower-level inspection, reconciliation, retirement, and offline-recovery contracts.
 

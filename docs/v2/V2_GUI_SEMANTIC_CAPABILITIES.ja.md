@@ -34,7 +34,7 @@ V2 Desktop surface には、既存 runtime capability に加えて desktop parit
 | `launch_application` | `LaunchApplication` | opaque identifier/name と bounded target による起動 |
 | `inspect_window` | `InspectWindow` | bounded normalized UI snapshot; CUMG scoped ref を mint |
 | `verify_ui_state` | `VerifyUiState` | bounded predicate; `unknown` を success とみなさない |
-| `terminate_application` | `TerminateApplication` | exact process termination; dangerous capability |
+| `terminate_application` | `TerminateApplication` | exact process termination; dangerous capability。v0.7 northboundではPIDに加えてbounded `application` recovery identityが必須だが、Agent commandはPID-onlyのまま |
 | `activate_window` | `ActivateWindow` | verification evidence を伴う process または exact window の activate |
 | `set_window_frame` | `SetWindowFrame` | exact top-level window geometry を set + verify |
 | `invoke_menu` | `InvokeMenu` | raw backend selector を使わない bounded semantic menu path |

@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 13;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 14;
+const MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 13;
 const SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 12;
 const REPLAY_TOMBSTONE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 11;
 const CURRENT_STATE_ACCEPTANCE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 10;
@@ -572,6 +573,95 @@ impl OperationEvidenceEnvelope {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+pub const MAX_RECOVERY_TARGET_TEXT_BYTES: usize = 512;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperationRecoveryTarget {
+    ApplicationLaunch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identifier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    ApplicationProcess {
+        process_id: u32,
+        application: String,
+    },
+}
+
+impl std::fmt::Debug for OperationRecoveryTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplicationLaunch { identifier, name } => f
+                .debug_struct("ApplicationLaunch")
+                .field("identifier_present", &identifier.is_some())
+                .field("name_present", &name.is_some())
+                .finish(),
+            Self::ApplicationProcess { .. } => f
+                .debug_struct("ApplicationProcess")
+                .field("process_id", &"[redacted]")
+                .field("application", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+impl OperationRecoveryTarget {
+    pub fn validate(&self, capability: DeviceCapability) -> Result<(), ExecutionError> {
+        match self {
+            Self::ApplicationLaunch { identifier, name } => {
+                let valid = |value: &str| {
+                    !value.trim().is_empty() && value.len() <= MAX_RECOVERY_TARGET_TEXT_BYTES
+                };
+                if capability != DeviceCapability::LaunchApplication
+                    || (identifier.is_none() && name.is_none())
+                    || identifier.as_deref().is_some_and(|value| !valid(value))
+                    || name.as_deref().is_some_and(|value| !valid(value))
+                {
+                    return Err(ExecutionError::InvalidOperation);
+                }
+            }
+            Self::ApplicationProcess {
+                process_id,
+                application,
+            } => {
+                if capability != DeviceCapability::TerminateApplication
+                    || *process_id == 0
+                    || application.trim().is_empty()
+                    || application.len() > MAX_RECOVERY_TARGET_TEXT_BYTES
+                {
+                    return Err(ExecutionError::InvalidOperation);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn recovery_target_for_command(command: &DeviceCommand) -> Option<OperationRecoveryTarget> {
+    match command {
+        DeviceCommand::LaunchApplication {
+            identifier, name, ..
+        } => Some(OperationRecoveryTarget::ApplicationLaunch {
+            identifier: identifier.clone(),
+            name: name.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn recovery_target_required(capability: DeviceCapability) -> bool {
+    matches!(
+        capability,
+        DeviceCapability::LaunchApplication | DeviceCapability::TerminateApplication
+    )
+}
+
 pub const MAX_SEMANTIC_CONSTRAINT_RULE_ID_BYTES: usize = 64;
 pub const SEMANTIC_CONSTRAINT_SNAPSHOT_DIGEST_BYTES: usize = 64;
 pub const MAX_SEMANTIC_CONSTRAINT_KIND_BYTES: usize = 64;
@@ -626,6 +716,7 @@ pub struct OperationAdmissionMetadata {
     pub audit: OperationAuditMetadata,
     pub request_fingerprint: Option<OperationRequestFingerprint>,
     pub evidence_envelope: Option<OperationEvidenceEnvelope>,
+    pub recovery_target: Option<OperationRecoveryTarget>,
     pub semantic_constraint: Option<SemanticConstraintAdmissionEvidence>,
 }
 
@@ -641,6 +732,12 @@ impl OperationAdmissionMetadata {
         }
         if let Some(envelope) = self.evidence_envelope.as_ref() {
             envelope.validate(capability)?;
+        }
+        if recovery_target_required(capability) && self.recovery_target.is_none() {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        if let Some(target) = self.recovery_target.as_ref() {
+            target.validate(capability)?;
         }
         if let Some(constraint) = self.semantic_constraint.as_ref() {
             constraint.validate_for_capability(capability)?;
@@ -1093,6 +1190,7 @@ pub struct QuarantineInspectionSnapshot {
     pub audit: OperationAuditMetadata,
     pub request_fingerprint: Option<OperationRequestFingerprint>,
     pub evidence_envelope: Option<OperationEvidenceEnvelope>,
+    pub recovery_target: Option<OperationRecoveryTarget>,
     pub semantic_constraint: Option<SemanticConstraintAdmissionEvidence>,
     pub prepared_at_ms: u64,
     pub dispatched_at_ms: Option<u64>,
@@ -1169,6 +1267,10 @@ pub struct SafetyOperationSnapshot {
     pub request_fingerprint: Option<OperationRequestFingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_envelope: Option<OperationEvidenceEnvelope>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovery_target_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_target: Option<OperationRecoveryTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_constraint: Option<SemanticConstraintAdmissionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1211,6 +1313,8 @@ struct SafetyOperation {
     audit: OperationAuditMetadata,
     request_fingerprint: Option<OperationRequestFingerprint>,
     evidence_envelope: Option<OperationEvidenceEnvelope>,
+    recovery_target_required: bool,
+    recovery_target: Option<OperationRecoveryTarget>,
     semantic_constraint: Option<SemanticConstraintAdmissionEvidence>,
     dispatch_binding: Option<OperationDispatchBinding>,
     reconciliation_status: Option<ReconciliationStatus>,
@@ -1289,6 +1393,7 @@ impl AuthoritativeOperationController {
             audit,
             request_fingerprint,
             evidence_envelope,
+            recovery_target,
             semantic_constraint,
         } = metadata;
         if !matches!(capability.class(), crate::v2_m0::CapabilityClass::Observe)
@@ -1340,6 +1445,8 @@ impl AuthoritativeOperationController {
                 audit,
                 request_fingerprint,
                 evidence_envelope,
+                recovery_target_required: recovery_target_required(capability),
+                recovery_target,
                 semantic_constraint,
                 dispatch_binding: None,
                 reconciliation_status: None,
@@ -2255,6 +2362,7 @@ impl AuthoritativeOperationController {
                     audit: record.audit.clone(),
                     request_fingerprint: record.request_fingerprint.clone(),
                     evidence_envelope: record.evidence_envelope.clone(),
+                    recovery_target: record.recovery_target.clone(),
                     semantic_constraint: record.semantic_constraint.clone(),
                     prepared_at_ms: record.prepared_at_ms,
                     dispatched_at_ms: record.dispatched_at_ms,
@@ -2452,6 +2560,8 @@ impl AuthoritativeOperationController {
                 audit: record.audit.clone(),
                 request_fingerprint: record.request_fingerprint.clone(),
                 evidence_envelope: record.evidence_envelope.clone(),
+                recovery_target_required: record.recovery_target_required,
+                recovery_target: record.recovery_target.clone(),
                 semantic_constraint: record.semantic_constraint.clone(),
                 dispatch_binding: record.dispatch_binding.clone(),
                 reconciliation_status: if state == HubOperationState::Indeterminate {
@@ -2516,6 +2626,10 @@ impl AuthoritativeOperationController {
                 .admission
                 .retired_indeterminate_tombstones
                 .is_empty();
+        let has_v14_recovery_target_state = snapshot
+            .operations
+            .iter()
+            .any(|record| record.recovery_target_required || record.recovery_target.is_some());
         let has_v11_compacted_state =
             self.admission.retired_indeterminate_count() != self.retirements.len();
         let has_v12_semantic_constraint_state = snapshot
@@ -2568,8 +2682,24 @@ impl AuthoritativeOperationController {
         });
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                if has_v14_recovery_target_state {
+                    return Err(ExecutionError::InvalidSnapshot);
+                }
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version =
+                        MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION => {
-                if has_v13_mutation_resume_state {
+                if has_v14_recovery_target_state || has_v13_mutation_resume_state {
                     return Err(ExecutionError::InvalidSnapshot);
                 }
                 for record in &mut snapshot.operations {
@@ -2889,6 +3019,7 @@ impl AuthoritativeOperationController {
                 | CURRENT_STATE_ACCEPTANCE_EXECUTION_SAFETY_SCHEMA_VERSION
                 | REPLAY_TOMBSTONE_EXECUTION_SAFETY_SCHEMA_VERSION
                 | SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION
+                | MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -2946,6 +3077,14 @@ impl AuthoritativeOperationController {
             return Err(ExecutionError::InvalidSnapshot);
         }
         if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && snapshot
+                .operations
+                .iter()
+                .any(|record| record.recovery_target_required || record.recovery_target.is_some())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION
             && (!snapshot.mutation_resume_barriers.is_empty()
                 || !snapshot.mutation_resumes.is_empty()
                 || snapshot.retirements.iter().any(|record| {
@@ -3045,6 +3184,12 @@ impl AuthoritativeOperationController {
                     .evidence_envelope
                     .as_ref()
                     .is_some_and(|envelope| envelope.validate(record.capability).is_err())
+                || (record.recovery_target_required && record.recovery_target.is_none())
+                || (record.recovery_target.is_some() && !record.recovery_target_required)
+                || record
+                    .recovery_target
+                    .as_ref()
+                    .is_some_and(|target| target.validate(record.capability).is_err())
                 || record
                     .semantic_constraint
                     .as_ref()
@@ -3091,6 +3236,8 @@ impl AuthoritativeOperationController {
                     audit: record.audit,
                     request_fingerprint: record.request_fingerprint,
                     evidence_envelope: record.evidence_envelope,
+                    recovery_target_required: record.recovery_target_required,
+                    recovery_target: record.recovery_target,
                     semantic_constraint: record.semantic_constraint,
                     dispatch_binding: record.dispatch_binding,
                     reconciliation_status: record.reconciliation_status,
@@ -4442,6 +4589,7 @@ mod tests {
                     audit: audit.clone(),
                     request_fingerprint: Some(fingerprint.clone()),
                     evidence_envelope: None,
+                    recovery_target: None,
                     semantic_constraint: None,
                 },
                 10,
@@ -4515,6 +4663,7 @@ mod tests {
                     },
                     request_fingerprint: Some(fingerprint),
                     evidence_envelope: None,
+                    recovery_target: None,
                     semantic_constraint: None,
                 },
                 10,
@@ -5921,6 +6070,7 @@ mod tests {
                     },
                     request_fingerprint: None,
                     evidence_envelope: None,
+                    recovery_target: None,
                     semantic_constraint: None,
                 },
                 1,
@@ -6256,6 +6406,7 @@ mod tests {
                     audit: OperationAuditMetadata::empty(),
                     request_fingerprint: None,
                     evidence_envelope: Some(envelope.clone()),
+                    recovery_target: None,
                     semantic_constraint: None,
                 },
                 10,
@@ -6304,6 +6455,176 @@ mod tests {
     }
 
     #[test]
+    fn new_v14_application_admission_requires_private_recovery_target() {
+        let mut ledger = controller();
+        for capability in [
+            DeviceCapability::LaunchApplication,
+            DeviceCapability::TerminateApplication,
+        ] {
+            let operation_id = match capability {
+                DeviceCapability::LaunchApplication => "op-launch-missing-target",
+                DeviceCapability::TerminateApplication => "op-terminate-missing-target",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                ledger.prepare_with_metadata(
+                    op(operation_id, 7),
+                    alice(),
+                    capability,
+                    OperationAdmissionMetadata::empty(),
+                    10,
+                ),
+                Err(ExecutionError::InvalidOperation)
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_target_v14_survives_restart_and_blocks_lossy_v13_downgrade() {
+        let mut ledger = controller();
+        let target = OperationRecoveryTarget::ApplicationProcess {
+            process_id: 42,
+            application: "Monokura".into(),
+        };
+        ledger
+            .prepare_with_metadata(
+                op("op-terminate-target", 7),
+                alice(),
+                DeviceCapability::TerminateApplication,
+                OperationAdmissionMetadata {
+                    audit: OperationAuditMetadata::empty(),
+                    request_fingerprint: None,
+                    evidence_envelope: None,
+                    recovery_target: Some(target.clone()),
+                    semantic_constraint: None,
+                },
+                10,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched("op-terminate-target", &alice(), 7, 11)
+            .unwrap();
+        ledger
+            .mark_connection_lost("op-terminate-target", 12)
+            .unwrap();
+
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.schema_version, EXECUTION_SAFETY_SCHEMA_VERSION);
+        assert_eq!(snapshot.operations[0].recovery_target, Some(target.clone()));
+        assert!(
+            serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("Monokura")
+        );
+        assert_eq!(
+            ledger.snapshot_for_restart_compatible_with(
+                MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        );
+
+        let mut restored = AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            snapshot,
+        )
+        .unwrap();
+        let inspections = restored.quarantine_inspections().unwrap();
+        assert_eq!(inspections.len(), 1);
+        assert_eq!(inspections[0].recovery_target, Some(target));
+        assert_eq!(
+            restored.prepare(
+                op("op-terminate-target", 8),
+                alice(),
+                DeviceCapability::TerminateApplication,
+                20,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
+    }
+
+    #[test]
+    fn recovery_target_v14_rejects_corrupt_or_mismatched_target_and_reads_v13_without_one() {
+        let mut legacy = controller();
+        legacy
+            .prepare(
+                op("op-v13-compatible", 1),
+                alice(),
+                DeviceCapability::Shell,
+                1,
+            )
+            .unwrap();
+        let v13 = legacy
+            .snapshot_for_restart_compatible_with(MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION)
+            .unwrap();
+        assert_eq!(
+            v13.schema_version,
+            MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION
+        );
+        AuthoritativeOperationController::restore_after_restart(
+            AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 8,
+            },
+            v13,
+        )
+        .unwrap();
+
+        let mut current = controller();
+        current
+            .prepare_with_metadata(
+                op("op-corrupt-target", 2),
+                alice(),
+                DeviceCapability::TerminateApplication,
+                OperationAdmissionMetadata {
+                    audit: OperationAuditMetadata::empty(),
+                    request_fingerprint: None,
+                    evidence_envelope: None,
+                    recovery_target: Some(OperationRecoveryTarget::ApplicationProcess {
+                        process_id: 9,
+                        application: "KaruPic".into(),
+                    }),
+                    semantic_constraint: None,
+                },
+                2,
+            )
+            .unwrap();
+        let mut corrupt = current.snapshot_for_restart();
+        corrupt.operations[0].recovery_target = Some(OperationRecoveryTarget::ApplicationProcess {
+            process_id: 9,
+            application: String::new(),
+        });
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                corrupt,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+
+        let mut mismatch = current.snapshot_for_restart();
+        mismatch.operations[0].recovery_target = Some(OperationRecoveryTarget::ApplicationLaunch {
+            identifier: Some("jp.ksk.karupic".into()),
+            name: None,
+        });
+        assert!(matches!(
+            AuthoritativeOperationController::restore_after_restart(
+                AdmissionLimits {
+                    max_global_active: 1,
+                    max_queued_per_device: 8,
+                },
+                mismatch,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        ));
+    }
+
+    #[test]
     fn semantic_constraint_v12_persists_exact_bounded_evidence_and_blocks_lossy_downgrade() {
         let mut ledger = AuthoritativeOperationController::new(AdmissionLimits {
             max_global_active: 1,
@@ -6319,6 +6640,7 @@ mod tests {
             audit: OperationAuditMetadata::empty(),
             request_fingerprint: None,
             evidence_envelope: None,
+            recovery_target: None,
             semantic_constraint: Some(SemanticConstraintAdmissionEvidence {
                 revision: 12,
                 snapshot_digest: "a".repeat(64),

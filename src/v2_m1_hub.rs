@@ -4744,6 +4744,7 @@ mod tests {
             audit: Default::default(),
             request_fingerprint: None,
             evidence_envelope: None,
+            recovery_target: None,
             semantic_constraint: Some(admitted),
         };
         {
