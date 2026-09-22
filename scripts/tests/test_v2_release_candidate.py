@@ -147,16 +147,42 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_smoke_resolves_relative_bundle_before_spawning(self):
         bundle = self.extract("macos")
         relative = bundle.relative_to(Path.cwd()) if bundle.is_relative_to(Path.cwd()) else bundle
-        completed = mock.Mock(returncode=0)
+        def completed(args, **_kwargs):
+            binary = Path(args[0])
+            if binary.name == "v2_recovery_enclave_helper":
+                return mock.Mock(returncode=0, stdout="helper 1\n", stderr="")
+            return mock.Mock(
+                returncode=0,
+                stdout=f"{binary.name} {self.VERSION} (commit {self.COMMIT})\n",
+                stderr="",
+            )
+
         with mock.patch.object(mod, "current_platform", return_value="macos"), mock.patch.object(
             mod.host_platform, "platform", return_value="test-host"
-        ), mock.patch.object(mod.subprocess, "run", return_value=completed) as run:
+        ), mock.patch.object(mod.subprocess, "run", side_effect=completed) as run:
             mod.smoke_bundle(relative)
         for call in run.call_args_list:
             binary = Path(call.args[0][0])
             self.assertTrue(binary.is_absolute())
-            expected_arg = "--version" if binary.name == "v2_recovery_enclave_helper" else "--help"
-            self.assertEqual(call.args[0][1], expected_arg)
+            self.assertEqual(call.args[0][1], "--version")
+
+    def test_smoke_rejects_binary_version_identity_mismatch(self):
+        bundle = self.extract("linux")
+
+        def completed(args, **_kwargs):
+            binary = Path(args[0])
+            commit = "b" * 40 if binary.name == "v2_hub" else self.COMMIT
+            return mock.Mock(
+                returncode=0,
+                stdout=f"{binary.name} {self.VERSION} (commit {commit})\n",
+                stderr="",
+            )
+
+        with mock.patch.object(mod, "current_platform", return_value="linux"), mock.patch.object(
+            mod.subprocess, "run", side_effect=completed
+        ):
+            with self.assertRaisesRegex(mod.CandidateError, "source commit differs from manifest"):
+                mod.smoke_bundle(bundle)
 
     def test_invalid_source_commit_is_refused_before_artifact_creation(self):
         binary_dir = self.make_binary_dir("linux")

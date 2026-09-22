@@ -41,6 +41,7 @@ const MAX_SEMANTIC_CONSTRAINT_POLICY_BYTES: u64 = 64 * 1024;
 #[derive(Debug, Parser)]
 #[command(name = "v2_hub")]
 #[command(about = "Single-device V2 Hub over gRPC/TLS for an always-on VM")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Args {
     #[arg(long, env = "CUMG_V2_HUB_BIND", default_value = "0.0.0.0:7443")]
     bind: SocketAddr,

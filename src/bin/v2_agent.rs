@@ -25,6 +25,7 @@ enum WorkspaceMutationMode {
 #[derive(Debug, Parser)]
 #[command(name = "cumg-v2-agent")]
 #[command(about = "Outbound V2 secure Agent for computer-use-mcp-gateway")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Config {
     #[arg(long, env = "CUMG_V2_HUB_ENDPOINT")]
     hub_endpoint: String,

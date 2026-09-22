@@ -41,6 +41,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Parser)]
 #[command(name = "cumg-v2-recover")]
 #[command(about = "Local-user approval for V2 online quarantine recovery")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Command,
