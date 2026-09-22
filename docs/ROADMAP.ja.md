@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-22 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.6.0` Managed Developer Execution が released baseline です。現在OPENのbacklogは `v0.10.0` まで明示的にversion割当済みです。**
+2026-09-22 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.7.0` Operator Ergonomics & Recovery Evidence が released baseline です。現在OPENのbacklogは `v0.10.0` まで明示的にversion割当済みで、unfinishedなv0.6.1 support-claim evidence trackは別枠で保持します。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,9 +34,9 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Released baseline: `0.6.x`
+## Released baseline: `0.7.x`
 
-`v0.6.0` が released **Managed Developer Execution** baseline です。#106 managed jobs、#114 sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 hardening、final #335 schema/artifact/upgrade/readiness integrationを完了します。exact release scopeは [`v2/V2_060_RELEASE_SCOPE.ja.md`](v2/V2_060_RELEASE_SCOPE.ja.md) に記録します。#139/#217/#228 のremaining acceptanceは **`v0.6.1 — Support Claim Expansion`** に割り当て、older support contractを遡及拡大しません。
+`v0.7.0` が released **Operator Ergonomics & Recovery Evidence** baseline です。admitted scopeは #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded ambiguous-target identity、#290 durable backend execution receipt、#347 verified single-Mac backup/restore を完了します。exact release scope / durable-state migration・rollback / withheld support claim は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md) に記録します。historical `v0.6.0` Managed Developer Execution scope は [`v2/V2_060_RELEASE_SCOPE.ja.md`](v2/V2_060_RELEASE_SCOPE.ja.md) に残します。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -81,12 +81,12 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 これらを満たすまでは V1 を narrow / regression-only に保ち、新しい capability は追加しません。
 
-## Post-v0.6 の numbered release sequence
+## Post-v0.6 の numbered release boundary
 
-`v0.6.0` は released / frozen の **Managed Developer Execution** baseline です。remaining OPEN backlog は unnumbered future bucket のままにせず、明示的な numbered release boundary を割り当てます。これらのversionはscope boundaryでありcalendar promiseではありません。issueを別versionへ移す場合はroadmapとmilestoneを明示的に更新します。
+`v0.7.0` は released / frozen の **Operator Ergonomics & Recovery Evidence** baseline です。これらのversion assignmentはscope boundaryでありcalendar promiseではありません。still-openのv0.6.1 support-claim evidence trackは独立しておりv0.7.0のprerequisiteではなく、unfinished claimをnewer releaseへ暗黙importしません。そのtrack完了がv0.7以降にadvertised support contractを新しく広げる場合は [`VERSIONING.ja.md`](VERSIONING.ja.md) に従い、obsoleteなpatch numberを強制せずappropriate later MINORへpublicationを再割当します。
 
-1. **`v0.6.1 — Support Claim Expansion`** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。compatibility-preservingなsupport-claim patchに限定し、`v0.6.0`やolder releaseを遡及拡大しません。required physical evidenceが不足するclaimは、`v0.6.1`を切る前にissueを明示的に後続versionへ移します。
-2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence`** — #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded ambiguous-target identity、#290 durable backend execution receipts、#347 verified single-Mac backup/restore。#289でreviewed target/evidence boundaryを定義し、#290がdurable receiptをauthoritative reconciliationへ利用し、#347がexact runtime/quarantine/replay/mutation-authority preservation と staged activation を閉じます。
+1. **`v0.6.1 — Support Claim Expansion` evidence track** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、final gate #346。open / withheldのままで、v0.6.0やv0.7.0を遡及拡大しません。
+2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence` — released。** #342 / #295 / #304 / #289 / #290 / #347 はcomplete。詳細は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md)。
 3. **`v0.8.0 — Backend Portability Evidence`** — #222で既存CUMGのGUI authority / ambiguity / recovery semanticsを、materially differentなsecond real backendに対して実証します。generic provider / VM / fleet productには拡張しません。
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
 5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
@@ -184,8 +184,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
-- **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。
-- **`v0.7.0 — Operator Ergonomics & Recovery Evidence`:** #342 / #295 / #304 / #289 / #290 / #347 で planned scope は完了し、#347 merge 後の milestone OPEN issue は **0**。
+- **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、#346 final support-claim gate。
 - **`v0.8.0 — Backend Portability Evidence`:** #222 second-real-backend semantic-neutrality proof。
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#284 final replacement / partition / physical-Handoff acceptance。
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。

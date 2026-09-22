@@ -4,7 +4,7 @@
 
 2026-09-22 時点の状況:
 
-- **Release sequencing:** `v0.6.0` Managed Developer Execution が released baseline のままです。control 12 / capability 8 / registry 8 / Hub-Agent 6 を pin します。`v0.7.0 — Operator Ergonomics & Recovery Evidence` implementation milestone は #342 operation-ID guidance、#295 bounded version identity、#304 unified status、#289 private ambiguous-target identity、#290 durable backend receipt、#347 verified backup/restore まで完了しました。これは通常の release process 実行前に release tag を主張するものではありません。#139 signed-token dogfood / #217 recovery parity / #228 physical Linux FIDO2 は withheld support-claim gate のまま、#215 は unsupported です。
+- **Release sequencing:** `v0.7.0 — Operator Ergonomics & Recovery Evidence` が released baseline です。live control/capability/registry/Hub-Agent schema は 12/8/8/6 のまま、durable execution-safety は v14、Agent M1 persistence は v6 です。#342 operation-ID guidance、#295 bounded version identity、#304 unified status、#289 private ambiguous-target identity、#290 durable backend receipt、#347 verified backup/restore を含みます。#139 signed-token dogfood / #217 recovery parity / #228 physical Linux FIDO2 は separate withheld support-claim gate のまま、#215 は unsupported です。
 - **Desktop semantic path:** complete / accepted。same-context の native element click/type/key targeting と、real-Cua による background AX element-action evidence を含みます。
 - **Browser core semantic path:** prepare、bind、inspect、navigate、click、type、dialog、pointer semantics まで complete / accepted です。
 - **Browser transfer:** complete / accepted。upload/download は scoped CUMG ref と Agent-private の bounded staging を使用し、任意の host path を northbound に公開しません。private staging を確立できない場合も privacy を保ったまま、Agent startup が失敗した正確な bounded stage / I/O class を host-local に記録します。
@@ -47,6 +47,8 @@
 
 ## 有効な契約
 
+- [`V2_070_RELEASE_SCOPE.ja.md`](V2_070_RELEASE_SCOPE.ja.md) — released `0.7.0` Operator Ergonomics & Recovery Evidence scope / durable-state migration・rollback / acceptance / support-claim matrix。
+- [`V2_060_RELEASE_SCOPE.ja.md`](V2_060_RELEASE_SCOPE.ja.md) — released `0.6.0` Managed Developer Execution scope / compatibility / acceptance / support-claim matrix。
 - [`V2_040_RELEASE_SCOPE.ja.md`](V2_040_RELEASE_SCOPE.ja.md) — released `0.4.0` scope / acceptance record / support-claim matrix。
 - [`V2_SEMANTIC_AUTHORIZATION.ja.md`](V2_SEMANTIC_AUTHORIZATION.ja.md) — typed narrow-only final-command semantic authorization / durable snapshot binding。
 - [`V2_POSITIONING.ja.md`](V2_POSITIONING.ja.md) — canonical product boundary の日本語版。
