@@ -15,6 +15,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "v2_handoff_ctl")]
 #[command(about = "Local operator control for the Agent-owned Handoff coordinator")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Args {
     #[arg(long, env = "CUMG_V2_HANDOFF_CONTROL_SOCKET")]
     socket: PathBuf,

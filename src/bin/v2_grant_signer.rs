@@ -19,6 +19,7 @@ const MAX_SIGNER_POLICY_BYTES: u64 = 64 * 1024;
 #[derive(Debug, Parser)]
 #[command(name = "v2_grant_signer")]
 #[command(about = "External V2 capability-grant signing authority over a Unix socket")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Args {
     #[arg(long, env = "CUMG_V2_GRANT_SIGNER_SOCKET")]
     socket: PathBuf,

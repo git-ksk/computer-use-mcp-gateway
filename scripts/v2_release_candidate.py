@@ -630,18 +630,24 @@ def smoke_bundle(bundle_root: Path) -> None:
         # The Secure Enclave helper is an internal bounded IPC executable, not a Clap CLI.
         # Its reviewed non-interactive smoke contract is --version; generate/sign/public would
         # access key material or LocalAuthentication and must never be triggered by packaging CI.
-        smoke_arg = "--version" if binary.name == "v2_recovery_enclave_helper" else "--help"
         result = subprocess.run(
-            [str(binary), smoke_arg],
+            [str(binary), "--version"],
             cwd=bundle_root,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=15,
             check=False,
         )
         if result.returncode != 0:
             raise CandidateError(f"packaged binary smoke failed: {binary.name}")
+        if binary.name != "v2_recovery_enclave_helper":
+            version_output = f"{result.stdout}\n{result.stderr}"
+            if str(manifest["package_version"]) not in version_output:
+                raise CandidateError(f"packaged binary version differs from manifest: {binary.name}")
+            if str(manifest["source_commit"]) not in version_output:
+                raise CandidateError(f"packaged binary source commit differs from manifest: {binary.name}")
     print(f"SMOKE_OK bundle={bundle_root.name} host={host_platform.platform()}")
 
 

@@ -8,6 +8,7 @@ use std::process::ExitCode;
 #[derive(Debug, Parser)]
 #[command(name = "v2_doctor")]
 #[command(about = "Privacy-bounded diagnostics for a single-Mac CUMG V2 deployment")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Args {
     #[arg(long, env = "CUMG_V2_INSTALL_ROOT")]
     install_root: Option<PathBuf>,

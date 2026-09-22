@@ -23,6 +23,7 @@ impl From<InputFormat> for CertificateFormat {
 #[derive(Debug, Parser)]
 #[command(name = "v2_tls_check")]
 #[command(about = "Check a V2 TLS certificate or trust anchor for expiry")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Cli {
     #[arg(long)]
     certificate: PathBuf,

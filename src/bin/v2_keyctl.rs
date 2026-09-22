@@ -13,6 +13,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "v2_keyctl")]
 #[command(about = "Offline V2 application-key generation and signed rotation documents")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Command,

@@ -67,6 +67,7 @@ jobs:
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             bins+=(--bin v2_doctor --bin v2_status --bin v2_recover)
           fi
+          export CUMG_SOURCE_COMMIT="$(git rev-parse HEAD)"
           cargo build --release --locked "${bins[@]}"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             scripts/build-macos-recovery-helper.sh target/release/v2_recovery_enclave_helper

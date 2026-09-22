@@ -40,6 +40,7 @@ fn handoff_is_idle(socket: &std::path::Path) -> bool {
 #[derive(Debug, Parser)]
 #[command(name = "v2_maint")]
 #[command(about = "Offline operator maintenance for durable V2 Hub state")]
+#[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Args {
     #[command(subcommand)]
     command: Command,

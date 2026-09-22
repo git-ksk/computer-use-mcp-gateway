@@ -755,7 +755,7 @@ tx_advance() {
 
 if [[ "$ARTIFACT_MODE" == "0" ]]; then
   BUILD_ERR="$(mktemp "${TMPDIR:-/tmp}/cumg-v2-build.XXXXXX")"
-  if ! cargo build -j "$CARGO_BUILD_JOBS" --release --locked \
+  if ! CUMG_SOURCE_COMMIT="$HEAD" cargo build -j "$CARGO_BUILD_JOBS" --release --locked \
     --bin v2_hub --bin v2_agent --bin v2_maint --bin v2_doctor --bin v2_status --bin v2_recover --bin v2_grant_signer 2>"$BUILD_ERR"; then
     cat "$BUILD_ERR" >&2
     if grep -Eqi 'No space left on device|ENOSPC|os error 28' "$BUILD_ERR"; then
