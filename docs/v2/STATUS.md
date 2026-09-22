@@ -4,7 +4,7 @@
 
 Status as of 2026-09-22:
 
-- **Release sequencing:** `v0.6.0` Managed Developer Execution remains the released baseline with control schema 12, capability schema 8, registry schema 8, and Hub-Agent schema 6. The `v0.7.0 — Operator Ergonomics & Recovery Evidence` implementation milestone is complete after #342 operation-ID guidance, #295 bounded version identity, #304 unified status, #289 private ambiguous-target identity, #290 durable backend receipts, and #347 verified backup/restore; this does not claim a release tag until the normal release process runs. #139 signed-token dogfood, #217 recovery parity, and #228 physical Linux FIDO2 remain separate withheld support-claim gates; Cloud Run #215 remains unsupported.
+- **Release sequencing:** `v0.7.0 — Operator Ergonomics & Recovery Evidence` is the released baseline. Live control/capability/registry/Hub-Agent schemas remain 12/8/8/6; durable execution-safety is v14 and Agent M1 persistence is v6 after #342 operation-ID guidance, #295 bounded version identity, #304 unified status, #289 private ambiguous-target identity, #290 durable backend receipts, and #347 verified backup/restore. #139 signed-token dogfood, #217 recovery parity, and #228 physical Linux FIDO2 remain separate withheld support-claim gates; Cloud Run #215 remains unsupported.
 - **Desktop semantic path:** complete and accepted, including same-context native element click/type/key targeting and real-Cua background AX element-action evidence.
 - **Browser core semantic path:** complete and accepted for prepare, bind, inspect, navigate, click, type, dialog, and pointer semantics.
 - **Browser transfer:** complete and accepted. Upload/download use scoped CUMG refs plus Agent-private bounded staging; no arbitrary host path is exposed northbound. Agent startup now preserves privacy while reporting the exact bounded staging-init stage and I/O class locally when private staging cannot be established.
@@ -47,6 +47,7 @@ Status as of 2026-09-22:
 
 ## Active contracts
 
+- [`V2_070_RELEASE_SCOPE.md`](V2_070_RELEASE_SCOPE.md) — released `0.7.0` Operator Ergonomics & Recovery Evidence scope, durable-state migration/rollback boundary, acceptance record, and support-claim matrix.
 - [`V2_060_RELEASE_SCOPE.md`](V2_060_RELEASE_SCOPE.md) — released `0.6.0` Managed Developer Execution scope, compatibility boundary, acceptance record, and support-claim matrix.
 
 - [`V2_040_RELEASE_SCOPE.md`](V2_040_RELEASE_SCOPE.md) — released `0.4.0` scope, acceptance record, and support-claim matrix.

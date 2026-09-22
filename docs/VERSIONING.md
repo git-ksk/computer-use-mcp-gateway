@@ -4,7 +4,7 @@
 
 CUMG uses Semantic Versioning with an explicit pre-1.0 policy.
 
-Current released line: **0.6.x**. `v0.6.0` is the released Managed Developer Execution baseline.
+Current released line: **0.7.x**. `v0.7.0` is the released Operator Ergonomics & Recovery Evidence baseline.
 
 ## Version shape
 
@@ -52,12 +52,12 @@ Security emergency changes may break compatibility when preserving compatibility
 
 ## Schema versions are independent
 
-Project/crate versions, wire protocol schemas, capability-advertisement schemas, and durable-state schemas serve different purposes. The released v0.6 baseline pins CONTROL_SCHEMA_VERSION = 12, capability schema 8, DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8, and HUB_AGENT_SCHEMA_VERSION = 6. Released v0.5 used control 10 / capability 6 / registry 8 / Hub-Agent 6; the historical #106 v0.6 development pairing used control 11 / capability 7. HUB_AGENT_SCHEMA_VERSION remains 6 because the outer signed envelope is unchanged. Mixed live versions fail closed.
+Project/crate versions, wire protocol schemas, capability-advertisement schemas, and durable-state schemas serve different purposes. The released v0.7 baseline keeps the live pairing at CONTROL_SCHEMA_VERSION = 12, capability schema 8, DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8, and HUB_AGENT_SCHEMA_VERSION = 6, matching released v0.6 at the live protocol boundary. v0.7 separately advances durable execution-safety state to schema v14 and Agent M1 persistence to schema v6. Released v0.5 used control 10 / capability 6 / registry 8 / Hub-Agent 6; the historical #106 v0.6 development pairing used control 11 / capability 7. HUB_AGENT_SCHEMA_VERSION remains 6 because the outer signed envelope is unchanged. Mixed live versions fail closed.
 
 - `CONTROL_SCHEMA_VERSION` changes when the live control-schema compatibility boundary changes.
 - capability-advertisement schema version changes when that live advertisement boundary changes.
 - `DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION` and `GRANT_LEDGER_SNAPSHOT_SCHEMA_VERSION` version their persisted structures independently; a future `CONTROL_SCHEMA_VERSION` bump must not change them unless the persisted structure itself changes.
-- historical v0.2.x checkpoints used the then-current control schema number as the persisted registry/grant-ledger tag. Runtime restore supports only the explicitly reviewed v0.2.0-and-later lineage: registry 2/capability 2, 3/capability 3, 4..=6/capability 4, 7/capability 5, released-v0.5 8/capability 6, historical #106 v0.6 8/capability 7, and current-v0.6 8/capability 8; grant-ledger tags remain independently versioned. Prototype tag 1, unknown/future tags, and impossible control/capability pairings fail closed.
+- historical v0.2.x checkpoints used the then-current control schema number as the persisted registry/grant-ledger tag. Runtime restore supports only the explicitly reviewed v0.2.0-and-later lineage: registry 2/capability 2, 3/capability 3, 4..=6/capability 4, 7/capability 5, released-v0.5 8/capability 6, historical #106 v0.6 8/capability 7, and released-v0.6/current-v0.7 8/capability 8; grant-ledger tags remain independently versioned. Prototype tag 1, unknown/future tags, and impossible control/capability pairings fail closed.
 - historical capability advertisements are not promoted into live authority during migration. The Hub validates the historical pairing, restores device identity/generation, marks the device offline, and requires a fresh Agent advertisement using the current live schema before dispatch.
 - a crate release does not automatically increment any schema.
 - a schema change does not determine the crate version arithmetically; use PATCH/MINOR based on public compatibility impact.
@@ -101,7 +101,7 @@ Before 1.0, only the **latest released minor line** is actively supported. Older
 
 ## Release-candidate artifacts
 
-The `v0.6.0` GitHub Release is **source-only**, matching the pre-1.0 publication boundary. Verified CI archives remain release evidence and are not official binary Release assets; they are never silently promoted into a supported distribution.
+The `v0.7.0` GitHub Release is **source-only**, matching the pre-1.0 publication boundary. Verified CI archives remain release evidence and are not official binary Release assets; they are never silently promoted into a supported distribution.
 
 The `Release Candidate Artifacts` workflow still builds bounded native candidates on Linux, macOS, and Windows. Manifest schema v3 records the package version, exact CUMG source commit, exact Hub/Agent, control, and capability schema versions, platform/architecture, exact allowlisted files, sizes, and SHA-256 identities. Linux and Windows candidates remain distribution evidence only.
 

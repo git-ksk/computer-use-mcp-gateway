@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased — v0.7.0
+## v0.7.0 — 2026-09-22
+
+Operator Ergonomics & Recovery Evidence release. This release improves caller-safe operation recovery, packaged/runtime identity inspection, unified read-only status, privacy-bounded target recovery evidence, authoritative backend receipt plumbing, and verified single-Mac disaster-recovery backup/restore while preserving exact authorization and no-auto-replay semantics. Live control/capability/registry/Hub-Agent schemas remain 12/8/8/6.
+
+### Caller operation-ID guidance (#342)
+
+- every effectful northbound tool continues to accept the exact `op_` + 32 lowercase-hex shape, while tool schemas and EN/JA recovery docs now explicitly require a fresh cryptographically secure random 128-bit value generated before each new effectful call;
+- patterned/counter/hand-authored IDs and reuse are explicitly documented as unsafe caller behavior; the server intentionally validates shape/replay identity rather than attempting heuristic entropy scoring.
+
+### Bounded build identity (#295)
+
+- reviewed V2 CLI binaries expose bounded `--version` output with package version plus the source commit embedded by the reviewed build path; ad-hoc builds without an injected reviewed commit report `commit unknown` rather than consulting Git at runtime or fabricating identity;
+- release-candidate fresh-extraction smoke requires binary package/source identity to match the closed artifact manifest. Human-readable version output remains operator convenience only; hashes/manifests remain authoritative for pairing, install, upgrade, and rollback.
+
+### Unified read-only runtime status (#304)
+
+- the Gateway exposes first-class read-only `cumg_status` using the same unified status composition as `v2_status`, so MCP consumers can inspect control-plane connectivity, quarantine/action-required state, lane readiness, Handoff/recovery/runtime pairing, and stable next-action codes without shell authority;
+- status remains observational only: it cannot grant capability, clear quarantine, reconcile/replay work, switch mutation authority, resume Handoff, reprovision recovery, or infer health from process liveness alone.
 
 ### Recovery target identity (#289)
 
@@ -24,7 +41,14 @@
 - backup manifests are canonical and externally anchored by their SHA-256. Restore requires that separately recorded digest, rejects corrupt/incomplete/extra/symlinked/weak-permission/mixed/newer state, and never treats a self-contained manifest/hash as proof of authenticity or snapshot freshness;
 - restore is split into a non-running staged phase and explicit activation. The exact original install/LaunchAgent profile must be clean, coordination lock inodes and ephemeral/browser/Playwright/log/socket/cache/stale-key material are not restored, and activation establishes a fresh Agent generation rather than inheriting checkpoint liveness;
 - Hub execution/quarantine/replay state is copied byte-for-byte and fingerprinted. Backup/restore itself never resolves ambiguity or changes mutation authority; post-activation quarantine may shrink only through the pre-existing authoritative recovery/reconciliation contract such as an exact persisted #290 receipt;
-- deterministic regression covers coherent-lock refusal, exact round-trip preservation, external-digest mismatch, tamper/missing/extra/symlink/unknown-state rejection, newer checkpoint schema, Handoff identity mismatch, clean-profile enforcement, and staged-copy tamper detection. Live control/capability/Hub-Agent and execution-safety schema versions are unchanged.
+- deterministic regression covers coherent-lock refusal, exact round-trip preservation, external-digest mismatch, tamper/missing/extra/symlink/unknown-state rejection, newer checkpoint schema, Handoff identity mismatch, clean-profile enforcement, and staged-copy tamper detection. Live control/capability/Hub-Agent schema versions are unchanged.
+
+### Compatibility, acceptance and publication
+
+- live control/capability/registry/Hub-Agent identity remains **12/8/8/6** from v0.6, while durable execution-safety is **v14** and Agent M1 persistence is **v6**. v0.6 -> v0.7 is a paired runtime upgrade; once v0.7 writes target-bearing v14 or receipt-bearing Agent v6 state, rollback uses the pre-upgrade v0.6 checkpoint plus version-paired v0.6 binaries/config rather than lossy downgrade;
+- #139 provider-specific signed-token acceptance, #217 cross-platform recovery parity, and #228 Linux FIDO2 UV physical acceptance remain withheld/open. Hosted Cloud Run/Handoff remains unsupported; #360 managed-job cgroup-v2 expansion and #361 SBOM/provenance-ready candidate evidence are not shipped by v0.7.0;
+- protected release evidence requires CodeQL, dependency review, docs/link checks, Rust CI, backend passthrough, Linux/macOS/Windows Cua smoke, and three-platform Release Candidate Artifacts on the exact release commit;
+- the GitHub Release remains **source-only**. Verified CI candidate archives are release evidence and are not attached as official binary assets or represented as signed/notarized public installers.
 
 ## v0.6.0 — 2026-09-22
 

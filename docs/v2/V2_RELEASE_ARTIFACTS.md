@@ -12,7 +12,7 @@ This document defines the post-#237 distribution boundary. Release artifacts imp
 | Linux Hub / Agent | reviewed native candidate evidence | existing source/service packaging; no official binary installer claim yet |
 | Windows desktop Agent | reviewed native candidate evidence | existing source/Task Scheduler profile; no official binary installer claim yet |
 
-A CI artifact is not automatically an official GitHub Release asset. The `v0.6.0` GitHub Release is source-only; its verified archives remain release evidence and are not attached as official binary assets. A later release may promote a reviewed artifact only through the documented release procedure with the required supply-chain evidence; tags and published assets are never inferred from CI success.
+A CI artifact is not automatically an official GitHub Release asset. The `v0.7.0` GitHub Release is source-only; its verified archives remain release evidence and are not attached as official binary assets. A later release may promote a reviewed artifact only through the documented release procedure with the required supply-chain evidence; tags and published assets are never inferred from CI success.
 
 ## macOS artifact identity
 
