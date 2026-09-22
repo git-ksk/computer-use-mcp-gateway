@@ -6,7 +6,16 @@ Status: **v0.4 Recovery & Reconciliation の active V2 contract**。
 
 ## Stable operation reference
 
-すべての effectful northbound tool は、`op_` + 32文字の lowercase hexadecimal（128 random bits）という exact form の optional `operation_id` を受け取ります。process/shell、effectful Desktop、effectful Browser が対象で、observation-only tool はこの field を受け取りません。response loss を recovery する必要がある work では、caller が call **前**に cryptographically random な fresh ID を生成して保持してください。response 全体が失われた場合に server-generated ID を後から知れるとは仮定できません。
+すべての effectful northbound tool は、`op_` + 32文字の lowercase hexadecimal（128 random bits）という exact form の optional `operation_id` を受け取ります。この field を指定する場合、caller は新しい effectful execution ごとに **call 前に cryptographically secure random な fresh 128-bit value** を生成し、response loss 時の `get_operation` 用に保持してください。覚えやすい値を手書きしたり、counter/pattern を使ったり、過去の operation ID を再利用してはいけません。server は wire shape と replay identity を検証しますが、syntactically valid な128-bit valueが本当にrandom生成されたかを推測する heuristic entropy scoring は意図的に行いません。
+
+代表的な CSPRNG 生成例:
+
+```text
+Python:  "op_" + secrets.token_hex(16)
+Node.js: "op_" + crypto.randomBytes(16).toString("hex")
+```
+
+値は effectful tool 呼び出し前に生成・保持してください。response 全体が失われた場合に server-generated ID を後から知れるとは仮定できません。2026-09-22 dogfood で観測された `op_69696969696969696969696969696969` のような patterned value は、生成してはいけない明示的な例です。
 
 accepted operation ID は既存の authoritative replay identity そのものです。同じ ID で別 execution を試すと `operation_replay` として拒否され、status lookup が replay や resume に変換することはありません。
 
