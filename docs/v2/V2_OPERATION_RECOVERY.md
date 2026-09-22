@@ -6,7 +6,16 @@ This contract provides read-only durable recovery for effectful operations whose
 
 ## Stable operation reference
 
-Every effectful northbound tool accepts an optional `operation_id` with the exact form `op_` followed by 32 lowercase hexadecimal characters (128 random bits). This includes process/shell, effectful Desktop operations, and effectful Browser operations; observation-only tools do not accept the field. For work whose response loss matters, callers should generate a fresh cryptographically random ID **before** the call and retain it locally. A caller cannot rely on learning a server-generated ID if the entire response is lost.
+Every effectful northbound tool accepts an optional `operation_id` with the exact form `op_` followed by 32 lowercase hexadecimal characters (128 random bits). This includes process/shell, effectful Desktop operations, and effectful Browser operations; observation-only tools do not accept the field. For every new effectful execution, callers that supply this field must generate a **fresh cryptographically secure random 128-bit value before the call** and retain it locally for `get_operation` if the response is lost. Do not hand-author memorable IDs, use counters/patterns, or reuse an earlier operation ID. The server validates the wire shape and replay identity; it deliberately does not apply heuristic entropy scoring to guess whether a syntactically valid 128-bit value was generated randomly.
+
+Representative CSPRNG generation:
+
+```text
+Python:  "op_" + secrets.token_hex(16)
+Node.js: "op_" + crypto.randomBytes(16).toString("hex")
+```
+
+Generate and retain the value before invoking the effectful tool. A caller cannot rely on learning a server-generated ID if the entire response is lost. The patterned `op_69696969696969696969696969696969` value observed during 2026-09-22 dogfood is an explicit example of what **not** to generate.
 
 An accepted operation ID is the existing authoritative replay identity. Reusing it for another execution is rejected as `operation_replay`; status lookup never turns that rejection into a replay or resume.
 

@@ -5491,7 +5491,8 @@ fn audit_correlation_id_schema() -> Value {
 fn operation_id_schema() -> Value {
     json!({
         "type": "string",
-        "pattern": "^op_[0-9a-f]{32}$"
+        "pattern": "^op_[0-9a-f]{32}$",
+        "description": "Optional caller-retained recovery ID. For each new effectful execution, generate a fresh cryptographically secure random 128-bit value before the call, encode it as op_ plus 32 lowercase hexadecimal characters, and retain it for get_operation if the response is lost. Never hand-author, use patterned/counter values, or reuse an earlier operation_id."
     })
 }
 
@@ -8406,6 +8407,9 @@ mod tests {
                 "missing operation_id on {name}"
             );
             assert!(schema.contains("^op_[0-9a-f]{32}$"));
+            assert!(schema.contains("fresh cryptographically secure random 128-bit value"));
+            assert!(schema.contains("Never hand-author"));
+            assert!(schema.contains("retain it for get_operation"));
         }
         for name in [TOOL_SCREENSHOT, TOOL_READ_FILE, TOOL_BROWSER_INSPECT] {
             let tool = tools
@@ -8462,6 +8466,16 @@ mod tests {
             recoverable_result_json(RecoverableOperationResult::EffectfulStatus),
             json!({"type": "effectful_status", "payload_retained": false})
         );
+    }
+
+    #[test]
+    fn patterned_operation_id_is_shape_valid_but_not_recommended() {
+        let patterned = "op_69696969696969696969696969696969";
+        assert!(validate_operation_id(patterned).is_ok());
+
+        let schema = serde_json::to_string(&operation_id_schema()).unwrap();
+        assert!(schema.contains("Never hand-author"));
+        assert!(schema.contains("patterned/counter values"));
     }
 
     #[test]
