@@ -10,7 +10,8 @@
 
 use crate::v2_execution_safety::{
     AgentTerminalEvidence, AuthoritativeOperationController, AuthoritativeSafetySnapshot,
-    MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES,
+    BackendExecutionReceipt, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES,
+    validate_backend_execution_receipt_journal,
 };
 use crate::v2_m0::{DeviceRegistry, DeviceRegistrySnapshot, GrantLedger, GrantLedgerSnapshot};
 use crate::v2_m0_execution::{AdmissionLimits, AgentExecutionGate, AgentExecutionSnapshot};
@@ -27,7 +28,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-pub const M1_STATE_SCHEMA_VERSION: u16 = 5;
+const LEGACY_M1_STATE_SCHEMA_VERSION: u16 = 5;
+pub const M1_STATE_SCHEMA_VERSION: u16 = 6;
+const BACKEND_RECEIPT_M1_STATE_SCHEMA_VERSION: u16 = 6;
 pub const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
 pub const MAX_RETAINED_CHECKPOINTS: usize = 64;
 
@@ -42,6 +45,8 @@ pub struct AgentPersistentState {
     #[serde(default)]
     pub terminal_evidence: Vec<AgentTerminalEvidence>,
     #[serde(default)]
+    pub backend_execution_receipts: Vec<BackendExecutionReceipt>,
+    #[serde(default)]
     pub managed_job_fail_closed: bool,
 }
 
@@ -51,6 +56,7 @@ pub struct RestoredAgentRuntimeSafety {
     pub grant_ledger: GrantLedger,
     pub execution: AgentExecutionGate,
     pub terminal_evidence: Vec<AgentTerminalEvidence>,
+    pub backend_execution_receipts: Vec<BackendExecutionReceipt>,
     pub managed_job_fail_closed: bool,
 }
 
@@ -89,12 +95,38 @@ impl AgentPersistentState {
         terminal_evidence: &[AgentTerminalEvidence],
         managed_job_fail_closed: bool,
     ) -> Result<Self, PersistenceError> {
+        Self::capture_with_runtime_evidence(
+            device_id,
+            trusted_hub,
+            grant_ledger,
+            execution,
+            terminal_evidence,
+            &[],
+            managed_job_fail_closed,
+        )
+    }
+
+    pub fn capture_with_runtime_evidence(
+        device_id: impl Into<String>,
+        trusted_hub: &TrustedHubIdentity,
+        grant_ledger: &GrantLedger,
+        execution: &AgentExecutionGate,
+        terminal_evidence: &[AgentTerminalEvidence],
+        backend_execution_receipts: &[BackendExecutionReceipt],
+        managed_job_fail_closed: bool,
+    ) -> Result<Self, PersistenceError> {
         let device_id = device_id.into();
         if device_id.trim().is_empty()
             || terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
             || terminal_evidence
                 .iter()
                 .any(|entry| entry.validate().is_err())
+            || validate_backend_execution_receipt_journal(backend_execution_receipts).is_err()
+            || backend_execution_receipts.iter().any(|receipt| {
+                !terminal_evidence
+                    .iter()
+                    .any(|terminal| terminal == &receipt.as_terminal_evidence())
+            })
         {
             return Err(PersistenceError::InvalidState);
         }
@@ -106,6 +138,7 @@ impl AgentPersistentState {
             grant_ledger: grant_ledger.snapshot(),
             execution: execution.snapshot_for_restart(),
             terminal_evidence: terminal_evidence.to_vec(),
+            backend_execution_receipts: backend_execution_receipts.to_vec(),
             managed_job_fail_closed,
         })
     }
@@ -144,13 +177,23 @@ impl AgentPersistentState {
     pub fn restore_with_runtime_safety(
         self,
     ) -> Result<RestoredAgentRuntimeSafety, PersistenceError> {
-        validate_state_schema(self.schema_version)?;
+        let persisted_schema_version = self.schema_version;
+        validate_state_schema(persisted_schema_version)?;
         if self.device_id.trim().is_empty()
             || self.terminal_evidence.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES
             || self
                 .terminal_evidence
                 .iter()
                 .any(|entry| entry.validate().is_err())
+            || (persisted_schema_version < BACKEND_RECEIPT_M1_STATE_SCHEMA_VERSION
+                && !self.backend_execution_receipts.is_empty())
+            || validate_backend_execution_receipt_journal(&self.backend_execution_receipts).is_err()
+            || self.backend_execution_receipts.iter().any(|receipt| {
+                !self
+                    .terminal_evidence
+                    .iter()
+                    .any(|terminal| terminal == &receipt.as_terminal_evidence())
+            })
         {
             return Err(PersistenceError::InvalidState);
         }
@@ -168,11 +211,11 @@ impl AgentPersistentState {
             grant_ledger,
             execution,
             terminal_evidence: self.terminal_evidence,
+            backend_execution_receipts: self.backend_execution_receipts,
             managed_job_fail_closed: self.managed_job_fail_closed,
         })
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubPersistentState {
     pub schema_version: u16,
@@ -493,7 +536,10 @@ fn sync_directory(directory: &Path) -> Result<(), PersistenceError> {
 }
 
 fn validate_state_schema(got: u16) -> Result<(), PersistenceError> {
-    if got == M1_STATE_SCHEMA_VERSION {
+    if matches!(
+        got,
+        LEGACY_M1_STATE_SCHEMA_VERSION | M1_STATE_SCHEMA_VERSION
+    ) {
         Ok(())
     } else {
         Err(PersistenceError::UnsupportedSchema { got })
@@ -894,6 +940,194 @@ mod tests {
         }
         let (_, _, _, _, restored_evidence) = state.restore_with_terminal_evidence().unwrap();
         assert_eq!(restored_evidence, vec![evidence]);
+    }
+
+    #[test]
+    fn backend_execution_receipt_survives_restart_with_exact_terminal_proof() {
+        use crate::v2_execution_safety::{
+            BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION, BackendExecutionReceipt,
+            BackendReceiptTargetBinding, BackendReceiptTerminalOutcome,
+        };
+
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let execution = AgentExecutionGate::default();
+        let receipt = BackendExecutionReceipt {
+            schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            operation: OperationRef {
+                device_id: "dev-receipt".into(),
+                device_generation: 7,
+                operation_id: "op-receipt-restart".into(),
+            },
+            capability_revision: 4,
+            capability: DeviceCapability::TerminateApplication,
+            dispatch_grant_id: "grant_receipt_restart".into(),
+            backend: "receipt-provider".into(),
+            backend_version: "1.2.3".into(),
+            provider_contract_schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            sequence: 9,
+            target_binding: Some(BackendReceiptTargetBinding::ApplicationProcess {
+                process_id: 77,
+            }),
+            terminal_outcome: BackendReceiptTerminalOutcome::EffectCommitted,
+        };
+        let evidence = receipt.as_terminal_evidence();
+        let state = AgentPersistentState::capture_with_runtime_evidence(
+            "dev-receipt",
+            &trusted_hub,
+            &grants,
+            &execution,
+            std::slice::from_ref(&evidence),
+            std::slice::from_ref(&receipt),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(state.schema_version, M1_STATE_SCHEMA_VERSION);
+        let encoded = serde_json::to_string(&state).unwrap();
+        for forbidden in [
+            "command",
+            "stdout",
+            "stderr",
+            "cwd",
+            "env",
+            "url",
+            "typed_text",
+            "provider_response",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "backend receipt state leaked {forbidden}"
+            );
+        }
+
+        let restored = state.restore_with_runtime_safety().unwrap();
+        assert_eq!(restored.terminal_evidence, vec![evidence]);
+        assert_eq!(restored.backend_execution_receipts, vec![receipt]);
+    }
+
+    #[test]
+    fn malformed_or_incomplete_backend_receipt_checkpoint_fails_closed() {
+        use crate::v2_execution_safety::{
+            BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION, BackendExecutionReceipt,
+            BackendReceiptTargetBinding, BackendReceiptTerminalOutcome,
+        };
+
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let execution = AgentExecutionGate::default();
+        let receipt = BackendExecutionReceipt {
+            schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            operation: OperationRef {
+                device_id: "dev-corrupt-receipt".into(),
+                device_generation: 5,
+                operation_id: "op-corrupt-receipt".into(),
+            },
+            capability_revision: 7,
+            capability: DeviceCapability::TerminateApplication,
+            dispatch_grant_id: "grant_corrupt_receipt".into(),
+            backend: "receipt-provider".into(),
+            backend_version: "1".into(),
+            provider_contract_schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            sequence: 3,
+            target_binding: Some(BackendReceiptTargetBinding::ApplicationProcess {
+                process_id: 91,
+            }),
+            terminal_outcome: BackendReceiptTerminalOutcome::EffectCommitted,
+        };
+        let evidence = receipt.as_terminal_evidence();
+        let state = AgentPersistentState::capture_with_runtime_evidence(
+            "dev-corrupt-receipt",
+            &trusted_hub,
+            &grants,
+            &execution,
+            std::slice::from_ref(&evidence),
+            std::slice::from_ref(&receipt),
+            false,
+        )
+        .unwrap();
+
+        let mut malformed = state.clone();
+        malformed.backend_execution_receipts[0].sequence = 0;
+        assert!(matches!(
+            malformed.restore_with_runtime_safety(),
+            Err(PersistenceError::InvalidState)
+        ));
+
+        let mut incomplete = state.clone();
+        incomplete.backend_execution_receipts[0].target_binding = None;
+        assert!(matches!(
+            incomplete.restore_with_runtime_safety(),
+            Err(PersistenceError::InvalidState)
+        ));
+
+        let mut orphaned = state;
+        orphaned.terminal_evidence.clear();
+        assert!(matches!(
+            orphaned.restore_with_runtime_safety(),
+            Err(PersistenceError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn historical_v5_agent_state_is_readable_but_v5_cannot_claim_v6_receipts() {
+        use crate::v2_execution_safety::{
+            BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION, BackendExecutionReceipt,
+            BackendReceiptTargetBinding, BackendReceiptTerminalOutcome,
+        };
+
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let execution = AgentExecutionGate::default();
+
+        let mut historical =
+            AgentPersistentState::capture("dev-v5", &trusted_hub, &grants, &execution).unwrap();
+        historical.schema_version = LEGACY_M1_STATE_SCHEMA_VERSION;
+        let restored = historical.restore_with_runtime_safety().unwrap();
+        assert!(restored.backend_execution_receipts.is_empty());
+
+        let receipt = BackendExecutionReceipt {
+            schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            operation: OperationRef {
+                device_id: "dev-v5".into(),
+                device_generation: 3,
+                operation_id: "op-v6-only-receipt".into(),
+            },
+            capability_revision: 2,
+            capability: DeviceCapability::TerminateApplication,
+            dispatch_grant_id: "grant_v6_only_receipt".into(),
+            backend: "receipt-provider".into(),
+            backend_version: "1".into(),
+            provider_contract_schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            sequence: 1,
+            target_binding: Some(BackendReceiptTargetBinding::ApplicationProcess {
+                process_id: 88,
+            }),
+            terminal_outcome: BackendReceiptTerminalOutcome::EffectCommitted,
+        };
+        let evidence = receipt.as_terminal_evidence();
+        let mut v6 = AgentPersistentState::capture_with_runtime_evidence(
+            "dev-v5",
+            &trusted_hub,
+            &grants,
+            &execution,
+            std::slice::from_ref(&evidence),
+            std::slice::from_ref(&receipt),
+            false,
+        )
+        .unwrap();
+        assert_eq!(v6.schema_version, 6);
+        v6.schema_version = LEGACY_M1_STATE_SCHEMA_VERSION;
+        assert!(matches!(
+            v6.restore_with_runtime_safety(),
+            Err(PersistenceError::InvalidState)
+        ));
     }
 
     #[test]

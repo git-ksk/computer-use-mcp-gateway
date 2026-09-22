@@ -9,8 +9,8 @@
 //! stores raw command, argv, cwd, or environment payloads.
 
 use crate::v2_m0::{
-    DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult, InputDeliveryMode, InputTarget,
-    ProcessOutput, ProcessRequest, ShellRequest,
+    CapabilityClass, DeviceCapability, DeviceCommand, DeviceErrorCode, DeviceResult,
+    InputDeliveryMode, InputTarget, ProcessOutput, ProcessRequest, ShellRequest,
 };
 use crate::v2_m0_execution::{
     AdmissionDecision, AdmissionLimits, CancellationDecision, CompletionDecision, ExecutionError,
@@ -45,6 +45,9 @@ pub const MAX_DISPATCH_FENCE_BYTES: usize = 128;
 pub const MAX_RECONCILIATION_DEVICE_ID_BYTES: usize = 128;
 pub const MAX_RECONCILIATION_OPERATION_ID_BYTES: usize = 128;
 pub const MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES: usize = 64;
+pub const MAX_AGENT_BACKEND_EXECUTION_RECEIPTS: usize = 64;
+pub const BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION: u16 = 1;
+pub const MAX_BACKEND_RECEIPT_PROVIDER_BYTES: usize = 128;
 pub const MAX_AUTO_RESOLUTION_RECORDS: usize = 64;
 pub const MAX_RETIREMENT_REASON_BYTES: usize = 1024;
 pub const MAX_RETIREMENT_RECORDS: usize = 64;
@@ -264,6 +267,215 @@ pub struct AgentTerminalEvidence {
     pub dispatch_grant_id: String,
     pub terminal_state: HubOperationState,
     pub evidence: ExecutionEvidence,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendReceiptTargetBinding {
+    ApplicationLaunch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identifier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    ApplicationProcess {
+        process_id: u32,
+    },
+}
+
+impl std::fmt::Debug for BackendReceiptTargetBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplicationLaunch { identifier, name } => f
+                .debug_struct("ApplicationLaunch")
+                .field("identifier_present", &identifier.is_some())
+                .field("name_present", &name.is_some())
+                .finish(),
+            Self::ApplicationProcess { .. } => f
+                .debug_struct("ApplicationProcess")
+                .field("process_id", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+impl BackendReceiptTargetBinding {
+    pub fn for_command(command: &DeviceCommand) -> Option<Self> {
+        match command {
+            DeviceCommand::LaunchApplication {
+                identifier, name, ..
+            } => Some(Self::ApplicationLaunch {
+                identifier: identifier.clone(),
+                name: name.clone(),
+            }),
+            DeviceCommand::TerminateApplication { process_id } => Some(Self::ApplicationProcess {
+                process_id: *process_id,
+            }),
+            _ => None,
+        }
+    }
+
+    fn validate_for_capability(&self, capability: DeviceCapability) -> Result<(), ExecutionError> {
+        match self {
+            Self::ApplicationLaunch { identifier, name } => {
+                let valid = |value: &str| {
+                    !value.trim().is_empty() && value.len() <= MAX_RECOVERY_TARGET_TEXT_BYTES
+                };
+                if capability != DeviceCapability::LaunchApplication
+                    || (identifier.is_none() && name.is_none())
+                    || identifier.as_deref().is_some_and(|value| !valid(value))
+                    || name.as_deref().is_some_and(|value| !valid(value))
+                {
+                    return Err(ExecutionError::InvalidOperation);
+                }
+            }
+            Self::ApplicationProcess { process_id } => {
+                if capability != DeviceCapability::TerminateApplication || *process_id == 0 {
+                    return Err(ExecutionError::InvalidOperation);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn matches_recovery_target(&self, target: &OperationRecoveryTarget) -> bool {
+        match (self, target) {
+            (
+                Self::ApplicationLaunch { identifier, name },
+                OperationRecoveryTarget::ApplicationLaunch {
+                    identifier: expected_identifier,
+                    name: expected_name,
+                },
+            ) => identifier == expected_identifier && name == expected_name,
+            (
+                Self::ApplicationProcess { process_id },
+                OperationRecoveryTarget::ApplicationProcess {
+                    process_id: expected_process_id,
+                    ..
+                },
+            ) => process_id == expected_process_id,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendReceiptTerminalOutcome {
+    EffectCommitted,
+    ProvenNotExecuted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendExecutionReceipt {
+    pub schema_version: u16,
+    pub operation: OperationRef,
+    pub capability_revision: u64,
+    pub capability: DeviceCapability,
+    pub dispatch_grant_id: String,
+    pub backend: String,
+    pub backend_version: String,
+    pub provider_contract_schema_version: u16,
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_binding: Option<BackendReceiptTargetBinding>,
+    pub terminal_outcome: BackendReceiptTerminalOutcome,
+}
+
+impl BackendExecutionReceipt {
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        OperationDispatchBinding::new(self.capability_revision, self.dispatch_grant_id.clone())?;
+        if self.schema_version != BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION
+            || self.provider_contract_schema_version != BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION
+            || self.operation.device_id.trim().is_empty()
+            || self.operation.device_id.len() > MAX_RECONCILIATION_DEVICE_ID_BYTES
+            || self.operation.device_generation == 0
+            || self.operation.operation_id.trim().is_empty()
+            || self.operation.operation_id.len() > MAX_RECONCILIATION_OPERATION_ID_BYTES
+            || self.capability.class() == CapabilityClass::Observe
+            || self.sequence == 0
+            || !valid_backend_receipt_provider_component(&self.backend)
+            || !valid_backend_receipt_provider_component(&self.backend_version)
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        let target_required = matches!(
+            self.capability,
+            DeviceCapability::LaunchApplication | DeviceCapability::TerminateApplication
+        );
+        if target_required != self.target_binding.is_some() {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        if let Some(target) = self.target_binding.as_ref() {
+            target.validate_for_capability(self.capability)?;
+        }
+        self.as_terminal_evidence().validate()
+    }
+
+    pub fn dispatch_binding(&self) -> OperationDispatchBinding {
+        OperationDispatchBinding {
+            capability_revision: self.capability_revision,
+            grant_id: self.dispatch_grant_id.clone(),
+        }
+    }
+
+    pub fn as_terminal_evidence(&self) -> AgentTerminalEvidence {
+        let (terminal_state, evidence) = match self.terminal_outcome {
+            BackendReceiptTerminalOutcome::EffectCommitted => (
+                HubOperationState::Completed,
+                ExecutionEvidence::VerifiedAgentResult,
+            ),
+            BackendReceiptTerminalOutcome::ProvenNotExecuted => (
+                HubOperationState::Failed,
+                ExecutionEvidence::VerifiedRemoteError,
+            ),
+        };
+        AgentTerminalEvidence {
+            operation: self.operation.clone(),
+            capability_revision: self.capability_revision,
+            capability: self.capability,
+            dispatch_grant_id: self.dispatch_grant_id.clone(),
+            terminal_state,
+            evidence,
+        }
+    }
+}
+
+fn valid_backend_receipt_provider_component(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_BACKEND_RECEIPT_PROVIDER_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+pub fn validate_backend_execution_receipt_journal(
+    receipts: &[BackendExecutionReceipt],
+) -> Result<(), ExecutionError> {
+    if receipts.len() > MAX_AGENT_BACKEND_EXECUTION_RECEIPTS {
+        return Err(ExecutionError::InvalidOperation);
+    }
+    let mut operation_ids = std::collections::HashSet::new();
+    let mut provider_sequences = std::collections::HashSet::new();
+    let mut latest_by_provider: HashMap<(&str, &str), u64> = HashMap::new();
+    for receipt in receipts {
+        receipt.validate()?;
+        if !operation_ids.insert(receipt.operation.operation_id.as_str())
+            || !provider_sequences.insert((
+                receipt.backend.as_str(),
+                receipt.backend_version.as_str(),
+                receipt.sequence,
+            ))
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+        let key = (receipt.backend.as_str(), receipt.backend_version.as_str());
+        if latest_by_provider
+            .insert(key, receipt.sequence)
+            .is_some_and(|latest| receipt.sequence <= latest)
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+    }
+    Ok(())
 }
 
 impl AgentTerminalEvidence {
@@ -5890,6 +6102,91 @@ mod tests {
             Err(ExecutionError::OwnershipFenceMismatch)
         );
         assert!(wrong_fence.quarantine("desktop-a").is_some());
+    }
+
+    #[test]
+    fn exact_backend_receipt_reuses_authoritative_reconciliation_without_replay() {
+        let binding = OperationDispatchBinding::new(31, "grant_backend_receipt_exact").unwrap();
+        let mut ledger = controller();
+        let operation = op("op-backend-receipt-reconcile", 9);
+        let recovery_target = OperationRecoveryTarget::ApplicationProcess {
+            process_id: 4242,
+            application: "KaruPic".into(),
+        };
+        ledger
+            .prepare_with_metadata(
+                operation.clone(),
+                alice(),
+                DeviceCapability::TerminateApplication,
+                OperationAdmissionMetadata {
+                    audit: OperationAuditMetadata::empty(),
+                    request_fingerprint: None,
+                    evidence_envelope: None,
+                    recovery_target: Some(recovery_target),
+                    semantic_constraint: None,
+                },
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched_with_binding(
+                &operation.operation_id,
+                &alice(),
+                operation.device_generation,
+                Some(binding.clone()),
+                2,
+            )
+            .unwrap();
+        ledger
+            .mark_connection_lost(&operation.operation_id, 3)
+            .unwrap();
+
+        assert!(ledger.quarantine("desktop-a").is_some());
+        assert_eq!(
+            ledger.state(&operation.operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+
+        let receipt = BackendExecutionReceipt {
+            schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            operation: operation.clone(),
+            capability_revision: binding.capability_revision,
+            capability: DeviceCapability::TerminateApplication,
+            dispatch_grant_id: binding.grant_id.clone(),
+            backend: "receipt-cu".into(),
+            backend_version: "2".into(),
+            provider_contract_schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            sequence: 17,
+            target_binding: Some(BackendReceiptTargetBinding::ApplicationProcess {
+                process_id: 4242,
+            }),
+            terminal_outcome: BackendReceiptTerminalOutcome::EffectCommitted,
+        };
+        receipt.validate().unwrap();
+
+        let (next, terminal_receipt) = ledger
+            .reconcile_authoritative_terminal(&receipt.as_terminal_evidence(), 4)
+            .unwrap();
+        assert_eq!(next, CompletionDecision::Idle);
+        assert_eq!(
+            terminal_receipt.terminal_state,
+            HubOperationState::Completed
+        );
+        assert_eq!(
+            ledger.state(&operation.operation_id),
+            Some(HubOperationState::Completed)
+        );
+        assert!(ledger.quarantine("desktop-a").is_none());
+        assert_eq!(ledger.auto_resolutions().len(), 1);
+        assert_eq!(
+            ledger.prepare(
+                op(&operation.operation_id, 10),
+                alice(),
+                DeviceCapability::TerminateApplication,
+                5,
+            ),
+            Err(ExecutionError::OperationReplay)
+        );
     }
 
     #[test]

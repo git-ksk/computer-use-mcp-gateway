@@ -424,6 +424,13 @@ mod tests {
                 agent_terminal_marker: AgentTerminalMarkerStatus::Present,
                 agent_terminal_marker_authoritative: false,
                 agent_terminal_evidence: AgentTerminalEvidenceStatus::ExactAuthoritative,
+                backend_execution_receipt:
+                    crate::v2_maintenance::BackendExecutionReceiptStatus::Absent,
+                backend_receipt_provider: None,
+                backend_receipt_provider_version: None,
+                backend_receipt_contract_schema_version: None,
+                backend_receipt_sequence: None,
+                backend_receipt_target_bound: None,
                 authoritative_terminal_state: Some("completed".into()),
                 authoritative_evidence_class: Some("verified_agent_result".into()),
                 evidence_authority: ReconciliationEvidenceAuthority::AuthoritativeTerminalEvidence,

@@ -10,6 +10,14 @@
 
 **Migration:** v0.7 clients calling `terminate_application` must pass `application` using the bounded application identity selected during prior observation (for example the `application` field returned by `list_windows`). Existing v0.6 clients that send only `process_id` receive an input-schema failure and must refresh MCP tool discovery/schema before using this effectful operation.
 
+### Authoritative backend execution receipts (#290)
+
+- Agent/backend adapters can opt into a reviewed payload-free durable receipt contract carrying exact operation/device-generation/capability-revision/capability/dispatch-grant/provider provenance, monotonic sequence, relevant application target binding, and terminal outcome. Missing, stale, malformed, conflicting, cross-operation, target-mismatched, or unsupported receipts never become terminal evidence;
+- exact receipts persist in Agent M1 checkpoint schema **v6**, survive restart, and are converted into the existing `AgentTerminalEvidence` so the signed #124 self-reconciliation path remains the only automatic settlement state machine. Hub execution-safety stays at **v14** and live control/capability/Hub-Agent schemas do not change;
+- historical Agent checkpoint schema v5 remains readable when it has no receipt state; receipt-bearing v6 state cannot be lossily represented as v5 and fails closed on downgrade/corruption;
+- the default adapter and current Cua MCP adapter do not claim a reviewed durable receipt source, so backend response loss before a definite Agent result remains `Indeterminate` / operator-required. Provider/log/current-state heuristics remain observational only;
+- `v2_maint audit-reconciliation` and `incident-brief` correlate bounded receipt provenance and #289 target binding while keeping external diagnostics separately labeled `observational_only`; generic MCP/status/log/metric surfaces remain payload/private-target safe.
+
 ## v0.6.0 — 2026-09-22
 
 Managed Developer Execution release. This release adds separately authorized managed developer jobs, a provider-isolated Playwright/E2E capability, and optional reviewed Linux cgroup-v2 process containment while preserving exact authorization, bounded execution, `Indeterminate` quarantine, and permanent no-auto-replay semantics.
