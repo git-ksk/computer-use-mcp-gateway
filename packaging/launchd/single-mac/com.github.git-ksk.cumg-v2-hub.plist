@@ -18,6 +18,8 @@
     <key>CUMG_V2_TLS_CERT_PEM_FILE</key><string>@ROOT@/v2/trust/tls-server.pem</string>
     <key>CUMG_V2_TLS_KEY_PEM_FILE</key><string>@ROOT@/v2/secrets/tls-server.key</string>
     <key>CUMG_V2_HUB_STATE_DIR</key><string>@ROOT@/v2/state/hub</string>
+    <key>CUMG_V2_STATUS_INSTALL_ROOT</key><string>@ROOT@</string>
+    <key>CUMG_V2_STATUS_RUN_ROOT</key><string>@RUN_ROOT@</string>
     <key>CUMG_V2_MCP_BIND</key><string>127.0.0.1:8102</string>
     <key>CUMG_V2_MCP_RESOURCE</key><string>https://REPLACE_WITH_PUBLIC_RESOURCE/mcp</string>
     <key>CUMG_V2_NORTHBOUND_POLICY_FILE</key><string>@ROOT@/v2/trust/northbound-policy.json</string>

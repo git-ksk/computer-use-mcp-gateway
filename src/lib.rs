@@ -56,6 +56,7 @@ pub mod v2_playwright_sandbox;
 pub mod v2_reference_backend;
 pub mod v2_semantic_constraints;
 pub mod v2_state_lock;
+pub mod v2_status_collector;
 pub(crate) mod v2_terminal_pty;
 #[cfg(all(test, unix))]
 mod v2_terminal_pty_acceptance;

@@ -60,12 +60,14 @@ use crate::{
     v2_managed_job::{
         MAX_MANAGED_JOB_LEASE_MS, MAX_MANAGED_JOB_LIFETIME_MS, MAX_MANAGED_JOB_OUTPUT_READ_BYTES,
     },
+    v2_operator_status::{GatewayLiveStatus, apply_gateway_live_status},
     v2_playwright_sandbox::{
         MAX_PLAYWRIGHT_GREP_BYTES, MAX_PLAYWRIGHT_OUTPUT_READ_BYTES, MAX_PLAYWRIGHT_PROJECT_BYTES,
         MAX_PLAYWRIGHT_TEST_LIFETIME_MS, MAX_PLAYWRIGHT_TEST_PATH_BYTES, MAX_PLAYWRIGHT_TEST_PATHS,
         MAX_PLAYWRIGHT_WORKERS, PlaywrightTestRequest,
     },
     v2_semantic_constraints::{SemanticConstraintError, SemanticConstraintPolicy},
+    v2_status_collector::OperatorStatusProvider,
 };
 use async_trait::async_trait;
 use axum::{
@@ -132,6 +134,7 @@ const TOOL_PLAYWRIGHT_TEST_STATUS: &str = "playwright_test_status";
 const TOOL_PLAYWRIGHT_TEST_OUTPUT: &str = "playwright_test_output";
 const TOOL_PLAYWRIGHT_TEST_STOP: &str = "playwright_test_stop";
 const TOOL_GET_OPERATION: &str = "get_operation";
+const TOOL_CUMG_STATUS: &str = "cumg_status";
 const TOOL_READ_FILE: &str = "read_file";
 const TOOL_LIST_DIRECTORY: &str = "list_directory";
 const TOOL_WRITE_WORKSPACE_FILE: &str = "write_workspace_file";
@@ -1208,6 +1211,7 @@ pub struct V2NorthboundMcp {
     semantic_constraints: Option<Arc<SemanticConstraintPolicy>>,
     request_fingerprint_secret: Option<Arc<[u8]>>,
     handoff_coordinator: Option<Arc<HandoffCoordinator>>,
+    status_provider: Option<Arc<dyn OperatorStatusProvider>>,
     interactions: Arc<TokioMutex<NorthboundInteractionState>>,
 }
 
@@ -1253,6 +1257,7 @@ impl V2NorthboundMcp {
             semantic_constraints: None,
             request_fingerprint_secret: None,
             handoff_coordinator: None,
+            status_provider: None,
             interactions: Arc::new(TokioMutex::new(NorthboundInteractionState::new())),
         }
     }
@@ -1264,6 +1269,11 @@ impl V2NorthboundMcp {
 
     pub fn with_handoff_coordinator(mut self, coordinator: Arc<HandoffCoordinator>) -> Self {
         self.handoff_coordinator = Some(coordinator);
+        self
+    }
+
+    pub fn with_status_provider(mut self, provider: Arc<dyn OperatorStatusProvider>) -> Self {
+        self.status_provider = Some(provider);
         self
     }
 
@@ -2614,6 +2624,9 @@ impl V2NorthboundMcp {
             .filter(|tool| match tool.name.as_ref() {
                 TOOL_OPEN_INTERACTION_CONTEXT | TOOL_CLOSE_INTERACTION_CONTEXT => context_access,
                 TOOL_GET_OPERATION => self.recovery_access_allowed(principal),
+                TOOL_CUMG_STATUS => {
+                    self.status_provider.is_some() && self.status_access_allowed(principal)
+                }
                 name => tool_capability(name).is_some_and(|capability| {
                     self.authorizer
                         .authorize_device_capability(principal, self.hub.device_id(), capability)
@@ -2634,6 +2647,48 @@ impl V2NorthboundMcp {
                     .authorize_device_capability(principal, self.hub.device_id(), capability)
                     .is_ok()
             })
+    }
+
+    fn status_access_allowed(&self, principal: &AuthenticatedClientPrincipal) -> bool {
+        all_tools()
+            .into_iter()
+            .filter_map(|tool| tool_capability(tool.name.as_ref()))
+            .any(|capability| {
+                self.authorizer
+                    .authorize_device_capability(principal, self.hub.device_id(), capability)
+                    .is_ok()
+            })
+    }
+
+    async fn cumg_status(
+        &self,
+        principal: &AuthenticatedClientPrincipal,
+    ) -> Result<CallToolResponse, McpError> {
+        if !self.status_access_allowed(principal) {
+            return Err(capability_not_authorized_error());
+        }
+        let provider = self.status_provider.as_ref().ok_or_else(|| {
+            McpError::invalid_request(
+                "CUMG status is unavailable",
+                Some(json!({"code": "status_unavailable"})),
+            )
+        })?;
+        let mut report = provider.status().await.map_err(|_| {
+            McpError::internal_error(
+                "CUMG status collection failed",
+                Some(json!({"code": "status_unavailable"})),
+            )
+        })?;
+        let capabilities = self.hub.current_capabilities().await;
+        let live = GatewayLiveStatus {
+            agent_connected: self.hub.is_online().await,
+            capabilities: capabilities.map(|advertisement| advertisement.supported),
+            quarantine_present: self.hub.desktop_quarantine().await.is_some(),
+        };
+        apply_gateway_live_status(&mut report, &live);
+        let payload = serde_json::to_value(report)
+            .map_err(|_| McpError::internal_error("CUMG status serialization failed", None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload.to_string())]).into())
     }
 
     async fn get_operation(
@@ -2934,6 +2989,10 @@ impl ServerHandler for V2NorthboundMcp {
             return self
                 .get_operation(&auth.principal, &args.operation_id)
                 .await;
+        }
+        if request.name.as_ref() == TOOL_CUMG_STATUS {
+            let _: EmptyArgs = parse_arguments(arguments)?;
+            return self.cumg_status(&auth.principal).await;
         }
         let capability = tool_capability(request.name.as_ref())
             .ok_or_else(|| McpError::invalid_params("Unknown V2 Hub tool", None))?;
@@ -4899,6 +4958,12 @@ fn all_tools() -> Vec<Tool> {
         )
         .with_annotations(ToolAnnotations::new().read_only(true)),
         Tool::new(
+            TOOL_CUMG_STATUS,
+            "Return the unified privacy-bounded CUMG runtime status. Strictly read-only: it never grants authority, clears quarantine, resumes Handoff, starts recovery, or replays work.",
+            object_schema(vec![], &[]),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(true).idempotent(true)),
+        Tool::new(
             TOOL_READ_PROCESS_OUTPUT,
             "Read a bounded stable byte range from short-lived process/shell output previously omitted by the 16 KiB inline result. The opaque output_ref is owner/device/operation scoped, expires, and does not survive Agent restart.",
             object_schema(
@@ -6800,6 +6865,81 @@ mod tests {
 
     struct AuditCaptureSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
+    struct StaticStatusProvider(crate::v2_operator_status::OperatorStatusReport);
+
+    #[async_trait]
+    impl OperatorStatusProvider for StaticStatusProvider {
+        async fn status(&self) -> Result<crate::v2_operator_status::OperatorStatusReport, ()> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn healthy_operator_status() -> crate::v2_operator_status::OperatorStatusReport {
+        use crate::{
+            v2_doctor::{
+                CheckpointReaderCompatibility, LaneReadiness, OperatorToolingStatus,
+                ReadinessLanes, RecoveryKeyReadinessStatus, RuntimePairingStatus,
+            },
+            v2_operator_status::{
+                BackendStatus, ControlPlaneConnectivity, ControlPlaneSummary,
+                HandoffOperatorStatus, HandoffSummary, IncidentReviewAvailability,
+                MaintenanceOperatorStatus, MaintenanceSummary, MutationAuthorityOperatorStatus,
+                MutationAuthorityOperatorSummary, OPERATOR_STATUS_SCHEMA_VERSION,
+                OperatorNextAction, OperatorOverallStatus, OperatorReasonCode,
+                OperatorRuntimeSummary, OperatorStatusReport, QuarantineStatus, RecoverySummary,
+                RuntimeVerificationStatus,
+            },
+        };
+        OperatorStatusReport {
+            schema_version: OPERATOR_STATUS_SCHEMA_VERSION,
+            overall: OperatorOverallStatus::Healthy,
+            control_plane: ControlPlaneSummary {
+                connectivity: ControlPlaneConnectivity::Connected,
+                agent_connected: Some(true),
+                backend: BackendStatus::Ready,
+            },
+            lanes: ReadinessLanes {
+                control_plane: LaneReadiness::Ready,
+                computer_use_observation: LaneReadiness::Ready,
+                filesystem_observation: LaneReadiness::Ready,
+                workspace_mutation: LaneReadiness::Ready,
+                effectful_execution: LaneReadiness::Ready,
+                browser_effectful_execution: LaneReadiness::Ready,
+            },
+            recovery: RecoverySummary {
+                quarantine: QuarantineStatus::Clear,
+                live_quarantine_count: Some(0),
+                replay_safe: None,
+                recovery_mode: "normal".into(),
+                incident_review: IncidentReviewAvailability::NotRequired,
+                key_readiness: RecoveryKeyReadinessStatus::Ready,
+                key_next_action: OperatorNextAction::None,
+            },
+            handoff: HandoffSummary {
+                status: HandoffOperatorStatus::Idle,
+            },
+            mutation_authority: MutationAuthorityOperatorSummary {
+                status: MutationAuthorityOperatorStatus::VerifiedV2,
+                owner: Some("v2".into()),
+                epoch: Some(1),
+            },
+            runtime: OperatorRuntimeSummary {
+                package_version: env!("CARGO_PKG_VERSION").into(),
+                source_commit: Some("a".repeat(40)),
+                verification: RuntimeVerificationStatus::Verified,
+                runtime_pairing: RuntimePairingStatus::Compatible,
+                operator_tooling: OperatorToolingStatus::Compatible,
+                checkpoint_reader_compatibility: CheckpointReaderCompatibility::Compatible,
+            },
+            maintenance: MaintenanceSummary {
+                status: MaintenanceOperatorStatus::None,
+                phase: None,
+            },
+            primary_reason: OperatorReasonCode::None,
+            next_action: OperatorNextAction::None,
+        }
+    }
+
     impl std::io::Write for AuditCaptureSink {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
@@ -7684,6 +7824,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_status_is_read_only_privacy_bounded_and_visible_while_agent_is_offline() {
+        use crate::{
+            v2_m0::{DeviceIdentity, GrantAuthority},
+            v2_m0_transport::HubIdentity,
+            v2_m1_hub::{HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
+        };
+
+        let device_identity = DeviceIdentity::generate();
+        let state_dir = temp_state_dir("offline-unified-status");
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(1),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device_identity.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let principal =
+            AuthenticatedClientPrincipal::new("https://auth.example", "status-user").unwrap();
+        let other =
+            AuthenticatedClientPrincipal::new("https://auth.example", "other-user").unwrap();
+        let mut policy = ClientAuthorizationPolicy::default();
+        policy.allow_device_capability(&principal, handle.device_id(), DeviceCapability::ReadFile);
+        let service = V2NorthboundMcp::new(handle.clone(), policy)
+            .with_status_provider(Arc::new(StaticStatusProvider(healthy_operator_status())));
+
+        let names: Vec<_> = service
+            .tools_for(&principal)
+            .await
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(names, vec![TOOL_CUMG_STATUS.to_owned()]);
+        assert!(handle.desktop_quarantine().await.is_none());
+
+        let response = service.cumg_status(&principal).await.unwrap();
+        let wire = match response {
+            CallToolResponse::Complete(result) => serde_json::to_string(&result).unwrap(),
+            other => panic!("unexpected status response: {other:?}"),
+        };
+        assert!(wire.contains("unavailable"));
+        assert!(wire.contains("control_plane_unavailable"));
+        assert!(wire.contains("live_quarantine_count"));
+        assert!(wire.contains("inspect_doctor"));
+        for forbidden in [
+            "operation_id",
+            "argv",
+            "cwd",
+            "typed_text",
+            "clipboard",
+            "credential",
+            "token",
+            "locator",
+        ] {
+            assert!(!wire.contains(forbidden), "status leaked {forbidden}");
+        }
+        assert!(handle.desktop_quarantine().await.is_none());
+        assert!(service.cumg_status(&other).await.is_err());
+
+        drop(service);
+        drop(hub);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
     async fn operation_recovery_remains_discoverable_while_agent_is_offline() {
         use crate::{
             v2_m0::{DeviceIdentity, GrantAuthority},
@@ -8126,16 +8342,18 @@ mod tests {
         assert_eq!(tool_capability(TOOL_OPEN_INTERACTION_CONTEXT), None);
         assert_eq!(tool_capability(TOOL_CLOSE_INTERACTION_CONTEXT), None);
         assert_eq!(tool_capability(TOOL_GET_OPERATION), None);
+        assert_eq!(tool_capability(TOOL_CUMG_STATUS), None);
         let names: Vec<_> = all_tools()
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names.len(), mappings.len() + 3);
+        assert_eq!(names.len(), mappings.len() + 4);
         let unique_names = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique_names.len(), names.len(), "duplicate MCP tool name");
         assert!(names.contains(&TOOL_OPEN_INTERACTION_CONTEXT.to_owned()));
         assert!(names.contains(&TOOL_CLOSE_INTERACTION_CONTEXT.to_owned()));
         assert!(names.contains(&TOOL_GET_OPERATION.to_owned()));
+        assert!(names.contains(&TOOL_CUMG_STATUS.to_owned()));
         assert!(
             !names
                 .iter()
@@ -8337,7 +8555,12 @@ mod tests {
             );
             assert!(schema.contains("^[A-Za-z0-9_.:-]+$"));
         }
-        for name in [TOOL_GET_OPERATION, TOOL_READ_FILE, TOOL_BROWSER_INSPECT] {
+        for name in [
+            TOOL_GET_OPERATION,
+            TOOL_CUMG_STATUS,
+            TOOL_READ_FILE,
+            TOOL_BROWSER_INSPECT,
+        ] {
             let tool = tools
                 .iter()
                 .find(|tool| tool.name.as_ref() == name)

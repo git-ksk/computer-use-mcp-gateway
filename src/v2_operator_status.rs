@@ -4,6 +4,7 @@
 //! maintenance authority. It only maps already-existing read-only observations
 //! into one schema suitable for CLI/Agent/UI consumers.
 
+use crate::v2_m0::{CapabilityClass, DeviceCapability};
 use crate::{
     v2_doctor::{
         CheckStatus, CheckpointReaderCompatibility, DoctorReport, LaneReadiness,
@@ -335,6 +336,141 @@ impl OperatorStatusReport {
             | OperatorOverallStatus::Unknown => 2,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayLiveStatus {
+    pub agent_connected: bool,
+    pub capabilities: Option<Vec<DeviceCapability>>,
+    pub quarantine_present: bool,
+}
+
+/// Overlay only facts the live Hub can prove without dispatching work.
+/// Runtime/tooling/Handoff/recovery-key state remains owned by the shared
+/// `v2_status` composition and is never inferred from process liveness.
+pub fn apply_gateway_live_status(report: &mut OperatorStatusReport, live: &GatewayLiveStatus) {
+    report.control_plane.agent_connected = Some(live.agent_connected);
+    report.control_plane.connectivity = if live.agent_connected {
+        ControlPlaneConnectivity::Connected
+    } else {
+        ControlPlaneConnectivity::Unavailable
+    };
+
+    report.recovery.quarantine = if live.quarantine_present {
+        QuarantineStatus::Present
+    } else {
+        QuarantineStatus::Clear
+    };
+    report.recovery.live_quarantine_count = Some(usize::from(live.quarantine_present));
+    report.recovery.replay_safe = live.quarantine_present.then_some(false);
+    report.recovery.incident_review = if live.quarantine_present {
+        IncidentReviewAvailability::Available
+    } else {
+        IncidentReviewAvailability::NotRequired
+    };
+
+    if live.quarantine_present {
+        report.overall = OperatorOverallStatus::ActionRequired;
+        report.primary_reason = OperatorReasonCode::PreviousOperationOutcomeUnknown;
+        report.next_action = OperatorNextAction::ReviewIncident;
+    } else if !live.agent_connected
+        && !matches!(report.overall, OperatorOverallStatus::ActionRequired)
+    {
+        report.overall = OperatorOverallStatus::Unavailable;
+        report.primary_reason = OperatorReasonCode::ControlPlaneUnavailable;
+        report.next_action = OperatorNextAction::InspectDoctor;
+    }
+
+    let Some(capabilities) = live.capabilities.as_deref() else {
+        if !live.agent_connected {
+            report.lanes.control_plane = LaneReadiness::Unavailable;
+            for lane in [
+                &mut report.lanes.computer_use_observation,
+                &mut report.lanes.filesystem_observation,
+                &mut report.lanes.workspace_mutation,
+                &mut report.lanes.effectful_execution,
+                &mut report.lanes.browser_effectful_execution,
+            ] {
+                if *lane != LaneReadiness::Unsupported {
+                    *lane = LaneReadiness::Unavailable;
+                }
+            }
+        }
+        return;
+    };
+
+    report.lanes.control_plane = LaneReadiness::Ready;
+    let supports =
+        |predicate: fn(DeviceCapability) -> bool| capabilities.iter().copied().any(predicate);
+    let computer_observation = supports(|capability| {
+        capability.class() == CapabilityClass::Observe
+            && !matches!(
+                capability,
+                DeviceCapability::ReadFile | DeviceCapability::ListDirectory
+            )
+    });
+    let filesystem_observation = supports(|capability| {
+        matches!(
+            capability,
+            DeviceCapability::ReadFile | DeviceCapability::ListDirectory
+        )
+    });
+    let workspace_mutation =
+        supports(|capability| matches!(capability, DeviceCapability::WriteWorkspaceFile));
+    let effectful = supports(|capability| capability.class() != CapabilityClass::Observe);
+    let computer_effectful = supports(|capability| {
+        capability.class() != CapabilityClass::Observe
+            && !matches!(
+                capability,
+                DeviceCapability::ExecuteProcess
+                    | DeviceCapability::Shell
+                    | DeviceCapability::WriteWorkspaceFile
+            )
+    });
+    let browser_effectful = supports(|capability| {
+        matches!(
+            capability,
+            DeviceCapability::BrowserPrepare
+                | DeviceCapability::BrowserNavigate
+                | DeviceCapability::BrowserClick
+                | DeviceCapability::BrowserType
+                | DeviceCapability::BrowserDialog
+                | DeviceCapability::BrowserPointer
+                | DeviceCapability::BrowserUploadFile
+                | DeviceCapability::BrowserDownload
+        )
+    });
+    let backend_ready = report.control_plane.backend == BackendStatus::Ready;
+    let backend_unavailable = report.control_plane.backend == BackendStatus::Unavailable;
+    let observe_lane = |supported: bool, backend_required: bool| {
+        if !supported {
+            LaneReadiness::Unsupported
+        } else if backend_required && backend_unavailable {
+            LaneReadiness::Unavailable
+        } else if backend_required && !backend_ready {
+            LaneReadiness::Unknown
+        } else {
+            LaneReadiness::Ready
+        }
+    };
+    let effect_lane = |supported: bool, backend_required: bool| {
+        if !supported {
+            LaneReadiness::Unsupported
+        } else if live.quarantine_present {
+            LaneReadiness::IndeterminateFenced
+        } else if backend_required && backend_unavailable {
+            LaneReadiness::Unavailable
+        } else if backend_required && !backend_ready {
+            LaneReadiness::Unknown
+        } else {
+            LaneReadiness::Ready
+        }
+    };
+    report.lanes.computer_use_observation = observe_lane(computer_observation, true);
+    report.lanes.filesystem_observation = observe_lane(filesystem_observation, false);
+    report.lanes.workspace_mutation = effect_lane(workspace_mutation, false);
+    report.lanes.effectful_execution = effect_lane(effectful, computer_effectful);
+    report.lanes.browser_effectful_execution = effect_lane(browser_effectful, true);
 }
 
 pub enum HandoffStatusInput<'a> {
@@ -975,6 +1111,128 @@ mod tests {
         assert_eq!(report.control_plane.agent_connected, Some(true));
         assert_eq!(report.recovery.quarantine, QuarantineStatus::Clear);
         assert_eq!(report.handoff.status, HandoffOperatorStatus::Idle);
+    }
+
+    #[test]
+    fn gateway_live_overlay_distinguishes_offline_from_quarantine_without_inventing_health() {
+        let doctor = healthy_doctor();
+        let handoff = idle_handoff();
+        let mut report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::Available(&handoff),
+            UpgradeStatusInput::None,
+        );
+        apply_gateway_live_status(
+            &mut report,
+            &GatewayLiveStatus {
+                agent_connected: false,
+                capabilities: None,
+                quarantine_present: false,
+            },
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::Unavailable);
+        assert_eq!(
+            report.primary_reason,
+            OperatorReasonCode::ControlPlaneUnavailable
+        );
+        assert_eq!(report.control_plane.agent_connected, Some(false));
+        assert_eq!(
+            report.control_plane.connectivity,
+            ControlPlaneConnectivity::Unavailable
+        );
+        assert_eq!(report.recovery.quarantine, QuarantineStatus::Clear);
+        assert_eq!(report.lanes.effectful_execution, LaneReadiness::Unavailable);
+
+        apply_gateway_live_status(
+            &mut report,
+            &GatewayLiveStatus {
+                agent_connected: false,
+                capabilities: None,
+                quarantine_present: true,
+            },
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::ActionRequired);
+        assert_eq!(
+            report.primary_reason,
+            OperatorReasonCode::PreviousOperationOutcomeUnknown
+        );
+        assert_eq!(report.next_action, OperatorNextAction::ReviewIncident);
+        assert_eq!(report.recovery.live_quarantine_count, Some(1));
+        assert_eq!(report.recovery.replay_safe, Some(false));
+    }
+
+    #[test]
+    fn gateway_live_overlay_supports_windows_shell_profile_without_platform_specific_commands() {
+        let doctor = healthy_doctor();
+        let handoff = idle_handoff();
+        let mut report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::Available(&handoff),
+            UpgradeStatusInput::None,
+        );
+        report.control_plane.backend = BackendStatus::NotConfigured;
+        apply_gateway_live_status(
+            &mut report,
+            &GatewayLiveStatus {
+                agent_connected: true,
+                capabilities: Some(vec![
+                    DeviceCapability::ReadFile,
+                    DeviceCapability::ListDirectory,
+                    DeviceCapability::ExecuteProcess,
+                    DeviceCapability::Shell,
+                ]),
+                quarantine_present: false,
+            },
+        );
+        assert_eq!(
+            report.control_plane.connectivity,
+            ControlPlaneConnectivity::Connected
+        );
+        assert_eq!(report.lanes.control_plane, LaneReadiness::Ready);
+        assert_eq!(report.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(report.lanes.effectful_execution, LaneReadiness::Ready);
+        assert_eq!(
+            report.lanes.computer_use_observation,
+            LaneReadiness::Unsupported
+        );
+        assert_eq!(report.lanes.workspace_mutation, LaneReadiness::Unsupported);
+        assert_eq!(
+            report.lanes.browser_effectful_execution,
+            LaneReadiness::Unsupported
+        );
+    }
+
+    #[test]
+    fn gateway_live_overlay_keeps_safe_observation_ready_while_effectful_is_fenced() {
+        let doctor = healthy_doctor();
+        let handoff = idle_handoff();
+        let mut report = build_operator_status(
+            &doctor,
+            HandoffStatusInput::Available(&handoff),
+            UpgradeStatusInput::None,
+        );
+        report.control_plane.backend = BackendStatus::NotConfigured;
+        apply_gateway_live_status(
+            &mut report,
+            &GatewayLiveStatus {
+                agent_connected: true,
+                capabilities: Some(vec![DeviceCapability::ReadFile, DeviceCapability::Shell]),
+                quarantine_present: true,
+            },
+        );
+        assert_eq!(report.recovery.quarantine, QuarantineStatus::Present);
+        assert_eq!(report.recovery.live_quarantine_count, Some(1));
+        assert_eq!(report.lanes.filesystem_observation, LaneReadiness::Ready);
+        assert_eq!(
+            report.lanes.effectful_execution,
+            LaneReadiness::IndeterminateFenced
+        );
+        assert_eq!(report.overall, OperatorOverallStatus::ActionRequired);
+        assert_eq!(
+            report.primary_reason,
+            OperatorReasonCode::PreviousOperationOutcomeUnknown
+        );
+        assert_eq!(report.next_action, OperatorNextAction::ReviewIncident);
     }
 
     #[test]
