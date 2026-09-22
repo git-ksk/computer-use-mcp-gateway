@@ -18,6 +18,14 @@
 - the default adapter and current Cua MCP adapter do not claim a reviewed durable receipt source, so backend response loss before a definite Agent result remains `Indeterminate` / operator-required. Provider/log/current-state heuristics remain observational only;
 - `v2_maint audit-reconciliation` and `incident-brief` correlate bounded receipt provenance and #289 target binding while keeping external diagnostics separately labeled `observational_only`; generic MCP/status/log/metric surfaces remain payload/private-target safe.
 
+### Verified single-Mac backup/restore (#347)
+
+- the macOS release candidate now ships `install/v2_backup_restore.py`, which creates a coherent owner-private backup only with reviewed writers stopped and the shared mutation-authority lock held, while preserving exact CUMG/Handoff runtime identity, durable Hub/Agent checkpoints, active recovery material, reviewed LaunchAgents, referenced in-root trust/secrets, and mutation owner/epoch;
+- backup manifests are canonical and externally anchored by their SHA-256. Restore requires that separately recorded digest, rejects corrupt/incomplete/extra/symlinked/weak-permission/mixed/newer state, and never treats a self-contained manifest/hash as proof of authenticity or snapshot freshness;
+- restore is split into a non-running staged phase and explicit activation. The exact original install/LaunchAgent profile must be clean, coordination lock inodes and ephemeral/browser/Playwright/log/socket/cache/stale-key material are not restored, and activation establishes a fresh Agent generation rather than inheriting checkpoint liveness;
+- Hub execution/quarantine/replay state is copied byte-for-byte and fingerprinted. Backup/restore itself never resolves ambiguity or changes mutation authority; post-activation quarantine may shrink only through the pre-existing authoritative recovery/reconciliation contract such as an exact persisted #290 receipt;
+- deterministic regression covers coherent-lock refusal, exact round-trip preservation, external-digest mismatch, tamper/missing/extra/symlink/unknown-state rejection, newer checkpoint schema, Handoff identity mismatch, clean-profile enforcement, and staged-copy tamper detection. Live control/capability/Hub-Agent and execution-safety schema versions are unchanged.
+
 ## v0.6.0 — 2026-09-22
 
 Managed Developer Execution release. This release adds separately authorized managed developer jobs, a provider-isolated Playwright/E2E capability, and optional reviewed Linux cgroup-v2 process containment while preserving exact authorization, bounded execution, `Indeterminate` quarantine, and permanent no-auto-replay semantics.

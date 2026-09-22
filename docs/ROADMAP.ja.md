@@ -86,7 +86,7 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 `v0.6.0` は released / frozen の **Managed Developer Execution** baseline です。remaining OPEN backlog は unnumbered future bucket のままにせず、明示的な numbered release boundary を割り当てます。これらのversionはscope boundaryでありcalendar promiseではありません。issueを別versionへ移す場合はroadmapとmilestoneを明示的に更新します。
 
 1. **`v0.6.1 — Support Claim Expansion`** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。compatibility-preservingなsupport-claim patchに限定し、`v0.6.0`やolder releaseを遡及拡大しません。required physical evidenceが不足するclaimは、`v0.6.1`を切る前にissueを明示的に後続versionへ移します。
-2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence`** — #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded ambiguous-target identity、#290 durable backend execution receipts。#289でreviewed target/evidence boundaryを定義してから、#290がdurable receiptをauthoritative reconciliationへ利用します。
+2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence`** — #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded ambiguous-target identity、#290 durable backend execution receipts、#347 verified single-Mac backup/restore。#289でreviewed target/evidence boundaryを定義し、#290がdurable receiptをauthoritative reconciliationへ利用し、#347がexact runtime/quarantine/replay/mutation-authority preservation と staged activation を閉じます。
 3. **`v0.8.0 — Backend Portability Evidence`** — #222で既存CUMGのGUI authority / ambiguity / recovery semanticsを、materially differentなsecond real backendに対して実証します。generic provider / VM / fleet productには拡張しません。
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
 5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
@@ -185,7 +185,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。
-- **`v0.7.0 — Operator Ergonomics & Recovery Evidence`:** #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded target identity、#290 durable backend execution receipts。
+- **`v0.7.0 — Operator Ergonomics & Recovery Evidence`:** #342 / #295 / #304 / #289 / #290 / #347 で planned scope は完了し、#347 merge 後の milestone OPEN issue は **0**。
 - **`v0.8.0 — Backend Portability Evidence`:** #222 second-real-backend semantic-neutrality proof。
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#284 final replacement / partition / physical-Handoff acceptance。
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。

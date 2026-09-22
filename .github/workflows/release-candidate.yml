@@ -148,6 +148,7 @@ jobs:
             scripts/v2_handoff_runtime_preflight.py \
             scripts/v2_handoff_runtime_cleanup.py \
             scripts/v2_deferred_cleanup_recovery.py \
+            scripts/v2_backup_restore.py \
             artifact-payload/install/
           cp packaging/launchd/single-mac/*.plist artifact-payload/launchd/
           cp packaging/release/SINGLE_MAC_ARTIFACT_INSTALL.md artifact-payload/install/README.md
