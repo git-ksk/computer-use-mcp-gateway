@@ -4,7 +4,7 @@
 
 CUMG は Semantic Versioning を採用し、pre-1.0 policy を明示します。
 
-現在の released line は **0.5.x** です。`v0.5.0` が released Least-privilege Workspace baseline です。
+現在の released line は **0.6.x** です。`v0.6.0` が released Managed Developer Execution baseline です。
 
 ## Version format
 
@@ -52,7 +52,7 @@ compatibility を維持すること自体が vulnerability を残す security em
 
 ## Schema version は独立管理
 
-project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。v0.5 released baseline は CONTROL_SCHEMA_VERSION = 10、capability schema 6、DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8、HUB_AGENT_SCHEMA_VERSION = 6 を pin します。historical な #106 v0.6 development pairing は control schema 11 / capability schema 7、current v0.6 Playwright sandbox surface は control schema 12 / capability schema 8 です。outer signed envelope は変わらないため HUB_AGENT_SCHEMA_VERSION は6のままです。mixed live version は fail closed です。
+project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。released v0.6 baseline は CONTROL_SCHEMA_VERSION = 12、capability schema 8、DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8、HUB_AGENT_SCHEMA_VERSION = 6 を pin します。released v0.5 は control 10 / capability 6 / registry 8 / Hub-Agent 6、historical #106 v0.6 development pairing は control 11 / capability 7 でした。outer signed envelope は変わらないため HUB_AGENT_SCHEMA_VERSION は6のままです。mixed live version は fail closed です。
 
 - `CONTROL_SCHEMA_VERSION` は live control-schema compatibility boundary が変わるときに変更;
 - capability-advertisement schema version は live advertisement boundary が変わるときに変更;
@@ -101,7 +101,7 @@ feature count は 1.0 gate ではありません。product boundary を先に変
 
 ## Release-candidate artifact
 
-`v0.5.0` GitHub Release は **source-only** です。verified CI archive は release evidence のままで official binary Release asset にはせず、supported distribution へ暗黙昇格させません。
+`v0.6.0` GitHub Release は **source-only** です。verified CI archive は release evidence のままで official binary Release asset にはせず、supported distribution へ暗黙昇格させません。
 
 `Release Candidate Artifacts` workflow は引き続き Linux / macOS / Windows の bounded native candidate を build します。manifest schema v3 は package version、exact CUMG source commit、exact Hub/Agent・control・capability schema version、platform/architecture、exact allowlisted file、size、SHA-256 identity を記録します。Linux / Windows candidate は distribution evidence のままです。
 

@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-09-21: **V1 implementation is closed and retained only as a legacy/regression surface; V2 is the recommended runtime; `v0.5.0` Least-privilege Workspace is the released baseline and `v0.6.0` Managed Developer Execution is the next planned feature minor.**
+Status as of 2026-09-22: **V1 remains a legacy/regression surface; V2 is the recommended runtime; `v0.6.0` Managed Developer Execution is the released baseline. No later feature minor is assigned by this roadmap snapshot.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -34,9 +34,9 @@ An ambiguous state-changing operation is never automatically retried or replayed
 
 The completed V1/V2 implementation history and acceptance evidence remain available through [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), [`v2/STATUS.md`](v2/STATUS.md), [`v2/acceptance/`](v2/acceptance/), and [`archive/`](archive/). This file intentionally focuses on work that is still relevant after the V2 closeout.
 
-## Released baseline: `0.5.x`; next planned feature minor: `0.6.0`
+## Released baseline: `0.6.x`
 
-`v0.5.0` is the released **Least-privilege Workspace** baseline. Its release scope completed #313/#105/#83/#107/#319/#323 plus the final #314 schema/config/readiness/upgrade integration gate; #308 adds Windows npm/CSPRNG recurrence coverage without changing runtime authority. The next planned feature minor is **`v0.6.0` — Managed Developer Execution**. Remaining acceptance for #139/#217/#228 is tracked on the **`v0.6.x — Support Claim Expansion`** track. Their implementations have older history, but a newly advertised provider/platform support claim belongs to the v0.6 release line or a later minor; it never retroactively changes the `v0.4.0`/`v0.5.0` support contract.
+`v0.6.0` is the released **Managed Developer Execution** baseline. Its scope completes #106 managed jobs, #114 sandboxed Playwright/E2E, #267 optional Linux cgroup-v2 hardening, and final #335 schema/artifact/upgrade/readiness integration. The exact release scope is recorded in [`v2/V2_060_RELEASE_SCOPE.md`](v2/V2_060_RELEASE_SCOPE.md). Remaining acceptance for #139/#217/#228 stays on the non-blocking **`v0.6.x — Support Claim Expansion`** track and does not retroactively widen older support contracts.
 
 The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Its accepted support boundary is recorded in the release-scope and status documents.
 
@@ -81,9 +81,9 @@ Retiring V1 is now a valid future simplification candidate, but removal must be 
 
 Until those conditions are met, keep V1 narrow and regression-only; do not expand it with new capabilities.
 
-## Post-v0.5 delivery sequence
+## v0.6 release closeout and post-release sequence
 
-v0.5.0 is the released and frozen **Least-privilege Workspace** baseline. There is no planned 0.5.1 train: open a patch release only for a concrete regression, security issue, or release/packaging defect that actually requires changing the released runtime. Remaining #139/#217/#228 acceptance is assigned to the non-blocking **v0.6.x Support Claim Expansion** track. If acceptance is complete before the v0.6.0 release freeze, the corresponding support claim may ship in v0.6.0; otherwise it remains explicitly withheld and is carried to a later v0.6.x or later minor release. It never reopens an older released minor.
+v0.6.0 is the released and frozen **Managed Developer Execution** baseline. Open a 0.6.x patch only for a concrete compatible regression, security issue, release/packaging defect, or an explicitly admitted support-claim expansion. #139/#217/#228 remain on the non-blocking **v0.6.x Support Claim Expansion** track and are explicitly withheld from v0.6.0. Their later acceptance does not retroactively widen v0.6.0 or any older released minor.
 
 The next numbered feature minor is **v0.6.0 — Managed Developer Execution**. Keep its feature boundary intentionally small and do not absorb unrelated hosted, recovery-research, or operator-UX work merely because it is open.
 
@@ -105,7 +105,7 @@ If evidence forces one of #106/#114/#267 to defer, update #335 and the support b
 
 The following work is **not admitted to v0.6.0 by default**: Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and general operator/consumer ergonomics (#295/#304). Those tracks remain visible below and can be admitted only by an explicit roadmap/milestone change with a bounded reason.
 
-The released v0.5.0 baseline pins control schema 10, capability schema 6, registry schema 8, and Hub-Agent schema 6. During v0.6 development #106 used the historical 11/7 live pairing; #114 advances the current live control/capability pairing to 12/8 while registry schema remains 8 and Hub-Agent schema remains 6. Mixed live versions fail closed. Workspace writable roots remain operator/device configuration while exact mutation capability is granted per principal. v0.5.0 does **not** claim per-principal path/root isolation unless a separate reviewed policy model is deliberately added.
+The released v0.6.0 baseline pins control schema 12, capability schema 8, registry schema 8, and Hub-Agent schema 6. Released v0.5.0 used 10/6/8/6 and historical #106 development used 11/7. Mixed live versions fail closed; persisted v0.5 registry state is migrated only through the reviewed historical pairing and stale capability advertisements are discarded before fresh v0.6 advertisement. Workspace writable roots remain operator/device configuration while exact mutation capability is granted per principal.
 
 Minor numbers are working release boundaries, not calendar promises. Optional platform/provider support claims remain withheld until explicit acceptance even when implementation is compiled into an artifact.
 

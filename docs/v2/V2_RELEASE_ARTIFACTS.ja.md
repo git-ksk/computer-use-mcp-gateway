@@ -12,7 +12,7 @@
 | Linux Hub / Agent | reviewed native candidate evidence | 既存 source / service packaging。official binary installer claim はまだしない |
 | Windows desktop Agent | reviewed native candidate evidence | 既存 source / Task Scheduler profile。official binary installer claim はまだしない |
 
-CI artifact は自動的に official GitHub Release asset にはなりません。`v0.5.0` GitHub Release は source-only で、verified archive は release evidence のまま official binary asset としては添付しません。将来 reviewed artifact を昇格する場合も required supply-chain evidence を含む documented release procedure を通し、CI success だけで tag / published asset を作りません。
+CI artifact は自動的に official GitHub Release asset にはなりません。`v0.6.0` GitHub Release は source-only で、verified archive は release evidence のまま official binary asset としては添付しません。将来 reviewed artifact を昇格する場合も required supply-chain evidence を含む documented release procedure を通し、CI success だけで tag / published asset を作りません。
 
 ## macOS artifact identity
 
