@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-22 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.6.0` Managed Developer Execution が released baseline です。このsnapshotでは次のfeature minorは未割当です。**
+2026-09-22 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.6.0` Managed Developer Execution が released baseline です。現在OPENのbacklogは `v0.10.0` まで明示的にversion割当済みです。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -36,7 +36,7 @@ completion provable?
 
 ## Released baseline: `0.6.x`
 
-`v0.6.0` が released **Managed Developer Execution** baseline です。#106 managed jobs、#114 sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 hardening、final #335 schema/artifact/upgrade/readiness integrationを完了します。exact release scopeは [`v2/V2_060_RELEASE_SCOPE.ja.md`](v2/V2_060_RELEASE_SCOPE.ja.md) に記録します。#139/#217/#228 のremaining acceptanceはnon-blocking **`v0.6.x — Support Claim Expansion`** trackのままで、older support contractを遡及拡大しません。
+`v0.6.0` が released **Managed Developer Execution** baseline です。#106 managed jobs、#114 sandboxed Playwright/E2E、#267 optional Linux cgroup-v2 hardening、final #335 schema/artifact/upgrade/readiness integrationを完了します。exact release scopeは [`v2/V2_060_RELEASE_SCOPE.ja.md`](v2/V2_060_RELEASE_SCOPE.ja.md) に記録します。#139/#217/#228 のremaining acceptanceは **`v0.6.1 — Support Claim Expansion`** に割り当て、older support contractを遡及拡大しません。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -81,13 +81,19 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 これらを満たすまでは V1 を narrow / regression-only に保ち、新しい capability は追加しません。
 
-## Post-v0.5 の開発シーケンス
+## Post-v0.6 の numbered release sequence
 
-v0.6.0 は released / frozen の **Managed Developer Execution** baseline です。0.6.x patch は compatible regression、security issue、release/packaging defect、または明示的にadmitしたsupport-claim expansionに限ります。#139/#217/#228 は non-blocking の **v0.6.x Support Claim Expansion** track に残し、v0.6.0では明示的にwithholdします。later acceptanceでv0.6.0やolder released minorのsupport contractを遡及拡大しません。
+`v0.6.0` は released / frozen の **Managed Developer Execution** baseline です。remaining OPEN backlog は unnumbered future bucket のままにせず、明示的な numbered release boundary を割り当てます。これらのversionはscope boundaryでありcalendar promiseではありません。issueを別versionへ移す場合はroadmapとmilestoneを明示的に更新します。
 
-次の numbered feature minor は **v0.6.0 — Managed Developer Execution** です。feature boundary は意図的に小さく保ち、OPEN だからという理由だけで unrelated hosted / recovery research / operator UX work を吸収しません。
+1. **`v0.6.1 — Support Claim Expansion`** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。compatibility-preservingなsupport-claim patchに限定し、`v0.6.0`やolder releaseを遡及拡大しません。required physical evidenceが不足するclaimは、`v0.6.1`を切る前にissueを明示的に後続versionへ移します。
+2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence`** — #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded ambiguous-target identity、#290 durable backend execution receipts。#289でreviewed target/evidence boundaryを定義してから、#290がdurable receiptをauthoritative reconciliationへ利用します。
+3. **`v0.8.0 — Backend Portability Evidence`** — #222で既存CUMGのGUI authority / ambiguity / recovery semanticsを、materially differentなsecond real backendに対して実証します。generic provider / VM / fleet productには拡張しません。
+4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
+5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
 
-### v0.6.0 working order
+各patch/minorは引き続きstanding [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateを満たす必要があります。optional provider/platform supportはassigned releaseでrequired evidenceが揃うまでwithholdし、version割当を理由にquarantine/no-auto-replay semanticsを弱めません。
+
+### v0.6.0 released working order
 
 1. **#106 — managed long-running jobs を foundation とする。** separately authorized な job lifecycle、owner/device binding、bounded output、expiry/concurrency、proven stop semantics を先に定義します。nohup、setsid、generic shell escape で persistent work を復活させません。
 2. **#114 — sandboxed Playwright/E2E は #106 の lifecycle が安定してから積む。** lifecycle/output/process-containment primitive は適切な範囲で再利用しますが、browser profile、filesystem、environment、artifact、network の制約は独立した sandbox boundary なので Playwright authority は分離したままにします。
@@ -103,7 +109,7 @@ v0.6.0 は released / frozen の **Managed Developer Execution** baseline です
 | Linux cgroup-v2 containment | #267 | bounded process/shell cleanup向け実装済みoptional hardening。Linux-only reviewed delegation |
 | Release integration / acceptance | #335 | schema、artifact、upgrade/rollback、dogfood、docs、support claim を閉じる required final gate |
 
-次の work は **default では v0.6.0 に admit しません**: Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、general operator/consumer ergonomics (#295/#304)。これらは下記で visibility を維持し、bounded な理由を伴う explicit roadmap/milestone change がある場合だけ admit します。
+`v0.6.0` freeze時点では Hosted Cloud Run Hub/Handoff (#215/#275-#284)、recovery evidence expansion (#289/#290)、second-real-backend semantic-neutrality proof (#222)、operator/consumer ergonomics (#295/#304) を意図的に除外していました。現在は上記のpost-v0.6 numbered releaseへ割当済みで、この記述はv0.6.0 release boundaryのhistorical recordとして維持します。
 
 released v0.6.0 baseline は control schema 12、capability schema 8、registry schema 8、Hub-Agent schema 6 を pin します。released v0.5.0 は 10/6/8/6、historical #106 development は 11/7 でした。mixed live version は fail closed で、persisted v0.5 registry state は reviewed historical pairingだけをmigrationし、stale capability advertisementを捨ててからfresh v0.6 advertisementを要求します。workspace writable root は operator/device configuration、exact mutation capability は principal 単位です。
 
@@ -178,13 +184,11 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
-- **`v0.6.x — Support Claim Expansion`（v0.6.0にはnon-blocking）:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。evidence完了後にv0.6のsupport contractを広げられます。v0.6.0 freezeまでにacceptanceが完了すればv0.6.0へ含め、間に合わなければclaimをwithholdして明示的に後続へ送ります。older releaseを後からsupported扱いにはしません。
-- **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E の順とし、#267 optional Linux cgroup-v2 containment は containment contract が安定した後に並行可能です。#335 が required final integration / release gate です。
-- **Operational usability / inspectability、unnumbered:** #304 は existing unified privacy-bounded runtime status を read-only MCP/Gateway 1 call として公開し、#295 は bounded human-readable --version identity を追加します。有用な cross-cutting product improvement ですが、explicit に admit しない限り v0.6.0 blocker にはしません。
-- **Recovery evidence hardening、unnumbered:** #289 は ambiguous application operation の privacy-bounded target identity を保持し、#290 は #124 self-reconciliation を exact durable backend receipt へ拡張します。reviewed target/evidence boundary に依存するため、deliberate release admission decision までは fail-closed のまま v0.6.0 外に置きます。
-- **Hosted deployment、future independent track:** #215 が Cloud Run support gate、#275 が Agent-owned Handoff topology、#276 が reviewed Handoff consumer boundary adoption、#277 が hosted operator routing、#282 が closed one-port ingress、#283 が durable Hub state / writer-epoch fencing、#284 が replacement / partition / physical-Handoff acceptance gate です。implementation / acceptance chain が完了するまで Hosted support は NO-GO のままです。
-- **Backend semantic-neutrality evidence:** #222 は second real computer-use backend で同じ GUI semantics を証明する evidence-driven work で、numbered release gate 外に置きます。
-- **Upstream-blocked V1 compatibility:** #14/#15 は upstream Cua blocked のままで active CUMG release blocker ではありません。
+- **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance。
+- **`v0.7.0 — Operator Ergonomics & Recovery Evidence`:** #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded target identity、#290 durable backend execution receipts。
+- **`v0.8.0 — Backend Portability Evidence`:** #222 second-real-backend semantic-neutrality proof。
+- **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#284 final replacement / partition / physical-Handoff acceptance。
+- **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。
 
 Hosted sequencing も明示します。#276/#277 が reviewed Handoff dependency、interface が安定すれば #282/#283 は並行可能、#284 が deployment acceptance を閉じます。#215 を NO-GO から変更するのはその evidence が揃った後だけです。
 
@@ -194,7 +198,7 @@ Cua authorization/product-boundary research #219 は [v2/V2_AUTHORIZATION_CAPABI
 
 ### `0.4.0` identity / semantic-authorization component
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) の implementation history は integrated `0.4.0` baseline にあります。verified external identityを既存`AuthenticatedClientPrincipal`へ落とし込み、exact principal/device/capability authorizationは変更しません。ただし still-open の physical signed-token dogfood は unfinished `0.4.0` work ではなく、`v0.6.x — Support Claim Expansion` milestone で追跡し、advertised support claim は v0.6 release以降でのみ有効化します。
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) の implementation history は integrated `0.4.0` baseline にあります。verified external identityを既存`AuthenticatedClientPrincipal`へ落とし込み、exact principal/device/capability authorizationは変更しません。ただし still-open の physical signed-token dogfood は unfinished `0.4.0` work ではなく、`v0.6.1 — Support Claim Expansion` milestone で追跡し、advertised support claim は v0.6 release以降でのみ有効化します。
 
 ```text
 external OAuth/OIDC identity provider
