@@ -18,6 +18,7 @@ The launcher never logs the configured argv. Do not place secret bytes in JSON a
 - The installer replaces inherited ACLs below `DataRoot` with FullControl for only the current user SID, `SYSTEM`, and built-in `Administrators`.
 - The scheduled tasks run as the current user, `Interactive` logon type, `Limited` run level. Do not elevate the Agent simply to make persistence work.
 - The shell-only Agent example contains no CUA command or GUI capability configuration.
+- The Hub example enables the read-only `cumg_status` collector with the Windows data-root layout. Live Hub facts (`Agent` connected state, advertised capabilities, and quarantine presence) are overlaid onto the shared schema-v1 status model without dispatching to the Agent. Platform-specific recovery reports `unsupported`; unavailable installed-runtime evidence stays explicit/unknown rather than being inferred healthy.
 
 `#121` adds runtime ACL validation as a second fail-closed layer. Packaging ACLs are not a replacement for runtime validation.
 ## Runtime Windows ACL policy

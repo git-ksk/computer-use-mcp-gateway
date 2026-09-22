@@ -14,6 +14,8 @@
     "--tls-cert-pem-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\tls\\tls-server.pem",
     "--tls-key-pem-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\tls\\tls-server.key",
     "--state-dir", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\state\\hub",
+    "--status-install-root", "%LOCALAPPDATA%\\computer-use-mcp-gateway",
+    "--status-run-root", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\run",
     "--mcp-bind", "127.0.0.1:8102",
     "--mcp-resource", "https://example.invalid/mcp",
     "--northbound-policy-file", "%LOCALAPPDATA%\\computer-use-mcp-gateway\\v2-windows-shell\\trust\\northbound-policy.json",

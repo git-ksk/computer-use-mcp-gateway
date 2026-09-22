@@ -47,6 +47,20 @@ fn single_mac_handoff_is_agent_owned_and_stably_codesigned_for_tcc() {
 }
 
 #[test]
+fn packaged_hubs_enable_read_only_unified_status_without_platform_specific_authority() {
+    let single_mac =
+        include_str!("../packaging/launchd/single-mac/com.github.git-ksk.cumg-v2-hub.plist");
+    let windows = include_str!("../packaging/windows/hub.config.example.json");
+
+    assert!(single_mac.contains("CUMG_V2_STATUS_INSTALL_ROOT"));
+    assert!(single_mac.contains("CUMG_V2_STATUS_RUN_ROOT"));
+    assert!(windows.contains("--status-install-root"));
+    assert!(windows.contains("--status-run-root"));
+    assert!(windows.contains(r"v2-windows-shell\\run"));
+    assert!(!windows.contains("mutation-authority"));
+}
+
+#[test]
 fn single_mac_upgrade_pins_handoff_schema_and_cleanup_lifecycle() {
     let upgrade = include_str!("../scripts/v2-single-mac-upgrade.sh");
     let cleanup = include_str!("../scripts/v2_handoff_runtime_cleanup.py");

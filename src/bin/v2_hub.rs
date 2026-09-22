@@ -25,6 +25,7 @@ use computer_use_mcp_gateway::{
     v2_oidc_jwt::{OidcJwtAlgorithm, OidcJwtConfig, OidcJwtVerifier},
     v2_operator_handoff::UnixOperatorHandoffAuthority,
     v2_semantic_constraints::SemanticConstraintPolicy,
+    v2_status_collector::{CollectedOperatorStatusProvider, OperatorStatusCollectionConfig},
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch};
@@ -70,6 +71,12 @@ struct Args {
     tls_key_pem_file: PathBuf,
     #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
     state_dir: PathBuf,
+    /// Install root used only by the read-only unified MCP status collector.
+    #[arg(long, env = "CUMG_V2_STATUS_INSTALL_ROOT")]
+    status_install_root: Option<PathBuf>,
+    /// Runtime/cache root used only by the read-only unified MCP status collector.
+    #[arg(long, env = "CUMG_V2_STATUS_RUN_ROOT")]
+    status_run_root: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_HEARTBEAT_TIMEOUT_SECS", default_value_t = 45)]
     heartbeat_timeout_secs: u64,
     /// Hard maximum authenticated Agent session lifetime. A fresh handshake is
@@ -655,6 +662,7 @@ fn build_northbound_runtime(
             Ok::<Arc<[u8]>, anyhow::Error>(Arc::from(secret.into_bytes()))
         })
         .transpose()?;
+    let status_provider = build_northbound_status_provider(args)?;
 
     let (router, resource, metadata_url, auth_mode) = if trusted_proxy_configured {
         let issuer = required(&args.trusted_proxy_issuer, "CUMG_V2_TRUSTED_PROXY_ISSUER")?;
@@ -698,6 +706,9 @@ fn build_northbound_runtime(
         }
         if let Some(coordinator) = handoff_coordinator.as_ref() {
             service = service.with_handoff_coordinator(coordinator.clone());
+        }
+        if let Some(provider) = status_provider.as_ref() {
+            service = service.with_status_provider(provider.clone());
         }
         let router = build_trusted_proxy_router(service, proxy_config)
             .layer(axum::middleware::from_fn_with_state(
@@ -756,6 +767,9 @@ fn build_northbound_runtime(
         }
         if let Some(coordinator) = handoff_coordinator.as_ref() {
             service = service.with_handoff_coordinator(coordinator.clone());
+        }
+        if let Some(provider) = status_provider.as_ref() {
+            service = service.with_status_provider(provider.clone());
         }
         let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
             axum::middleware::from_fn_with_state(
@@ -817,6 +831,9 @@ fn build_northbound_runtime(
         if let Some(coordinator) = handoff_coordinator.as_ref() {
             service = service.with_handoff_coordinator(coordinator.clone());
         }
+        if let Some(provider) = status_provider.as_ref() {
+            service = service.with_status_provider(provider.clone());
+        }
         let router = build_northbound_router(service, mcp_config, Arc::new(verifier)).layer(
             axum::middleware::from_fn_with_state(
                 overload,
@@ -833,6 +850,53 @@ fn build_northbound_runtime(
         metadata_url,
         auth_mode,
     }))
+}
+
+fn status_home(install_root: &std::path::Path) -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return Ok(PathBuf::from(profile));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(install_root.to_path_buf());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = install_root;
+        bail!("HOME is required when CUMG_V2_STATUS_INSTALL_ROOT is configured")
+    }
+}
+
+fn build_northbound_status_provider(
+    args: &Args,
+) -> Result<Option<Arc<CollectedOperatorStatusProvider>>> {
+    let Some(install_root) = args.status_install_root.as_ref() else {
+        return Ok(None);
+    };
+    ensure!(
+        install_root.is_absolute(),
+        "CUMG_V2_STATUS_INSTALL_ROOT must be absolute"
+    );
+    let home = status_home(install_root)?;
+    let run_root = args
+        .status_run_root
+        .clone()
+        .unwrap_or_else(|| home.join("Library/Caches/cumg-v2"));
+    ensure!(
+        run_root.is_absolute(),
+        "CUMG_V2_STATUS_RUN_ROOT must be absolute"
+    );
+    let mut config =
+        OperatorStatusCollectionConfig::installed_defaults(home, install_root.clone(), run_root);
+    config.hub_state_dir = Some(args.state_dir.clone());
+    config.grant_signer_socket = args.grant_signer_socket.clone();
+    config.tls_server_certificate = Some(args.tls_cert_pem_file.clone());
+    config.handoff_control_socket = args.handoff_control_socket.clone();
+    Ok(Some(Arc::new(CollectedOperatorStatusProvider::new(config))))
 }
 
 fn validate_northbound_auth_mode_selection(
