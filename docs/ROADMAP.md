@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-09-22: **V1 remains a legacy/regression surface; V2 is the recommended runtime; `v0.6.0` Managed Developer Execution is the released baseline. No later feature minor is assigned by this roadmap snapshot.**
+Status as of 2026-09-22: **V1 remains a legacy/regression surface; V2 is the recommended runtime; `v0.6.0` Managed Developer Execution is the released baseline. The currently open backlog is explicitly assigned through `v0.10.0`.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -36,7 +36,7 @@ The completed V1/V2 implementation history and acceptance evidence remain availa
 
 ## Released baseline: `0.6.x`
 
-`v0.6.0` is the released **Managed Developer Execution** baseline. Its scope completes #106 managed jobs, #114 sandboxed Playwright/E2E, #267 optional Linux cgroup-v2 hardening, and final #335 schema/artifact/upgrade/readiness integration. The exact release scope is recorded in [`v2/V2_060_RELEASE_SCOPE.md`](v2/V2_060_RELEASE_SCOPE.md). Remaining acceptance for #139/#217/#228 stays on the non-blocking **`v0.6.x — Support Claim Expansion`** track and does not retroactively widen older support contracts.
+`v0.6.0` is the released **Managed Developer Execution** baseline. Its scope completes #106 managed jobs, #114 sandboxed Playwright/E2E, #267 optional Linux cgroup-v2 hardening, and final #335 schema/artifact/upgrade/readiness integration. The exact release scope is recorded in [`v2/V2_060_RELEASE_SCOPE.md`](v2/V2_060_RELEASE_SCOPE.md). Remaining acceptance for #139/#217/#228 is assigned to **`v0.6.1 — Support Claim Expansion`** and does not retroactively widen older support contracts.
 
 The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Its accepted support boundary is recorded in the release-scope and status documents.
 
@@ -81,13 +81,19 @@ Retiring V1 is now a valid future simplification candidate, but removal must be 
 
 Until those conditions are met, keep V1 narrow and regression-only; do not expand it with new capabilities.
 
-## v0.6 release closeout and post-release sequence
+## Post-v0.6 numbered release sequence
 
-v0.6.0 is the released and frozen **Managed Developer Execution** baseline. Open a 0.6.x patch only for a concrete compatible regression, security issue, release/packaging defect, or an explicitly admitted support-claim expansion. #139/#217/#228 remain on the non-blocking **v0.6.x Support Claim Expansion** track and are explicitly withheld from v0.6.0. Their later acceptance does not retroactively widen v0.6.0 or any older released minor.
+`v0.6.0` is the released and frozen **Managed Developer Execution** baseline. The remaining open backlog now has an explicit numbered release boundary rather than an unnumbered future bucket. These version assignments are scope boundaries, not calendar promises; moving an issue between versions requires an explicit roadmap and milestone change.
 
-The next numbered feature minor is **v0.6.0 — Managed Developer Execution**. Keep its feature boundary intentionally small and do not absorb unrelated hosted, recovery-research, or operator-UX work merely because it is open.
+1. **`v0.6.1 — Support Claim Expansion`** — #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance. This is a compatibility-preserving support-claim patch only; it does not reopen `v0.6.0` or retroactively widen older releases. If any claim lacks required physical evidence, move that issue explicitly before cutting `v0.6.1` rather than implying support.
+2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence`** — #342 operation-ID guidance, #295 bounded `--version` identity, #304 unified read-only runtime status, #289 privacy-bounded ambiguous-target identity, and #290 durable backend execution receipts. #289 defines the reviewed target/evidence boundary before #290 may use durable receipts for authoritative reconciliation.
+3. **`v0.8.0 — Backend Portability Evidence`** — #222 proves the existing CUMG GUI authority/ambiguity/recovery semantics against a second materially different real backend. This remains a portability/evidence release, not a generic provider, VM, or fleet product.
+4. **`v0.9.0 — Hosted Hub & Handoff`** — #215, #275, #276, #277, #282, #283, and final acceptance #284. #276/#277 establish the reviewed Handoff dependency and hosted operator route; #282/#283 may then progress in parallel; #284 is the required replacement/partition/physical-Handoff acceptance gate before hosted support can be advertised.
+5. **`v0.10.0 — Legacy V1 Retirement`** — deliberate retirement of `v1_gateway`, including resolution/closure of V1-only upstream-blocked #14/#15. Removal remains conditional on confirming no supported deployment depends on V1 and intentionally migrating or archiving still-valuable regression fixtures.
 
-### v0.6.0 working order
+A patch/minor must still satisfy the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate. Optional provider/platform support stays withheld until its assigned release has the required evidence, and no version assignment weakens quarantine/no-auto-replay semantics.
+
+### v0.6.0 released working order
 
 1. **#106 — managed long-running jobs is the foundation.** Define the separately authorized job lifecycle, owner/device binding, bounded output, expiry/concurrency, and proven stop semantics first. Do not reintroduce persistent work through nohup, setsid, or generic shell escape.
 2. **#114 — sandboxed Playwright/E2E builds on the managed lifecycle after #106 stabilizes.** Reuse lifecycle/output/process-containment primitives where they fit, but keep Playwright authority separate because browser profile, filesystem, environment, artifact, and network constraints form a distinct sandbox boundary.
@@ -103,7 +109,7 @@ If evidence forces one of #106/#114/#267 to defer, update #335 and the support b
 | Linux cgroup-v2 containment | #267 | Implemented optional platform hardening for bounded process/shell cleanup; Linux-only reviewed delegation |
 | Release integration / acceptance | #335 | Required final gate across schemas, artifacts, upgrade/rollback, dogfood, docs, and support claims |
 
-The following work is **not admitted to v0.6.0 by default**: Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and general operator/consumer ergonomics (#295/#304). Those tracks remain visible below and can be admitted only by an explicit roadmap/milestone change with a bounded reason.
+At the `v0.6.0` freeze, Hosted Cloud Run Hub/Handoff (#215/#275-#284), recovery evidence expansion (#289/#290), second-real-backend semantic-neutrality proof (#222), and operator/consumer ergonomics (#295/#304) were deliberately excluded. They are now assigned to the numbered post-v0.6 releases above; this historical boundary remains part of the v0.6.0 release record.
 
 The released v0.6.0 baseline pins control schema 12, capability schema 8, registry schema 8, and Hub-Agent schema 6. Released v0.5.0 used 10/6/8/6 and historical #106 development used 11/7. Mixed live versions fail closed; persisted v0.5 registry state is migrated only through the reviewed historical pairing and stale capability advertisements are discarded before fresh v0.6 advertisement. Workspace writable roots remain operator/device configuration while exact mutation capability is granted per principal.
 
@@ -178,13 +184,11 @@ This queue records the practical result of continued Handoff integration and phy
 
 Every OPEN issue must appear in one of the buckets below or in another explicit roadmap section. The inventory describes admission and ordering; it does not imply that every open issue belongs to the next release.
 
-- **`v0.6.x — Support Claim Expansion` (non-blocking for v0.6.0):** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance. These can widen the v0.6 support contract when their evidence is complete. Acceptance complete before the v0.6.0 freeze may be included in v0.6.0; otherwise the claim stays withheld and moves forward explicitly. Older releases are never re-labeled as supporting the provider/platform after the fact.
-- **v0.6.0 — Managed Developer Execution:** #106 managed-job lifecycle -> #114 sandboxed Playwright/E2E, with #267 optional Linux cgroup-v2 containment allowed to proceed in parallel once the containment contract is stable; #335 is the required final integration/release gate.
-- **Operational usability / inspectability, unnumbered:** #304 exposes the existing unified privacy-bounded runtime status as one read-only MCP/Gateway call; #295 adds bounded human-readable --version identity. These are useful cross-cutting product improvements but are not v0.6.0 blockers unless explicitly admitted.
-- **Recovery evidence hardening, unnumbered:** #289 preserves privacy-bounded target identity for ambiguous application operations; #290 extends #124 self-reconciliation with exact durable backend receipts and depends on the reviewed target/evidence boundary. Keep both fail-closed and outside v0.6.0 until a deliberate release admission decision.
-- **Hosted deployment, future independent track:** #215 remains the Cloud Run support gate; #275 defines the Agent-owned Handoff topology; #276 adopts the reviewed Handoff consumer boundary; #277 provides hosted operator routing; #282 composes the closed one-port ingress while #283 adds durable Hub state/writer-epoch fencing; #284 is the replacement/partition/physical-Handoff acceptance gate. Hosted support remains NO-GO until the implementation and acceptance chain is complete.
-- **Backend semantic-neutrality evidence:** #222 proves the same GUI semantics with a second real computer-use backend and remains evidence-driven outside a numbered release gate.
-- **Upstream-blocked V1 compatibility:** #14 and #15 remain blocked on upstream Cua and are not active CUMG release blockers.
+- **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, and #228 physical Linux FIDO2 UV acceptance.
+- **`v0.7.0 — Operator Ergonomics & Recovery Evidence`:** #342 operation-ID guidance, #295 bounded `--version` identity, #304 unified read-only runtime status, #289 privacy-bounded target identity, and #290 durable backend execution receipts.
+- **`v0.8.0 — Backend Portability Evidence`:** #222 second-real-backend semantic-neutrality proof.
+- **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate, #275 Agent-owned Handoff topology, #276 reviewed Handoff consumer adoption, #277 hosted operator routing, #282 closed one-port ingress, #283 durable Hub state/writer-epoch fencing, and #284 final replacement/partition/physical-Handoff acceptance.
+- **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 remain upstream-blocked while V1 exists; this release resolves or closes them as part of deliberate `v1_gateway` retirement rather than expanding V1.
 
 Hosted sequencing is intentionally explicit: #276/#277 provide the reviewed Handoff dependency, #282 and #283 can progress in parallel once their interfaces are stable, and #284 closes deployment acceptance. #215 moves from NO-GO only after that evidence exists.
 
@@ -194,7 +198,7 @@ The Cua authorization/product-boundary research in #219 is completed by [v2/V2_A
 
 ### `0.4.0` identity and semantic-authorization component
 
-Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) has implementation history in the integrated `0.4.0` baseline: provider-neutral signed-token verification reduces a verified external identity to the existing `AuthenticatedClientPrincipal`, while exact principal/device/capability authorization remains unchanged. Its still-open physical signed-token dogfood is not unfinished `0.4.0` work; it is tracked on the `v0.6.x — Support Claim Expansion` milestone and becomes an advertised support claim only in a v0.6 release or later.
+Issue [#139](https://github.com/git-ksk/computer-use-mcp-gateway/issues/139) has implementation history in the integrated `0.4.0` baseline: provider-neutral signed-token verification reduces a verified external identity to the existing `AuthenticatedClientPrincipal`, while exact principal/device/capability authorization remains unchanged. Its still-open physical signed-token dogfood is not unfinished `0.4.0` work; it is tracked on the `v0.6.1 — Support Claim Expansion` milestone and becomes an advertised support claim only in a v0.6 release or later.
 
 ```text
 external OAuth/OIDC identity provider
