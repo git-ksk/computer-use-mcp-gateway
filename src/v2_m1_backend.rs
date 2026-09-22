@@ -14,6 +14,9 @@ use crate::v2_browser_execute::{
     execute_cua_browser_download, execute_cua_browser_upload,
 };
 use crate::v2_browser_staging::{PreparedBrowserDownload, ResolvedStagedUpload};
+use crate::v2_execution_safety::{
+    BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION, BackendExecutionReceipt, BackendReceiptTargetBinding,
+};
 use crate::v2_m0::{
     CAPABILITY_SCHEMA_VERSION, CapabilityAdvertisement, DeviceCapability, DeviceCommand,
     DeviceResult, InputDeliveryMode, InputTarget, KeyboardModifier, MAX_CLIPBOARD_TEXT_BYTES,
@@ -24,6 +27,7 @@ use crate::v2_m0::{
     UiElementSelector, UiImage, UiPredicate, UiPredicateResult, UiRect, UiRole, VerificationStatus,
     WindowInfo,
 };
+use crate::v2_m0_execution::OperationRef;
 use crate::v2_m0_transport::CancellationDisposition;
 use crate::v2_observability::SafeErrorCode;
 use anyhow::Error as AnyError;
@@ -63,6 +67,36 @@ impl BackendExecutionOutcome {
     }
 }
 
+/// Payload-free binding supplied to a reviewed backend receipt provider.
+///
+/// This context contains only CUMG control-plane identity and bounded target
+/// selectors. It intentionally excludes raw GUI payloads, typed text, URLs,
+/// argv, environment, and provider response text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendExecutionReceiptContext {
+    pub operation: OperationRef,
+    pub capability_revision: u64,
+    pub capability: DeviceCapability,
+    pub dispatch_grant_id: String,
+    pub backend: String,
+    pub backend_version: String,
+    pub target_binding: Option<BackendReceiptTargetBinding>,
+}
+
+impl BackendExecutionReceiptContext {
+    pub fn matches_receipt(&self, receipt: &BackendExecutionReceipt) -> bool {
+        receipt.validate().is_ok()
+            && receipt.operation == self.operation
+            && receipt.capability_revision == self.capability_revision
+            && receipt.capability == self.capability
+            && receipt.dispatch_grant_id == self.dispatch_grant_id
+            && receipt.backend == self.backend
+            && receipt.backend_version == self.backend_version
+            && receipt.provider_contract_schema_version == BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION
+            && receipt.target_binding == self.target_binding
+    }
+}
+
 /// Replacement seam for a typed Computer Use executor.
 ///
 /// Implementations must return `Completed` only when their backend contract has enough
@@ -82,6 +116,15 @@ pub trait ComputerUseBackendAdapter: Send + Sync {
     /// backends may keep the default no-op implementation.
     async fn end_interaction_session(&self, _context_id: &str) -> Result<(), M1BackendError> {
         Ok(())
+    }
+
+    /// Read one exact durable backend receipt without replaying or re-probing the mutation.
+    /// Backends without a reviewed durable receipt contract must keep the default.
+    async fn recover_execution_receipt(
+        &self,
+        _context: &BackendExecutionReceiptContext,
+    ) -> Result<Option<BackendExecutionReceipt>, M1BackendError> {
+        Ok(None)
     }
 
     async fn execute(

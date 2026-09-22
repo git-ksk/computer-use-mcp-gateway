@@ -184,7 +184,17 @@ pub enum AgentTerminalEvidenceStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum BackendExecutionReceiptStatus {
+    ExactAuthoritative,
+    Absent,
+    Unavailable,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReconciliationEvidenceAuthority {
+    AuthoritativeBackendReceipt,
     AuthoritativeTerminalEvidence,
     LegacyNonAuthoritativeMarker,
     ObservationalCorrelationOnly,
@@ -231,6 +241,9 @@ pub enum ReconciliationRecommendedAction {
 #[serde(rename_all = "snake_case")]
 pub enum ReconciliationAuditReason {
     AuthoritativeTerminalEvidenceAvailable,
+    AuthoritativeBackendReceiptAvailable,
+    BackendReceiptMismatch,
+    BackendReceiptTargetMismatch,
     LegacyAgentTerminalMarkerOnly,
     ObservationalCorrelationOnly,
     MissingExactDispatchBinding,
@@ -263,6 +276,12 @@ pub struct ReconciliationReadinessAudit {
     pub agent_terminal_marker: AgentTerminalMarkerStatus,
     pub agent_terminal_marker_authoritative: bool,
     pub agent_terminal_evidence: AgentTerminalEvidenceStatus,
+    pub backend_execution_receipt: BackendExecutionReceiptStatus,
+    pub backend_receipt_provider: Option<String>,
+    pub backend_receipt_provider_version: Option<String>,
+    pub backend_receipt_contract_schema_version: Option<u16>,
+    pub backend_receipt_sequence: Option<u64>,
+    pub backend_receipt_target_bound: Option<bool>,
     pub authoritative_terminal_state: Option<String>,
     pub authoritative_evidence_class: Option<String>,
     pub evidence_authority: ReconciliationEvidenceAuthority,
@@ -580,6 +599,12 @@ pub fn audit_reconciliation_read_only(
         agent_terminal_marker: AgentTerminalMarkerStatus::Unavailable,
         agent_terminal_marker_authoritative: false,
         agent_terminal_evidence: AgentTerminalEvidenceStatus::Unavailable,
+        backend_execution_receipt: BackendExecutionReceiptStatus::Unavailable,
+        backend_receipt_provider: None,
+        backend_receipt_provider_version: None,
+        backend_receipt_contract_schema_version: None,
+        backend_receipt_sequence: None,
+        backend_receipt_target_bound: None,
         authoritative_terminal_state: None,
         authoritative_evidence_class: None,
         evidence_authority: ReconciliationEvidenceAuthority::Missing,
@@ -621,6 +646,60 @@ pub fn audit_reconciliation_read_only(
             .push(ReconciliationAuditReason::DeviceMismatch);
         fail_reconciliation_audit_closed(&mut report);
         return Ok(report);
+    }
+
+    report.backend_execution_receipt = BackendExecutionReceiptStatus::Absent;
+    let matching_receipt = agent_state
+        .backend_execution_receipts
+        .iter()
+        .find(|candidate| candidate.operation.operation_id == operation_id);
+    if let Some(receipt) = matching_receipt {
+        report.backend_receipt_provider = Some(receipt.backend.clone());
+        report.backend_receipt_provider_version = Some(receipt.backend_version.clone());
+        report.backend_receipt_contract_schema_version =
+            Some(receipt.provider_contract_schema_version);
+        report.backend_receipt_sequence = Some(receipt.sequence);
+
+        let Some(binding) = hub_record.dispatch_binding.as_ref() else {
+            report.backend_execution_receipt = BackendExecutionReceiptStatus::Mismatch;
+            report
+                .reasons
+                .push(ReconciliationAuditReason::BackendReceiptMismatch);
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        };
+        if receipt.operation != inspection.operation
+            || receipt.capability != inspection.capability
+            || receipt.dispatch_binding() != *binding
+        {
+            report.backend_execution_receipt = BackendExecutionReceiptStatus::Mismatch;
+            report
+                .reasons
+                .push(ReconciliationAuditReason::BackendReceiptMismatch);
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
+
+        let target_match = match (
+            receipt.target_binding.as_ref(),
+            hub_record.recovery_target.as_ref(),
+        ) {
+            (Some(receipt_target), Some(recovery_target)) => {
+                receipt_target.matches_recovery_target(recovery_target)
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        report.backend_receipt_target_bound = Some(target_match);
+        if !target_match {
+            report.backend_execution_receipt = BackendExecutionReceiptStatus::Mismatch;
+            report
+                .reasons
+                .push(ReconciliationAuditReason::BackendReceiptTargetMismatch);
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
+        report.backend_execution_receipt = BackendExecutionReceiptStatus::ExactAuthoritative;
     }
 
     let marker_present = agent_state
@@ -714,8 +793,27 @@ pub fn audit_reconciliation_read_only(
             return Ok(report);
         }
 
+        if let Some(receipt) = matching_receipt
+            && receipt.as_terminal_evidence() != *terminal
+        {
+            report.backend_execution_receipt = BackendExecutionReceiptStatus::Mismatch;
+            report
+                .reasons
+                .push(ReconciliationAuditReason::BackendReceiptMismatch);
+            fail_reconciliation_audit_closed(&mut report);
+            return Ok(report);
+        }
         report.agent_terminal_evidence = AgentTerminalEvidenceStatus::ExactAuthoritative;
-        report.evidence_authority = ReconciliationEvidenceAuthority::AuthoritativeTerminalEvidence;
+        report.evidence_authority = if report.backend_execution_receipt
+            == BackendExecutionReceiptStatus::ExactAuthoritative
+        {
+            report
+                .reasons
+                .push(ReconciliationAuditReason::AuthoritativeBackendReceiptAvailable);
+            ReconciliationEvidenceAuthority::AuthoritativeBackendReceipt
+        } else {
+            ReconciliationEvidenceAuthority::AuthoritativeTerminalEvidence
+        };
         report.evidence_status = ReconciliationEvidenceStatus::Sufficient;
         report.authoritative_terminal_state =
             Some(hub_operation_state_name(terminal.terminal_state).to_owned());
@@ -2175,6 +2273,132 @@ mod tests {
         assert!(!encoded.contains(hidden_fence));
         assert!(!encoded.contains("https://issuer.example"));
         assert!(!encoded.contains("alice"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_audit_correlates_exact_backend_receipt_with_private_target() {
+        use crate::v2_execution_safety::{
+            BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION, BackendExecutionReceipt,
+            BackendReceiptTargetBinding, BackendReceiptTerminalOutcome,
+        };
+
+        let root = test_dir("reconciliation-backend-receipt");
+        let hub_dir = root.join("hub");
+        let agent_dir = root.join("agent");
+        let identity = DeviceIdentity::generate();
+        let mut registry = DeviceRegistry::default();
+        let device_id = registry.provision_trusted_device(identity.verifying_key());
+        let operation_id = "op_backend_receipt_audit".to_owned();
+        let operation = OperationRef {
+            device_id: device_id.clone(),
+            device_generation: 1,
+            operation_id: operation_id.clone(),
+        };
+        let owner = OperationOwner::new("https://issuer.example", "alice").unwrap();
+        let binding = OperationDispatchBinding::new(17, "grant_backend_receipt_private").unwrap();
+        let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 2,
+        })
+        .unwrap();
+        execution
+            .prepare_with_metadata(
+                operation.clone(),
+                owner.clone(),
+                DeviceCapability::TerminateApplication,
+                OperationAdmissionMetadata {
+                    audit: OperationAuditMetadata::empty(),
+                    request_fingerprint: None,
+                    evidence_envelope: None,
+                    recovery_target: Some(OperationRecoveryTarget::ApplicationProcess {
+                        process_id: 4242,
+                        application: "KaruPic".into(),
+                    }),
+                    semantic_constraint: None,
+                },
+                100,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched_with_binding(&operation_id, &owner, 1, Some(binding.clone()), 110)
+            .unwrap();
+        execution.mark_connection_lost(&operation_id, 120).unwrap();
+        CheckpointStore::new(hub_dir.clone(), "hub")
+            .unwrap()
+            .save(&HubPersistentState::capture(&registry, &execution))
+            .unwrap();
+
+        let receipt = BackendExecutionReceipt {
+            schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            operation: operation.clone(),
+            capability_revision: binding.capability_revision,
+            capability: DeviceCapability::TerminateApplication,
+            dispatch_grant_id: binding.grant_id.clone(),
+            backend: "receipt-provider".into(),
+            backend_version: "1.2.3".into(),
+            provider_contract_schema_version: BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            sequence: 21,
+            target_binding: Some(BackendReceiptTargetBinding::ApplicationProcess {
+                process_id: 4242,
+            }),
+            terminal_outcome: BackendReceiptTerminalOutcome::EffectCommitted,
+        };
+        let terminal = receipt.as_terminal_evidence();
+        let hub = HubIdentity::generate();
+        let trusted_hub = TrustedHubIdentity::new(hub.verifier());
+        let authority = GrantAuthority::generate();
+        let grants = GrantLedger::new(authority.verifier());
+        let agent_execution = AgentExecutionGate::restore_after_restart(AgentExecutionSnapshot {
+            replay_generation: Some(1),
+            terminal_operation_ids: vec![operation_id.clone()],
+        })
+        .unwrap();
+        let agent_state = AgentPersistentState::capture_with_runtime_evidence(
+            device_id.clone(),
+            &trusted_hub,
+            &grants,
+            &agent_execution,
+            std::slice::from_ref(&terminal),
+            std::slice::from_ref(&receipt),
+            false,
+        )
+        .unwrap();
+        CheckpointStore::new(agent_dir.clone(), "agent")
+            .unwrap()
+            .save(&agent_state)
+            .unwrap();
+
+        let report = audit_reconciliation_read_only(&hub_dir, &agent_dir, &operation_id).unwrap();
+        assert_eq!(
+            report.backend_execution_receipt,
+            BackendExecutionReceiptStatus::ExactAuthoritative
+        );
+        assert_eq!(
+            report.evidence_authority,
+            ReconciliationEvidenceAuthority::AuthoritativeBackendReceipt
+        );
+        assert_eq!(
+            report.backend_receipt_provider.as_deref(),
+            Some("receipt-provider")
+        );
+        assert_eq!(
+            report.backend_receipt_provider_version.as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(report.backend_receipt_contract_schema_version, Some(1));
+        assert_eq!(report.backend_receipt_sequence, Some(21));
+        assert_eq!(report.backend_receipt_target_bound, Some(true));
+        assert_eq!(
+            report.resolution_readiness,
+            ReconciliationResolutionReadiness::ConfirmedCompletedSupported
+        );
+        assert!(!report.replay_old_operation);
+
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("grant_backend_receipt_private"));
+        assert!(!encoded.contains("KaruPic"));
+        assert!(!encoded.contains("4242"));
         let _ = std::fs::remove_dir_all(root);
     }
 

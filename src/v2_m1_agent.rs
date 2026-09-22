@@ -17,7 +17,9 @@ use crate::v2_ephemeral_data_refs::{
     AgentEphemeralDataStore, EphemeralDataKind,
 };
 use crate::v2_execution_safety::{
-    AgentTerminalEvidence, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES, terminal_evidence_for_device_result,
+    AgentTerminalEvidence, BackendExecutionReceipt, BackendReceiptTargetBinding,
+    MAX_AGENT_BACKEND_EXECUTION_RECEIPTS, MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES,
+    terminal_evidence_for_device_result,
 };
 use crate::v2_linux_cgroup::LinuxCgroupV2Containment;
 use crate::v2_m0::{
@@ -40,7 +42,8 @@ use crate::v2_m0_transport::{
 use crate::v2_m0_trust::TrustedHubIdentity;
 use crate::v2_m1::ReconnectPolicy;
 use crate::v2_m1_backend::{
-    BackendExecutionOutcome, ComputerUseBackendAdapter, CuaMcpAdapter, M1BackendError,
+    BackendExecutionOutcome, BackendExecutionReceiptContext, ComputerUseBackendAdapter,
+    CuaMcpAdapter, M1BackendError,
 };
 use crate::v2_m1_filesystem::{FilesystemError, FilesystemExecutor, FilesystemPolicy};
 use crate::v2_m1_grpc::{
@@ -233,6 +236,7 @@ pub struct AgentService {
     grants: GrantLedger,
     execution: AgentExecutionGate,
     terminal_evidence: VecDeque<AgentTerminalEvidence>,
+    backend_execution_receipts: VecDeque<BackendExecutionReceipt>,
     checkpoint: CheckpointStore,
 }
 
@@ -318,51 +322,59 @@ impl AgentService {
         // Browser transfer staging is created only after that reviewed root exists.
         let checkpoint = CheckpointStore::new(config.state_dir.clone(), "agent")
             .map_err(AgentServiceError::Persistence)?;
-        let (trusted_hub, grants, execution, terminal_evidence, managed_job_fail_closed) =
-            match checkpoint.load_latest::<AgentPersistentState>() {
-                Ok(state) => {
-                    let restored = state
-                        .restore_with_runtime_safety()
-                        .map_err(AgentServiceError::Persistence)?;
-                    if restored.device_id != config.device_id {
-                        return Err(AgentServiceError::CheckpointIdentityMismatch);
-                    }
-                    let mut trusted_hub = restored.trusted_hub;
-                    let mut grants = restored.grant_ledger;
+        let (
+            trusted_hub,
+            grants,
+            execution,
+            terminal_evidence,
+            backend_execution_receipts,
+            managed_job_fail_closed,
+        ) = match checkpoint.load_latest::<AgentPersistentState>() {
+            Ok(state) => {
+                let restored = state
+                    .restore_with_runtime_safety()
+                    .map_err(AgentServiceError::Persistence)?;
+                if restored.device_id != config.device_id {
+                    return Err(AgentServiceError::CheckpointIdentityMismatch);
+                }
+                let mut trusted_hub = restored.trusted_hub;
+                let mut grants = restored.grant_ledger;
+                if trusted_hub.verifier() != material.trusted_hub {
+                    let rotation = material
+                        .hub_rotation
+                        .as_ref()
+                        .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
+                    trusted_hub
+                        .apply_rotation(rotation)
+                        .map_err(AgentServiceError::Trust)?;
                     if trusted_hub.verifier() != material.trusted_hub {
-                        let rotation = material
-                            .hub_rotation
-                            .as_ref()
-                            .ok_or(AgentServiceError::CheckpointTrustMismatch)?;
-                        trusted_hub
-                            .apply_rotation(rotation)
-                            .map_err(AgentServiceError::Trust)?;
-                        if trusted_hub.verifier() != material.trusted_hub {
-                            return Err(AgentServiceError::CheckpointTrustMismatch);
-                        }
+                        return Err(AgentServiceError::CheckpointTrustMismatch);
                     }
-                    reconcile_grant_verifiers(&mut grants, &material);
-                    (
-                        trusted_hub,
-                        grants,
-                        restored.execution,
-                        restored.terminal_evidence.into_iter().collect(),
-                        restored.managed_job_fail_closed,
-                    )
                 }
-                Err(PersistenceError::NoCheckpoint) => {
-                    let mut grants = GrantLedger::new(material.grant_verifier);
-                    reconcile_grant_verifiers(&mut grants, &material);
-                    (
-                        TrustedHubIdentity::new(material.trusted_hub),
-                        grants,
-                        AgentExecutionGate::default(),
-                        VecDeque::new(),
-                        false,
-                    )
-                }
-                Err(error) => return Err(AgentServiceError::Persistence(error)),
-            };
+                reconcile_grant_verifiers(&mut grants, &material);
+                (
+                    trusted_hub,
+                    grants,
+                    restored.execution,
+                    restored.terminal_evidence.into_iter().collect(),
+                    restored.backend_execution_receipts.into_iter().collect(),
+                    restored.managed_job_fail_closed,
+                )
+            }
+            Err(PersistenceError::NoCheckpoint) => {
+                let mut grants = GrantLedger::new(material.grant_verifier);
+                reconcile_grant_verifiers(&mut grants, &material);
+                (
+                    TrustedHubIdentity::new(material.trusted_hub),
+                    grants,
+                    AgentExecutionGate::default(),
+                    VecDeque::new(),
+                    VecDeque::new(),
+                    false,
+                )
+            }
+            Err(error) => return Err(AgentServiceError::Persistence(error)),
+        };
         let ephemeral_data = match config.ephemeral_data_parent.as_deref() {
             Some(parent) => Some(Arc::new(StdMutex::new(
                 AgentEphemeralDataStore::new(parent, AgentEphemeralDataLimits::default())
@@ -411,6 +423,7 @@ impl AgentService {
             grants,
             execution,
             terminal_evidence,
+            backend_execution_receipts,
             checkpoint,
         };
         // Establish a baseline checkpoint before accepting any command.
@@ -456,12 +469,23 @@ impl AgentService {
 
     fn persist_state(&self) -> Result<(), AgentServiceError> {
         let terminal_evidence: Vec<_> = self.terminal_evidence.iter().cloned().collect();
-        let state = AgentPersistentState::capture_with_runtime_safety(
+        let backend_execution_receipts: Vec<_> = self
+            .backend_execution_receipts
+            .iter()
+            .filter(|receipt| {
+                terminal_evidence
+                    .iter()
+                    .any(|terminal| terminal == &receipt.as_terminal_evidence())
+            })
+            .cloned()
+            .collect();
+        let state = AgentPersistentState::capture_with_runtime_evidence(
             self.config.device_id.clone(),
             &self.trusted_hub,
             &self.grants,
             &self.execution,
             &terminal_evidence,
+            &backend_execution_receipts,
             self.managed_job_fail_closed,
         )
         .map_err(|error| {
@@ -858,6 +882,7 @@ impl AgentService {
                             &mut operation_done_rx,
                             &mut self.execution,
                             &mut self.terminal_evidence,
+                            &mut self.backend_execution_receipts,
                             &session.device_id,
                         )
                         .await?;
@@ -897,6 +922,7 @@ impl AgentService {
                             &mut operation_done_rx,
                             &mut self.execution,
                             &mut self.terminal_evidence,
+                            &mut self.backend_execution_receipts,
                             &session.device_id,
                         )
                         .await?;
@@ -1016,6 +1042,25 @@ impl AgentService {
                                 result,
                             ).map_err(AgentServiceError::Protocol)?;
                             send_agent(&outbound_tx, AgentToHub::Result(signed)).await?;
+                        }
+                        AgentOperationOutcome::BackendReceipt(receipt) => {
+                            record_backend_execution_receipt(
+                                &mut self.backend_execution_receipts,
+                                &mut self.terminal_evidence,
+                                receipt,
+                            )?;
+                            // Receipt provenance and the derived #124 terminal proof are
+                            // committed in one Agent checkpoint before transport churn.
+                            self.persist_state()?;
+                            tracing::info!(
+                                event = "v2_agent_backend_receipt_committed",
+                                operation_id = %completion.operation_id,
+                                device_id = %session.device_id,
+                                generation = session.generation,
+                                outcome = "authoritative_receipt_persisted",
+                                "authoritative backend receipt persisted; reconnecting for existing reconciliation path"
+                            );
+                            return Ok(SessionExit::Reconnect);
                         }
                         AgentOperationOutcome::Indeterminate(cause) => {
                             // No authoritative terminal proof exists for an indeterminate
@@ -1192,6 +1237,7 @@ impl AgentService {
                             &mut operation_done_rx,
                             &mut self.execution,
                             &mut self.terminal_evidence,
+                            &mut self.backend_execution_receipts,
                             &session.device_id,
                         )
                         .await?;
@@ -2060,6 +2106,20 @@ impl AgentService {
                                     let upload_staging = self.browser_upload_staging.clone();
                                     let download_staging = self.browser_download_staging.clone();
                                     let capability_revision = session.capabilities.revision;
+                                    let advertisement = computer_use.advertisement();
+                                    let receipt_context = BackendExecutionReceiptContext {
+                                        operation: OperationRef {
+                                            device_id: session.device_id.clone(),
+                                            device_generation: worker_generation,
+                                            operation_id: worker_operation_id.clone(),
+                                        },
+                                        capability_revision,
+                                        capability,
+                                        dispatch_grant_id: dispatch_grant_id.clone(),
+                                        backend: advertisement.backend,
+                                        backend_version: advertisement.backend_version,
+                                        target_binding: BackendReceiptTargetBinding::for_command(&command),
+                                    };
                                     let (cancel_tx, cancel_rx) = watch::channel(false);
                                     tokio::spawn(async move {
                                         let outcome = execute_computer_use_operation(
@@ -2067,8 +2127,7 @@ impl AgentService {
                                             command,
                                             upload_staging,
                                             download_staging,
-                                            worker_generation,
-                                            capability_revision,
+                                            receipt_context,
                                             cancel_rx,
                                         )
                                         .await;
@@ -2150,6 +2209,7 @@ impl AgentService {
                 &mut operation_done_rx,
                 &mut self.execution,
                 &mut self.terminal_evidence,
+                &mut self.backend_execution_receipts,
                 &session.device_id,
             )
             .await?;
@@ -2189,6 +2249,7 @@ enum ActiveCancellation {
 #[derive(Debug)]
 enum AgentOperationOutcome {
     Result(Result<DeviceResult, AgentOperationError>),
+    BackendReceipt(BackendExecutionReceipt),
     Indeterminate(AgentIndeterminateCause),
 }
 
@@ -2460,11 +2521,60 @@ fn record_terminal_evidence(
     Ok(())
 }
 
+fn record_backend_execution_receipt(
+    receipt_journal: &mut VecDeque<BackendExecutionReceipt>,
+    terminal_journal: &mut VecDeque<AgentTerminalEvidence>,
+    receipt: BackendExecutionReceipt,
+) -> Result<(), AgentServiceError> {
+    receipt.validate().map_err(AgentServiceError::Execution)?;
+    if let Some(existing) = receipt_journal
+        .iter()
+        .find(|existing| existing.operation.operation_id == receipt.operation.operation_id)
+    {
+        if existing == &receipt {
+            return Ok(());
+        }
+        return Err(AgentServiceError::Execution(
+            crate::v2_m0_execution::ExecutionError::InvalidOperation,
+        ));
+    }
+    if receipt_journal.iter().any(|existing| {
+        existing.backend == receipt.backend
+            && existing.backend_version == receipt.backend_version
+            && existing.sequence >= receipt.sequence
+    }) {
+        return Err(AgentServiceError::Execution(
+            crate::v2_m0_execution::ExecutionError::InvalidOperation,
+        ));
+    }
+    let terminal = receipt.as_terminal_evidence();
+    if let Some(existing) = terminal_journal
+        .iter()
+        .find(|existing| existing.operation.operation_id == terminal.operation.operation_id)
+    {
+        if existing != &terminal {
+            return Err(AgentServiceError::Execution(
+                crate::v2_m0_execution::ExecutionError::InvalidOperation,
+            ));
+        }
+    } else {
+        terminal_journal.push_back(terminal);
+        while terminal_journal.len() > MAX_AGENT_TERMINAL_EVIDENCE_ENTRIES {
+            terminal_journal.pop_front();
+        }
+    }
+    receipt_journal.push_back(receipt);
+    while receipt_journal.len() > MAX_AGENT_BACKEND_EXECUTION_RECEIPTS {
+        receipt_journal.pop_front();
+    }
+    Ok(())
+}
 async fn terminate_active(
     active: &mut Option<ActiveOperation>,
     operation_done_rx: &mut mpsc::Receiver<OperationCompletion>,
     execution: &mut AgentExecutionGate,
     terminal_evidence: &mut VecDeque<AgentTerminalEvidence>,
+    backend_execution_receipts: &mut VecDeque<BackendExecutionReceipt>,
     device_id: &str,
 ) -> Result<(), AgentServiceError> {
     let Some(operation) = active.take() else {
@@ -2489,9 +2599,19 @@ async fn terminate_active(
     // If the worker already reached the same terminal result that the normal
     // protocol would accept, retain only its payload-free proof. Otherwise the
     // disconnect remains ambiguous and no evidence is manufactured.
-    if let AgentOperationOutcome::Result(result) = &completion.outcome {
-        let device_result = normalized_device_result(result);
-        record_terminal_evidence(terminal_evidence, device_id, &operation, &device_result)?;
+    match &completion.outcome {
+        AgentOperationOutcome::Result(result) => {
+            let device_result = normalized_device_result(result);
+            record_terminal_evidence(terminal_evidence, device_id, &operation, &device_result)?;
+        }
+        AgentOperationOutcome::BackendReceipt(receipt) => {
+            record_backend_execution_receipt(
+                backend_execution_receipts,
+                terminal_evidence,
+                receipt.clone(),
+            )?;
+        }
+        AgentOperationOutcome::Indeterminate(_) => {}
     }
     // Process descendants have been killed/waited by ProcessExecutor. Read-only
     // filesystem operations are bounded and awaited before the replay ID is
@@ -2781,16 +2901,37 @@ fn browser_refusal_error_code(reason: BrowserRefusalReason) -> DeviceErrorCode {
     }
 }
 
+async fn recover_authoritative_backend_receipt(
+    computer_use: &Arc<dyn ComputerUseBackendAdapter>,
+    context: &BackendExecutionReceiptContext,
+    fallback: AgentOperationOutcome,
+) -> AgentOperationOutcome {
+    if context.capability.class() == CapabilityClass::Observe {
+        return fallback;
+    }
+    match computer_use.recover_execution_receipt(context).await {
+        Ok(Some(receipt)) if context.matches_receipt(&receipt) => {
+            AgentOperationOutcome::BackendReceipt(receipt)
+        }
+        // Missing, malformed, stale, mismatched, or provider-error evidence is
+        // never promoted. Preserve the original ambiguous outcome so Hub
+        // quarantine/no-replay behavior remains authoritative.
+        Ok(Some(_)) | Ok(None) | Err(_) => fallback,
+    }
+}
+
 async fn execute_computer_use_operation(
     computer_use: Arc<dyn ComputerUseBackendAdapter>,
     command: DeviceCommand,
     upload_staging: BrowserUploadStagingBroker,
     download_staging: BrowserDownloadStagingBroker,
-    device_generation: u64,
-    capability_revision: u64,
+    receipt_context: BackendExecutionReceiptContext,
     cancellation: watch::Receiver<bool>,
 ) -> AgentOperationOutcome {
     use crate::v2_browser_runtime::{BrowserBackendCommand, BrowserBackendResult};
+
+    let device_generation = receipt_context.operation.device_generation;
+    let capability_revision = receipt_context.capability_revision;
 
     match &command {
         DeviceCommand::Browser {
@@ -2845,17 +2986,34 @@ async fn execute_computer_use_operation(
                     AgentOperationOutcome::Result(Ok(result))
                 }
                 Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
-                    AgentOperationOutcome::Indeterminate(
-                        AgentIndeterminateCause::CancellationPropagated,
+                    recover_authoritative_backend_receipt(
+                        &computer_use,
+                        &receipt_context,
+                        AgentOperationOutcome::Indeterminate(
+                            AgentIndeterminateCause::CancellationPropagated,
+                        ),
                     )
+                    .await
                 }
                 Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
-                    AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
+                    recover_authoritative_backend_receipt(
+                        &computer_use,
+                        &receipt_context,
+                        AgentOperationOutcome::Indeterminate(
+                            AgentIndeterminateCause::BackendTimedOut,
+                        ),
+                    )
+                    .await
                 }
                 Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate) => {
-                    AgentOperationOutcome::Result(Ok(DeviceResult::Error {
-                        code: DeviceErrorCode::BackendOutcomeIndeterminate,
-                    }))
+                    recover_authoritative_backend_receipt(
+                        &computer_use,
+                        &receipt_context,
+                        AgentOperationOutcome::Result(Ok(DeviceResult::Error {
+                            code: DeviceErrorCode::BackendOutcomeIndeterminate,
+                        })),
+                    )
+                    .await
                 }
                 Err(error) => {
                     let _ = upload_staging.consume_handles(
@@ -2940,17 +3098,34 @@ async fn execute_computer_use_operation(
                     // The backend may still be writing. Leave this private operation staged;
                     // execution safety quarantines the interaction until explicit resolution,
                     // and context teardown removes the private directory.
-                    AgentOperationOutcome::Indeterminate(
-                        AgentIndeterminateCause::CancellationPropagated,
+                    recover_authoritative_backend_receipt(
+                        &computer_use,
+                        &receipt_context,
+                        AgentOperationOutcome::Indeterminate(
+                            AgentIndeterminateCause::CancellationPropagated,
+                        ),
                     )
+                    .await
                 }
                 Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
-                    AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
+                    recover_authoritative_backend_receipt(
+                        &computer_use,
+                        &receipt_context,
+                        AgentOperationOutcome::Indeterminate(
+                            AgentIndeterminateCause::BackendTimedOut,
+                        ),
+                    )
+                    .await
                 }
                 Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate) => {
-                    AgentOperationOutcome::Result(Ok(DeviceResult::Error {
-                        code: DeviceErrorCode::BackendOutcomeIndeterminate,
-                    }))
+                    recover_authoritative_backend_receipt(
+                        &computer_use,
+                        &receipt_context,
+                        AgentOperationOutcome::Result(Ok(DeviceResult::Error {
+                            code: DeviceErrorCode::BackendOutcomeIndeterminate,
+                        })),
+                    )
+                    .await
                 }
                 Err(error) => {
                     let _ = download_staging.abort(
@@ -2968,17 +3143,32 @@ async fn execute_computer_use_operation(
                 AgentOperationOutcome::Result(Ok(result))
             }
             Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate) => {
-                AgentOperationOutcome::Indeterminate(
-                    AgentIndeterminateCause::CancellationPropagated,
+                recover_authoritative_backend_receipt(
+                    &computer_use,
+                    &receipt_context,
+                    AgentOperationOutcome::Indeterminate(
+                        AgentIndeterminateCause::CancellationPropagated,
+                    ),
                 )
+                .await
             }
             Ok(BackendExecutionOutcome::TimedOutIndeterminate) => {
-                AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut)
+                recover_authoritative_backend_receipt(
+                    &computer_use,
+                    &receipt_context,
+                    AgentOperationOutcome::Indeterminate(AgentIndeterminateCause::BackendTimedOut),
+                )
+                .await
             }
             Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate) => {
-                AgentOperationOutcome::Result(Ok(DeviceResult::Error {
-                    code: DeviceErrorCode::BackendOutcomeIndeterminate,
-                }))
+                recover_authoritative_backend_receipt(
+                    &computer_use,
+                    &receipt_context,
+                    AgentOperationOutcome::Result(Ok(DeviceResult::Error {
+                        code: DeviceErrorCode::BackendOutcomeIndeterminate,
+                    })),
+                )
+                .await
             }
             Err(error) => AgentOperationOutcome::Result(Err(AgentOperationError::Backend(error))),
         },
@@ -3729,6 +3919,236 @@ mod tests {
                 _ => Err(M1BackendError::UnsupportedCommand(command.capability())),
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct ReceiptAwareComputerUseBackend {
+        receipt: Option<BackendExecutionReceipt>,
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerUseBackendAdapter for ReceiptAwareComputerUseBackend {
+        fn advertisement(&self) -> CapabilityAdvertisement {
+            CapabilityAdvertisement {
+                backend: "receipt-cu".into(),
+                backend_version: "2".into(),
+                platform: "test".into(),
+                capability_schema_version: CAPABILITY_SCHEMA_VERSION,
+                revision: 1,
+                supported: vec![DeviceCapability::TerminateApplication],
+            }
+        }
+
+        async fn connect(&self) -> Result<(), M1BackendError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), M1BackendError> {
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            _command: &DeviceCommand,
+            _cancellation: watch::Receiver<bool>,
+        ) -> Result<BackendExecutionOutcome, M1BackendError> {
+            Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
+        }
+
+        async fn recover_execution_receipt(
+            &self,
+            _context: &BackendExecutionReceiptContext,
+        ) -> Result<Option<BackendExecutionReceipt>, M1BackendError> {
+            Ok(self.receipt.clone())
+        }
+    }
+
+    fn terminate_receipt_context(operation_id: &str) -> BackendExecutionReceiptContext {
+        BackendExecutionReceiptContext {
+            operation: OperationRef {
+                device_id: "dev-receipt".into(),
+                device_generation: 41,
+                operation_id: operation_id.into(),
+            },
+            capability_revision: 9,
+            capability: DeviceCapability::TerminateApplication,
+            dispatch_grant_id: "grant_receipt_fence".into(),
+            backend: "receipt-cu".into(),
+            backend_version: "2".into(),
+            target_binding: Some(BackendReceiptTargetBinding::ApplicationProcess {
+                process_id: 4242,
+            }),
+        }
+    }
+
+    fn exact_backend_receipt(
+        context: &BackendExecutionReceiptContext,
+        sequence: u64,
+    ) -> BackendExecutionReceipt {
+        BackendExecutionReceipt {
+            schema_version: crate::v2_execution_safety::BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            operation: context.operation.clone(),
+            capability_revision: context.capability_revision,
+            capability: context.capability,
+            dispatch_grant_id: context.dispatch_grant_id.clone(),
+            backend: context.backend.clone(),
+            backend_version: context.backend_version.clone(),
+            provider_contract_schema_version:
+                crate::v2_execution_safety::BACKEND_EXECUTION_RECEIPT_SCHEMA_VERSION,
+            sequence,
+            target_binding: context.target_binding.clone(),
+            terminal_outcome:
+                crate::v2_execution_safety::BackendReceiptTerminalOutcome::EffectCommitted,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_backend_receipt_recovers_response_loss_without_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "cumg-agent-backend-receipt-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let upload = BrowserUploadStagingBroker::new(&root).unwrap();
+        let download = BrowserDownloadStagingBroker::new(&root).unwrap();
+        let context = terminate_receipt_context("op-backend-receipt");
+        let receipt = exact_backend_receipt(&context, 7);
+        let backend: Arc<dyn ComputerUseBackendAdapter> =
+            Arc::new(ReceiptAwareComputerUseBackend {
+                receipt: Some(receipt.clone()),
+            });
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = execute_computer_use_operation(
+            backend,
+            DeviceCommand::TerminateApplication { process_id: 4242 },
+            upload,
+            download,
+            context,
+            cancel_rx,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            AgentOperationOutcome::BackendReceipt(ref recovered) if recovered == &receipt
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatched_backend_receipt_keeps_response_loss_indeterminate() {
+        let root = std::env::temp_dir().join(format!(
+            "cumg-agent-backend-receipt-missing-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let context = terminate_receipt_context("op-backend-receipt-missing");
+        let exact = exact_backend_receipt(&context, 8);
+        let mut cases: Vec<(&str, Option<BackendExecutionReceipt>)> = vec![("missing", None)];
+
+        let mut operation = exact.clone();
+        operation.operation.operation_id = "op-cross-operation-substitution".into();
+        cases.push(("operation_id", Some(operation)));
+
+        let mut device = exact.clone();
+        device.operation.device_id = "dev-other".into();
+        cases.push(("device", Some(device)));
+
+        let mut generation = exact.clone();
+        generation.operation.device_generation += 1;
+        cases.push(("generation", Some(generation)));
+
+        let mut capability_revision = exact.clone();
+        capability_revision.capability_revision += 1;
+        cases.push(("capability_revision", Some(capability_revision)));
+
+        let mut capability = exact.clone();
+        capability.capability = DeviceCapability::LaunchApplication;
+        capability.target_binding = Some(BackendReceiptTargetBinding::ApplicationLaunch {
+            identifier: Some("com.example.other".into()),
+            name: None,
+        });
+        cases.push(("capability", Some(capability)));
+
+        let mut dispatch = exact.clone();
+        dispatch.dispatch_grant_id = "grant_other_dispatch".into();
+        cases.push(("dispatch_grant", Some(dispatch)));
+
+        let mut backend = exact.clone();
+        backend.backend = "unknown-provider".into();
+        cases.push(("backend_provenance", Some(backend)));
+
+        let mut backend_version = exact.clone();
+        backend_version.backend_version = "other-version".into();
+        cases.push(("backend_version", Some(backend_version)));
+
+        let mut receipt_schema = exact.clone();
+        receipt_schema.schema_version = 0;
+        cases.push(("receipt_schema", Some(receipt_schema)));
+
+        let mut provider_schema = exact.clone();
+        provider_schema.provider_contract_schema_version = 0;
+        cases.push(("provider_schema", Some(provider_schema)));
+
+        let mut sequence = exact.clone();
+        sequence.sequence = 0;
+        cases.push(("sequence", Some(sequence)));
+
+        let mut missing_target = exact.clone();
+        missing_target.target_binding = None;
+        cases.push(("missing_target", Some(missing_target)));
+
+        let mut target = exact.clone();
+        target.target_binding =
+            Some(BackendReceiptTargetBinding::ApplicationProcess { process_id: 9999 });
+        cases.push(("target", Some(target)));
+
+        for (case, receipt) in cases {
+            let backend: Arc<dyn ComputerUseBackendAdapter> =
+                Arc::new(ReceiptAwareComputerUseBackend { receipt });
+            let (_cancel_tx, cancel_rx) = watch::channel(false);
+            let outcome = execute_computer_use_operation(
+                backend,
+                DeviceCommand::TerminateApplication { process_id: 4242 },
+                BrowserUploadStagingBroker::new(&root).unwrap(),
+                BrowserDownloadStagingBroker::new(&root).unwrap(),
+                context.clone(),
+                cancel_rx,
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    AgentOperationOutcome::Result(Ok(DeviceResult::Error {
+                        code: DeviceErrorCode::BackendOutcomeIndeterminate
+                    }))
+                ),
+                "case={case}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backend_receipt_journal_is_idempotent_and_rejects_conflicts_or_stale_sequence() {
+        let context = terminate_receipt_context("op-receipt-journal");
+        let receipt = exact_backend_receipt(&context, 11);
+        let mut receipts = VecDeque::new();
+        let mut terminal = VecDeque::new();
+        record_backend_execution_receipt(&mut receipts, &mut terminal, receipt.clone()).unwrap();
+        record_backend_execution_receipt(&mut receipts, &mut terminal, receipt.clone()).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(terminal, VecDeque::from([receipt.as_terminal_evidence()]));
+
+        let mut conflict = receipt.clone();
+        conflict.sequence = 12;
+        assert!(record_backend_execution_receipt(&mut receipts, &mut terminal, conflict).is_err());
+
+        let mut stale_context = terminate_receipt_context("op-receipt-stale");
+        stale_context.operation.operation_id = "op-receipt-stale".into();
+        let stale = exact_backend_receipt(&stale_context, 10);
+        assert!(record_backend_execution_receipt(&mut receipts, &mut terminal, stale).is_err());
     }
 
     #[test]

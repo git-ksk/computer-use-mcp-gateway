@@ -662,6 +662,34 @@ pub fn render_incident_brief_text(brief: &IncidentBrief) -> String {
     } else {
         output.push_str("  No authoritative terminal proof\n");
     }
+    match brief.cumg.backend_execution_receipt {
+        crate::v2_maintenance::BackendExecutionReceiptStatus::ExactAuthoritative => {
+            let provider = brief
+                .cumg
+                .backend_receipt_provider
+                .as_deref()
+                .unwrap_or("unknown");
+            let version = brief
+                .cumg
+                .backend_receipt_provider_version
+                .as_deref()
+                .unwrap_or("unknown");
+            output.push_str(&format!(
+                "  Backend execution receipt: exact_authoritative provider={provider} version={version} [CUMG authority]\n"
+            ));
+        }
+        crate::v2_maintenance::BackendExecutionReceiptStatus::Mismatch => {
+            output.push_str(
+                "  Backend execution receipt: mismatch [not settlement authority; keep quarantine]\n",
+            );
+        }
+        crate::v2_maintenance::BackendExecutionReceiptStatus::Absent => {
+            output.push_str("  Backend execution receipt: absent\n");
+        }
+        crate::v2_maintenance::BackendExecutionReceiptStatus::Unavailable => {
+            output.push_str("  Backend execution receipt: unavailable\n");
+        }
+    }
     if !brief.cumg.replay_old_operation {
         output.push_str("  Old operation has not been replayed\n");
     }
@@ -834,6 +862,12 @@ mod tests {
             agent_terminal_marker: AgentTerminalMarkerStatus::Absent,
             agent_terminal_marker_authoritative: false,
             agent_terminal_evidence: AgentTerminalEvidenceStatus::Absent,
+            backend_execution_receipt: crate::v2_maintenance::BackendExecutionReceiptStatus::Absent,
+            backend_receipt_provider: None,
+            backend_receipt_provider_version: None,
+            backend_receipt_contract_schema_version: None,
+            backend_receipt_sequence: None,
+            backend_receipt_target_bound: None,
             authoritative_terminal_state: None,
             authoritative_evidence_class: None,
             evidence_authority: ReconciliationEvidenceAuthority::Missing,
@@ -968,6 +1002,55 @@ mod tests {
         assert!(rendered.contains("Continuation authority"));
         assert!(rendered.contains("current_state_acceptance=eligible"));
         assert!(rendered.contains("mutation_resume_required_after_acceptance=true"));
+    }
+
+    #[test]
+    fn incident_brief_labels_backend_receipt_authority_separately_from_observations() {
+        let mut audit = audit("terminate_application");
+        audit.backend_execution_receipt =
+            crate::v2_maintenance::BackendExecutionReceiptStatus::ExactAuthoritative;
+        audit.backend_receipt_provider = Some("receipt-provider".into());
+        audit.backend_receipt_provider_version = Some("1.2.3".into());
+        audit.backend_receipt_contract_schema_version = Some(1);
+        audit.backend_receipt_sequence = Some(9);
+        audit.backend_receipt_target_bound = Some(true);
+        audit.authoritative_terminal_state = Some("completed".into());
+        audit.authoritative_evidence_class = Some("verified_agent_result".into());
+        audit.evidence_authority = ReconciliationEvidenceAuthority::AuthoritativeBackendReceipt;
+        audit.evidence_status = ReconciliationEvidenceStatus::Sufficient;
+        audit.resolution_readiness = ReconciliationResolutionReadiness::ConfirmedCompletedSupported;
+        audit.supported_decisions = vec![ReconciliationSupportedDecision::ConfirmedCompleted];
+        audit.manual_audit_required = false;
+        audit.recommended_action = ReconciliationRecommendedAction::AuthorizedRecoverySupported;
+        audit.reasons = vec![
+            ReconciliationAuditReason::AuthoritativeBackendReceiptAvailable,
+            ReconciliationAuditReason::AuthoritativeTerminalEvidenceAvailable,
+        ];
+
+        let diagnostics = vec![diagnostic(
+            IncidentDiagnosticSource::Cua,
+            IncidentDiagnosticFinding::FailureResponseObserved,
+        )];
+        let brief = compose_incident_brief(inspection("terminate_application"), audit, diagnostics)
+            .unwrap();
+
+        assert_eq!(
+            brief.cumg.evidence_authority,
+            ReconciliationEvidenceAuthority::AuthoritativeBackendReceipt
+        );
+        assert_eq!(
+            brief.diagnostics[0].authority,
+            IncidentDiagnosticAuthority::ObservationalOnly
+        );
+        let encoded = serde_json::to_string(&brief).unwrap();
+        assert!(encoded.contains("authoritative_backend_receipt"));
+        assert!(encoded.contains("receipt-provider"));
+        assert!(encoded.contains("observational_only"));
+        let rendered = render_incident_brief_text(&brief);
+        assert!(rendered.contains(
+            "Backend execution receipt: exact_authoritative provider=receipt-provider version=1.2.3 [CUMG authority]"
+        ));
+        assert!(rendered.contains("Observational findings are not recovery authority"));
     }
 
     #[test]
