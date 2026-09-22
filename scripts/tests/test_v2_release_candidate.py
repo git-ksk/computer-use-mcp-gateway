@@ -126,6 +126,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertIn("bin/v2_recovery_enclave_helper", mod.expected_binary_paths("macos"))
         self.assertIn("components/handoff-runtime.tar.gz", mod.expected_artifact_paths("macos"))
         self.assertIn("install/v2_deferred_cleanup_recovery.py", mod.expected_artifact_paths("macos"))
+        self.assertIn("install/v2_backup_restore.py", mod.expected_artifact_paths("macos"))
 
     def test_macos_candidate_rejects_tampered_install_asset(self):
         bundle = self.extract("macos")
