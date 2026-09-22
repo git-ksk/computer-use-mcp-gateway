@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — v0.7.0
+
+### Recovery target identity (#289)
+
+- execution-safety durable schema **v14** adds private recovery-target metadata for application-targeted effectful operations; v13 and earlier reviewed state remains readable, while a v14 operation carrying recovery-target state cannot be lossily downgraded to v13;
+- `launch_application` persists its bounded identifier/name selector as recovery metadata; `terminate_application` now requires a bounded `application` value alongside `process_id` so a later local operator can identify the caller-selected application after an ambiguous termination; the Agent control command remains PID-only and live Hub-Agent/control schema versions are unchanged;
+- recovery target metadata is checkpoint-local and observational only. Normal northbound MCP, `get_operation`, generic quarantine JSON, logs, metrics, and unified status do not disclose it. The local `v2_maint incident-brief` surface may reveal it solely to support independent Human verification and never treats it as settlement or replay authority.
+
+**Migration:** v0.7 clients calling `terminate_application` must pass `application` using the bounded application identity selected during prior observation (for example the `application` field returned by `list_windows`). Existing v0.6 clients that send only `process_id` receive an input-schema failure and must refresh MCP tool discovery/schema before using this effectful operation.
+
 ## v0.6.0 — 2026-09-22
 
 Managed Developer Execution release. This release adds separately authorized managed developer jobs, a provider-isolated Playwright/E2E capability, and optional reviewed Linux cgroup-v2 process containment while preserving exact authorization, bounded execution, `Indeterminate` quarantine, and permanent no-auto-replay semantics.

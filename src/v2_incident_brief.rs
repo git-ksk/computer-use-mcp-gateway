@@ -2,6 +2,7 @@
 //! Optional diagnostics are closed, observational-only inputs and never recovery authority.
 
 use crate::mutation_authority::{MutationAuthorityRole, inspect_mutation_authority};
+use crate::v2_execution_safety::OperationRecoveryTarget;
 use crate::v2_maintenance::{
     MaintenanceError, QuarantineInspection, ReconciliationEvidenceSource,
     ReconciliationReadinessAudit, ReconciliationRecommendedAction, ReconciliationSupportedDecision,
@@ -12,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-pub const INCIDENT_BRIEF_SCHEMA_VERSION: u16 = 2;
+pub const INCIDENT_BRIEF_SCHEMA_VERSION: u16 = 3;
 pub const INCIDENT_DIAGNOSTICS_SCHEMA_VERSION: u16 = 1;
 pub const MAX_INCIDENT_DIAGNOSTIC_OBSERVATIONS: usize = 16;
 
@@ -242,10 +243,65 @@ pub struct IncidentContinuationSummary {
     pub mutation_resume_required_after_acceptance: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentRecoveryTargetAuthority {
+    RecoveryMetadataOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IncidentRecoveryTargetSummary {
+    ApplicationLaunch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        identifier: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        authority: IncidentRecoveryTargetAuthority,
+        settlement_authority: bool,
+        replay_authority: bool,
+    },
+    ApplicationProcess {
+        process_id: u32,
+        application: String,
+        authority: IncidentRecoveryTargetAuthority,
+        settlement_authority: bool,
+        replay_authority: bool,
+    },
+}
+
+impl IncidentRecoveryTargetSummary {
+    fn from_private_target(target: OperationRecoveryTarget) -> Self {
+        match target {
+            OperationRecoveryTarget::ApplicationLaunch { identifier, name } => {
+                Self::ApplicationLaunch {
+                    identifier,
+                    name,
+                    authority: IncidentRecoveryTargetAuthority::RecoveryMetadataOnly,
+                    settlement_authority: false,
+                    replay_authority: false,
+                }
+            }
+            OperationRecoveryTarget::ApplicationProcess {
+                process_id,
+                application,
+            } => Self::ApplicationProcess {
+                process_id,
+                application,
+                authority: IncidentRecoveryTargetAuthority::RecoveryMetadataOnly,
+                settlement_authority: false,
+                replay_authority: false,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IncidentBrief {
     pub schema_version: u16,
     pub operation: IncidentOperationSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_target: Option<IncidentRecoveryTargetSummary>,
     /// Exact #133 audit: this remains the controlling CUMG authority view.
     pub cumg: ReconciliationReadinessAudit,
     /// Continuation authority is deliberately separate from factual reconciliation.
@@ -364,6 +420,10 @@ fn compose_incident_brief(
 
     let contradictions = contradictions(&audit, &diagnostics);
     let human_summary = human_summary(&inspection, &audit, &diagnostics, &contradictions);
+    let recovery_target = inspection
+        .recovery_target
+        .clone()
+        .map(IncidentRecoveryTargetSummary::from_private_target);
     let operation = IncidentOperationSummary {
         operation_id: inspection.blocking_operation_id.clone(),
         capability: inspection.capability.clone(),
@@ -393,6 +453,7 @@ fn compose_incident_brief(
     Ok(IncidentBrief {
         schema_version: INCIDENT_BRIEF_SCHEMA_VERSION,
         operation,
+        recovery_target,
         cumg: audit,
         continuation,
         mutation_authority: IncidentMutationAuthoritySummary {
@@ -572,6 +633,30 @@ pub fn render_incident_brief_text(brief: &IncidentBrief) -> String {
     } else {
         "  Dispatch not recorded\n"
     });
+    if let Some(target) = brief.recovery_target.as_ref() {
+        output
+            .push_str("  Recovery target [local metadata only; not settlement/replay authority]: ");
+        match target {
+            IncidentRecoveryTargetSummary::ApplicationLaunch {
+                identifier, name, ..
+            } => {
+                let value = serde_json::json!({"identifier": identifier, "name": name});
+                output.push_str(&value.to_string());
+            }
+            IncidentRecoveryTargetSummary::ApplicationProcess {
+                process_id,
+                application,
+                ..
+            } => {
+                let value = serde_json::json!({
+                    "process_id": process_id,
+                    "application": application,
+                });
+                output.push_str(&value.to_string());
+            }
+        }
+        output.push('\n');
+    }
     if let Some(state) = brief.cumg.authoritative_terminal_state.as_deref() {
         output.push_str(&format!("  Authoritative terminal proof: {state}\n"));
     } else {
@@ -704,6 +789,7 @@ mod tests {
             client_correlation_id: None,
             request_fingerprint_present: false,
             evidence_envelope: None,
+            recovery_target: None,
             dispatch_binding_present: true,
             semantic_operation_class: capability.into(),
             effect_class: "effectful".into(),
@@ -774,6 +860,38 @@ mod tests {
             finding,
             absence_of_evidence: finding.absence_of_evidence(),
         }
+    }
+
+    #[test]
+    fn local_incident_brief_exposes_recovery_target_without_granting_settlement_or_replay() {
+        let mut private = inspection("terminate_application");
+        private.recovery_target = Some(OperationRecoveryTarget::ApplicationProcess {
+            process_id: 4242,
+            application: "Monokura".into(),
+        });
+
+        // The generic quarantine inspection contract remains privacy-bounded.
+        let generic = serde_json::to_string(&private).unwrap();
+        assert!(!generic.contains("Monokura"));
+        assert!(!generic.contains("4242"));
+        assert!(!generic.contains("recovery_target"));
+
+        let brief =
+            compose_incident_brief(private, audit("terminate_application"), Vec::new()).unwrap();
+        let encoded = serde_json::to_string(&brief).unwrap();
+        assert!(encoded.contains("Monokura"));
+        assert!(encoded.contains("4242"));
+        assert!(encoded.contains("recovery_metadata_only"));
+        assert!(encoded.contains("\"settlement_authority\":false"));
+        assert!(encoded.contains("\"replay_authority\":false"));
+        assert!(brief.cumg.supported_decisions.is_empty());
+        assert_eq!(
+            brief.human_summary.decision_guidance,
+            IncidentDecisionGuidance::KeepQuarantine
+        );
+        let rendered = render_incident_brief_text(&brief);
+        assert!(rendered.contains("Monokura"));
+        assert!(rendered.contains("local metadata only; not settlement/replay authority"));
     }
 
     #[test]

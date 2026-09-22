@@ -29,10 +29,12 @@ use crate::{
     },
     v2_ephemeral_data_refs::DEFAULT_MAX_AGENT_EPHEMERAL_READ_BYTES,
     v2_execution_safety::{
-        OperationAdmissionMetadata, OperationAuditMetadata, OperationEvidenceEnvelope,
-        OperationOwner, OperationRequestFingerprint, RecoverableOperationResult,
+        MAX_RECOVERY_TARGET_TEXT_BYTES, OperationAdmissionMetadata, OperationAuditMetadata,
+        OperationEvidenceEnvelope, OperationOwner, OperationRecoveryTarget,
+        OperationRequestFingerprint, RecoverableOperationResult,
         SemanticConstraintAdmissionEvidence, fingerprint_pointer_click_request,
-        fingerprint_process_request, fingerprint_shell_request, text_input_evidence_envelope,
+        fingerprint_process_request, fingerprint_shell_request, recovery_target_for_command,
+        text_input_evidence_envelope,
     },
     v2_handoff_coordinator::{HandoffAdmission, HandoffCoordinator, HandoffCoordinatorError},
     v2_interaction_context::{
@@ -1201,6 +1203,7 @@ struct NorthboundOperationCall {
 /// only this wrapper so constrained fields cannot be rebuilt after authorization.
 struct AuthorizedSemanticCommand {
     command: DeviceCommand,
+    recovery_target: Option<OperationRecoveryTarget>,
     semantic_constraint: Option<SemanticConstraintAdmissionEvidence>,
 }
 
@@ -1327,6 +1330,7 @@ impl V2NorthboundMcp {
         &self,
         principal: &AuthenticatedClientPrincipal,
         command: DeviceCommand,
+        recovery_target_override: Option<OperationRecoveryTarget>,
     ) -> Result<AuthorizedSemanticCommand, McpError> {
         let capability = command.capability();
         // Repeat exact-capability authorization at the finalized-command seam.
@@ -1368,8 +1372,16 @@ impl V2NorthboundMcp {
             },
             None => None,
         };
+        let recovery_target =
+            recovery_target_override.or_else(|| recovery_target_for_command(&command));
+        if let Some(target) = recovery_target.as_ref() {
+            target.validate(capability).map_err(|_| {
+                McpError::invalid_params("Recovery target metadata is invalid", None)
+            })?;
+        }
         Ok(AuthorizedSemanticCommand {
             command,
+            recovery_target,
             semantic_constraint,
         })
     }
@@ -2123,7 +2135,7 @@ impl V2NorthboundMcp {
             data_base64: BrowserUploadPayload::after_contract_validation(request.data_base64),
             expected_bytes: expected_bytes as u64,
         };
-        let authorized = self.authorize_final_command(principal, command)?;
+        let authorized = self.authorize_final_command(principal, command, None)?;
         let execution = self
             .execute_command(principal, authorized, Some(&binding), operation, context)
             .await;
@@ -2184,7 +2196,7 @@ impl V2NorthboundMcp {
         let command = DeviceCommand::Browser {
             command: prepared.command.clone(),
         };
-        let authorized = self.authorize_final_command(principal, command)?;
+        let authorized = self.authorize_final_command(principal, command, None)?;
         let public_operation_id = operation.operation_id.clone();
         let result = match self
             .execute_command(
@@ -2820,6 +2832,7 @@ impl V2NorthboundMcp {
     ) -> Result<DeviceResult, McpError> {
         let AuthorizedSemanticCommand {
             command,
+            recovery_target,
             semantic_constraint,
         } = authorized;
         let handoff = self
@@ -2836,6 +2849,7 @@ impl V2NorthboundMcp {
             audit,
             request_fingerprint,
             evidence_envelope,
+            recovery_target,
             semantic_constraint,
         };
         let pending = if let Some(admission) = handoff.as_ref() {
@@ -3467,6 +3481,7 @@ impl ServerHandler for V2NorthboundMcp {
                 .await;
         }
 
+        let mut recovery_target_override: Option<OperationRecoveryTarget> = None;
         let command_result: Result<DeviceCommand, McpError> = (|| match request.name.as_ref() {
             TOOL_LIST_APPS => Ok(DeviceCommand::ListApplications),
             TOOL_GET_SCREEN_SIZE => Ok(DeviceCommand::ScreenGeometry),
@@ -3791,8 +3806,20 @@ impl ServerHandler for V2NorthboundMcp {
                 }
             }
             TOOL_TERMINATE_APPLICATION => {
-                let args: ProcessIdArgs = parse_arguments(arguments)?;
+                let args: TerminateApplicationArgs = parse_arguments(arguments)?;
                 require_positive_process_id(args.process_id)?;
+                if args.application.trim().is_empty()
+                    || args.application.len() > MAX_RECOVERY_TARGET_TEXT_BYTES
+                {
+                    return Err(McpError::invalid_params(
+                        "application must contain 1..=512 UTF-8 bytes",
+                        None,
+                    ));
+                }
+                recovery_target_override = Some(OperationRecoveryTarget::ApplicationProcess {
+                    process_id: args.process_id,
+                    application: args.application,
+                });
                 Ok(DeviceCommand::TerminateApplication {
                     process_id: args.process_id,
                 })
@@ -3981,7 +4008,8 @@ impl ServerHandler for V2NorthboundMcp {
             _ => None,
         };
 
-        let authorized = self.authorize_final_command(&auth.principal, command)?;
+        let authorized =
+            self.authorize_final_command(&auth.principal, command, recovery_target_override)?;
         let public_operation_id = recoverable_effectful_call.then(|| operation_id.clone());
         let mut result = match self
             .execute_command(
@@ -5323,7 +5351,20 @@ fn all_tools() -> Vec<Tool> {
         Tool::new(
             TOOL_TERMINATE_APPLICATION,
             "Force-terminate one exact process. Unsaved application state may be lost.",
-            object_schema(vec![("process_id", positive_integer_schema())], &["process_id"]),
+            object_schema(
+                vec![
+                    ("process_id", positive_integer_schema()),
+                    (
+                        "application",
+                        json!({
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RECOVERY_TARGET_TEXT_BYTES
+                        }),
+                    ),
+                ],
+                &["process_id", "application"],
+            ),
         )
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
@@ -6542,8 +6583,9 @@ fn parse_pointer_button(value: Option<&str>) -> Result<PointerButton, McpError> 
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProcessIdArgs {
+struct TerminateApplicationArgs {
     process_id: u32,
+    application: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7582,6 +7624,7 @@ mod tests {
                 DeviceCommand::TypeText {
                     text: "éé".into()
                 },
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -7600,6 +7643,7 @@ mod tests {
             DeviceCommand::TypeText {
                 text: secret_text.into(),
             },
+            None,
         ) {
             Ok(_) => panic!("oversized finalized text unexpectedly authorized"),
             Err(error) => error,
@@ -7620,6 +7664,7 @@ mod tests {
                         url: allowed_url.into(),
                     },
                 },
+                None,
             )
             .unwrap();
         match &allowed_nav.command {
@@ -7641,6 +7686,7 @@ mod tests {
                     url: denied_url.into(),
                 },
             },
+            None,
         ) {
             Ok(_) => panic!("disallowed finalized origin unexpectedly authorized"),
             Err(error) => error,
@@ -7651,9 +7697,11 @@ mod tests {
         assert!(!denied_debug.contains("EVIL_URL_SECRET"));
 
         let other = AuthenticatedClientPrincipal::new("https://auth.example", "other").unwrap();
-        let exact_denied = match service
-            .authorize_final_command(&other, DeviceCommand::TypeText { text: "ok".into() })
-        {
+        let exact_denied = match service.authorize_final_command(
+            &other,
+            DeviceCommand::TypeText { text: "ok".into() },
+            None,
+        ) {
             Ok(_) => panic!("semantic policy unexpectedly widened exact capability authority"),
             Err(error) => error,
         };
@@ -8901,6 +8949,49 @@ mod tests {
             PointerButton::Right
         );
         assert!(parse_pointer_button(Some("primary")).is_err());
+    }
+
+    #[test]
+    fn terminate_application_requires_bounded_recovery_identity_without_changing_agent_command() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == TOOL_TERMINATE_APPLICATION)
+            .unwrap();
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|value| value == "process_id"));
+        assert!(required.iter().any(|value| value == "application"));
+        assert_eq!(
+            schema["properties"]["application"]["maxLength"],
+            MAX_RECOVERY_TARGET_TEXT_BYTES
+        );
+
+        assert!(
+            parse_arguments::<TerminateApplicationArgs>(Some(
+                serde_json::json!({"process_id": 42})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))
+            .is_err()
+        );
+        let args: TerminateApplicationArgs = parse_arguments(Some(
+            serde_json::json!({"process_id": 42, "application": "Monokura"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ))
+        .unwrap();
+        assert_eq!(args.process_id, 42);
+        assert_eq!(args.application, "Monokura");
+        let command = DeviceCommand::TerminateApplication {
+            process_id: args.process_id,
+        };
+        assert_eq!(
+            command,
+            DeviceCommand::TerminateApplication { process_id: 42 }
+        );
     }
 
     #[test]

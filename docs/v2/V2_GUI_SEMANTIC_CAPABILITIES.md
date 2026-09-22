@@ -41,7 +41,7 @@ extension:
 | `launch_application` | `LaunchApplication` | launch by opaque identifier/name with bounded targets |
 | `inspect_window` | `InspectWindow` | bounded normalized UI snapshot; mints CUMG scoped refs |
 | `verify_ui_state` | `VerifyUiState` | bounded predicates; `unknown` is never success |
-| `terminate_application` | `TerminateApplication` | exact process termination; dangerous capability |
+| `terminate_application` | `TerminateApplication` | exact process termination; dangerous capability; v0.7 northbound requires bounded `application` recovery identity alongside PID while the Agent command remains PID-only |
 | `activate_window` | `ActivateWindow` | activate a process or exact window with verification evidence |
 | `set_window_frame` | `SetWindowFrame` | set and verify exact top-level window geometry |
 | `invoke_menu` | `InvokeMenu` | invoke a bounded semantic menu path without raw backend selectors |

@@ -401,6 +401,7 @@ mod tests {
                 execution_outcome: "indeterminate".into(),
                 retry_safe: false,
             },
+            recovery_target: None,
             continuation: IncidentContinuationSummary {
                 current_state_acceptance_eligibility: "ineligible_policy".into(),
                 policy: None,

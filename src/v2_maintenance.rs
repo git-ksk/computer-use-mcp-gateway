@@ -5,12 +5,12 @@
 
 use crate::v2_execution_safety::{
     AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
-    ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner, ReconciliationStatus,
-    RequestFingerprintComparison, ResolutionRecord, RetirementAuthority, RetirementCapacity,
-    RetirementDisposition, RetirementPolicy, RetirementRecord, TextInputTargetEvidence,
-    compare_request_fingerprint, current_state_acceptance_policy_for_capability,
-    fingerprint_process_request, fingerprint_shell_request, fingerprint_text_input_candidate,
-    retirement_policy_for_capability,
+    ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner, OperationRecoveryTarget,
+    ReconciliationStatus, RequestFingerprintComparison, ResolutionRecord, RetirementAuthority,
+    RetirementCapacity, RetirementDisposition, RetirementPolicy, RetirementRecord,
+    TextInputTargetEvidence, compare_request_fingerprint,
+    current_state_acceptance_policy_for_capability, fingerprint_process_request,
+    fingerprint_shell_request, fingerprint_text_input_candidate, retirement_policy_for_capability,
 };
 use crate::v2_m0::{
     CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
@@ -90,6 +90,11 @@ pub struct QuarantineInspection {
     pub client_correlation_id: Option<String>,
     pub request_fingerprint_present: bool,
     pub evidence_envelope: Option<OperationEvidenceInspection>,
+    /// Private-checkpoint recovery metadata. Intentionally excluded from the
+    /// generic inspect-quarantine JSON contract; incident-brief is the reviewed
+    /// local-only disclosure surface.
+    #[serde(skip_serializing)]
+    pub recovery_target: Option<OperationRecoveryTarget>,
     pub dispatch_binding_present: bool,
     pub semantic_operation_class: String,
     pub effect_class: String,
@@ -390,6 +395,7 @@ pub fn inspect_quarantines_read_only(
                 client_correlation_id: inspection.audit.client_correlation_id,
                 request_fingerprint_present,
                 evidence_envelope,
+                recovery_target: inspection.recovery_target,
                 dispatch_binding_present: inspection.dispatch_binding_present,
                 semantic_operation_class: capability.to_owned(),
                 effect_class: capability_effect_class(inspection.capability).to_owned(),
@@ -1821,6 +1827,7 @@ mod tests {
                     audit: OperationAuditMetadata::empty(),
                     request_fingerprint: None,
                     evidence_envelope: Some(envelope),
+                    recovery_target: None,
                     semantic_constraint: None,
                 },
                 100,
@@ -1868,6 +1875,7 @@ mod tests {
                     audit: OperationAuditMetadata::empty(),
                     request_fingerprint: None,
                     evidence_envelope: Some(envelope),
+                    recovery_target: None,
                     semantic_constraint: None,
                 },
                 100,
@@ -1934,6 +1942,7 @@ mod tests {
                     },
                     request_fingerprint: Some(fingerprint.clone()),
                     evidence_envelope: None,
+                    recovery_target: None,
                     semantic_constraint: None,
                 },
                 100,
