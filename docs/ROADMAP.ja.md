@@ -87,11 +87,20 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 1. **`v0.6.1 — Support Claim Expansion` evidence track** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、final gate #346。open / withheldのままで、v0.6.0やv0.7.0を遡及拡大しません。
 2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence` — released。** #342 / #295 / #304 / #289 / #290 / #347 はcomplete。詳細は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md)。
-3. **`v0.8.0 — Backend Portability & Recovery Safety`** — #222で既存CUMGのGUI authority / ambiguity / recovery semanticsをmaterially differentなsecond real backendに対して実証し、#377でHubがpre-delivery non-executionをauthoritativeに証明できる狭いpre-enqueue failureをreplayなしでauto-resolveできるようにします。両方をrequired release gateとします。generic provider / VM / fleet productには拡張せず、quarantine / no-auto-replay semanticsも弱めません。
+3. **`v0.8.0 — Backend Portability & Recovery Safety`** — #377でHubがauthoritativeに証明できる狭いpre-enqueue non-deliveryをreplayなしでauto-resolveできるようにし、#379でsemantic refusalのcaller-facing diagnosis/remediationをauthorityやreplay permissionに変えず統一し、#380でambient host authorityを継承せずconstrained shell/process environmentとPATH contractを明示し、その上で#222によりGUI authority / ambiguity / recovery semanticsをmaterially differentなsecond real backendへ実証します。#222と#377をcore portability/safety release gateとし、#379/#380もv0.8 admitted scopeとしてrelease前にcloseまたはexplicit re-scopeします。generic provider / VM / fleet productには拡張せず、authorization / privacy / quarantine / no-auto-replay semanticsも弱めません。
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
 5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
 
 各patch/minorは引き続きstanding [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateを満たす必要があります。optional provider/platform supportはassigned releaseでrequired evidenceが揃うまでwithholdし、version割当を理由にquarantine/no-auto-replay semanticsを弱めません。
+
+### v0.8.0 working order
+
+1. **#377 — authoritative recovery boundaryを先に固める。** operationがdelivery pathに受理されなかったことをexactに証明できるHub-local pre-enqueue non-delivery evidenceだけを追加し、commit-before-dispatch、uncertainty時quarantine、permanent no-auto-replayを維持します。
+2. **#379 / #380 — caller ergonomicsはnon-authoritative mappingを守る限り並行可能。** existing safe error/status taxonomyを再利用し、remediationとreplay safetyを分離し、host shell stateのimplicit sourceやcapability拡張をせずconstrained execution environmentを文書化します。
+3. **#222 — safety/caller contractが十分stableになってからmaterially differentなreal backendでportabilityを実証する。** second backendはCUMG-owned semantic capabilityを使い、ambiguous post-dispatch branchも意図的にexerciseします。provider-specific identity/errorはadapter boundaryより下に留めます。
+4. **v0.8.0 closeout — 4 issueすべてをstanding Product Readiness gateと照合する。** existing Cua regressionをgreenに保ち、#222のphysical/provider-backed evidenceを必須とし、#377のunsafe-neighbor testをfail-closedのまま維持し、#379/#380でimplicit fallback / authority escalation / ambient environment inheritance / replay semanticsを導入しません。
+
+#222でrequired real-backend acceptance evidenceを得られない場合はsupport claimをwithholdし、v0.8.0 completeとはしません。#379/#380をre-scopeする場合はmilestoneとこのroadmapを両方explicitに更新し、staleなadmitted scopeをsilentにshipしません。
 
 ### v0.6.0 released working order
 
@@ -185,7 +194,7 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、#346 final support-claim gate。
-- **`v0.8.0 — Backend Portability & Recovery Safety`:** #222 second-real-backend semantic-neutrality proof、#377 authoritative Hub pre-delivery non-execution auto-reconciliation。
+- **`v0.8.0 — Backend Portability & Recovery Safety`:** #377 authoritative Hub pre-delivery non-execution auto-reconciliation、#379 structured semantic-refusal diagnosis/remediation、#380 constrained execution-environment/PATH ergonomics、#222 second-real-backend semantic-neutrality proof。
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#284 final replacement / partition / physical-Handoff acceptance。
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。
 
