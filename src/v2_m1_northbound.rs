@@ -29,8 +29,8 @@ use crate::{
     },
     v2_ephemeral_data_refs::DEFAULT_MAX_AGENT_EPHEMERAL_READ_BYTES,
     v2_execution_safety::{
-        MAX_RECOVERY_TARGET_TEXT_BYTES, OperationAdmissionMetadata, OperationAuditMetadata,
-        OperationEvidenceEnvelope, OperationOwner, OperationRecoveryTarget,
+        ExecutionEvidence, MAX_RECOVERY_TARGET_TEXT_BYTES, OperationAdmissionMetadata,
+        OperationAuditMetadata, OperationEvidenceEnvelope, OperationOwner, OperationRecoveryTarget,
         OperationRequestFingerprint, RecoverableOperationResult,
         SemanticConstraintAdmissionEvidence, fingerprint_pointer_click_request,
         fingerprint_process_request, fingerprint_shell_request, recovery_target_for_command,
@@ -2720,6 +2720,13 @@ impl V2NorthboundMcp {
         self.authorize(principal, recovery.capability)?;
 
         let state = public_recovery_state(recovery.state, recovery.result.as_ref());
+        let confirmed_not_executed = recovery.receipt.as_ref().is_some_and(|receipt| {
+            matches!(
+                receipt.evidence,
+                ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                    | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+            )
+        });
         let public_operation_id = recovery.operation.operation_id.clone();
         let mut payload = json!({
             "type": "operation_status",
@@ -2734,6 +2741,9 @@ impl V2NorthboundMcp {
         }
         if state == "indeterminate" {
             add_indeterminate_guidance(&mut payload, "reconcile_indeterminate");
+        } else if confirmed_not_executed {
+            payload["resolution"] = json!("confirmed_not_executed");
+            add_confirmed_not_executed_guidance(&mut payload);
         }
         if let Some(receipt) = recovery.receipt {
             payload["finalized_at_ms"] = json!(receipt.finalized_at_ms);
@@ -4486,6 +4496,13 @@ fn add_indeterminate_guidance(payload: &mut Value, next_action: &'static str) {
     payload["follow_up_effectful_operation"] = json!("new_operation_id_required");
 }
 
+fn add_confirmed_not_executed_guidance(payload: &mut Value) {
+    payload["execution_may_have_occurred"] = json!(false);
+    payload["blind_replay_safe"] = json!(false);
+    payload["next_action"] = json!("retry_with_new_operation_id_if_still_needed");
+    payload["follow_up_effectful_operation"] = json!("new_operation_id_required");
+}
+
 fn hub_error_to_mcp(error: HubCommandError) -> McpError {
     let (message, code, blocking_operation_id) = match error {
         HubCommandError::AgentOffline => ("Agent is offline", "agent_offline", None),
@@ -4508,6 +4525,11 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         HubCommandError::CancelledBeforeDispatch => (
             "Operation was cancelled before dispatch",
             "cancelled_before_dispatch",
+            None,
+        ),
+        HubCommandError::ConfirmedNotExecuted => (
+            "Hub proved the operation was not delivered to the Agent",
+            "confirmed_not_executed",
             None,
         ),
         HubCommandError::SemanticConstraintSnapshotStale => (
@@ -4596,6 +4618,8 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
         data["blind_replay_safe"] = json!(false);
         data["effectful_execution_fenced"] = json!(true);
         data["next_action"] = json!("local_user_resume_mutations");
+    } else if code == "confirmed_not_executed" {
+        add_confirmed_not_executed_guidance(&mut data);
     }
     McpError::invalid_request(message, Some(data))
 }
@@ -4644,6 +4668,8 @@ fn execution_error_response(error: McpError) -> CallToolResponse {
                 "inspect_reconciliation_status"
             },
         );
+    } else if code == "confirmed_not_executed" {
+        add_confirmed_not_executed_guidance(&mut payload);
     }
     CallToolResult::error(vec![ContentBlock::text(payload.to_string())]).into()
 }
@@ -8560,6 +8586,17 @@ mod tests {
                 "follow_up_effectful_operation": "new_operation_id_required"
             })
         );
+        let mut confirmed = json!({});
+        add_confirmed_not_executed_guidance(&mut confirmed);
+        assert_eq!(
+            confirmed,
+            json!({
+                "execution_may_have_occurred": false,
+                "blind_replay_safe": false,
+                "next_action": "retry_with_new_operation_id_if_still_needed",
+                "follow_up_effectful_operation": "new_operation_id_required"
+            })
+        );
     }
 
     #[test]
@@ -8876,6 +8913,39 @@ mod tests {
         assert!(cancelled.contains("operation_cancelled"));
         assert!(cancelled_before_dispatch.contains("cancelled_before_dispatch"));
         assert!(indeterminate.contains("device_indeterminate"));
+    }
+
+    #[test]
+    fn confirmed_not_executed_is_distinct_from_retry_safe_replay() {
+        let error = hub_error_to_mcp(HubCommandError::ConfirmedNotExecuted);
+        let data = error.data.as_ref().unwrap();
+        assert_eq!(data["code"], "confirmed_not_executed");
+        assert_eq!(data["execution_may_have_occurred"], false);
+        assert_eq!(data["blind_replay_safe"], false);
+        assert_eq!(
+            data["next_action"],
+            "retry_with_new_operation_id_if_still_needed"
+        );
+        assert_eq!(
+            data["follow_up_effectful_operation"],
+            "new_operation_id_required"
+        );
+
+        let response =
+            execution_error_response(hub_error_to_mcp(HubCommandError::ConfirmedNotExecuted));
+        let serialized = match response {
+            CallToolResponse::Complete(result) => {
+                assert_eq!(result.is_error, Some(true));
+                serde_json::to_string(&result).unwrap()
+            }
+            other => panic!("unexpected tool response: {other:?}"),
+        };
+        assert!(serialized.contains("confirmed_not_executed"));
+        assert!(serialized.contains("execution_may_have_occurred"));
+        assert!(serialized.contains("blind_replay_safe"));
+        assert!(serialized.contains("retry_with_new_operation_id_if_still_needed"));
+        assert!(serialized.contains("new_operation_id_required"));
+        assert!(serialized.contains("retry_safe"));
     }
 
     #[test]

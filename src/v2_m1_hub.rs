@@ -10,10 +10,11 @@ use crate::v2_ephemeral_data_refs::{
     HubEphemeralRefLimits, HubEphemeralRefRegistry,
 };
 use crate::v2_execution_safety::{
-    AuthoritativeOperationController, DesktopQuarantine, ExecutionReceipt, IndeterminateReason,
-    OperationAdmissionMetadata, OperationDispatchBinding, OperationExecutionLane, OperationOwner,
-    OperationRecoverySnapshot, ReconciliationStatus, RecoverableOperationResult, ResolutionRecord,
-    RetirementAuthority, RetirementPolicy, RetirementRecord, terminal_evidence_for_device_result,
+    AuthoritativeOperationController, DesktopQuarantine, ExecutionEvidence, ExecutionReceipt,
+    IndeterminateReason, OperationAdmissionMetadata, OperationDispatchBinding,
+    OperationExecutionLane, OperationOwner, OperationRecoverySnapshot, ReconciliationStatus,
+    RecoverableOperationResult, ResolutionRecord, RetirementAuthority, RetirementPolicy,
+    RetirementRecord, terminal_evidence_for_device_result,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
 use crate::v2_m0::{
@@ -37,7 +38,7 @@ use crate::v2_m0_transport::{
 };
 use crate::v2_m0_trust::{DeviceKeyRotation, apply_device_key_rotation};
 use crate::v2_m1_grpc::{
-    decode_agent_frame, encode_hub_frame,
+    GrpcCarrierError, decode_agent_frame, encode_hub_frame,
     proto::{AgentFrame, HubFrame, agent_control_server::AgentControl},
 };
 use crate::v2_m1_persistence::{
@@ -428,6 +429,38 @@ struct PendingOperation {
 enum DispatchOutcome {
     Sent,
     Rejected(CompletionDecision),
+}
+
+enum HubCommandSendError {
+    EncodeBeforeEnqueue(GrpcCarrierError),
+    OutboundClosedBeforeEnqueue,
+}
+
+impl HubCommandSendError {
+    const fn evidence(&self) -> ExecutionEvidence {
+        match self {
+            Self::EncodeBeforeEnqueue(_) => ExecutionEvidence::HubEncodeFailedBeforeEnqueue,
+            Self::OutboundClosedBeforeEnqueue => ExecutionEvidence::HubOutboundClosedBeforeEnqueue,
+        }
+    }
+
+    const fn closes_session(&self) -> bool {
+        matches!(self, Self::OutboundClosedBeforeEnqueue)
+    }
+
+    fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::EncodeBeforeEnqueue(_) => "carrier_error",
+            Self::OutboundClosedBeforeEnqueue => "outbound_closed",
+        }
+    }
+
+    fn into_service_error(self) -> HubServiceError {
+        match self {
+            Self::EncodeBeforeEnqueue(error) => HubServiceError::Carrier(error),
+            Self::OutboundClosedBeforeEnqueue => HubServiceError::OutboundClosed,
+        }
+    }
 }
 
 enum CommandSessionFence {
@@ -1465,7 +1498,7 @@ impl SingleDeviceHub {
                 operation_id,
                 &owner,
                 generation,
-                dispatch_binding,
+                dispatch_binding.clone(),
                 unix_time_ms()?,
             )?;
             persist_locked(&self.inner, &persistent)?;
@@ -1475,17 +1508,108 @@ impl SingleDeviceHub {
             .get_mut(operation_id)
             .ok_or(HubServiceError::PendingOperationMissing)?
             .envelope = Some(command);
-        send_hub(outbound, HubToAgent::Command(remote)).await?;
-        tracing::info!(
-            event = "v2_operation_dispatched",
+
+        match send_command_hub(outbound, HubToAgent::Command(remote)).await {
+            Ok(()) => {
+                tracing::info!(
+                    event = "v2_operation_dispatched",
+                    operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    capability = crate::v2_observability::capability_name(capability),
+                    outcome = "dispatched",
+                    "operation dispatched to Agent"
+                );
+                Ok(DispatchOutcome::Sent)
+            }
+            Err(failure) => {
+                let Some(binding) = dispatch_binding.as_ref() else {
+                    return Err(failure.into_service_error());
+                };
+                let evidence = failure.evidence();
+                let next = self
+                    .commit_hub_pre_enqueue_non_delivery(
+                        operation_id,
+                        &owner,
+                        generation,
+                        binding,
+                        evidence,
+                    )
+                    .await?;
+
+                if let Some(operation) = pending.remove(operation_id) {
+                    let _ = operation
+                        .reply
+                        .send(Err(HubCommandError::ConfirmedNotExecuted));
+                }
+
+                tracing::warn!(
+                    event = "v2_operation_pre_enqueue_non_delivery",
+                    operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    capability = crate::v2_observability::capability_name(capability),
+                    outcome = "confirmed_not_executed",
+                    error_code = failure.safe_error_code(),
+                    evidence = ?evidence,
+                    old_operation_replayed = false,
+                    "Hub authoritatively proved the command was not accepted by the outbound path"
+                );
+
+                if failure.closes_session() {
+                    Err(HubServiceError::OutboundClosed)
+                } else {
+                    Ok(DispatchOutcome::Rejected(next))
+                }
+            }
+        }
+    }
+
+    async fn commit_hub_pre_enqueue_non_delivery(
+        &self,
+        operation_id: &str,
+        owner: &OperationOwner,
+        generation: u64,
+        dispatch_binding: &OperationDispatchBinding,
+        evidence: ExecutionEvidence,
+    ) -> Result<CompletionDecision, HubServiceError> {
+        let now_ms = unix_time_ms()?;
+        let mut persistent = self.inner.persistent.lock().await;
+        let mut candidate = persistent.execution.clone();
+        let (next, _) = candidate.resolve_hub_pre_enqueue_non_delivery(
             operation_id,
-            device_id = %self.inner.device_id,
+            owner,
             generation,
-            capability = crate::v2_observability::capability_name(capability),
-            outcome = "dispatched",
-            "operation dispatched to Agent"
-        );
-        Ok(DispatchOutcome::Sent)
+            dispatch_binding,
+            evidence,
+            now_ms,
+        )?;
+
+        let state = HubPersistentState::capture(&persistent.registry, &candidate);
+        let checkpoint_bytes = match self.inner.checkpoint.save_with_size(&state) {
+            Ok((_, checkpoint_bytes)) => checkpoint_bytes,
+            Err(error) => {
+                crate::v2_observability::persistence_failure(
+                    crate::v2_observability::PersistenceComponent::Hub,
+                );
+                tracing::error!(
+                    event = "v2_persistence_failure",
+                    operation_id,
+                    device_id = %self.inner.device_id,
+                    generation,
+                    outcome = "failed_closed",
+                    error_code = error.safe_error_code(),
+                    component = "hub",
+                    "Hub pre-enqueue non-delivery proof could not be committed; operation remains fail-closed"
+                );
+                return Err(HubServiceError::Persistence(error));
+            }
+        };
+        self.inner
+            .last_checkpoint_bytes
+            .store(checkpoint_bytes, Ordering::Release);
+        persistent.execution = candidate;
+        Ok(next)
     }
 
     async fn reject_for_semantic_constraint_snapshot(
@@ -4281,6 +4405,17 @@ fn unexpected_agent_message(expected: &'static str, message: &AgentToHub) -> Hub
     HubServiceError::UnexpectedMessage { expected, got }
 }
 
+async fn send_command_hub(
+    sender: &mpsc::Sender<Result<HubFrame, Status>>,
+    message: HubToAgent,
+) -> Result<(), HubCommandSendError> {
+    let frame = encode_hub_frame(&message).map_err(HubCommandSendError::EncodeBeforeEnqueue)?;
+    sender
+        .send(Ok(frame))
+        .await
+        .map_err(|_| HubCommandSendError::OutboundClosedBeforeEnqueue)
+}
+
 async fn send_hub(
     sender: &mpsc::Sender<Result<HubFrame, Status>>,
     message: HubToAgent,
@@ -4425,6 +4560,7 @@ pub enum HubCommandError {
     SessionSuperseded,
     SessionClosed,
     CancelledBeforeDispatch,
+    ConfirmedNotExecuted,
     SemanticConstraintSnapshotStale,
     OperationReplay,
     Busy,
@@ -4446,6 +4582,7 @@ impl SafeErrorCode for HubCommandError {
             Self::SessionSuperseded => "session_superseded",
             Self::SessionClosed => "session_closed",
             Self::CancelledBeforeDispatch => "cancelled_before_dispatch",
+            Self::ConfirmedNotExecuted => "confirmed_not_executed",
             Self::SemanticConstraintSnapshotStale => "semantic_constraint_snapshot_stale",
             Self::OperationReplay => "operation_replay",
             Self::Busy => "busy",
@@ -5424,6 +5561,325 @@ mod tests {
                 assert!(block.contains(field), "{event} missing {field}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn closed_outbound_before_enqueue_durably_self_resolves_without_replay() {
+        let state_dir = test_state_dir("pre-enqueue-closed-outbound");
+        let device = DeviceIdentity::generate();
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let hello = AgentHello::new(
+            handle.device_id().to_owned(),
+            CapabilityAdvertisement {
+                backend: "fixture".into(),
+                backend_version: "1".into(),
+                platform: "test".into(),
+                capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+                revision: 1,
+                supported: vec![DeviceCapability::TypeText],
+            },
+        );
+        let challenge = hub.inner.material.hub_identity.challenge(&hello).unwrap();
+        let owner = OperationOwner::local_hub();
+        let operation_id = "op-pre-enqueue-closed-outbound".to_owned();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::TypeText,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            operation_id.clone(),
+            PendingOperation {
+                owner: owner.clone(),
+                command: DeviceCommand::TypeText {
+                    text: "bounded".into(),
+                },
+                expected_semantic_constraint_snapshot: None,
+                handoff: None,
+                envelope: None,
+                reply: reply_tx,
+            },
+        )]);
+        let (outbound, outbound_rx) = mpsc::channel(1);
+        drop(outbound_rx);
+
+        assert!(matches!(
+            hub.dispatch_operation(
+                &outbound,
+                &hello,
+                &challenge,
+                1,
+                1,
+                &TrustedSessionClock::new(10),
+                &operation_id,
+                &mut pending,
+            )
+            .await,
+            Err(HubServiceError::OutboundClosed)
+        ));
+        assert!(pending.is_empty());
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            Err(HubCommandError::ConfirmedNotExecuted)
+        );
+        {
+            let persistent = handle.inner.persistent.lock().await;
+            assert_eq!(
+                persistent.execution.state(&operation_id),
+                Some(HubOperationState::Cancelled)
+            );
+            assert!(
+                persistent
+                    .execution
+                    .quarantine(handle.device_id())
+                    .is_none()
+            );
+            let resolution = persistent
+                .execution
+                .auto_resolutions()
+                .iter()
+                .find(|resolution| resolution.operation.operation_id == operation_id)
+                .unwrap();
+            assert_eq!(
+                resolution.evidence,
+                ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+            );
+            assert_eq!(resolution.terminal_state, HubOperationState::Cancelled);
+        }
+
+        let store = CheckpointStore::new(state_dir.clone(), "hub").unwrap();
+        let checkpoint = store.load_latest::<HubPersistentState>().unwrap();
+        let (_, restored) = checkpoint
+            .restore(AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            restored.state(&operation_id),
+            Some(HubOperationState::Cancelled)
+        );
+        assert!(restored.quarantine(handle.device_id()).is_none());
+        assert_eq!(restored.auto_resolutions().len(), 1);
+
+        drop(hub);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn accepted_outbound_then_session_loss_remains_indeterminate_and_quarantined() {
+        let state_dir = test_state_dir("post-enqueue-session-loss");
+        let device = DeviceIdentity::generate();
+        let (hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+        let hello = AgentHello::new(
+            handle.device_id().to_owned(),
+            CapabilityAdvertisement {
+                backend: "fixture".into(),
+                backend_version: "1".into(),
+                platform: "test".into(),
+                capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+                revision: 1,
+                supported: vec![DeviceCapability::TypeText],
+            },
+        );
+        let challenge = hub.inner.material.hub_identity.challenge(&hello).unwrap();
+        let owner = OperationOwner::local_hub();
+        let operation_id = "op-post-enqueue-session-loss".to_owned();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::TypeText,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            operation_id.clone(),
+            PendingOperation {
+                owner,
+                command: DeviceCommand::TypeText {
+                    text: "bounded".into(),
+                },
+                expected_semantic_constraint_snapshot: None,
+                handoff: None,
+                envelope: None,
+                reply: reply_tx,
+            },
+        )]);
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+
+        assert!(matches!(
+            hub.dispatch_operation(
+                &outbound,
+                &hello,
+                &challenge,
+                1,
+                1,
+                &TrustedSessionClock::new(10),
+                &operation_id,
+                &mut pending,
+            )
+            .await
+            .unwrap(),
+            DispatchOutcome::Sent
+        ));
+        assert!(
+            outbound_rx.recv().await.is_some(),
+            "frame must have been accepted"
+        );
+        drop(outbound_rx);
+
+        hub.cleanup_session(1).await.unwrap();
+        let persistent = handle.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(&operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+        let quarantine = persistent.execution.quarantine(handle.device_id()).unwrap();
+        assert_eq!(quarantine.operation_id, operation_id);
+        assert_eq!(quarantine.reason, IndeterminateReason::ConnectionLost);
+        assert!(persistent.execution.auto_resolutions().is_empty());
+        drop(persistent);
+
+        drop(hub);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn command_send_classifies_only_pre_enqueue_failures_as_authoritative_non_delivery() {
+        let oversized = HubToAgent::HeartbeatAck(crate::v2_m0_transport::HubHeartbeatAck {
+            schema_version: crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION,
+            device_id: "x".repeat(crate::v2_m1_grpc::MAX_GRPC_APPLICATION_MESSAGE_BYTES + 1024),
+            device_generation: 1,
+            sequence: 1,
+            hub_time_ms: 1,
+            signature: Vec::new(),
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        let error = send_command_hub(&tx, oversized).await.unwrap_err();
+        assert!(matches!(
+            error,
+            HubCommandSendError::EncodeBeforeEnqueue(GrpcCarrierError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let ordinary = HubToAgent::HeartbeatAck(crate::v2_m0_transport::HubHeartbeatAck {
+            schema_version: crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION,
+            device_id: "dev-fixture".into(),
+            device_generation: 1,
+            sequence: 1,
+            hub_time_ms: 1,
+            signature: Vec::new(),
+        });
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert!(matches!(
+            send_command_hub(&tx, ordinary).await,
+            Err(HubCommandSendError::OutboundClosedBeforeEnqueue)
+        ));
+    }
+
+    #[test]
+    fn pre_enqueue_resolution_is_durable_before_live_swap_and_never_sends_or_replays() {
+        let source = include_str!("v2_m1_hub.rs");
+        let start = source
+            .find("async fn commit_hub_pre_enqueue_non_delivery(")
+            .unwrap();
+        let end = source[start..]
+            .find("async fn reject_for_semantic_constraint_snapshot(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let block = &source[start..end];
+        let durable = block.find("checkpoint.save_with_size(&state)").unwrap();
+        let live_swap = block.find("persistent.execution = candidate").unwrap();
+        assert!(durable < live_swap);
+        assert!(block.contains("resolve_hub_pre_enqueue_non_delivery"));
+        for forbidden in [
+            "send_command_hub(",
+            "send_hub(",
+            "HubToAgent::Command",
+            "dispatch_operation(",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "pre-enqueue resolution must not contain {forbidden}"
+            );
+        }
+
+        let dispatch_start = source.find("async fn dispatch_operation(").unwrap();
+        let dispatch_end = source[dispatch_start..]
+            .find("async fn commit_hub_pre_enqueue_non_delivery(")
+            .map(|offset| dispatch_start + offset)
+            .unwrap();
+        let dispatch = &source[dispatch_start..dispatch_end];
+        let committed = dispatch.find("mark_dispatched_with_binding(").unwrap();
+        let send = dispatch.find("send_command_hub(").unwrap();
+        assert!(committed < send);
+        assert_eq!(dispatch.matches("send_command_hub(").count(), 1);
     }
 
     #[test]
