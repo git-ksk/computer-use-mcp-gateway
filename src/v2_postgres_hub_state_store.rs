@@ -12,7 +12,9 @@ use crate::{
     v2_m1_persistence::{HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError},
 };
 use async_trait::async_trait;
-use std::{fmt, future::Future, path::Path, time::Duration};
+#[cfg(unix)]
+use std::path::Path;
+use std::{fmt, future::Future, time::Duration};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio_postgres::{Client, GenericClient, NoTls, Row};
 
@@ -188,7 +190,10 @@ impl PostgresHubStateStore {
 
         let mut postgres = tokio_postgres::Config::new();
         if config.host.starts_with('/') {
+            #[cfg(unix)]
             postgres.host_path(Path::new(&config.host));
+            #[cfg(not(unix))]
+            return Err(HubStateStoreError::InvalidConfiguration);
         } else {
             postgres.host(&config.host).port(config.port);
         }
