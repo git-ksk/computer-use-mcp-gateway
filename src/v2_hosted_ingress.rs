@@ -5,8 +5,15 @@
 //! before dispatching to the existing Agent gRPC, northbound MCP, or hosted
 //! Handoff routers. Unknown or ambiguous routes fail closed.
 
-use axum::http::Method;
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::{Method, StatusCode, header::CONTENT_TYPE},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
 use std::fmt;
+use std::sync::Arc;
 
 pub const AGENT_GRPC_OPEN_SESSION_PATH: &str = "/cumg.v2.AgentControl/OpenSession";
 
@@ -114,6 +121,12 @@ impl HostedIngressClassifier {
             if !matches!(*method, Method::POST | Method::GET | Method::DELETE) {
                 return Err(HostedIngressError::MethodNotAllowed);
             }
+            if content_type.is_some_and(is_native_grpc_content_type) {
+                return Err(HostedIngressError::InvalidContentType);
+            }
+            if method == Method::POST && !content_type.is_some_and(is_json_content_type) {
+                return Err(HostedIngressError::InvalidContentType);
+            }
             return Ok(HostedIngressSurface::NorthboundMcp);
         }
         if path == self.mcp_metadata_path {
@@ -180,6 +193,51 @@ fn is_json_content_type(value: &str) -> bool {
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
 }
 
+#[derive(Clone)]
+struct HostedIngressGateState {
+    classifier: Arc<HostedIngressClassifier>,
+}
+
+pub fn apply_hosted_ingress_classifier(
+    router: Router,
+    classifier: HostedIngressClassifier,
+) -> Router {
+    router.layer(middleware::from_fn_with_state(
+        HostedIngressGateState {
+            classifier: Arc::new(classifier),
+        },
+        hosted_ingress_gate,
+    ))
+}
+
+async fn hosted_ingress_gate(
+    State(state): State<HostedIngressGateState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    match state
+        .classifier
+        .classify(request.method(), request.uri().path(), content_type)
+    {
+        Ok(_) => next.run(request).await,
+        Err(error) => hosted_ingress_error_response(error),
+    }
+}
+
+fn hosted_ingress_error_response(error: HostedIngressError) -> Response {
+    let status = match error {
+        HostedIngressError::UnknownRoute => StatusCode::NOT_FOUND,
+        HostedIngressError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+        HostedIngressError::InvalidContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        HostedIngressError::InvalidConfiguration => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.safe_code()).into_response()
+}
+
 fn valid_exact_path(path: &str) -> bool {
     path.starts_with('/')
         && path.len() > 1
@@ -237,14 +295,26 @@ mod tests {
     #[test]
     fn mcp_route_is_exact_and_never_matches_handoff_or_grpc() {
         let classifier = classifier();
-        for method in [Method::POST, Method::GET, Method::DELETE] {
+        assert_eq!(
+            classifier.classify(&Method::POST, "/mcp", Some("application/json")),
+            Ok(HostedIngressSurface::NorthboundMcp)
+        );
+        for method in [Method::GET, Method::DELETE] {
             assert_eq!(
                 classifier.classify(&method, "/mcp", None),
                 Ok(HostedIngressSurface::NorthboundMcp)
             );
         }
         assert_eq!(
-            classifier.classify(&Method::POST, "/mcp/extra", None),
+            classifier.classify(&Method::POST, "/mcp", None),
+            Err(HostedIngressError::InvalidContentType)
+        );
+        assert_eq!(
+            classifier.classify(&Method::POST, "/mcp", Some("application/grpc")),
+            Err(HostedIngressError::InvalidContentType)
+        );
+        assert_eq!(
+            classifier.classify(&Method::POST, "/mcp/extra", Some("application/json")),
             Err(HostedIngressError::UnknownRoute)
         );
     }
@@ -325,6 +395,114 @@ mod tests {
                 "unexpectedly classified {path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn classifier_middleware_dispatches_only_the_selected_surface() {
+        use axum::{
+            body::{Body, to_bytes},
+            http::{Request, header::CONTENT_TYPE},
+            routing::{get, post},
+        };
+        use tower::ServiceExt;
+
+        let agent = Router::new().route(AGENT_GRPC_OPEN_SESSION_PATH, post(|| async { "agent" }));
+        let mcp = Router::new().route("/mcp", post(|| async { "mcp" })).route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(|| async { "mcp-metadata" }),
+        );
+        let handoff = Router::new()
+            .route(
+                "/operator/v1/handoff/context",
+                post(|| async { "handoff-context" }),
+            )
+            .route(
+                "/operator/v1/handoff/control",
+                post(|| async { "handoff-control" }),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/operator/v1/handoff",
+                get(|| async { "handoff-metadata" }),
+            );
+        let app = apply_hosted_ingress_classifier(agent.merge(mcp).merge(handoff), classifier());
+
+        async fn body_text(response: Response) -> String {
+            String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec()).unwrap()
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(AGENT_GRPC_OPEN_SESSION_PATH)
+                    .header(CONTENT_TYPE, "application/grpc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "agent");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_text(response).await, "mcp");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/operator/v1/handoff/control")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_text(response).await, "handoff-control");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/operator/v1/handoff/control")
+                    .header(CONTENT_TYPE, "application/grpc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            body_text(response).await,
+            "hosted_ingress_invalid_content_type"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_text(response).await, "hosted_ingress_unknown_route");
     }
 
     #[test]

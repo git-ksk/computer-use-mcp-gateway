@@ -97,15 +97,19 @@ Extra quarantine is an acceptable conservative failure mode; lost ambiguity is n
 
 ### 5. One-port protocol multiplexing
 
-A supported Cloud Run Hub needs one reviewed ingress service on Cloud Run's `PORT`. The recommended direction is one application-level HTTP/2/h2c listener that routes only closed protocol surfaces:
+PR #285 implements the candidate hosted profile as one application-level HTTP/2/h2c listener on Cloud Run's `PORT`. It is enabled only by explicit `CUMG_V2_HOSTED_PROFILE=true`; the ordinary VM/single-host listener layout is unchanged.
 
-- Agent gRPC service methods -> existing Agent application authentication/device identity and signed protocol semantics;
-- northbound MCP paths -> existing OAuth/trusted-proxy principal authentication and exact CUMG authorization;
-- explicitly documented health/metadata paths -> their existing coarse/read-only policy.
+The shared listener routes only the closed surfaces admitted by `HostedIngressClassifier`:
 
-There must be no generic pass-through route.
+- exact Agent gRPC `OpenSession` -> the existing Tonic `AgentControlServer` and unchanged application-level Ed25519/device protocol;
+- exact protected MCP resource + RFC 9728 metadata paths -> the existing northbound OAuth/OIDC/introspection router and exact CUMG authorization;
+- exact hosted Handoff `/context`, `/control`, and RFC 9728 metadata paths -> the #277 operator OAuth resource and exact principal/device/action authorization.
 
-Cloud Run terminates public TLS. The hosted ingress therefore cannot depend on the current private `v2_hub` TLS listener shape. This does **not** weaken Agent identity: Agent application-level Ed25519 identity/enrollment remains independent of transport TLS. The hosted profile must explicitly document Google frontend trust, h2c inside the service boundary, and northbound HTTPS resource identity.
+Hosted startup fails closed if Hub TLS certificate/key files or `CUMG_V2_MCP_BIND` are configured because Google terminates public TLS and the container listener is intentionally h2c. Trusted-proxy auth is also rejected on the public hosted profile. MCP and hosted Handoff must use distinct protected resource URIs; OIDC mode additionally requires distinct audiences. OAuth introspection mode validates each token against the exact resource URI. Agent Ed25519 identity remains independent of transport TLS.
+
+The candidate startup contract requires `CUMG_V2_HOSTED_PROFILE=true`, Cloud Run `PORT`, the existing complete MCP resource/policy/OAuth configuration, plus `CUMG_V2_HOSTED_HANDOFF_RESOURCE`, `CUMG_V2_HOSTED_HANDOFF_REQUIRED_SCOPES`, and `CUMG_V2_HOSTED_HANDOFF_POLICY_FILE`. OIDC/JWT mode additionally requires `CUMG_V2_HOSTED_HANDOFF_OIDC_AUDIENCE`, distinct from `CUMG_V2_OIDC_AUDIENCE`; introspection mode forbids that Handoff OIDC audience setting.
+
+There is no generic pass-through/fallback proxy. Unknown paths, near matches, unsupported methods, and wrong cross-surface content types are rejected before the selected service. The candidate exposes no CUMG `/healthz` route, so health is not an unauthenticated application endpoint in this composition. Protected-resource metadata is exact GET-only. `tests/v2_hosted_one_port.rs` proves a real h2c listener carries Tonic gRPC plus MCP and Handoff HTTP/2 on the same port and rejects cross-surface delivery.
 
 ### 6. Hosted Handoff composition
 
@@ -140,7 +144,7 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 | Ephemeral filesystem excluded from authoritative state | Design decision complete; implementation pending |
 | Provider-neutral durable Hub-state backend | Pending |
 | Monotonic writer fencing and stale-writer dispatch denial | Pending |
-| One-port h2c gRPC + MCP ingress with separate auth boundaries | Pending |
+| One-port h2c gRPC + MCP + hosted Handoff ingress with separate auth boundaries | Candidate implemented in PR #285; local h2c integration green, merge/hosted acceptance pending |
 | 3300s proactive Agent stream rotation acceptance | Pending |
 | <=8s hosted drain plus forced-kill fail-closed acceptance | Pending |
 | Concurrent old/new revision fencing test | Pending |

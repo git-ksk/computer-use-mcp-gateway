@@ -125,7 +125,7 @@ Hosted CUMG must treat the following lifetimes as independent:
 
 A viewer reconnect or managed transport fallback may rotate (4) and (5) without recreating (3), changing (2), or advancing (1). Hub replacement may advance (6) without implying any Handoff authority change. Every stale generation fails closed.
 
-This model consumes the upstream v0.4.1 Desktop Session / Display Backend separation when CUMG updates its pinned Handoff revision.
+This model consumes the upstream v0.4.5 Desktop Session / Display Backend separation when CUMG updates its pinned Handoff revision.
 
 ## Hosted operator control
 
@@ -279,9 +279,9 @@ The preferred sequencing is:
 1. **Freeze this architecture (#275).** Keep Agent-owned canonical Handoff authority and hosted routing non-authoritative.
 2. **Adopt a reviewed newer Handoff pin separately in #276.** Consume v0.4.1-or-newer boundaries with CUMG integration/acceptance evidence.
 3. **Consume upstream provider-neutral connectivity (#19).** Remove any consumer-visible provider-specific relay assumptions.
-4. **Implement the hosted operator/routing adapter in #277.** PR #281 now provides the transport-neutral authorization core, principal/action-bound opaque context handles, a separate OAuth HTTP router with no MCP tool surface, and a process-memory-only provider-blind routing fence with independent Agent/intervention/viewer/transport generations and zero-route restart semantics. Production `v2_hub` listener composition remains intentionally deferred to #215 one-port ingress rather than creating a temporary extra public port.
-5. **Implement #215 durable Hub/writer fencing and one-port hosted ingress.** Compose the reviewed #277 router into that one-port ingress and Handoff checks into the commit-before-dispatch boundary.
-6. **Run hosted failure/physical acceptance.** Include Hub replacement, stale writer, Agent reconnect/restart, viewer reconnect, WSS/WebRTC fallback and the complete Human Done/verification/resume lifecycle.
+4. **Hosted operator/routing adapter (#277) is implemented.** PR #281 provides the transport-neutral authorization core, principal/action-bound opaque context handles, a separate OAuth HTTP router with no MCP tool surface, and a process-memory-only provider-blind routing fence with independent Agent/intervention/viewer/transport generations and zero-route restart semantics.
+5. **Hosted one-port ingress (#282) is implemented in candidate PR #285.** The reviewed #277 router, protected MCP router, and Agent gRPC service share one exact-classified Cloud Run `PORT` h2c listener while VM/single-host listener behavior remains unchanged. Durable Hub/writer fencing remains #283.
+6. **Run hosted failure/physical acceptance after #283/#353.** Include Hub replacement, stale writer, Agent reconnect/restart, viewer reconnect, WSS/WebRTC fallback and the complete Human Done/verification/resume lifecycle under #284.
 
 Steps 2-4 may develop in parallel where their interfaces are already fixed, but no hosted support claim may bypass #215's durable-state/fencing gate.
 

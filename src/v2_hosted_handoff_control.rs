@@ -10,7 +10,7 @@ use crate::{
         HandoffCoordinator, HandoffOperatorCommand, HandoffOperatorControlError,
         HandoffSessionFence, valid_operator_context_handle,
     },
-    v2_m0_trust::AuthenticatedClientPrincipal,
+    v2_m0_trust::{AuthenticatedClientPrincipal, TrustError},
     v2_m1_hub::HubHandle,
     v2_operator_handoff::HandoffRuntimeStatus,
 };
@@ -199,6 +199,84 @@ struct HostedHandoffPrincipalDeviceKey {
     issuer: String,
     subject: String,
     device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedHandoffPolicyDocument {
+    pub grants: Vec<HostedHandoffPolicyGrant>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedHandoffPolicyGrant {
+    pub issuer: String,
+    pub subject: String,
+    pub device_id: String,
+    pub actions: Vec<HostedHandoffAction>,
+}
+
+#[derive(Debug)]
+pub enum HostedHandoffPolicyError {
+    Json(serde_json::Error),
+    Trust(TrustError),
+    EmptyPolicy,
+    IssuerMismatch,
+    DeviceMismatch,
+    EmptyActions,
+    DuplicateGrant,
+}
+
+impl fmt::Display for HostedHandoffPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for HostedHandoffPolicyError {}
+
+impl HostedHandoffPolicyDocument {
+    pub fn from_json(value: &str) -> Result<Self, HostedHandoffPolicyError> {
+        serde_json::from_str(value).map_err(HostedHandoffPolicyError::Json)
+    }
+
+    pub fn build_policy(
+        self,
+        expected_issuer: &str,
+        expected_device_id: &str,
+    ) -> Result<HostedHandoffAuthorizationPolicy, HostedHandoffPolicyError> {
+        if self.grants.is_empty() {
+            return Err(HostedHandoffPolicyError::EmptyPolicy);
+        }
+        let mut policy = HostedHandoffAuthorizationPolicy::default();
+        let mut seen = HashSet::new();
+        for grant in self.grants {
+            if grant.issuer != expected_issuer {
+                return Err(HostedHandoffPolicyError::IssuerMismatch);
+            }
+            if grant.device_id != expected_device_id {
+                return Err(HostedHandoffPolicyError::DeviceMismatch);
+            }
+            if grant.actions.is_empty() {
+                return Err(HostedHandoffPolicyError::EmptyActions);
+            }
+            let principal = AuthenticatedClientPrincipal::new(grant.issuer, grant.subject)
+                .map_err(HostedHandoffPolicyError::Trust)?;
+            for action in grant.actions {
+                let key = (
+                    principal.issuer.clone(),
+                    principal.subject.clone(),
+                    grant.device_id.clone(),
+                    action,
+                );
+                if !seen.insert(key) {
+                    return Err(HostedHandoffPolicyError::DuplicateGrant);
+                }
+                policy.allow(&principal, &grant.device_id, action);
+            }
+        }
+        Ok(policy)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -589,6 +667,50 @@ mod tests {
             parsed.into_operator_command(),
             Err(HostedHandoffControlError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn hosted_policy_document_is_exact_and_fail_closed() {
+        let document = HostedHandoffPolicyDocument::from_json(
+            r#"{"grants":[{"issuer":"https://operator.example","subject":"alice","device_id":"device-a","actions":["status","begin"]}]}"#,
+        )
+        .unwrap();
+        let policy = document
+            .build_policy("https://operator.example", "device-a")
+            .unwrap();
+        let alice = principal("alice");
+        assert!(
+            policy
+                .authorize(&alice, "device-a", HostedHandoffAction::Status)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .authorize(&alice, "device-a", HostedHandoffAction::Begin)
+                .is_ok()
+        );
+        assert_eq!(
+            policy.authorize(&alice, "device-a", HostedHandoffAction::RequestResume),
+            Err(HostedHandoffControlError::Unauthorized)
+        );
+
+        let wrong_issuer = HostedHandoffPolicyDocument::from_json(
+            r#"{"grants":[{"issuer":"https://other.example","subject":"alice","device_id":"device-a","actions":["status"]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            wrong_issuer.build_policy("https://operator.example", "device-a"),
+            Err(HostedHandoffPolicyError::IssuerMismatch)
+        ));
+
+        let duplicate = HostedHandoffPolicyDocument::from_json(
+            r#"{"grants":[{"issuer":"https://operator.example","subject":"alice","device_id":"device-a","actions":["status","status"]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            duplicate.build_policy("https://operator.example", "device-a"),
+            Err(HostedHandoffPolicyError::DuplicateGrant)
+        ));
     }
 
     #[test]

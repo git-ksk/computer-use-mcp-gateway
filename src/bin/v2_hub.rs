@@ -5,6 +5,9 @@ use computer_use_mcp_gateway::v2_handoff_control::UnixHandoffControlServer;
 use computer_use_mcp_gateway::{
     v2_grant_signer::HubGrantSigner,
     v2_handoff_coordinator::HandoffCoordinator,
+    v2_hosted_handoff_control::{HostedHandoffControlService, HostedHandoffPolicyDocument},
+    v2_hosted_handoff_http::{HostedHandoffHttpConfig, build_hosted_handoff_router},
+    v2_hosted_ingress::{HostedIngressClassifier, apply_hosted_ingress_classifier},
     v2_m0_trust::DeviceKeyRotation,
     v2_m1_grpc::{
         MAX_GRPC_TRANSPORT_MESSAGE_BYTES, proto::agent_control_server::AgentControlServer,
@@ -18,9 +21,9 @@ use computer_use_mcp_gateway::{
         load_trusted_text, load_verifying_key,
     },
     v2_m1_northbound::{
-        NorthboundMcpConfig, NorthboundPolicyDocument, OAuthIntrospectionConfig,
-        OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp, build_northbound_router,
-        build_trusted_proxy_router,
+        AccessTokenVerifier, NorthboundMcpConfig, NorthboundPolicyDocument,
+        OAuthIntrospectionConfig, OAuthIntrospectionVerifier, TrustedProxyConfig, V2NorthboundMcp,
+        build_northbound_router, build_trusted_proxy_router,
     },
     v2_oidc_jwt::{OidcJwtAlgorithm, OidcJwtConfig, OidcJwtVerifier},
     v2_operator_handoff::UnixOperatorHandoffAuthority,
@@ -29,7 +32,10 @@ use computer_use_mcp_gateway::{
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, watch};
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::{
+    service::Routes,
+    transport::{Identity, Server, ServerTlsConfig},
+};
 use tracing::{info, warn};
 
 const MAX_OAUTH_SECRET_BYTES: u64 = 16 * 1024;
@@ -37,11 +43,12 @@ const MAX_TRUSTED_PROXY_SECRET_BYTES: u64 = 256;
 const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
 const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
+const MAX_HOSTED_HANDOFF_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SEMANTIC_CONSTRAINT_POLICY_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "v2_hub")]
-#[command(about = "Single-device V2 Hub over gRPC/TLS for an always-on VM")]
+#[command(about = "Single-device V2 Hub for VM or explicit hosted one-port deployment")]
 #[command(version = env!("CUMG_BUILD_VERSION"))]
 struct Args {
     #[arg(long, env = "CUMG_V2_HUB_BIND", default_value = "0.0.0.0:7443")]
@@ -66,9 +73,16 @@ struct Args {
     #[arg(long, env = "CUMG_V2_DEVICE_ROTATION_FILE")]
     device_rotation_file: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_TLS_CERT_PEM_FILE")]
-    tls_cert_pem_file: PathBuf,
+    tls_cert_pem_file: Option<PathBuf>,
     #[arg(long, env = "CUMG_V2_TLS_KEY_PEM_FILE")]
-    tls_key_pem_file: PathBuf,
+    tls_key_pem_file: Option<PathBuf>,
+    /// Explicit hosted/Cloud Run profile. Public TLS is terminated before the container and the
+    /// Hub serves one internal HTTP/2 cleartext (h2c) listener on `PORT`.
+    #[arg(long, env = "CUMG_V2_HOSTED_PROFILE", default_value_t = false)]
+    hosted_profile: bool,
+    /// Cloud Run supplies this variable. It is consumed only when the explicit hosted profile is enabled.
+    #[arg(long, env = "PORT")]
+    hosted_port: Option<u16>,
     #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
     state_dir: PathBuf,
     /// Install root used only by the read-only unified MCP status collector.
@@ -122,6 +136,19 @@ struct Args {
     /// Canonical public HTTPS URI of the MCP resource, including its endpoint path.
     #[arg(long, env = "CUMG_V2_MCP_RESOURCE")]
     mcp_resource: Option<String>,
+    /// Canonical hosted Handoff operator resource root, for example
+    /// https://hub.example/operator/v1/handoff. Hosted only.
+    #[arg(long, env = "CUMG_V2_HOSTED_HANDOFF_RESOURCE")]
+    hosted_handoff_resource: Option<String>,
+    /// Space-separated scopes required by the hosted Handoff operator resource. Hosted only.
+    #[arg(long, env = "CUMG_V2_HOSTED_HANDOFF_REQUIRED_SCOPES")]
+    hosted_handoff_required_scopes: Option<String>,
+    /// Exact principal -> device -> Handoff-action authorization policy. Hosted only.
+    #[arg(long, env = "CUMG_V2_HOSTED_HANDOFF_POLICY_FILE")]
+    hosted_handoff_policy_file: Option<PathBuf>,
+    /// Separate OIDC/JWT audience for the hosted Handoff resource. Hosted OIDC mode only.
+    #[arg(long, env = "CUMG_V2_HOSTED_HANDOFF_OIDC_AUDIENCE")]
+    hosted_handoff_oidc_audience: Option<String>,
     /// OAuth authorization-server issuer advertised through RFC 9728 metadata.
     #[arg(long, env = "CUMG_V2_OAUTH_AUTHORIZATION_SERVER")]
     oauth_authorization_server: Option<String>,
@@ -232,10 +259,21 @@ struct Args {
 }
 
 struct NorthboundRuntime {
-    bind: SocketAddr,
+    bind: Option<SocketAddr>,
     router: axum::Router,
     resource: String,
+    mcp_path: String,
+    metadata_path: String,
     metadata_url: Option<String>,
+    auth_mode: &'static str,
+}
+
+struct HostedHandoffRuntime {
+    router: axum::Router,
+    resource: String,
+    context_path: String,
+    control_path: String,
+    metadata_path: String,
     auth_mode: &'static str,
 }
 
@@ -243,6 +281,7 @@ struct NorthboundRuntime {
 async fn main() -> Result<()> {
     let _observability = computer_use_mcp_gateway::v2_observability::init("cumg-v2-hub")?;
     let args = Args::parse();
+    validate_profile_configuration(&args)?;
     ensure!(
         args.heartbeat_timeout_secs > 0,
         "CUMG_V2_HEARTBEAT_TIMEOUT_SECS must be greater than zero"
@@ -349,9 +388,19 @@ async fn main() -> Result<()> {
             .context("failed to load enrolled Agent public key")?,
         device_rotation,
     };
-    let (cert_pem, key_pem) =
-        load_tls_server_identity(&args.tls_cert_pem_file, &args.tls_key_pem_file)
-            .context("failed to load TLS server identity")?;
+    let tls_identity = if args.hosted_profile {
+        None
+    } else {
+        let cert = args
+            .tls_cert_pem_file
+            .as_ref()
+            .expect("validated non-hosted TLS certificate");
+        let key = args
+            .tls_key_pem_file
+            .as_ref()
+            .expect("validated non-hosted TLS key");
+        Some(load_tls_server_identity(cert, key).context("failed to load TLS server identity")?)
+    };
     let (hub, handle) = SingleDeviceHub::new(
         HubServiceConfig {
             state_dir: args.state_dir.clone(),
@@ -375,6 +424,12 @@ async fn main() -> Result<()> {
         &device_id,
         handoff_coordinator.clone(),
     )?;
+    let hosted_handoff = build_hosted_handoff_runtime(
+        &args,
+        handle.clone(),
+        &device_id,
+        handoff_coordinator.clone(),
+    )?;
 
     #[cfg(unix)]
     let handoff_control_server = if let Some(path) = args.handoff_control_socket.as_ref() {
@@ -391,11 +446,21 @@ async fn main() -> Result<()> {
         "CUMG_V2_HANDOFF_CONTROL_SOCKET is supported only on Unix hosts"
     );
 
+    let startup_bind = if args.hosted_profile {
+        SocketAddr::from((
+            [0, 0, 0, 0],
+            args.hosted_port.expect("validated hosted PORT"),
+        ))
+    } else {
+        args.bind
+    };
     info!(
         event = "v2_hub_start",
-        bind = %args.bind,
+        profile = if args.hosted_profile { "hosted_one_port" } else { "single_host" },
+        bind = %startup_bind,
         device_id = %device_id,
         northbound_mcp_enabled = northbound.is_some(),
+        hosted_handoff_enabled = hosted_handoff.is_some(),
         "starting single-device V2 Hub"
     );
 
@@ -487,48 +552,97 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let grpc_shutdown = shutdown_rx.clone();
-    let grpc = Server::builder()
-        .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
-        .add_service(
-            AgentControlServer::new(hub)
-                .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES),
-        )
-        .serve_with_shutdown(args.bind, wait_for_shutdown(grpc_shutdown));
+    let agent_service = AgentControlServer::new(hub)
+        .max_decoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_GRPC_TRANSPORT_MESSAGE_BYTES);
 
-    if let Some(northbound) = northbound {
-        let listener = tokio::net::TcpListener::bind(northbound.bind)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to bind northbound MCP listener at {}",
-                    northbound.bind
-                )
-            })?;
-        info!(
-            event = "v2_northbound_mcp_start",
-            bind = %northbound.bind,
-            resource = %northbound.resource,
-            metadata_url = northbound.metadata_url.as_deref().unwrap_or("none"),
-            auth_mode = northbound.auth_mode,
-            "starting protected northbound MCP resource server"
-        );
-        let http_shutdown = shutdown_rx;
-        let http = axum::serve(
-            listener,
-            northbound
-                .router
-                .into_make_service_with_connect_info::<SocketAddr>(),
+    if args.hosted_profile {
+        let port = args.hosted_port.expect("validated hosted PORT");
+        let bind = SocketAddr::from(([0, 0, 0, 0], port));
+        let northbound =
+            northbound.context("hosted profile requires protected northbound MCP runtime")?;
+        let hosted_handoff =
+            hosted_handoff.context("hosted profile requires protected Handoff operator runtime")?;
+        let classifier = HostedIngressClassifier::new(
+            northbound.mcp_path.clone(),
+            northbound.metadata_path.clone(),
+            hosted_handoff.context_path.clone(),
+            hosted_handoff.control_path.clone(),
+            hosted_handoff.metadata_path.clone(),
         )
-        .with_graceful_shutdown(wait_for_shutdown(http_shutdown));
-        tokio::try_join!(
-            async { grpc.await.context("V2 Hub gRPC server failed") },
-            async { http.await.context("V2 Hub northbound MCP server failed") },
-        )?;
+        .context("invalid hosted one-port route composition")?;
+
+        // Tonic 0.14 can add the Agent gRPC NamedService directly to an Axum router.
+        // Google terminates public TLS; this single container listener intentionally
+        // serves HTTP/2 cleartext (h2c). Agent application-level Ed25519 identity
+        // remains independent of transport TLS.
+        let http_router = northbound.router.merge(hosted_handoff.router);
+        let router = Routes::from(http_router)
+            .add_service(agent_service)
+            .into_axum_router();
+        let router = apply_hosted_ingress_classifier(router, classifier);
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("failed to bind hosted one-port listener at {bind}"))?;
+        info!(
+            event = "v2_hosted_one_port_start",
+            bind = %bind,
+            transport = "h2c",
+            mcp_resource = %northbound.resource,
+            mcp_metadata_url = northbound.metadata_url.as_deref().unwrap_or("none"),
+            mcp_auth_mode = northbound.auth_mode,
+            handoff_resource = %hosted_handoff.resource,
+            handoff_auth_mode = hosted_handoff.auth_mode,
+            agent_identity = "ed25519_application_level",
+            "starting closed hosted Agent gRPC + MCP + Handoff one-port ingress"
+        );
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+        .await
+        .context("V2 Hub hosted one-port server failed")?;
     } else {
-        grpc.await.context("V2 Hub gRPC server failed")?;
+        let (cert_pem, key_pem) = tls_identity.expect("validated non-hosted TLS identity");
+        let grpc_shutdown = shutdown_rx.clone();
+        let grpc = Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem)))?
+            .add_service(agent_service)
+            .serve_with_shutdown(args.bind, wait_for_shutdown(grpc_shutdown));
+
+        if let Some(northbound) = northbound {
+            let bind = northbound
+                .bind
+                .expect("non-hosted northbound runtime must carry loopback bind");
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("failed to bind northbound MCP listener at {bind}"))?;
+            info!(
+                event = "v2_northbound_mcp_start",
+                bind = %bind,
+                resource = %northbound.resource,
+                metadata_url = northbound.metadata_url.as_deref().unwrap_or("none"),
+                auth_mode = northbound.auth_mode,
+                "starting protected northbound MCP resource server"
+            );
+            let http_shutdown = shutdown_rx;
+            let http = axum::serve(
+                listener,
+                northbound
+                    .router
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(wait_for_shutdown(http_shutdown));
+            tokio::try_join!(
+                async { grpc.await.context("V2 Hub gRPC server failed") },
+                async { http.await.context("V2 Hub northbound MCP server failed") },
+            )?;
+        } else {
+            grpc.await.context("V2 Hub gRPC server failed")?;
+        }
     }
+
     #[cfg(unix)]
     if let Some(task) = handoff_control_task {
         task.await
@@ -556,6 +670,20 @@ async fn build_handoff_coordinator(
         !(args.handoff_control_socket.is_some() && args.operator_handoff_socket.is_some()),
         "first-class Agent-owned Handoff and CUMG_V2_OPERATOR_HANDOFF_SOCKET are mutually exclusive"
     );
+
+    if args.hosted_profile {
+        ensure!(
+            args.handoff_control_socket.is_none() && args.operator_handoff_socket.is_none(),
+            "hosted profile uses the OAuth Handoff operator resource and must not configure local Handoff operator sockets"
+        );
+        info!(
+            event = "v2_handoff_runtime_configured",
+            mode = "agent_owned_hosted",
+            outcome = "ready",
+            "hosted Handoff coordination routes to the controlled Agent without a Hub-local operator socket"
+        );
+        return Ok(Some(Arc::new(HandoffCoordinator::agent_owned(hub))));
+    }
 
     if args.handoff_control_socket.is_some() {
         info!(
@@ -617,16 +745,28 @@ fn build_northbound_runtime(
     .into_iter()
     .any(|value| value);
 
-    let Some(bind) = args.mcp_bind else {
-        if configured {
-            bail!("CUMG_V2_MCP_BIND is required when northbound settings are configured");
+    let bind = if args.hosted_profile {
+        ensure!(
+            args.mcp_bind.is_none(),
+            "hosted profile serves MCP on the shared PORT listener; CUMG_V2_MCP_BIND must be unset"
+        );
+        if !configured {
+            bail!("hosted profile requires northbound MCP configuration");
         }
-        return Ok(None);
+        None
+    } else {
+        let Some(bind) = args.mcp_bind else {
+            if configured {
+                bail!("CUMG_V2_MCP_BIND is required when northbound settings are configured");
+            }
+            return Ok(None);
+        };
+        ensure!(
+            bind.ip().is_loopback(),
+            "CUMG_V2_MCP_BIND must remain loopback-only; terminate public HTTPS before the Hub"
+        );
+        Some(bind)
     };
-    ensure!(
-        bind.ip().is_loopback(),
-        "CUMG_V2_MCP_BIND must remain loopback-only; terminate public HTTPS before the Hub"
-    );
 
     let resource = required(&args.mcp_resource, "CUMG_V2_MCP_RESOURCE")?;
     let policy_file = args
@@ -843,13 +983,256 @@ fn build_northbound_runtime(
         (router, resource, Some(metadata_url), "oauth_introspection")
     };
 
+    let (mcp_path, metadata_path) = if args.hosted_profile {
+        let mcp_uri = args
+            .mcp_resource
+            .as_ref()
+            .expect("validated hosted MCP resource")
+            .parse::<axum::http::Uri>()
+            .context("invalid hosted MCP resource URI")?;
+        let metadata_uri = metadata_url
+            .as_deref()
+            .context("hosted MCP OAuth mode must expose protected-resource metadata")?
+            .parse::<axum::http::Uri>()
+            .context("invalid hosted MCP metadata URI")?;
+        (mcp_uri.path().to_owned(), metadata_uri.path().to_owned())
+    } else {
+        (String::new(), String::new())
+    };
+
     Ok(Some(NorthboundRuntime {
         bind,
         router,
         resource,
+        mcp_path,
+        metadata_path,
         metadata_url,
         auth_mode,
     }))
+}
+
+fn build_hosted_handoff_runtime(
+    args: &Args,
+    handle: computer_use_mcp_gateway::v2_m1_hub::HubHandle,
+    device_id: &str,
+    handoff_coordinator: Option<Arc<HandoffCoordinator>>,
+) -> Result<Option<HostedHandoffRuntime>> {
+    if !args.hosted_profile {
+        return Ok(None);
+    }
+
+    let coordinator =
+        handoff_coordinator.context("hosted profile requires Agent-owned Handoff coordination")?;
+    let resource = required(
+        &args.hosted_handoff_resource,
+        "CUMG_V2_HOSTED_HANDOFF_RESOURCE",
+    )?;
+    let authorization_server = required(
+        &args.oauth_authorization_server,
+        "CUMG_V2_OAUTH_AUTHORIZATION_SERVER",
+    )?;
+    let scopes = required(
+        &args.hosted_handoff_required_scopes,
+        "CUMG_V2_HOSTED_HANDOFF_REQUIRED_SCOPES",
+    )?
+    .split_ascii_whitespace()
+    .map(ToOwned::to_owned)
+    .collect::<Vec<_>>();
+    let config = HostedHandoffHttpConfig::new(resource, authorization_server, scopes)
+        .context("invalid hosted Handoff OAuth resource configuration")?;
+    let policy_file = args
+        .hosted_handoff_policy_file
+        .as_ref()
+        .context("CUMG_V2_HOSTED_HANDOFF_POLICY_FILE is required in hosted profile")?;
+    let policy_text = load_trusted_text(policy_file, MAX_HOSTED_HANDOFF_POLICY_BYTES)
+        .context("failed to load hosted Handoff authorization policy")?;
+    let policy = HostedHandoffPolicyDocument::from_json(&policy_text)
+        .context("failed to parse hosted Handoff authorization policy")?
+        .build_policy(config.authorization_server(), device_id)
+        .context("invalid hosted Handoff principal/device/action policy")?;
+
+    let oidc_configured = args.oidc_audience.is_some()
+        || args.oidc_jwks_uri.is_some()
+        || args.oidc_allowed_algorithms.is_some();
+    let introspection_configured = args.oauth_introspection_endpoint.is_some()
+        || args.oauth_introspection_client_id.is_some()
+        || args.oauth_introspection_client_secret_file.is_some();
+
+    let (verifier, auth_mode): (Arc<dyn AccessTokenVerifier>, &'static str) = if oidc_configured {
+        let audience = required(
+            &args.hosted_handoff_oidc_audience,
+            "CUMG_V2_HOSTED_HANDOFF_OIDC_AUDIENCE",
+        )?;
+        let jwks_uri = required(&args.oidc_jwks_uri, "CUMG_V2_OIDC_JWKS_URI")?;
+        let algorithms = parse_oidc_algorithms(required(
+            &args.oidc_allowed_algorithms,
+            "CUMG_V2_OIDC_ALLOWED_ALGORITHMS",
+        )?)?;
+        let mut verifier_config = OidcJwtConfig::new(
+            config.authorization_server(),
+            audience,
+            jwks_uri,
+            algorithms,
+        );
+        verifier_config.clock_skew = Duration::from_secs(args.oidc_clock_skew_secs);
+        verifier_config.jwks_cache_ttl = Duration::from_secs(args.oidc_jwks_cache_secs);
+        verifier_config.unknown_kid_refresh_interval =
+            Duration::from_secs(args.oidc_unknown_kid_refresh_secs);
+        verifier_config.http_timeout = Duration::from_secs(args.oidc_http_timeout_secs);
+        (
+            Arc::new(
+                OidcJwtVerifier::new(verifier_config)
+                    .context("invalid hosted Handoff OIDC/JWT verifier configuration")?,
+            ),
+            "oidc_jwt",
+        )
+    } else if introspection_configured {
+        let introspection_endpoint = required(
+            &args.oauth_introspection_endpoint,
+            "CUMG_V2_OAUTH_INTROSPECTION_ENDPOINT",
+        )?;
+        let introspection_client_id = required(
+            &args.oauth_introspection_client_id,
+            "CUMG_V2_OAUTH_INTROSPECTION_CLIENT_ID",
+        )?;
+        let secret_file = args
+            .oauth_introspection_client_secret_file
+            .as_ref()
+            .context("CUMG_V2_OAUTH_INTROSPECTION_CLIENT_SECRET_FILE is required")?;
+        let secret = load_secret_text(secret_file, MAX_OAUTH_SECRET_BYTES)
+            .context("failed to load OAuth introspection client secret")?;
+        let mut verifier_config = OAuthIntrospectionConfig::new(
+            config.authorization_server(),
+            config.resource(),
+            introspection_endpoint,
+            introspection_client_id,
+            secret,
+        );
+        verifier_config.timeout = Duration::from_secs(args.oauth_introspection_timeout_secs);
+        (
+            Arc::new(
+                OAuthIntrospectionVerifier::new(verifier_config)
+                    .context("invalid hosted Handoff OAuth introspection configuration")?,
+            ),
+            "oauth_introspection",
+        )
+    } else {
+        bail!("hosted profile requires OIDC/JWT or OAuth introspection authentication");
+    };
+
+    let service = Arc::new(
+        HostedHandoffControlService::new(
+            device_id.to_owned(),
+            Arc::new(policy),
+            coordinator,
+            handle,
+        )
+        .context("invalid hosted Handoff control service configuration")?,
+    );
+    let context_path = config.context_path().to_owned();
+    let control_path = config.control_path().to_owned();
+    let metadata_path = config.metadata_path().to_owned();
+    let resource = config.resource().to_owned();
+    let router = build_hosted_handoff_router(service, config, verifier);
+
+    Ok(Some(HostedHandoffRuntime {
+        router,
+        resource,
+        context_path,
+        control_path,
+        metadata_path,
+        auth_mode,
+    }))
+}
+
+fn validate_profile_configuration(args: &Args) -> Result<()> {
+    let hosted_handoff_configured = args.hosted_handoff_resource.is_some()
+        || args.hosted_handoff_required_scopes.is_some()
+        || args.hosted_handoff_policy_file.is_some()
+        || args.hosted_handoff_oidc_audience.is_some();
+    let trusted_proxy_configured = args.trusted_proxy_issuer.is_some()
+        || args.trusted_proxy_subject.is_some()
+        || args.trusted_proxy_secret_file.is_some();
+    let oidc_configured = args.oidc_audience.is_some()
+        || args.oidc_jwks_uri.is_some()
+        || args.oidc_allowed_algorithms.is_some();
+    let introspection_configured = args.oauth_introspection_endpoint.is_some()
+        || args.oauth_introspection_client_id.is_some()
+        || args.oauth_introspection_client_secret_file.is_some();
+
+    if args.hosted_profile {
+        ensure!(
+            args.hosted_port.is_some_and(|port| port > 0),
+            "hosted profile requires Cloud Run PORT"
+        );
+        ensure!(
+            args.drain_timeout_secs <= 8,
+            "hosted profile requires CUMG_V2_DRAIN_TIMEOUT_SECS <= 8"
+        );
+        ensure!(
+            args.tls_cert_pem_file.is_none() && args.tls_key_pem_file.is_none(),
+            "hosted profile terminates public TLS before the container; CUMG_V2_TLS_* must be unset"
+        );
+        ensure!(
+            args.mcp_bind.is_none(),
+            "hosted profile serves MCP on shared PORT; CUMG_V2_MCP_BIND must be unset"
+        );
+        ensure!(
+            !trusted_proxy_configured,
+            "hosted profile requires OAuth/OIDC bearer authentication; trusted-proxy mode is not accepted on public hosted ingress"
+        );
+        ensure!(
+            oidc_configured ^ introspection_configured,
+            "hosted profile requires exactly one of OIDC/JWT or OAuth introspection authentication"
+        );
+        ensure!(
+            args.hosted_handoff_resource.is_some()
+                && args.hosted_handoff_required_scopes.is_some()
+                && args.hosted_handoff_policy_file.is_some(),
+            "hosted profile requires complete hosted Handoff resource/scope/policy configuration"
+        );
+        ensure!(
+            args.mcp_resource.is_some()
+                && args.northbound_policy_file.is_some()
+                && args.oauth_authorization_server.is_some()
+                && args.oauth_required_scopes.is_some(),
+            "hosted profile requires the complete protected northbound MCP resource/policy/scope configuration"
+        );
+        ensure!(
+            args.hosted_handoff_resource != args.mcp_resource,
+            "hosted Handoff and MCP must use distinct protected resource URIs"
+        );
+        if oidc_configured {
+            let mcp_audience = required(&args.oidc_audience, "CUMG_V2_OIDC_AUDIENCE")?;
+            let handoff_audience = required(
+                &args.hosted_handoff_oidc_audience,
+                "CUMG_V2_HOSTED_HANDOFF_OIDC_AUDIENCE",
+            )?;
+            ensure!(
+                mcp_audience != handoff_audience,
+                "hosted Handoff and MCP must use distinct OIDC audiences"
+            );
+        } else {
+            ensure!(
+                args.hosted_handoff_oidc_audience.is_none(),
+                "CUMG_V2_HOSTED_HANDOFF_OIDC_AUDIENCE is valid only in hosted OIDC/JWT mode"
+            );
+        }
+        ensure!(
+            args.handoff_control_socket.is_none() && args.operator_handoff_socket.is_none(),
+            "hosted profile must not configure local Handoff operator sockets"
+        );
+    } else {
+        ensure!(
+            args.tls_cert_pem_file.is_some() && args.tls_key_pem_file.is_some(),
+            "non-hosted profile requires CUMG_V2_TLS_CERT_PEM_FILE and CUMG_V2_TLS_KEY_PEM_FILE"
+        );
+        ensure!(
+            !hosted_handoff_configured,
+            "hosted Handoff resource settings require CUMG_V2_HOSTED_PROFILE=true"
+        );
+    }
+    Ok(())
 }
 
 fn status_home(install_root: &std::path::Path) -> Result<PathBuf> {
@@ -894,7 +1277,7 @@ fn build_northbound_status_provider(
         OperatorStatusCollectionConfig::installed_defaults(home, install_root.clone(), run_root);
     config.hub_state_dir = Some(args.state_dir.clone());
     config.grant_signer_socket = args.grant_signer_socket.clone();
-    config.tls_server_certificate = Some(args.tls_cert_pem_file.clone());
+    config.tls_server_certificate = args.tls_cert_pem_file.clone();
     config.handoff_control_socket = args.handoff_control_socket.clone();
     Ok(Some(Arc::new(CollectedOperatorStatusProvider::new(config))))
 }
@@ -993,6 +1376,139 @@ mod auth_mode_tests {
         assert!(validate_northbound_auth_mode_selection(true, false, true, true).is_err());
         assert!(validate_northbound_auth_mode_selection(false, true, true, true).is_err());
         assert!(validate_northbound_auth_mode_selection(false, false, true, true).is_err());
+    }
+
+    fn parsed_args(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "v2_hub",
+            "--hub-secret-file",
+            "/tmp/hub.key",
+            "--device-public-key-file",
+            "/tmp/device.pub",
+            "--state-dir",
+            "/tmp/state",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).unwrap()
+    }
+
+    fn hosted_oidc_args() -> Args {
+        parsed_args(&[
+            "--hosted-profile",
+            "--hosted-port",
+            "8080",
+            "--drain-timeout-secs",
+            "8",
+            "--mcp-resource",
+            "https://hub.example/mcp",
+            "--northbound-policy-file",
+            "/tmp/mcp-policy.json",
+            "--oauth-authorization-server",
+            "https://issuer.example",
+            "--oauth-required-scopes",
+            "cumg:mcp",
+            "--oidc-audience",
+            "cumg-mcp",
+            "--oidc-jwks-uri",
+            "https://issuer.example/jwks",
+            "--oidc-allowed-algorithms",
+            "RS256",
+            "--hosted-handoff-resource",
+            "https://hub.example/operator/v1/handoff",
+            "--hosted-handoff-required-scopes",
+            "cumg:handoff",
+            "--hosted-handoff-policy-file",
+            "/tmp/handoff-policy.json",
+            "--hosted-handoff-oidc-audience",
+            "cumg-handoff",
+        ])
+    }
+
+    #[test]
+    fn hosted_profile_requires_one_port_h2c_and_distinct_auth_resources() {
+        let args = hosted_oidc_args();
+        assert!(validate_profile_configuration(&args).is_ok());
+
+        let with_tls = parsed_args(&[
+            "--hosted-profile",
+            "--hosted-port",
+            "8080",
+            "--tls-cert-pem-file",
+            "/tmp/cert.pem",
+            "--tls-key-pem-file",
+            "/tmp/key.pem",
+            "--mcp-resource",
+            "https://hub.example/mcp",
+            "--northbound-policy-file",
+            "/tmp/mcp-policy.json",
+            "--oauth-authorization-server",
+            "https://issuer.example",
+            "--oauth-required-scopes",
+            "cumg:mcp",
+            "--oidc-audience",
+            "cumg-mcp",
+            "--oidc-jwks-uri",
+            "https://issuer.example/jwks",
+            "--oidc-allowed-algorithms",
+            "RS256",
+            "--hosted-handoff-resource",
+            "https://hub.example/operator/v1/handoff",
+            "--hosted-handoff-required-scopes",
+            "cumg:handoff",
+            "--hosted-handoff-policy-file",
+            "/tmp/handoff-policy.json",
+            "--hosted-handoff-oidc-audience",
+            "cumg-handoff",
+        ]);
+        assert!(validate_profile_configuration(&with_tls).is_err());
+
+        let mut same_audience = hosted_oidc_args();
+        same_audience.hosted_handoff_oidc_audience = same_audience.oidc_audience.clone();
+        assert!(validate_profile_configuration(&same_audience).is_err());
+
+        let mut same_resource = hosted_oidc_args();
+        same_resource.hosted_handoff_resource = same_resource.mcp_resource.clone();
+        assert!(validate_profile_configuration(&same_resource).is_err());
+
+        let mut loopback_mcp = hosted_oidc_args();
+        loopback_mcp.mcp_bind = Some("127.0.0.1:7444".parse().unwrap());
+        assert!(validate_profile_configuration(&loopback_mcp).is_err());
+
+        let mut missing_handoff_scope = hosted_oidc_args();
+        missing_handoff_scope.hosted_handoff_required_scopes = None;
+        assert!(validate_profile_configuration(&missing_handoff_scope).is_err());
+
+        let mut missing_handoff_policy = hosted_oidc_args();
+        missing_handoff_policy.hosted_handoff_policy_file = None;
+        assert!(validate_profile_configuration(&missing_handoff_policy).is_err());
+
+        let mut excessive_drain = hosted_oidc_args();
+        excessive_drain.drain_timeout_secs = 9;
+        assert!(validate_profile_configuration(&excessive_drain).is_err());
+    }
+
+    #[test]
+    fn non_hosted_profile_retains_tls_and_rejects_hosted_only_settings() {
+        let args = parsed_args(&[
+            "--tls-cert-pem-file",
+            "/tmp/cert.pem",
+            "--tls-key-pem-file",
+            "/tmp/key.pem",
+        ]);
+        assert!(validate_profile_configuration(&args).is_ok());
+
+        let missing_tls = parsed_args(&[]);
+        assert!(validate_profile_configuration(&missing_tls).is_err());
+
+        let with_hosted_resource = parsed_args(&[
+            "--tls-cert-pem-file",
+            "/tmp/cert.pem",
+            "--tls-key-pem-file",
+            "/tmp/key.pem",
+            "--hosted-handoff-resource",
+            "https://hub.example/operator/v1/handoff",
+        ]);
+        assert!(validate_profile_configuration(&with_hosted_resource).is_err());
     }
 
     #[test]
