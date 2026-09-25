@@ -6101,6 +6101,59 @@ mod tests {
         }
     }
 
+    fn postgres_test_config(
+        state_key: &str,
+    ) -> Option<crate::v2_postgres_hub_state_store::PostgresHubStateStoreConfig> {
+        std::env::var("CUMG_TEST_POSTGRES_URL").ok()?;
+        let host = std::env::var("CUMG_TEST_POSTGRES_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let port = std::env::var("CUMG_TEST_POSTGRES_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5432);
+        let database = std::env::var("CUMG_TEST_POSTGRES_DB").unwrap_or_else(|_| "cumg".into());
+        let user = std::env::var("CUMG_TEST_POSTGRES_USER").unwrap_or_else(|_| "postgres".into());
+        let mut config = crate::v2_postgres_hub_state_store::PostgresHubStateStoreConfig::new(
+            host, database, user, state_key,
+        )
+        .unwrap()
+        .with_port(port)
+        .unwrap()
+        .with_timeouts(Duration::from_secs(5), Duration::from_secs(5))
+        .unwrap();
+        if let Ok(password) = std::env::var("CUMG_TEST_POSTGRES_PASSWORD") {
+            config = config.with_password(password).unwrap();
+        }
+        Some(config)
+    }
+
+    async fn prepare_postgres_test_schema() -> bool {
+        let Ok(url) = std::env::var("CUMG_TEST_POSTGRES_URL") else {
+            return false;
+        };
+        let Ok((client, connection)) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await
+        else {
+            panic!("CUMG_TEST_POSTGRES_URL is set but PostgreSQL is unavailable");
+        };
+        tokio::spawn(async move {
+            connection.await.unwrap();
+        });
+        client
+            .batch_execute("SELECT pg_advisory_lock(391284);")
+            .await
+            .unwrap();
+        let migration = client
+            .batch_execute(include_str!(
+                "../packaging/postgres/001_hosted_hub_state.sql"
+            ))
+            .await;
+        client
+            .batch_execute("SELECT pg_advisory_unlock(391284);")
+            .await
+            .unwrap();
+        migration.unwrap();
+        true
+    }
+
     async fn prepare_type_text_for_dispatch(
         hub: &SingleDeviceHub,
         handle: &HubHandle,
@@ -6158,6 +6211,97 @@ mod tests {
             },
         )]);
         (hello, challenge, owner, pending)
+    }
+
+    #[tokio::test]
+    async fn postgres_replacement_writer_fences_old_live_dispatch_before_enqueue() {
+        if !prepare_postgres_test_schema().await {
+            return;
+        }
+
+        let state_key = format!("hub-replacement-{}", rand::random::<u64>());
+        let device = DeviceIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+
+        let config_a = hosted_test_config("postgres-writer-a");
+        let state_dir_a = config_a.state_dir.clone();
+        let store_a = Arc::new(
+            crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
+                postgres_test_config(&state_key).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (hub_a, handle_a) =
+            SingleDeviceHub::new_with_async_state_store(config_a, material.clone(), store_a)
+                .await
+                .unwrap();
+
+        let operation_id = "op-postgres-stale-writer-dispatch";
+        let (hello, challenge, _owner, mut pending) =
+            prepare_type_text_for_dispatch(&hub_a, &handle_a, operation_id).await;
+
+        let config_b = hosted_test_config("postgres-writer-b");
+        let state_dir_b = config_b.state_dir.clone();
+        let store_b = Arc::new(
+            crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
+                postgres_test_config(&state_key).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (_hub_b, handle_b) =
+            SingleDeviceHub::new_with_async_state_store(config_b, material, store_b)
+                .await
+                .unwrap();
+
+        {
+            let persistent = handle_b.inner.persistent.lock().await;
+            assert_eq!(
+                persistent.execution.state(operation_id),
+                Some(HubOperationState::Cancelled)
+            );
+            assert_eq!(
+                persistent.execution.receipt(operation_id).unwrap().evidence,
+                ExecutionEvidence::CancelledBeforeDispatch
+            );
+        }
+
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        let result = hub_a
+            .dispatch_operation(
+                &outbound,
+                &hello,
+                &challenge,
+                1,
+                1,
+                &TrustedSessionClock::new(10),
+                operation_id,
+                &mut pending,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(HubServiceError::StateStore(HubStateStoreError::StaleWriter))
+                | Err(HubServiceError::StateStore(
+                    HubStateStoreError::RevisionConflict
+                ))
+        ));
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(hub_a.inner.writer_fenced.load(Ordering::Acquire));
+
+        drop(handle_b);
+        drop(handle_a);
+        let _ = std::fs::remove_dir_all(state_dir_a);
+        let _ = std::fs::remove_dir_all(state_dir_b);
     }
 
     #[tokio::test]
