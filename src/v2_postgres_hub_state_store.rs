@@ -627,6 +627,7 @@ mod tests {
 
     #[test]
     fn config_debug_redacts_password_and_connection_locator() {
+        let password = format!("test-secret-{}", rand::random::<u64>());
         let config = PostgresHubStateStoreConfig::new(
             "/cloudsql/private-project:region:instance",
             "private_database",
@@ -634,11 +635,11 @@ mod tests {
             "device-state",
         )
         .unwrap()
-        .with_password("sentinel-password-never-log")
+        .with_password(password.clone())
         .unwrap();
         let rendered = format!("{config:?}");
         assert!(rendered.contains("[REDACTED]"));
-        assert!(!rendered.contains("sentinel-password-never-log"));
+        assert!(!rendered.contains(&password));
         assert!(!rendered.contains("private-project"));
         assert!(!rendered.contains("private_database"));
         assert!(!rendered.contains("private_user"));

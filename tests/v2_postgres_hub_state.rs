@@ -29,18 +29,16 @@ fn config(state_key: &str) -> Option<PostgresHubStateStoreConfig> {
         .unwrap_or(5432);
     let database = std::env::var("CUMG_TEST_POSTGRES_DB").unwrap_or_else(|_| "cumg".into());
     let user = std::env::var("CUMG_TEST_POSTGRES_USER").unwrap_or_else(|_| "postgres".into());
-    let password =
-        std::env::var("CUMG_TEST_POSTGRES_PASSWORD").unwrap_or_else(|_| "postgres".into());
-    Some(
-        PostgresHubStateStoreConfig::new(host, database, user, state_key)
-            .unwrap()
-            .with_port(port)
-            .unwrap()
-            .with_password(password)
-            .unwrap()
-            .with_timeouts(Duration::from_secs(5), Duration::from_secs(5))
-            .unwrap(),
-    )
+    let mut config = PostgresHubStateStoreConfig::new(host, database, user, state_key)
+        .unwrap()
+        .with_port(port)
+        .unwrap()
+        .with_timeouts(Duration::from_secs(5), Duration::from_secs(5))
+        .unwrap();
+    if let Ok(password) = std::env::var("CUMG_TEST_POSTGRES_PASSWORD") {
+        config = config.with_password(password).unwrap();
+    }
+    Some(config)
 }
 
 async fn prepare_schema() -> bool {
