@@ -27,6 +27,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
+use rand::{RngCore, rngs::OsRng};
 use std::{
     fmt,
     sync::{Arc, Mutex},
@@ -138,6 +139,7 @@ pub enum HandoffOperatorControlError {
     Unsupported,
     NoFreshExactWindow,
     SessionFenceMismatch,
+    ContextHandleMismatch,
     InvalidRecoveryProof,
     AgentNotIdle,
     DeviceQuarantined,
@@ -151,6 +153,7 @@ impl HandoffOperatorControlError {
             Self::Unsupported => "handoff_control_unsupported",
             Self::NoFreshExactWindow => "handoff_no_fresh_exact_window",
             Self::SessionFenceMismatch => "handoff_session_fence_mismatch",
+            Self::ContextHandleMismatch => "handoff_context_handle_mismatch",
             Self::InvalidRecoveryProof => "handoff_invalid_recovery_proof",
             Self::AgentNotIdle => "handoff_agent_not_idle",
             Self::DeviceQuarantined => "handoff_device_quarantined",
@@ -180,6 +183,7 @@ impl From<HandoffControlError> for HandoffOperatorControlError {
 struct SelectedWindowAuthority {
     authority: AgentAuthorityRequest,
     expires_at: Instant,
+    context_handle: String,
 }
 
 #[derive(Default)]
@@ -380,6 +384,7 @@ impl HandoffCoordinator {
             .last_observed = Some(SelectedWindowAuthority {
             authority: control_authority(authority),
             expires_at: selection_expiry(context_valid_for),
+            context_handle: random_operator_context_handle(),
         });
     }
 
@@ -397,13 +402,24 @@ impl HandoffCoordinator {
             .last_admitted = Some(SelectedWindowAuthority {
             authority: control_authority(authority),
             expires_at: selection_expiry(context_valid_for),
+            context_handle: random_operator_context_handle(),
         });
     }
 
+    #[cfg(test)]
     fn selected_authority(
         &self,
         admitted: bool,
         session: Option<HandoffSessionFence>,
+    ) -> Result<AgentAuthorityRequest, HandoffOperatorControlError> {
+        self.selected_authority_for_context(admitted, session, None)
+    }
+
+    fn selected_authority_for_context(
+        &self,
+        admitted: bool,
+        session: Option<HandoffSessionFence>,
+        expected_context_handle: Option<&str>,
     ) -> Result<AgentAuthorityRequest, HandoffOperatorControlError> {
         let session = session.ok_or(HandoffOperatorControlError::SessionFenceMismatch)?;
         let selections = self
@@ -424,13 +440,45 @@ impl HandoffCoordinator {
         {
             return Err(HandoffOperatorControlError::SessionFenceMismatch);
         }
+        if expected_context_handle.is_some_and(|handle| handle != selected.context_handle.as_str())
+        {
+            return Err(HandoffOperatorControlError::ContextHandleMismatch);
+        }
         Ok(selected.authority.clone())
+    }
+
+    pub fn issue_operator_context_handle(
+        &self,
+        admitted: bool,
+        session: Option<HandoffSessionFence>,
+    ) -> Result<String, HandoffOperatorControlError> {
+        let session = session.ok_or(HandoffOperatorControlError::SessionFenceMismatch)?;
+        let selections = self
+            .selections
+            .lock()
+            .expect("handoff selection lock poisoned");
+        let selected = if admitted {
+            selections.last_admitted.as_ref()
+        } else {
+            selections.last_observed.as_ref()
+        }
+        .ok_or(HandoffOperatorControlError::NoFreshExactWindow)?;
+        if Instant::now() >= selected.expires_at {
+            return Err(HandoffOperatorControlError::NoFreshExactWindow);
+        }
+        if selected.authority.generation != session.generation
+            || selected.authority.capability_revision != session.capability_revision
+        {
+            return Err(HandoffOperatorControlError::SessionFenceMismatch);
+        }
+        Ok(selected.context_handle.clone())
     }
 
     async fn remote_operator_control(
         &self,
         command: HandoffOperatorCommand,
         session: Option<HandoffSessionFence>,
+        context_handle: Option<&str>,
     ) -> Result<HandoffRuntimeStatus, HandoffOperatorControlError> {
         let hub = self
             .remote_hub
@@ -440,11 +488,19 @@ impl HandoffCoordinator {
             HandoffOperatorCommand::Status => (RemoteHandoffOperatorCommand::Status, None),
             HandoffOperatorCommand::Begin => (
                 RemoteHandoffOperatorCommand::Begin,
-                Some(remote_authority(&self.selected_authority(true, session)?)),
+                Some(remote_authority(&self.selected_authority_for_context(
+                    true,
+                    session,
+                    context_handle,
+                )?)),
             ),
             HandoffOperatorCommand::RecoverReissue => (
                 RemoteHandoffOperatorCommand::RecoverReissue,
-                Some(remote_authority(&self.selected_authority(false, session)?)),
+                Some(remote_authority(&self.selected_authority_for_context(
+                    false,
+                    session,
+                    context_handle,
+                )?)),
             ),
             HandoffOperatorCommand::RecoverRebind {
                 prior_context_id,
@@ -460,12 +516,20 @@ impl HandoffCoordinator {
                         prior_generation,
                         prior_capability_revision,
                     },
-                    Some(remote_authority(&self.selected_authority(false, session)?)),
+                    Some(remote_authority(&self.selected_authority_for_context(
+                        false,
+                        session,
+                        context_handle,
+                    )?)),
                 )
             }
             HandoffOperatorCommand::RebindLive => (
                 RemoteHandoffOperatorCommand::RebindLive,
-                Some(remote_authority(&self.selected_authority(false, session)?)),
+                Some(remote_authority(&self.selected_authority_for_context(
+                    false,
+                    session,
+                    context_handle,
+                )?)),
             ),
             HandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch } => (
                 RemoteHandoffOperatorCommand::AbandonExpiredRecovery { expected_epoch },
@@ -529,8 +593,32 @@ impl HandoffCoordinator {
         command: HandoffOperatorCommand,
         session: Option<HandoffSessionFence>,
     ) -> Result<HandoffRuntimeStatus, HandoffOperatorControlError> {
+        self.operator_control_inner(command, session, None).await
+    }
+
+    pub async fn operator_control_for_context(
+        &self,
+        command: HandoffOperatorCommand,
+        session: Option<HandoffSessionFence>,
+        context_handle: &str,
+    ) -> Result<HandoffRuntimeStatus, HandoffOperatorControlError> {
+        if !valid_operator_context_handle(context_handle) {
+            return Err(HandoffOperatorControlError::ContextHandleMismatch);
+        }
+        self.operator_control_inner(command, session, Some(context_handle))
+            .await
+    }
+
+    async fn operator_control_inner(
+        &self,
+        command: HandoffOperatorCommand,
+        session: Option<HandoffSessionFence>,
+        context_handle: Option<&str>,
+    ) -> Result<HandoffRuntimeStatus, HandoffOperatorControlError> {
         if self.remote_hub.is_some() {
-            return self.remote_operator_control(command, session).await;
+            return self
+                .remote_operator_control(command, session, context_handle)
+                .await;
         }
         let runtime = self
             .managed_runtime
@@ -539,7 +627,8 @@ impl HandoffCoordinator {
         match command {
             HandoffOperatorCommand::Status => runtime.status().await.map_err(Into::into),
             HandoffOperatorCommand::Begin => {
-                let authority = self.selected_authority(true, session)?;
+                let authority =
+                    self.selected_authority_for_context(true, session, context_handle)?;
                 runtime
                     .control(HandoffRuntimeControl::Begin { authority })
                     .await
@@ -550,7 +639,8 @@ impl HandoffCoordinator {
                 if !status.recovery_required || status.recovery_expired {
                     return Err(HandoffOperatorControlError::InvalidLifecycleState);
                 }
-                let authority = self.selected_authority(false, session)?;
+                let authority =
+                    self.selected_authority_for_context(false, session, context_handle)?;
                 runtime
                     .control(HandoffRuntimeControl::RecoverReissue { authority })
                     .await
@@ -568,7 +658,8 @@ impl HandoffCoordinator {
                 if !status.recovery_required {
                     return Err(HandoffOperatorControlError::InvalidLifecycleState);
                 }
-                let authority = self.selected_authority(false, session)?;
+                let authority =
+                    self.selected_authority_for_context(false, session, context_handle)?;
                 if prior_generation.is_some_and(|value| value == 0 || value > authority.generation)
                     || prior_capability_revision
                         .is_some_and(|value| value > authority.capability_revision)
@@ -586,7 +677,8 @@ impl HandoffCoordinator {
                     .map_err(Into::into)
             }
             HandoffOperatorCommand::RebindLive => {
-                let authority = self.selected_authority(false, session)?;
+                let authority =
+                    self.selected_authority_for_context(false, session, context_handle)?;
                 runtime
                     .control(HandoffRuntimeControl::RebindLive { authority })
                     .await
@@ -743,6 +835,26 @@ impl HandoffCoordinator {
             .await
             .map_err(HandoffCoordinatorError::Backend)
     }
+}
+
+fn random_operator_context_handle() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    let mut value = String::with_capacity(37);
+    value.push_str("hctx_");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("write to String cannot fail");
+    }
+    value
+}
+
+pub fn valid_operator_context_handle(value: &str) -> bool {
+    value.len() == 37
+        && value.starts_with("hctx_")
+        && value[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn selection_expiry(context_valid_for: Option<Duration>) -> Instant {
@@ -908,6 +1020,62 @@ mod tests {
                 }),
             ),
             Err(HandoffOperatorControlError::NoFreshExactWindow)
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_context_handle_is_opaque_exact_selection_bound_and_rotates() {
+        let backend = Arc::new(FakeAuthority::new(Ok(AgentAuthorityDecision::Allow)));
+        let coordinator = HandoffCoordinator::new(backend);
+        let session = Some(HandoffSessionFence {
+            generation: 7,
+            capability_revision: 9,
+        });
+        coordinator
+            .admit_agent_with_context_valid_for(
+                &principal(),
+                "device-1",
+                7,
+                9,
+                &verification_command(),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        let first = coordinator
+            .issue_operator_context_handle(true, session)
+            .unwrap();
+        assert!(valid_operator_context_handle(&first));
+        assert!(!first.contains("0123456789abcdef0123456789abcdef"));
+        assert!(
+            coordinator
+                .selected_authority_for_context(true, session, Some(&first))
+                .is_ok()
+        );
+
+        coordinator
+            .admit_agent_with_context_valid_for(
+                &principal(),
+                "device-1",
+                7,
+                9,
+                &verification_command(),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        let second = coordinator
+            .issue_operator_context_handle(true, session)
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            coordinator.selected_authority_for_context(true, session, Some(&first)),
+            Err(HandoffOperatorControlError::ContextHandleMismatch)
+        );
+        assert!(
+            coordinator
+                .selected_authority_for_context(true, session, Some(&second))
+                .is_ok()
         );
     }
 
