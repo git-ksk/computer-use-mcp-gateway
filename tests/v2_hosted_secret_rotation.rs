@@ -243,6 +243,44 @@ fn handoff_viewer_and_transport_rotation_never_changes_agent_or_intervention_aut
 }
 
 #[test]
+fn hosted_rotation_checkpoint_contains_no_private_key_material() {
+    let device_secret = [0xa1; 32];
+    let hub_secret = [0xb2; 32];
+    let grant_secret = [0xc3; 32];
+
+    let device = DeviceIdentity::from_secret_key_bytes(device_secret);
+    let _hub = HubIdentity::from_secret_key_bytes(hub_secret);
+    let _grant = GrantAuthority::from_secret_key_bytes(grant_secret);
+
+    let mut registry = DeviceRegistry::default();
+    let challenge = DeviceRegistry::enrollment_challenge();
+    registry
+        .enroll(
+            device.verifying_key().as_bytes(),
+            &challenge,
+            &device.enrollment_proof(&challenge),
+        )
+        .unwrap();
+    let execution = AuthoritativeOperationController::new(AdmissionLimits {
+        max_global_active: 1,
+        max_queued_per_device: 1,
+    })
+    .unwrap();
+
+    let encoded =
+        serde_json::to_string(&HubPersistentState::capture(&registry, &execution)).unwrap();
+    for private_byte in [0xa1_u8, 0xb2, 0xc3] {
+        let repeated = format!(
+            "{private_byte},{private_byte},{private_byte},{private_byte},{private_byte},{private_byte},{private_byte},{private_byte}"
+        );
+        assert!(
+            !encoded.contains(&repeated),
+            "authoritative checkpoint exposed private key material"
+        );
+    }
+}
+
+#[test]
 fn hosted_auth_debug_output_redacts_client_secret_value() {
     let sentinel = "hosted-rotation-secret-SHOULD-NEVER-APPEAR";
     let config = OAuthIntrospectionConfig::new(

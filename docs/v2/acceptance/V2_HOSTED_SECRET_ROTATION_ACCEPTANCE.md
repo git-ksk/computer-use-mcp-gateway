@@ -28,7 +28,8 @@ Secret-store/workload identity, OAuth credentials, Hub/device identity, grant si
 2. device-key rotation invalidates the old session/key while an already ambiguous operation remains exact `Indeterminate` + quarantine and rejects replay after restart;
 3. Hub trust continuity and grant-signing overlap/retirement rotate independently;
 4. viewer/transport replacement rotates only those Handoff generations, leaving Agent generation/intervention epoch unchanged and stale transport unusable;
-5. OAuth introspection config debug output redacts the client-secret value.
+5. authoritative Hub checkpoint serialization contains no private Hub/device/grant key material;
+6. OAuth introspection config debug output redacts the client-secret value.
 
 Existing `v2_m1_hub_service` session-reauthentication, `v2_m1_partition_recovery`, #283 writer-fence/replacement, and #277 Handoff routing regressions remain part of the evidence set.
 

@@ -28,7 +28,8 @@ secret-store/workload identity、OAuth credential、Hub/device identity、grant 
 2. device-key rotationでold session/keyをinvalidateしても、既にambiguousなoperationはrestart後もexact `Indeterminate` + quarantineを保持しreplay拒否;
 3. Hub trust continuityとgrant-signing overlap/retirementは独立rotation;
 4. viewer/transport replacementはそのHandoff generationだけrotateし、Agent generation/intervention epochは不変、stale transportは利用不能;
-5. OAuth introspection configのDebug出力はclient-secret valueをredact。
+5. authoritative Hub checkpoint serializationにprivate Hub/device/grant key materialを含めない;
+6. OAuth introspection configのDebug出力はclient-secret valueをredact。
 
 既存の`v2_m1_hub_service` session reauthentication、`v2_m1_partition_recovery`、#283 writer-fence/replacement、#277 Handoff routing regressionもevidence setに含めます。
 
