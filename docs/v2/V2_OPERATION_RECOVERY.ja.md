@@ -42,6 +42,10 @@ public state は次のとおりです。
 
 `original_retry_safe` は常に `false` です。mutating command の blind retry ではなく recovery を使います。northbound error が `device_indeterminate` の場合は、bounded な actionable guidance として `execution_may_have_occurred=true`、`blind_replay_safe=false`、`next_action=get_operation_then_reconcile`、`follow_up_effectful_operation=new_operation_id_required` を返します。exact `get_operation` がまだ `indeterminate` の場合は `next_action=reconcile_indeterminate` へ進みます。これらは authoritative operation state から導出し、command text の heuristic 解析は行いません。reconciliation 後に effectful work を続ける場合も fresh operation ID の新規operationとして実行し、quarantine中のold operationをreplayしません。
 
+### Structured refusal remediation は recovery authority ではない (#379)
+
+caller-facing semantic refusalは既存stable error `code`をそのまま再利用し、[`../TROUBLESHOOTING.md`](../TROUBLESHOOTING.md)で定義するboundedな `required_actor` / `next_action` metadataだけをadditiveに返せます。このhintはexecution history、quarantine、capability authorization、browser trust/consent、interaction scope、replay safetyを変更しません。`device_indeterminate`、`confirmed_not_executed`、`mutation_resume_required` は専用recovery semanticsを維持し、generic refusal remediationがそれを上書きしたりsettlementを捏造したりしてはいけません。
+
 ### Hub-authoritative pre-enqueue non-delivery (v0.8 / #377)
 
 execution-safety schema **v15** は、Hubがeffectful operationをすでにdurable `Dispatched`としてcommitした後でも、exact first outbound attemptが **per-session Hub→Agent queueにencoded commandをacceptされる前** に失敗したことをHub自身が証明できる狭いケースだけをautomatic non-execution proofとして追加します。対象は `encode_hub_frame()` がenqueue前に失敗した場合、またはTokio `mpsc::Sender::send()` がreceiver closedによりunsent frameを返した場合だけです。provider log、Agent evidenceの欠落、timeout、successful enqueue後のtransport/writer failure、silenceは同じ証拠として扱いません。

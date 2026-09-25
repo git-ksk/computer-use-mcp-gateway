@@ -42,6 +42,10 @@ Public states are:
 
 `original_retry_safe` is always `false`. Recovery is the safe alternative to blindly retrying a mutating command. A northbound `device_indeterminate` error also carries bounded actionable guidance: `execution_may_have_occurred=true`, `blind_replay_safe=false`, `next_action=get_operation_then_reconcile`, and `follow_up_effectful_operation=new_operation_id_required`. If the exact `get_operation` lookup itself remains `indeterminate`, its next action is `reconcile_indeterminate`. These fields are derived from the authoritative operation state, never from command-text heuristics. A later effectful attempt is a new operation only after reconciliation; it never replays the quarantined operation.
 
+### Structured refusal remediation is not recovery authority (#379)
+
+Caller-facing semantic refusals reuse their existing stable error `code` and may add bounded `required_actor` / `next_action` metadata as documented in [`../TROUBLESHOOTING.md`](../TROUBLESHOOTING.md). The hint does not change execution history, quarantine, capability authorization, browser trust/consent, interaction scope, or replay safety. `device_indeterminate`, `confirmed_not_executed`, and `mutation_resume_required` retain their dedicated recovery semantics; generic refusal remediation must not override them or manufacture a settlement.
+
 ### Hub-authoritative pre-enqueue non-delivery (v0.8 / #377)
 
 Execution-safety schema **v15** adds one deliberately narrow automatic non-execution proof after the Hub has already durably committed an effectful operation as `Dispatched`. The proof is valid only when the exact first Hub outbound attempt fails **before the per-session Hub→Agent queue accepts the encoded command**: either `encode_hub_frame()` fails before enqueue, or Tokio `mpsc::Sender::send()` returns the unsent frame because the receiver is closed. These are Hub-local facts about the exact dispatch attempt; provider logs, missing Agent evidence, timeouts, later transport/writer failures, or silence after successful enqueue are not equivalent evidence.
