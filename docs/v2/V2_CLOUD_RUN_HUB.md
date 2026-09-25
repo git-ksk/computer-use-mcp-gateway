@@ -1,6 +1,6 @@
 # V2 Cloud Run Hub support gate
 
-Status: **design complete, implementation/acceptance pending** for Issue #215.
+Status: **design complete; #282 ingress merged; #283 durable-state/writer-fence core implemented on the v0.9.0 candidate branch; hosted provider and deployment/physical acceptance pending** for Issue #215.
 
 Cloud Run is **not a supported CUMG Hub deployment** yet. The existing single-host/VM Hub profile remains the supported model. This document defines the architecture and evidence required before that support claim can change.
 
@@ -24,13 +24,13 @@ Authoritative references:
 - <https://docs.cloud.google.com/run/docs/configuring/min-instances>
 - <https://docs.cloud.google.com/run/docs/configuring/max-instances-limits>
 
-## Current CUMG incompatibilities
+## Remaining CUMG hosted gaps
 
-The current Hub cannot be called Cloud-Run-ready by changing deployment flags alone.
+The Hub still cannot be called Cloud-Run-ready by deployment flags alone, although #282 and the automated #283 core remove two earlier architectural blockers.
 
-1. `CheckpointStore` is explicitly local-filesystem based. Its commit proof depends on private pending files, flush/fsync, no-clobber publication, and directory fsync.
-2. `v2_hub` currently exposes separate Agent gRPC/TLS and northbound MCP HTTP listeners. Cloud Run supplies one ingress port.
-3. Current Hub authority is process-local around one `HubHandle`, including in-memory pending-operation coordination. Session affinity cannot make that state authoritative across replacement/concurrent instances.
+1. #283 now separates authoritative persistence behind a provider-neutral state-store/CAS contract while retaining `CheckpointStore` as the local backend. A production external durable provider for the hosted profile is still pending and must satisfy the same conformance contract.
+2. #282 is merged: hosted mode can carry Agent gRPC, MCP, and hosted Handoff on one exact h2c `PORT` without changing the VM/single-host listener layout. Real Cloud Run ingress acceptance is still pending.
+3. #283 makes writer epoch/revision durable authority rather than session affinity/process ownership. Real concurrent hosted revisions must still prove this against the selected external provider.
 4. The default planned shutdown drain is 30 seconds, longer than Cloud Run's documented 10-second instance-shutdown grace period.
 5. The current 3600-second Agent session lifetime exactly matches Cloud Run's maximum request timeout. That leaves no platform headroom for a controlled stream rotation.
 
@@ -57,6 +57,10 @@ At minimum it must support:
 - fail-closed behavior for unavailable, ambiguous, or partially failed persistence.
 
 A Cloud Storage or mounted-filesystem implementation is not presumed equivalent. It needs its own proof if proposed.
+
+The #283 core now provides a provider-neutral `HubAuthoritativeStateStore` contract, a local `CheckpointStore` adapter, and a deterministic in-memory conformance provider. The contract carries a monotonic state revision plus writer epoch, requires compare-and-commit on both, and read-verifies a complete committed snapshot before live authority advances. Local publication uses the append-only checkpoint sequence as the physical CAS boundary. Historical Hub M1 schema 5/6 checkpoints remain readable as unfenced migration input; the first Hub writer acquisition publishes Hub M1 schema 7 with an explicit durable fence. A schema-7 checkpoint missing that fence is rejected rather than reinterpreted as legacy.
+
+The automated core also proves two-writer replacement, cross-instance local CAS races, provider-unavailable pre-dispatch failure, stale-writer dispatch denial with an old live stream, restart after durable dispatch restoring exact `Indeterminate` quarantine, and stale recovery being unable to clear quarantine. These are core semantics only: no Cloud Run/database-specific durable provider is selected by #283, and real hosted revision overlap/backup/physical acceptance remains owned by #284/#215.
 
 ### 2. Fencing before effect dispatch
 
@@ -97,7 +101,7 @@ Extra quarantine is an acceptable conservative failure mode; lost ambiguity is n
 
 ### 5. One-port protocol multiplexing
 
-PR #285 implements the candidate hosted profile as one application-level HTTP/2/h2c listener on Cloud Run's `PORT`. It is enabled only by explicit `CUMG_V2_HOSTED_PROFILE=true`; the ordinary VM/single-host listener layout is unchanged.
+Merged PR #285 implements the hosted profile candidate as one application-level HTTP/2/h2c listener on Cloud Run's `PORT`. It is enabled only by explicit `CUMG_V2_HOSTED_PROFILE=true`; the ordinary VM/single-host listener layout is unchanged.
 
 The shared listener routes only the closed surfaces admitted by `HostedIngressClassifier`:
 
@@ -141,14 +145,14 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 | Gate | Current status |
 | --- | --- |
 | Current Cloud Run limits re-verified | Design evidence complete (2026-09-03) |
-| Ephemeral filesystem excluded from authoritative state | Design decision complete; implementation pending |
-| Provider-neutral durable Hub-state backend | Pending |
-| Monotonic writer fencing and stale-writer dispatch denial | Pending |
-| One-port h2c gRPC + MCP + hosted Handoff ingress with separate auth boundaries | Candidate implemented in PR #285; local h2c integration green, merge/hosted acceptance pending |
+| Ephemeral filesystem excluded from authoritative state | Core seam complete; hosted external durable provider pending |
+| Provider-neutral durable Hub-state backend | #283 core implemented: trait + local adapter + deterministic conformance provider; hosted external provider pending |
+| Monotonic writer fencing and stale-writer dispatch denial | #283 automated core green; hosted revision-overlap acceptance pending |
+| One-port h2c gRPC + MCP + hosted Handoff ingress with separate auth boundaries | PR #285 merged; local h2c integration green, real hosted acceptance pending |
 | 3300s proactive Agent stream rotation acceptance | Pending |
 | <=8s hosted drain plus forced-kill fail-closed acceptance | Pending |
-| Concurrent old/new revision fencing test | Pending |
-| Durable quarantine/replay-barrier restore after replacement | Pending |
+| Concurrent old/new revision fencing test | Deterministic two-writer core green; real hosted revision A/B acceptance pending |
+| Durable quarantine/replay-barrier restore after replacement | Core replacement/restart regression green; hosted backup/restore acceptance pending |
 | Hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
 | Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation/acceptance pending |
 | Physical Agent + real Cua interrupted-effect acceptance | Pending |

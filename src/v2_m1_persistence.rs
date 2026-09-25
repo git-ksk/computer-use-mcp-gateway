@@ -30,6 +30,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 const LEGACY_M1_STATE_SCHEMA_VERSION: u16 = 5;
 pub const M1_STATE_SCHEMA_VERSION: u16 = 6;
+pub const HUB_M1_STATE_SCHEMA_VERSION: u16 = 7;
+pub const HUB_PERSISTENCE_FENCE_SCHEMA_VERSION: u16 = 1;
 const BACKEND_RECEIPT_M1_STATE_SCHEMA_VERSION: u16 = 6;
 pub const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
 pub const MAX_RETAINED_CHECKPOINTS: usize = 64;
@@ -216,11 +218,32 @@ impl AgentPersistentState {
         })
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubPersistenceFenceSnapshot {
+    pub schema_version: u16,
+    pub revision: u64,
+    pub writer_epoch: u64,
+}
+
+impl HubPersistenceFenceSnapshot {
+    pub fn validate(&self) -> Result<(), PersistenceError> {
+        if self.schema_version != HUB_PERSISTENCE_FENCE_SCHEMA_VERSION
+            || self.revision == 0
+            || self.writer_epoch == 0
+        {
+            return Err(PersistenceError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubPersistentState {
     pub schema_version: u16,
     pub registry: DeviceRegistrySnapshot,
     pub execution: AuthoritativeSafetySnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_fence: Option<HubPersistenceFenceSnapshot>,
 }
 
 impl HubPersistentState {
@@ -229,9 +252,10 @@ impl HubPersistentState {
         execution: &AuthoritativeOperationController,
     ) -> Self {
         Self {
-            schema_version: M1_STATE_SCHEMA_VERSION,
+            schema_version: HUB_M1_STATE_SCHEMA_VERSION,
             registry: registry.snapshot(),
             execution: execution.snapshot_for_restart(),
+            durable_fence: None,
         }
     }
 
@@ -239,7 +263,10 @@ impl HubPersistentState {
         self,
         limits: AdmissionLimits,
     ) -> Result<(DeviceRegistry, AuthoritativeOperationController), PersistenceError> {
-        validate_state_schema(self.schema_version)?;
+        validate_hub_state_schema(self.schema_version)?;
+        if let Some(fence) = self.durable_fence {
+            fence.validate()?;
+        }
         let mut registry = DeviceRegistry::from_persisted_snapshot(self.registry)
             .map_err(PersistenceError::Control)?;
         // A Hub process restart destroys every live transport session. Persisted
@@ -394,11 +421,85 @@ impl CheckpointStore {
     }
 
     pub fn load_latest<T: DeserializeOwned>(&self) -> Result<T, PersistenceError> {
+        self.load_latest_with_sequence().map(|(_, value)| value)
+    }
+
+    /// Load the exact latest committed checkpoint together with its monotonic
+    /// append sequence. Pending/incomplete candidates are never visible here.
+    pub fn load_latest_with_sequence<T: DeserializeOwned>(
+        &self,
+    ) -> Result<(u64, T), PersistenceError> {
         self.ensure_directory()?;
-        let path = self
-            .latest_checkpoint()?
+        let sequence = self
+            .latest_sequence()?
             .ok_or(PersistenceError::NoCheckpoint)?;
-        read_secure_json(&path)
+        let path = self.checkpoint_path(sequence);
+        Ok((sequence, read_secure_json(&path)?))
+    }
+
+    /// Publish exactly one next checkpoint iff the caller's expected latest
+    /// sequence is still current. This is the local CheckpointStore CAS primitive
+    /// used by the provider-neutral Hub writer fence.
+    pub fn save_if_latest_sequence_with_size<T: Serialize>(
+        &self,
+        expected_latest: Option<u64>,
+        value: &T,
+    ) -> Result<(PathBuf, usize), PersistenceError> {
+        self.ensure_directory()?;
+        if self.latest_sequence()? != expected_latest {
+            return Err(PersistenceError::ConditionalConflict);
+        }
+
+        let sequence = expected_latest
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(PersistenceError::SequenceContention)?;
+        let payload = serde_json::to_vec(value).map_err(PersistenceError::Serialization)?;
+        if u64::try_from(payload.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_BYTES {
+            return Err(PersistenceError::CheckpointTooLarge);
+        }
+        let payload_len = payload.len();
+
+        let (pending_path, mut file) = self.create_pending_checkpoint()?;
+        let pending_write = (|| -> std::io::Result<()> {
+            file.write_all(&payload)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(error) = pending_write {
+            let _ = fs::remove_file(&pending_path);
+            return Err(PersistenceError::Io(error));
+        }
+
+        let path = self.checkpoint_path(sequence);
+        match fs::hard_link(&pending_path, &path) {
+            Ok(()) => {
+                // The final name is now visible. Failure to fsync the directory
+                // means publication may or may not survive a crash, so callers
+                // must not treat this as a proven pre-commit failure.
+                if sync_directory(&self.directory).is_err() {
+                    let _ = fs::remove_file(&pending_path);
+                    return Err(PersistenceError::PublicationUncertain);
+                }
+                if fs::remove_file(&pending_path).is_ok() {
+                    let _ = sync_directory(&self.directory);
+                }
+                // Retention cleanup happens strictly after durable publication and
+                // cannot retroactively make the authoritative commit fail.
+                let _ = self.prune_old_checkpoints(MAX_RETAINED_CHECKPOINTS);
+                Ok((path, payload_len))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&pending_path);
+                Err(PersistenceError::ConditionalConflict)
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&pending_path);
+                Err(PersistenceError::Io(error))
+            }
+        }
     }
 
     fn ensure_directory(&self) -> Result<(), PersistenceError> {
@@ -426,12 +527,6 @@ impl CheckpointStore {
         Ok(self
             .latest_sequence()?
             .map_or(1, |sequence| sequence.saturating_add(1)))
-    }
-
-    fn latest_checkpoint(&self) -> Result<Option<PathBuf>, PersistenceError> {
-        Ok(self
-            .latest_sequence()?
-            .map(|sequence| self.checkpoint_path(sequence)))
     }
 
     fn latest_sequence(&self) -> Result<Option<u64>, PersistenceError> {
@@ -546,6 +641,17 @@ fn validate_state_schema(got: u16) -> Result<(), PersistenceError> {
     }
 }
 
+fn validate_hub_state_schema(got: u16) -> Result<(), PersistenceError> {
+    if matches!(
+        got,
+        LEGACY_M1_STATE_SCHEMA_VERSION | M1_STATE_SCHEMA_VERSION | HUB_M1_STATE_SCHEMA_VERSION
+    ) {
+        Ok(())
+    } else {
+        Err(PersistenceError::UnsupportedSchema { got })
+    }
+}
+
 pub enum PersistenceError {
     Io(std::io::Error),
     Serialization(serde_json::Error),
@@ -558,6 +664,8 @@ pub enum PersistenceError {
     CheckpointTooLarge,
     NoCheckpoint,
     SequenceContention,
+    ConditionalConflict,
+    PublicationUncertain,
     InvalidRetention,
     InvalidState,
 }
@@ -615,6 +723,8 @@ impl SafeErrorCode for PersistenceError {
             Self::CheckpointTooLarge => "persistence_checkpoint_too_large",
             Self::NoCheckpoint => "persistence_no_checkpoint",
             Self::SequenceContention => "persistence_sequence_contention",
+            Self::ConditionalConflict => "persistence_conditional_conflict",
+            Self::PublicationUncertain => "persistence_publication_uncertain",
             Self::InvalidRetention => "persistence_invalid_retention",
             Self::InvalidState => "persistence_invalid_state",
         }

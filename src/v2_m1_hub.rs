@@ -17,6 +17,9 @@ use crate::v2_execution_safety::{
     RetirementRecord, terminal_evidence_for_device_result,
 };
 use crate::v2_grant_signer::{GrantSignerError, HubGrantSigner};
+use crate::v2_hub_state_store::{
+    HubAuthoritativeStateStore, HubStateStoreError, HubWriterLease, LocalCheckpointHubStateStore,
+};
 use crate::v2_m0::{
     CONTROL_SCHEMA_VERSION, CapabilityAdvertisement, CommandEnvelope, DeviceCapability,
     DeviceCommand, DeviceErrorCode, DeviceRegistry, DeviceResult, DirectoryEntry, ProcessOutput,
@@ -41,9 +44,7 @@ use crate::v2_m1_grpc::{
     GrpcCarrierError, decode_agent_frame, encode_hub_frame,
     proto::{AgentFrame, HubFrame, agent_control_server::AgentControl},
 };
-use crate::v2_m1_persistence::{
-    CheckpointStore, HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError,
-};
+use crate::v2_m1_persistence::{HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError};
 use crate::v2_m1_process::DEFAULT_MAX_RETAINED_OUTPUT_BYTES_PER_STREAM;
 use crate::v2_managed_job::{
     DEFAULT_MANAGED_JOB_OUTPUT_BYTES_PER_STREAM, MAX_MANAGED_JOB_LEASE_MS,
@@ -157,6 +158,9 @@ impl HubServiceConfig {
 struct PersistentHubState {
     registry: DeviceRegistry,
     execution: AuthoritativeOperationController,
+    writer: HubWriterLease,
+    committed_registry: DeviceRegistry,
+    committed_execution: AuthoritativeOperationController,
 }
 
 #[derive(Clone)]
@@ -184,11 +188,12 @@ struct HubInner {
     config: HubServiceConfig,
     material: HubProvisionedMaterial,
     device_id: String,
-    checkpoint: CheckpointStore,
-    _state_lock: StateDirectoryLock,
+    state_store: Arc<dyn HubAuthoritativeStateStore>,
+    _state_lock: Option<StateDirectoryLock>,
     persistent: Mutex<PersistentHubState>,
     live: Mutex<Option<LiveSession>>,
     draining: AtomicBool,
+    writer_fenced: AtomicBool,
     semantic_constraint_snapshot: OnceLock<SemanticConstraintSnapshotIdentity>,
     last_checkpoint_bytes: AtomicUsize,
     session_slots: Arc<Semaphore>,
@@ -500,56 +505,99 @@ impl SingleDeviceHub {
         config.validate()?;
         let state_lock = StateDirectoryLock::acquire(&config.state_dir)
             .map_err(HubServiceError::StateDirectoryLock)?;
-        let checkpoint = CheckpointStore::new(config.state_dir.clone(), "hub")
+        let state_store: Arc<dyn HubAuthoritativeStateStore> = Arc::new(
+            LocalCheckpointHubStateStore::new(config.state_dir.clone())
+                .map_err(HubServiceError::StateStore)?,
+        );
+        Self::new_with_state_store_and_lock(config, material, state_store, Some(state_lock))
+    }
+
+    /// Construct a Hub over a provider-neutral authoritative state store.
+    ///
+    /// Hosted providers own their own cross-instance fencing; the local constructor above
+    /// additionally retains the historical state-directory lock.
+    pub fn new_with_state_store(
+        config: HubServiceConfig,
+        material: HubProvisionedMaterial,
+        state_store: Arc<dyn HubAuthoritativeStateStore>,
+    ) -> Result<(Self, HubHandle), HubServiceError> {
+        config.validate()?;
+        Self::new_with_state_store_and_lock(config, material, state_store, None)
+    }
+
+    fn restore_runtime_state(
+        state: HubPersistentState,
+        config: &HubServiceConfig,
+        material: &HubProvisionedMaterial,
+    ) -> Result<(String, DeviceRegistry, AuthoritativeOperationController), HubServiceError> {
+        if state.registry.devices.len() != 1 {
+            return Err(HubServiceError::CheckpointDeviceTrustMismatch);
+        }
+        let device_id = state.registry.devices[0].device_id.clone();
+        let (mut registry, execution) = state
+            .restore(config.admission_limits())
             .map_err(HubServiceError::Persistence)?;
+        if registry
+            .device_verifier(&device_id)
+            .map_err(HubServiceError::Control)?
+            != material.device_verifier
+        {
+            let rotation = material
+                .device_rotation
+                .as_ref()
+                .ok_or(HubServiceError::CheckpointDeviceTrustMismatch)?;
+            if rotation.device_id != device_id {
+                return Err(HubServiceError::CheckpointDeviceTrustMismatch);
+            }
+            apply_device_key_rotation(&mut registry, rotation, rotation.rotation_epoch)
+                .map_err(HubServiceError::Trust)?;
+            if registry
+                .device_verifier(&device_id)
+                .map_err(HubServiceError::Control)?
+                != material.device_verifier
+            {
+                return Err(HubServiceError::CheckpointDeviceTrustMismatch);
+            }
+        }
+        Ok((device_id, registry, execution))
+    }
+
+    fn new_with_state_store_and_lock(
+        config: HubServiceConfig,
+        material: HubProvisionedMaterial,
+        state_store: Arc<dyn HubAuthoritativeStateStore>,
+        state_lock: Option<StateDirectoryLock>,
+    ) -> Result<(Self, HubHandle), HubServiceError> {
         let recovery_verifier = RecoveryVerifier::load_optional(&config.state_dir)
             .map_err(HubServiceError::OnlineRecovery)?;
 
-        let mut identity_registry = DeviceRegistry::default();
-        let provisioned_device_id =
-            identity_registry.provision_trusted_device(material.device_verifier);
-        let (device_id, registry, execution) = match checkpoint.load_latest::<HubPersistentState>()
+        let mut bootstrap_registry = DeviceRegistry::default();
+        bootstrap_registry.provision_trusted_device(material.device_verifier);
+        let bootstrap_execution = AuthoritativeOperationController::new(config.admission_limits())
+            .map_err(HubServiceError::Execution)?;
+        let bootstrap_state =
+            HubPersistentState::capture(&bootstrap_registry, &bootstrap_execution);
+
+        // Validate the current exact snapshot before publishing a migration/writer fence.
+        // A rejected historical checkpoint must remain byte-for-byte untouched.
+        if let Some(current) = state_store
+            .load_current()
+            .map_err(HubServiceError::StateStore)?
         {
-            Ok(state) => {
-                if state.registry.devices.len() != 1 {
-                    return Err(HubServiceError::CheckpointDeviceTrustMismatch);
-                }
-                let device_id = state.registry.devices[0].device_id.clone();
-                let (mut registry, execution) = state
-                    .restore(config.admission_limits())
-                    .map_err(HubServiceError::Persistence)?;
-                if registry
-                    .device_verifier(&device_id)
-                    .map_err(HubServiceError::Control)?
-                    != material.device_verifier
-                {
-                    let rotation = material
-                        .device_rotation
-                        .as_ref()
-                        .ok_or(HubServiceError::CheckpointDeviceTrustMismatch)?;
-                    if rotation.device_id != device_id {
-                        return Err(HubServiceError::CheckpointDeviceTrustMismatch);
-                    }
-                    apply_device_key_rotation(&mut registry, rotation, rotation.rotation_epoch)
-                        .map_err(HubServiceError::Trust)?;
-                    if registry
-                        .device_verifier(&device_id)
-                        .map_err(HubServiceError::Control)?
-                        != material.device_verifier
-                    {
-                        return Err(HubServiceError::CheckpointDeviceTrustMismatch);
-                    }
-                }
-                (device_id, registry, execution)
-            }
-            Err(PersistenceError::NoCheckpoint) => (
-                provisioned_device_id,
-                identity_registry,
-                AuthoritativeOperationController::new(config.admission_limits())
-                    .map_err(HubServiceError::Execution)?,
-            ),
-            Err(error) => return Err(HubServiceError::Persistence(error)),
-        };
+            let _ = Self::restore_runtime_state(current.state, &config, &material)?;
+        }
+
+        // Writer acquisition is itself durable and read-after-commit verified. Re-read/restore
+        // the returned record because another writer may have committed between the validation
+        // read above and this acquisition attempt.
+        let acquired = state_store
+            .acquire_writer(&bootstrap_state)
+            .map_err(HubServiceError::StateStore)?;
+        let writer = acquired.lease();
+        let (device_id, registry, execution) =
+            Self::restore_runtime_state(acquired.state, &config, &material)?;
+        let committed_registry = registry.clone();
+        let committed_execution = execution.clone();
 
         let ephemeral_refs = HubEphemeralRefRegistry::new(HubEphemeralRefLimits::default())
             .map_err(|_| HubServiceError::InvalidConfig("invalid ephemeral ref registry limits"))?;
@@ -572,14 +620,18 @@ impl SingleDeviceHub {
             config,
             material,
             device_id,
-            checkpoint,
+            state_store,
             _state_lock: state_lock,
             persistent: Mutex::new(PersistentHubState {
                 registry,
                 execution,
+                writer,
+                committed_registry,
+                committed_execution,
             }),
             live: Mutex::new(None),
             draining: AtomicBool::new(false),
+            writer_fenced: AtomicBool::new(false),
             semantic_constraint_snapshot: OnceLock::new(),
             last_checkpoint_bytes: AtomicUsize::new(0),
             session_slots,
@@ -593,7 +645,8 @@ impl SingleDeviceHub {
         let service = Self {
             inner: inner.clone(),
         };
-        // Establish a fail-closed baseline before the service accepts a session.
+        // Persist the restart-normalized registry (offline until fresh auth) and any accepted
+        // device-key rotation before this writer accepts a session.
         service.persist_blocking()?;
         Ok((service, HubHandle { inner }))
     }
@@ -725,12 +778,12 @@ impl SingleDeviceHub {
     }
 
     fn persist_blocking(&self) -> Result<(), HubServiceError> {
-        let persistent = self
+        let mut persistent = self
             .inner
             .persistent
             .try_lock()
             .map_err(|_| HubServiceError::StateBusy)?;
-        persist_locked(&self.inner, &persistent)
+        persist_locked(&self.inner, &mut persistent)
     }
 
     async fn run_session(
@@ -742,6 +795,9 @@ impl SingleDeviceHub {
             AgentToHub::Hello(hello) => hello,
             other => return Err(unexpected_agent_message("hello", &other)),
         };
+        if self.inner.writer_fenced.load(Ordering::Acquire) {
+            return Err(HubServiceError::StateBusy);
+        }
         if self.inner.draining.load(Ordering::Acquire) {
             tracing::info!(
                 event = "v2_agent_session_rejected",
@@ -791,7 +847,7 @@ impl SingleDeviceHub {
                 .prune_terminal_before_generation(&self.inner.device_id, session.generation)?;
             // Generation advancement and safe replay-tombstone pruning must
             // survive a Hub crash before the Agent receives acceptance.
-            persist_locked(&self.inner, &persistent)?;
+            persist_locked(&self.inner, &mut persistent)?;
             session
         };
 
@@ -1069,7 +1125,7 @@ impl SingleDeviceHub {
                                         let recovery_evidence_read = persistent
                                             .execution
                                             .is_recovery_evidence_read(&operation_id);
-                                        persist_locked(&self.inner, &persistent)?;
+                                        persist_locked(&self.inner, &mut persistent)?;
                                         Ok((decision, recovery_evidence_read))
                                     }
                                     Err(error) => Err(command_error_from_execution(error)),
@@ -1159,6 +1215,10 @@ impl SingleDeviceHub {
                                 request_id.clone(),
                                 request,
                             )?;
+                            // Handoff authority is Agent-owned, but a stale Hub writer must not
+                            // mutate it through an old live stream. Commit an unchanged authoritative
+                            // snapshot under the current writer epoch immediately before enqueue.
+                            self.fence_handoff_authority_change().await?;
                             handoff_waiters.insert(request_id, reply);
                             send_hub(&outbound, HubToAgent::HandoffRequest(remote)).await?;
                         }
@@ -1172,7 +1232,7 @@ impl SingleDeviceHub {
                                     unix_time_ms()?,
                                 ) {
                                     Ok(decision) => {
-                                        persist_locked(&self.inner, &persistent)?;
+                                        persist_locked(&self.inner, &mut persistent)?;
                                         Ok(decision)
                                     }
                                     Err(error) => Err(command_error_from_execution(error)),
@@ -1401,6 +1461,14 @@ impl SingleDeviceHub {
         }
     }
 
+    async fn fence_handoff_authority_change(&self) -> Result<(), HubServiceError> {
+        if self.inner.writer_fenced.load(Ordering::Acquire) {
+            return Err(HubServiceError::StateBusy);
+        }
+        let mut persistent = self.inner.persistent.lock().await;
+        persist_locked(&self.inner, &mut persistent)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_operation(
         &self,
@@ -1501,7 +1569,7 @@ impl SingleDeviceHub {
                 dispatch_binding.clone(),
                 unix_time_ms()?,
             )?;
-            persist_locked(&self.inner, &persistent)?;
+            persist_locked(&self.inner, &mut persistent)?;
         }
         let capability = command.command.capability();
         pending
@@ -1585,30 +1653,20 @@ impl SingleDeviceHub {
             now_ms,
         )?;
 
-        let state = HubPersistentState::capture(&persistent.registry, &candidate);
-        let checkpoint_bytes = match self.inner.checkpoint.save_with_size(&state) {
-            Ok((_, checkpoint_bytes)) => checkpoint_bytes,
-            Err(error) => {
-                crate::v2_observability::persistence_failure(
-                    crate::v2_observability::PersistenceComponent::Hub,
-                );
-                tracing::error!(
-                    event = "v2_persistence_failure",
-                    operation_id,
-                    device_id = %self.inner.device_id,
-                    generation,
-                    outcome = "failed_closed",
-                    error_code = error.safe_error_code(),
-                    component = "hub",
-                    "Hub pre-enqueue non-delivery proof could not be committed; operation remains fail-closed"
-                );
-                return Err(HubServiceError::Persistence(error));
-            }
-        };
-        self.inner
-            .last_checkpoint_bytes
-            .store(checkpoint_bytes, Ordering::Release);
-        persistent.execution = candidate;
+        if let Err(error) =
+            persist_execution_candidate_locked(&self.inner, &mut persistent, candidate)
+        {
+            tracing::error!(
+                event = "v2_pre_enqueue_non_delivery_commit_failed",
+                operation_id,
+                device_id = %self.inner.device_id,
+                generation,
+                outcome = "failed_closed",
+                error_code = error.safe_error_code(),
+                "Hub pre-enqueue non-delivery proof could not be committed; operation remains fail-closed"
+            );
+            return Err(error);
+        }
         Ok(next)
     }
 
@@ -1627,7 +1685,7 @@ impl SingleDeviceHub {
                 generation,
                 unix_time_ms()?,
             )?;
-            persist_locked(&self.inner, &persistent)?;
+            persist_locked(&self.inner, &mut persistent)?;
             match decision {
                 CancellationDecision::CancelledBeforeDispatch { next } => next,
                 CancellationDecision::AlreadyTerminal(_) => CompletionDecision::Idle,
@@ -1669,7 +1727,7 @@ impl SingleDeviceHub {
                 generation,
                 unix_time_ms()?,
             )?;
-            persist_locked(&self.inner, &persistent)?;
+            persist_locked(&self.inner, &mut persistent)?;
             match decision {
                 CancellationDecision::CancelledBeforeDispatch { next } => next,
                 CancellationDecision::AlreadyTerminal(_) => CompletionDecision::Idle,
@@ -1711,7 +1769,7 @@ impl SingleDeviceHub {
                 generation,
                 unix_time_ms()?,
             )?;
-            persist_locked(&self.inner, &persistent)?;
+            persist_locked(&self.inner, &mut persistent)?;
             match decision {
                 CancellationDecision::CancelledBeforeDispatch { next } => next,
                 CancellationDecision::AlreadyTerminal(_) => CompletionDecision::Idle,
@@ -1811,29 +1869,8 @@ impl SingleDeviceHub {
             }
         }
 
-        let state = HubPersistentState::capture(&persistent.registry, &candidate);
-        let checkpoint_bytes = match self.inner.checkpoint.save_with_size(&state) {
-            Ok((_, checkpoint_bytes)) => checkpoint_bytes,
-            Err(error) => {
-                crate::v2_observability::persistence_failure(
-                    crate::v2_observability::PersistenceComponent::Hub,
-                );
-                tracing::error!(
-                    event = "v2_persistence_failure",
-                    device_id = %self.inner.device_id,
-                    outcome = "failed",
-                    error_code = error.safe_error_code(),
-                    component = "hub",
-                    "Hub reconciliation checkpoint persistence failed"
-                );
-                return Err(HubServiceError::Persistence(error));
-            }
-        };
-        self.inner
-            .last_checkpoint_bytes
-            .store(checkpoint_bytes, Ordering::Release);
+        persist_execution_candidate_locked(&self.inner, &mut persistent, candidate)?;
         // Only now can quarantine disappear from the live authoritative state.
-        persistent.execution = candidate;
         drop(persistent);
 
         for (operation_id, capability, terminal_state) in resolved {
@@ -1942,7 +1979,7 @@ impl SingleDeviceHub {
                     let settled = persistent
                         .execution
                         .mark_recovery_read_interrupted(&operation_id, unix_time_ms()?)?;
-                    persist_locked(&self.inner, &persistent)?;
+                    persist_locked(&self.inner, &mut persistent)?;
                     settled
                 };
                 crate::v2_observability::operation_completed(
@@ -1996,7 +2033,7 @@ impl SingleDeviceHub {
                     })
                     .cloned()
                     .collect();
-                persist_locked(&self.inner, &persistent)?;
+                persist_locked(&self.inner, &mut persistent)?;
                 cancelled
             };
             for cancelled_id in cancelled_queued {
@@ -2063,7 +2100,7 @@ impl SingleDeviceHub {
                     result,
                 )?;
             }
-            persist_locked(&self.inner, &persistent)?;
+            persist_locked(&self.inner, &mut persistent)?;
             settled
         };
         let outcome = match terminal_state {
@@ -2237,7 +2274,7 @@ impl SingleDeviceHub {
                 })
                 .cloned()
                 .collect();
-            persist_locked(&self.inner, &persistent)?;
+            persist_locked(&self.inner, &mut persistent)?;
             cancelled
         };
 
@@ -2410,7 +2447,7 @@ impl SingleDeviceHub {
                     })
                     .cloned()
                     .collect();
-                persist_locked(&self.inner, &persistent)?;
+                persist_locked(&self.inner, &mut persistent)?;
                 cancelled
             };
             for operation_id in cancelled_queued {
@@ -2782,7 +2819,7 @@ impl SingleDeviceHub {
                     )?;
                 }
             }
-            if let Err(error) = persist_locked(&self.inner, &persistent) {
+            if let Err(error) = persist_locked(&self.inner, &mut persistent) {
                 persistent.execution = AuthoritativeOperationController::restore_after_restart(
                     self.inner.config.admission_limits(),
                     rollback,
@@ -2929,7 +2966,7 @@ impl SingleDeviceHub {
         {
             persistent.registry.disconnect(&self.inner.device_id)?;
         }
-        persist_locked(&self.inner, &persistent)?;
+        persist_locked(&self.inner, &mut persistent)?;
         for (operation_id, capability) in recovery_reads_interrupted {
             crate::v2_observability::operation_completed(
                 capability,
@@ -3832,6 +3869,9 @@ impl HubHandle {
         &self,
         request: RemoteHandoffRequestKind,
     ) -> Result<RemoteHandoffResponseKind, HubCommandError> {
+        if self.inner.writer_fenced.load(Ordering::Acquire) {
+            return Err(HubCommandError::Busy);
+        }
         if request.requires_agent_idle() {
             let persistent = self.inner.persistent.lock().await;
             if request.starts_human_control()
@@ -3883,7 +3923,9 @@ impl HubHandle {
         metadata: OperationAdmissionMetadata,
         session_fence: CommandSessionFence,
     ) -> Result<HubPendingCommand, HubCommandError> {
-        if self.inner.draining.load(Ordering::Acquire) {
+        if self.inner.draining.load(Ordering::Acquire)
+            || self.inner.writer_fenced.load(Ordering::Acquire)
+        {
             return Err(HubCommandError::Busy);
         }
         if operation_id.is_empty() {
@@ -4206,7 +4248,7 @@ impl HubHandle {
                 unix_time_ms().map_err(|_| HubCommandError::Rejected)?,
             )
             .map_err(command_error_from_execution)?;
-        if persist_locked(&self.inner, &persistent).is_err() {
+        if persist_locked(&self.inner, &mut persistent).is_err() {
             persistent.execution = AuthoritativeOperationController::restore_after_restart(
                 self.inner.config.admission_limits(),
                 rollback,
@@ -4355,31 +4397,81 @@ fn emit_quarantine_created_alert(
     );
 }
 
-fn persist_locked(
+fn committed_state_bytes(state: &HubPersistentState) -> usize {
+    serde_json::to_vec(state)
+        .map(|payload| payload.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn commit_hub_state(
     inner: &HubInner,
-    persistent: &PersistentHubState,
-) -> Result<(), HubServiceError> {
-    let state = HubPersistentState::capture(&persistent.registry, &persistent.execution);
-    let checkpoint_bytes = match inner.checkpoint.save_with_size(&state) {
-        Ok((_, checkpoint_bytes)) => checkpoint_bytes,
+    lease: HubWriterLease,
+    state: &HubPersistentState,
+) -> Result<crate::v2_hub_state_store::DurableHubState, HubServiceError> {
+    match inner.state_store.compare_and_commit(lease, state) {
+        Ok(committed) => {
+            inner
+                .last_checkpoint_bytes
+                .store(committed_state_bytes(&committed.state), Ordering::Release);
+            Ok(committed)
+        }
         Err(error) => {
+            if error.fences_current_writer() {
+                inner.writer_fenced.store(true, Ordering::Release);
+            }
             crate::v2_observability::persistence_failure(
                 crate::v2_observability::PersistenceComponent::Hub,
             );
             tracing::error!(
                 event = "v2_persistence_failure",
                 device_id = %inner.device_id,
-                outcome = "failed",
+                writer_epoch = lease.epoch.0,
+                expected_revision = lease.revision.0,
+                outcome = "failed_closed",
                 error_code = error.safe_error_code(),
                 component = "hub",
-                "Hub checkpoint persistence failed"
+                "Hub authoritative state commit failed"
             );
-            return Err(HubServiceError::Persistence(error));
+            Err(HubServiceError::StateStore(error))
         }
-    };
-    inner
-        .last_checkpoint_bytes
-        .store(checkpoint_bytes, Ordering::Release);
+    }
+}
+
+fn persist_locked(
+    inner: &HubInner,
+    persistent: &mut PersistentHubState,
+) -> Result<(), HubServiceError> {
+    let state = HubPersistentState::capture(&persistent.registry, &persistent.execution);
+    match commit_hub_state(inner, persistent.writer, &state) {
+        Ok(committed) => {
+            persistent.writer = committed.lease();
+            persistent.committed_registry = persistent.registry.clone();
+            persistent.committed_execution = persistent.execution.clone();
+            Ok(())
+        }
+        Err(error) => {
+            // Never let a mutation exist only in live memory. The caller receives the failure and
+            // the live authority is restored to the last state that this writer durably committed.
+            persistent.registry = persistent.committed_registry.clone();
+            persistent.execution = persistent.committed_execution.clone();
+            Err(error)
+        }
+    }
+}
+
+fn persist_execution_candidate_locked(
+    inner: &HubInner,
+    persistent: &mut PersistentHubState,
+    candidate: AuthoritativeOperationController,
+) -> Result<(), HubServiceError> {
+    let state = HubPersistentState::capture(&persistent.registry, &candidate);
+    let committed = commit_hub_state(inner, persistent.writer, &state)?;
+    // Candidate state is promoted to live authority only after the provider's read-after-commit
+    // verification succeeds.
+    persistent.execution = candidate;
+    persistent.writer = committed.lease();
+    persistent.committed_registry = persistent.registry.clone();
+    persistent.committed_execution = persistent.execution.clone();
     Ok(())
 }
 
@@ -4615,6 +4707,7 @@ impl std::error::Error for HubCommandError {}
 pub enum HubServiceError {
     InvalidConfig(&'static str),
     Persistence(PersistenceError),
+    StateStore(HubStateStoreError),
     OnlineRecovery(RecoveryError),
     StateDirectoryLock(StateDirectoryLockError),
     Control(crate::v2_m0::ControlError),
@@ -4683,6 +4776,7 @@ impl SafeErrorCode for HubServiceError {
         match self {
             Self::InvalidConfig(_) => "invalid_config",
             Self::Persistence(error) => error.safe_error_code(),
+            Self::StateStore(error) => error.safe_error_code(),
             Self::OnlineRecovery(error) => error.safe_code(),
             Self::StateDirectoryLock(StateDirectoryLockError::Busy) => "state_directory_busy",
             Self::StateDirectoryLock(_) => "state_directory_lock_error",
@@ -4738,6 +4832,7 @@ mod tests {
     use crate::v2_m0::GrantAuthority;
     use crate::v2_m0_transport::RemoteHandoffOperatorCommand;
     use crate::v2_m0_trust::build_device_key_rotation;
+    use crate::v2_m1_persistence::CheckpointStore;
 
     #[test]
     fn unsupported_hub_agent_schema_has_bounded_specific_grpc_status() {
@@ -4938,7 +5033,7 @@ mod tests {
                     1,
                 )
                 .unwrap();
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -5164,7 +5259,7 @@ mod tests {
                     1,
                 )
                 .unwrap();
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
         handle
             .install_semantic_constraint_snapshot(8, &digest_b)
@@ -5385,7 +5480,7 @@ mod tests {
                 .execution
                 .mark_dispatched(&operation_id, &owner, 1, 2)
                 .unwrap();
-            persist_locked(&hub.inner, &persistent).unwrap();
+            persist_locked(&hub.inner, &mut persistent).unwrap();
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         let mut pending = HashMap::from([(
@@ -5491,7 +5586,7 @@ mod tests {
                 .execution
                 .mark_connection_lost(&operation_id, 3)
                 .unwrap();
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
 
         assert_eq!(
@@ -5545,7 +5640,7 @@ mod tests {
                     1,
                 )
                 .unwrap();
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
 
         assert_eq!(
@@ -5634,7 +5729,7 @@ mod tests {
                     1,
                 )
                 .unwrap();
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
 
         handle.begin_shutdown_drain();
@@ -5655,7 +5750,7 @@ mod tests {
                 decision,
                 CancellationDecision::CancelledBeforeDispatch { .. }
             ));
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
         tokio::time::timeout(Duration::from_millis(200), handle.wait_for_shutdown_drain())
             .await
@@ -5827,6 +5922,345 @@ mod tests {
         }
     }
 
+    fn hosted_test_config(name: &str) -> HubServiceConfig {
+        HubServiceConfig {
+            state_dir: test_state_dir(name),
+            heartbeat_timeout: Duration::from_secs(5),
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 1,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        }
+    }
+
+    async fn prepare_type_text_for_dispatch(
+        hub: &SingleDeviceHub,
+        handle: &HubHandle,
+        operation_id: &str,
+    ) -> (
+        AgentHello,
+        HubChallenge,
+        OperationOwner,
+        HashMap<String, PendingOperation>,
+    ) {
+        let hello = AgentHello::new(
+            handle.device_id().to_owned(),
+            CapabilityAdvertisement {
+                backend: "fixture".into(),
+                backend_version: "1".into(),
+                platform: "test".into(),
+                capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+                revision: 1,
+                supported: vec![DeviceCapability::TypeText],
+            },
+        );
+        let challenge = hub.inner.material.hub_identity.challenge(&hello).unwrap();
+        let owner = OperationOwner::local_hub();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.to_owned(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::TypeText,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
+        }
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let pending = HashMap::from([(
+            operation_id.to_owned(),
+            PendingOperation {
+                owner: owner.clone(),
+                command: DeviceCommand::TypeText {
+                    text: "bounded".into(),
+                },
+                expected_semantic_constraint_snapshot: None,
+                handoff: None,
+                envelope: None,
+                reply: reply_tx,
+            },
+        )]);
+        (hello, challenge, owner, pending)
+    }
+
+    #[tokio::test]
+    async fn replacement_writer_fences_old_live_dispatch_before_enqueue() {
+        use crate::v2_hub_state_store::MemoryHubStateStore;
+
+        let store = Arc::new(MemoryHubStateStore::default());
+        let device = DeviceIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+        let (hub_a, handle_a) = SingleDeviceHub::new_with_state_store(
+            hosted_test_config("writer-a"),
+            material.clone(),
+            store.clone(),
+        )
+        .unwrap();
+        let operation_id = "op-stale-writer-dispatch";
+        let (hello, challenge, _owner, mut pending) =
+            prepare_type_text_for_dispatch(&hub_a, &handle_a, operation_id).await;
+
+        // Replacement acquires a strictly newer epoch while A still retains its
+        // in-memory Agent-facing dispatch path.
+        let (_hub_b, handle_b) = SingleDeviceHub::new_with_state_store(
+            hosted_test_config("writer-b"),
+            material,
+            store.clone(),
+        )
+        .unwrap();
+        {
+            let persistent = handle_b.inner.persistent.lock().await;
+            assert_eq!(
+                persistent.execution.state(operation_id),
+                Some(HubOperationState::Cancelled)
+            );
+            let receipt = persistent.execution.receipt(operation_id).unwrap();
+            assert_eq!(receipt.evidence, ExecutionEvidence::CancelledBeforeDispatch);
+        }
+
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        let result = hub_a
+            .dispatch_operation(
+                &outbound,
+                &hello,
+                &challenge,
+                1,
+                1,
+                &TrustedSessionClock::new(10),
+                operation_id,
+                &mut pending,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(HubServiceError::StateStore(HubStateStoreError::StaleWriter))
+                | Err(HubServiceError::StateStore(
+                    HubStateStoreError::RevisionConflict
+                ))
+        ));
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(hub_a.inner.writer_fenced.load(Ordering::Acquire));
+        let persistent = handle_a.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(operation_id),
+            Some(HubOperationState::ActiveNotDispatched)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_durable_provider_prevents_dispatch_and_rolls_back_live_state() {
+        use crate::v2_hub_state_store::MemoryHubStateStore;
+
+        let store = Arc::new(MemoryHubStateStore::default());
+        let device = DeviceIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+        let (hub, handle) = SingleDeviceHub::new_with_state_store(
+            hosted_test_config("provider-unavailable"),
+            material,
+            store.clone(),
+        )
+        .unwrap();
+        let operation_id = "op-provider-unavailable";
+        let (hello, challenge, _owner, mut pending) =
+            prepare_type_text_for_dispatch(&hub, &handle, operation_id).await;
+        store.fail_next_commit();
+
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        assert!(matches!(
+            hub.dispatch_operation(
+                &outbound,
+                &hello,
+                &challenge,
+                1,
+                1,
+                &TrustedSessionClock::new(10),
+                operation_id,
+                &mut pending,
+            )
+            .await,
+            Err(HubServiceError::StateStore(HubStateStoreError::Unavailable))
+        ));
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let persistent = handle.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(operation_id),
+            Some(HubOperationState::ActiveNotDispatched)
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_after_durable_dispatch_restores_indeterminate_quarantine() {
+        use crate::v2_hub_state_store::MemoryHubStateStore;
+
+        let store = Arc::new(MemoryHubStateStore::default());
+        let device = DeviceIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+        let (hub_a, handle_a) = SingleDeviceHub::new_with_state_store(
+            hosted_test_config("dispatch-crash-a"),
+            material.clone(),
+            store.clone(),
+        )
+        .unwrap();
+        let operation_id = "op-dispatch-crash-replacement";
+        let (hello, challenge, _owner, mut pending) =
+            prepare_type_text_for_dispatch(&hub_a, &handle_a, operation_id).await;
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        assert!(matches!(
+            hub_a
+                .dispatch_operation(
+                    &outbound,
+                    &hello,
+                    &challenge,
+                    1,
+                    1,
+                    &TrustedSessionClock::new(10),
+                    operation_id,
+                    &mut pending,
+                )
+                .await
+                .unwrap(),
+            DispatchOutcome::Sent
+        ));
+        assert!(outbound_rx.recv().await.is_some());
+
+        // Simulate process loss after the durable dispatch commit and outbound
+        // acceptance but before any terminal proof is recorded.
+        drop(pending);
+        drop(outbound);
+        drop(outbound_rx);
+        drop(handle_a);
+        drop(hub_a);
+
+        let (_hub_b, handle_b) = SingleDeviceHub::new_with_state_store(
+            hosted_test_config("dispatch-crash-b"),
+            material,
+            store,
+        )
+        .unwrap();
+        let quarantine = handle_b.desktop_quarantine().await.unwrap();
+        assert_eq!(quarantine.operation_id, operation_id);
+        assert_eq!(
+            quarantine.reason,
+            IndeterminateReason::HubRestartAfterDispatch
+        );
+        let persistent = handle_b.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_writer_cannot_clear_quarantine_after_replacement() {
+        use crate::v2_hub_state_store::MemoryHubStateStore;
+
+        let store = Arc::new(MemoryHubStateStore::default());
+        let device = DeviceIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+        let (hub_a, handle_a) = SingleDeviceHub::new_with_state_store(
+            hosted_test_config("stale-recovery-a"),
+            material.clone(),
+            store.clone(),
+        )
+        .unwrap();
+        let operation_id = "op-stale-recovery";
+        let owner = OperationOwner::local_hub();
+        {
+            let mut persistent = handle_a.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: handle_a.device_id().to_owned(),
+                        device_generation: 1,
+                        operation_id: operation_id.to_owned(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::TypeText,
+                    1,
+                )
+                .unwrap();
+            persistent
+                .execution
+                .mark_dispatched(operation_id, &owner, 1, 2)
+                .unwrap();
+            persistent
+                .execution
+                .mark_indeterminate(
+                    operation_id,
+                    &owner,
+                    1,
+                    IndeterminateReason::BackendOutcomeUnproven,
+                    3,
+                )
+                .unwrap();
+            persist_locked(&handle_a.inner, &mut persistent).unwrap();
+        }
+
+        let (_hub_b, handle_b) = SingleDeviceHub::new_with_state_store(
+            hosted_test_config("stale-recovery-b"),
+            material,
+            store,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_a
+                .resolve_indeterminate(
+                    operation_id,
+                    OperationOwner::local_hub(),
+                    IndeterminateResolution::ConfirmedNotExecuted,
+                    "reviewed local recovery evidence",
+                )
+                .await,
+            Err(HubCommandError::Rejected)
+        ));
+        assert!(hub_a.inner.writer_fenced.load(Ordering::Acquire));
+        assert_eq!(
+            handle_a.desktop_quarantine().await.unwrap().operation_id,
+            operation_id
+        );
+        assert_eq!(
+            handle_b.desktop_quarantine().await.unwrap().operation_id,
+            operation_id
+        );
+    }
+
     #[tokio::test]
     async fn closed_outbound_before_enqueue_durably_self_resolves_without_replay() {
         let state_dir = test_state_dir("pre-enqueue-closed-outbound");
@@ -5879,7 +6313,7 @@ mod tests {
                     1,
                 )
                 .unwrap();
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         let mut pending = HashMap::from([(
@@ -6014,7 +6448,7 @@ mod tests {
                     1,
                 )
                 .unwrap();
-            persist_locked(&handle.inner, &persistent).unwrap();
+            persist_locked(&handle.inner, &mut persistent).unwrap();
         }
         let (reply_tx, _reply_rx) = oneshot::channel();
         let mut pending = HashMap::from([(
@@ -6118,10 +6552,19 @@ mod tests {
             .map(|offset| start + offset)
             .unwrap();
         let block = &source[start..end];
-        let durable = block.find("checkpoint.save_with_size(&state)").unwrap();
-        let live_swap = block.find("persistent.execution = candidate").unwrap();
-        assert!(durable < live_swap);
+        assert!(block.contains("persist_execution_candidate_locked("));
         assert!(block.contains("resolve_hub_pre_enqueue_non_delivery"));
+        let helper_start = source
+            .find("fn persist_execution_candidate_locked(")
+            .unwrap();
+        let helper_end = source[helper_start..]
+            .find("fn unexpected_agent_message(")
+            .map(|offset| helper_start + offset)
+            .unwrap();
+        let helper = &source[helper_start..helper_end];
+        let durable = helper.find("commit_hub_state(").unwrap();
+        let live_swap = helper.find("persistent.execution = candidate").unwrap();
+        assert!(durable < live_swap);
         for forbidden in [
             "send_command_hub(",
             "send_hub(",
@@ -6140,10 +6583,45 @@ mod tests {
             .map(|offset| dispatch_start + offset)
             .unwrap();
         let dispatch = &source[dispatch_start..dispatch_end];
-        let committed = dispatch.find("mark_dispatched_with_binding(").unwrap();
+        let marked = dispatch.find("mark_dispatched_with_binding(").unwrap();
+        let persisted = dispatch.find("persist_locked(&self.inner").unwrap();
         let send = dispatch.find("send_command_hub(").unwrap();
-        assert!(committed < send);
+        assert!(marked < persisted);
+        assert!(persisted < send);
         assert_eq!(dispatch.matches("send_command_hub(").count(), 1);
+    }
+
+    #[test]
+    fn handoff_authority_change_is_writer_fenced_immediately_before_agent_enqueue() {
+        let source = include_str!("v2_m1_hub.rs");
+        let start = source
+            .find("HubRequest::Handoff { request_id, request, reply }")
+            .unwrap();
+        let end = source[start..]
+            .find("HubRequest::Cancel {")
+            .map(|offset| start + offset)
+            .unwrap();
+        let block = &source[start..end];
+        let fence = block
+            .find("fence_handoff_authority_change().await?")
+            .unwrap();
+        let waiter = block.find("handoff_waiters.insert").unwrap();
+        let send = block
+            .find("send_hub(&outbound, HubToAgent::HandoffRequest(remote)).await?")
+            .unwrap();
+        assert!(fence < waiter);
+        assert!(waiter < send);
+
+        let helper_start = source
+            .find("async fn fence_handoff_authority_change(&self)")
+            .unwrap();
+        let helper_end = source[helper_start..]
+            .find("#[allow(clippy::too_many_arguments)]")
+            .map(|offset| helper_start + offset)
+            .unwrap();
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("writer_fenced.load(Ordering::Acquire)"));
+        assert!(helper.contains("persist_locked(&self.inner, &mut persistent)"));
     }
 
     #[test]
@@ -6157,8 +6635,17 @@ mod tests {
             .map(|offset| start + offset)
             .unwrap();
         let block = &source[start..end];
-        let durable = block.find("checkpoint.save_with_size(&state)").unwrap();
-        let live_swap = block.find("persistent.execution = candidate").unwrap();
+        assert!(block.contains("persist_execution_candidate_locked("));
+        let helper_start = source
+            .find("fn persist_execution_candidate_locked(")
+            .unwrap();
+        let helper_end = source[helper_start..]
+            .find("fn unexpected_agent_message(")
+            .map(|offset| helper_start + offset)
+            .unwrap();
+        let helper = &source[helper_start..helper_end];
+        let durable = helper.find("commit_hub_state(").unwrap();
+        let live_swap = helper.find("persistent.execution = candidate").unwrap();
         assert!(durable < live_swap);
         for forbidden in [
             "dispatch_operation(",

@@ -62,6 +62,8 @@ Agent state:
 
 workflow は committed checkpoint history を file のまま copy し、checkpoint JSON を deserialize / rewrite しません。backup 前と activation 前に latest checkpoint が supported compatibility contract で readable であることを要求します。
 
+Hub M1 schema 7以降では durable writer fence もauthoritative checkpointの一部です。fence schema、monotonic revision、writer epochをbackup/restoreでbyte-for-byte保持し、restoreがそれらを新造・減算・除去したり、新しいauthority生成に再利用したりしてはいけません。current schemaなのにfenceが無いHub checkpointはinvalidです。offline local maintenanceが同じwriter epochのままstate revisionを進められるのは、exclusive state-directory maintenance lockを保持し、local checkpoint CASでcommitし、exact read-backを検証する場合だけです。その後に起動するHub processはservice開始前に必ずstrictly newer writer epochを取得します。
+
 state directory 下に存在しても次は明示的に non-authoritative で、backup から除外します。
 
 - `.cumg-v2-state.lock` と pending checkpoint;

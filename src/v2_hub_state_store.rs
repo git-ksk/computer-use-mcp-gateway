@@ -4,8 +4,11 @@
 //! encoded by `HubPersistentState`; a commit publishes that complete snapshot atomically or fails.
 //! Hosted backends must provide the same compare-and-commit contract.
 
-use crate::v2_m1_persistence::{CheckpointStore, HubPersistentState, PersistenceError};
-use serde::{Deserialize, Serialize};
+use crate::v2_m1_persistence::{
+    CheckpointStore, HUB_M1_STATE_SCHEMA_VERSION, HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+    HubPersistenceFenceSnapshot, HubPersistentState, PersistenceError,
+};
+use crate::v2_observability::SafeErrorCode;
 use std::{
     fmt,
     path::PathBuf,
@@ -14,13 +17,13 @@ use std::{
 
 pub const HUB_DURABLE_RECORD_SCHEMA_VERSION: u16 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubStateRevision(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubWriterEpoch(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableHubState {
     pub store_schema_version: u16,
     pub revision: HubStateRevision,
@@ -29,14 +32,70 @@ pub struct DurableHubState {
 }
 
 impl DurableHubState {
-    fn validate(&self) -> Result<(), HubStateStoreError> {
+    fn committed(
+        revision: HubStateRevision,
+        writer_epoch: HubWriterEpoch,
+        mut state: HubPersistentState,
+    ) -> Result<Self, HubStateStoreError> {
+        if revision.0 == 0 || writer_epoch.0 == 0 {
+            return Err(HubStateStoreError::InvalidState);
+        }
+        state.schema_version = HUB_M1_STATE_SCHEMA_VERSION;
+        state.durable_fence = Some(HubPersistenceFenceSnapshot {
+            schema_version: HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+            revision: revision.0,
+            writer_epoch: writer_epoch.0,
+        });
+        let record = Self {
+            store_schema_version: HUB_DURABLE_RECORD_SCHEMA_VERSION,
+            revision,
+            writer_epoch,
+            state,
+        };
+        record.validate_committed()?;
+        Ok(record)
+    }
+
+    fn legacy(state: HubPersistentState) -> Self {
+        Self {
+            store_schema_version: HUB_DURABLE_RECORD_SCHEMA_VERSION,
+            revision: HubStateRevision(0),
+            writer_epoch: HubWriterEpoch(0),
+            state,
+        }
+    }
+
+    fn validate_committed(&self) -> Result<(), HubStateStoreError> {
         if self.store_schema_version != HUB_DURABLE_RECORD_SCHEMA_VERSION
             || self.revision.0 == 0
             || self.writer_epoch.0 == 0
         {
             return Err(HubStateStoreError::InvalidState);
         }
+        let fence = self
+            .state
+            .durable_fence
+            .ok_or(HubStateStoreError::InvalidState)?;
+        fence.validate()?;
+        if self.state.schema_version != HUB_M1_STATE_SCHEMA_VERSION
+            || fence.schema_version != HUB_PERSISTENCE_FENCE_SCHEMA_VERSION
+            || fence.revision != self.revision.0
+            || fence.writer_epoch != self.writer_epoch.0
+        {
+            return Err(HubStateStoreError::InvalidState);
+        }
         Ok(())
+    }
+
+    pub const fn is_legacy_unfenced(&self) -> bool {
+        self.revision.0 == 0 && self.writer_epoch.0 == 0
+    }
+
+    pub const fn lease(&self) -> HubWriterLease {
+        HubWriterLease {
+            epoch: self.writer_epoch,
+            revision: self.revision,
+        }
     }
 }
 
@@ -47,14 +106,27 @@ pub struct HubWriterLease {
 }
 
 pub trait HubAuthoritativeStateStore: Send + Sync {
+    /// Read the exact latest committed snapshot. Implementations must never silently fall back to an
+    /// older committed snapshot when the latest record is unavailable, corrupt, or ambiguous.
     fn load_current(&self) -> Result<Option<DurableHubState>, HubStateStoreError>;
 
     /// Acquire a strictly newer writer epoch and durably publish it with the unchanged authoritative
-    /// state. The returned revision is the exact revision against which the first mutation commits.
-    fn acquire_writer(&self) -> Result<Option<HubWriterLease>, HubStateStoreError>;
+    /// state. If the store is empty, `initial_state` is published as the first authoritative state.
+    /// The returned record is the durable read-after-commit result and its revision is the exact
+    /// revision against which the first mutation commits.
+    fn acquire_writer(
+        &self,
+        initial_state: &HubPersistentState,
+    ) -> Result<DurableHubState, HubStateStoreError>;
 
     /// Atomically publish a complete new state iff both revision and writer epoch still match.
     /// Implementations must verify the committed record with a durable read before returning success.
+    ///
+    /// Error classification is part of the safety contract:
+    /// - `Unavailable` means the provider can prove that no candidate became authoritative;
+    /// - revision/epoch conflicts mean another writer won and the current writer is stale;
+    /// - any commit whose publication may have happened but cannot be durably verified must return
+    ///   `ReadAfterCommitMismatch`, never `Unavailable`.
     fn compare_and_commit(
         &self,
         lease: HubWriterLease,
@@ -65,6 +137,7 @@ pub trait HubAuthoritativeStateStore: Send + Sync {
 #[derive(Debug)]
 pub enum HubStateStoreError {
     Persistence(PersistenceError),
+    Unavailable,
     RevisionConflict,
     StaleWriter,
     RevisionOverflow,
@@ -73,19 +146,35 @@ pub enum HubStateStoreError {
     ReadAfterCommitMismatch,
 }
 
+impl HubStateStoreError {
+    pub const fn fences_current_writer(&self) -> bool {
+        matches!(
+            self,
+            Self::RevisionConflict
+                | Self::StaleWriter
+                | Self::RevisionOverflow
+                | Self::InvalidState
+                | Self::ReadAfterCommitMismatch
+        )
+    }
+
+    pub fn safe_error_code(&self) -> &'static str {
+        match self {
+            Self::Persistence(error) => error.safe_error_code(),
+            Self::Unavailable => "hub_state_store_unavailable",
+            Self::RevisionConflict => "hub_state_store_revision_conflict",
+            Self::StaleWriter => "hub_state_store_stale_writer",
+            Self::RevisionOverflow => "hub_state_store_revision_overflow",
+            Self::EpochOverflow => "hub_state_store_epoch_overflow",
+            Self::InvalidState => "hub_state_store_invalid_state",
+            Self::ReadAfterCommitMismatch => "hub_state_store_read_after_commit_mismatch",
+        }
+    }
+}
+
 impl fmt::Display for HubStateStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Persistence(error) => write!(f, "hub_state_store_persistence:{error:?}"),
-            Self::RevisionConflict => f.write_str("hub_state_store_revision_conflict"),
-            Self::StaleWriter => f.write_str("hub_state_store_stale_writer"),
-            Self::RevisionOverflow => f.write_str("hub_state_store_revision_overflow"),
-            Self::EpochOverflow => f.write_str("hub_state_store_epoch_overflow"),
-            Self::InvalidState => f.write_str("hub_state_store_invalid_state"),
-            Self::ReadAfterCommitMismatch => {
-                f.write_str("hub_state_store_read_after_commit_mismatch")
-            }
-        }
+        f.write_str(self.safe_error_code())
     }
 }
 
@@ -100,82 +189,137 @@ impl From<PersistenceError> for HubStateStoreError {
 #[derive(Clone)]
 pub struct LocalCheckpointHubStateStore {
     checkpoint: CheckpointStore,
+    gate: Arc<Mutex<()>>,
 }
 
 impl LocalCheckpointHubStateStore {
     pub fn new(directory: impl Into<PathBuf>) -> Result<Self, HubStateStoreError> {
         Ok(Self {
             checkpoint: CheckpointStore::new(directory, "hub")?,
+            gate: Arc::new(Mutex::new(())),
         })
     }
 
-    fn load_compat(&self) -> Result<Option<DurableHubState>, HubStateStoreError> {
-        let value = match self.checkpoint.load_latest::<serde_json::Value>() {
+    fn load_compat_with_sequence_unlocked(
+        &self,
+    ) -> Result<Option<(u64, DurableHubState)>, HubStateStoreError> {
+        let (sequence, state) = match self
+            .checkpoint
+            .load_latest_with_sequence::<HubPersistentState>()
+        {
             Ok(value) => value,
             Err(PersistenceError::NoCheckpoint) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if let Ok(record) = serde_json::from_value::<DurableHubState>(value.clone()) {
-            record.validate()?;
-            return Ok(Some(record));
-        }
-        let legacy = serde_json::from_value::<HubPersistentState>(value)
-            .map_err(|_| HubStateStoreError::InvalidState)?;
-        // Legacy checkpoints have no writer authority. They are migration input only; acquiring a
-        // writer publishes the first fenced record before any later mutation can dispatch.
-        Ok(Some(DurableHubState {
+        let Some(fence) = state.durable_fence else {
+            if state.schema_version == HUB_M1_STATE_SCHEMA_VERSION {
+                // Current Hub state is never authoritative without its fencing
+                // metadata. Treating a stripped current record as legacy would
+                // reset writer authority on the next acquisition.
+                return Err(HubStateStoreError::InvalidState);
+            }
+            return Ok(Some((sequence, DurableHubState::legacy(state))));
+        };
+        fence.validate()?;
+        let record = DurableHubState {
             store_schema_version: HUB_DURABLE_RECORD_SCHEMA_VERSION,
-            revision: HubStateRevision(0),
-            writer_epoch: HubWriterEpoch(0),
-            state: legacy,
-        }))
+            revision: HubStateRevision(fence.revision),
+            writer_epoch: HubWriterEpoch(fence.writer_epoch),
+            state,
+        };
+        record.validate_committed()?;
+        Ok(Some((sequence, record)))
     }
 
-    fn save_and_verify(
+    fn load_compat_unlocked(&self) -> Result<Option<DurableHubState>, HubStateStoreError> {
+        Ok(self
+            .load_compat_with_sequence_unlocked()?
+            .map(|(_, record)| record))
+    }
+
+    fn save_and_verify_unlocked(
         &self,
+        expected_sequence: Option<u64>,
         record: &DurableHubState,
     ) -> Result<DurableHubState, HubStateStoreError> {
-        record.validate()?;
-        self.checkpoint.save(record)?;
-        let verified = self
-            .load_compat()?
+        record.validate_committed()?;
+        self.checkpoint
+            .save_if_latest_sequence_with_size(expected_sequence, &record.state)
+            .map_err(|error| match error {
+                PersistenceError::PublicationUncertain => {
+                    HubStateStoreError::ReadAfterCommitMismatch
+                }
+                other => HubStateStoreError::Persistence(other),
+            })?;
+        let (verified_sequence, verified) = self
+            .load_compat_with_sequence_unlocked()?
             .ok_or(HubStateStoreError::ReadAfterCommitMismatch)?;
-        if verified != *record {
+        if verified_sequence != expected_sequence.unwrap_or(0).saturating_add(1)
+            || verified != *record
+        {
             return Err(HubStateStoreError::ReadAfterCommitMismatch);
         }
         Ok(verified)
+    }
+
+    fn classify_conditional_conflict(
+        &self,
+        lease: HubWriterLease,
+    ) -> Result<HubStateStoreError, HubStateStoreError> {
+        let current = self
+            .load_compat_unlocked()?
+            .ok_or(HubStateStoreError::RevisionConflict)?;
+        Ok(if current.writer_epoch != lease.epoch {
+            HubStateStoreError::StaleWriter
+        } else {
+            HubStateStoreError::RevisionConflict
+        })
     }
 }
 
 impl HubAuthoritativeStateStore for LocalCheckpointHubStateStore {
     fn load_current(&self) -> Result<Option<DurableHubState>, HubStateStoreError> {
-        self.load_compat()
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| HubStateStoreError::InvalidState)?;
+        self.load_compat_unlocked()
     }
 
-    fn acquire_writer(&self) -> Result<Option<HubWriterLease>, HubStateStoreError> {
-        let Some(current) = self.load_compat()? else {
-            return Ok(None);
+    fn acquire_writer(
+        &self,
+        initial_state: &HubPersistentState,
+    ) -> Result<DurableHubState, HubStateStoreError> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| HubStateStoreError::InvalidState)?;
+        let current = self.load_compat_with_sequence_unlocked()?;
+        let (expected_sequence, revision, epoch, state) = match current {
+            Some((sequence, current)) => (
+                Some(sequence),
+                current
+                    .revision
+                    .0
+                    .checked_add(1)
+                    .ok_or(HubStateStoreError::RevisionOverflow)?,
+                current
+                    .writer_epoch
+                    .0
+                    .checked_add(1)
+                    .ok_or(HubStateStoreError::EpochOverflow)?,
+                current.state,
+            ),
+            None => (None, 1, 1, initial_state.clone()),
         };
-        let revision = current
-            .revision
-            .0
-            .checked_add(1)
-            .ok_or(HubStateStoreError::RevisionOverflow)?;
-        let epoch = current
-            .writer_epoch
-            .0
-            .checked_add(1)
-            .ok_or(HubStateStoreError::EpochOverflow)?;
-        let committed = self.save_and_verify(&DurableHubState {
-            store_schema_version: HUB_DURABLE_RECORD_SCHEMA_VERSION,
-            revision: HubStateRevision(revision),
-            writer_epoch: HubWriterEpoch(epoch),
-            state: current.state,
-        })?;
-        Ok(Some(HubWriterLease {
-            epoch: committed.writer_epoch,
-            revision: committed.revision,
-        }))
+        let record =
+            DurableHubState::committed(HubStateRevision(revision), HubWriterEpoch(epoch), state)?;
+        match self.save_and_verify_unlocked(expected_sequence, &record) {
+            Err(HubStateStoreError::Persistence(PersistenceError::ConditionalConflict)) => {
+                Err(HubStateStoreError::RevisionConflict)
+            }
+            result => result,
+        }
     }
 
     fn compare_and_commit(
@@ -183,8 +327,12 @@ impl HubAuthoritativeStateStore for LocalCheckpointHubStateStore {
         lease: HubWriterLease,
         state: &HubPersistentState,
     ) -> Result<DurableHubState, HubStateStoreError> {
-        let current = self
-            .load_compat()?
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| HubStateStoreError::InvalidState)?;
+        let (sequence, current) = self
+            .load_compat_with_sequence_unlocked()?
             .ok_or(HubStateStoreError::RevisionConflict)?;
         if current.writer_epoch != lease.epoch {
             return Err(HubStateStoreError::StaleWriter);
@@ -197,30 +345,46 @@ impl HubAuthoritativeStateStore for LocalCheckpointHubStateStore {
             .0
             .checked_add(1)
             .ok_or(HubStateStoreError::RevisionOverflow)?;
-        self.save_and_verify(&DurableHubState {
-            store_schema_version: HUB_DURABLE_RECORD_SCHEMA_VERSION,
-            revision: HubStateRevision(revision),
-            writer_epoch: lease.epoch,
-            state: state.clone(),
-        })
+        let record =
+            DurableHubState::committed(HubStateRevision(revision), lease.epoch, state.clone())?;
+        match self.save_and_verify_unlocked(Some(sequence), &record) {
+            Err(HubStateStoreError::Persistence(PersistenceError::ConditionalConflict)) => {
+                Err(self.classify_conditional_conflict(lease)?)
+            }
+            result => result,
+        }
     }
+}
+
+#[derive(Default)]
+struct MemoryHubStateStoreInner {
+    current: Option<DurableHubState>,
+    fail_next_commit: bool,
 }
 
 #[derive(Clone, Default)]
 pub struct MemoryHubStateStore {
-    inner: Arc<Mutex<Option<DurableHubState>>>,
+    inner: Arc<Mutex<MemoryHubStateStoreInner>>,
 }
 
 impl MemoryHubStateStore {
     pub fn seeded(state: HubPersistentState) -> Self {
+        let current = DurableHubState::committed(HubStateRevision(1), HubWriterEpoch(1), state)
+            .expect("seed state must be valid");
         Self {
-            inner: Arc::new(Mutex::new(Some(DurableHubState {
-                store_schema_version: HUB_DURABLE_RECORD_SCHEMA_VERSION,
-                revision: HubStateRevision(1),
-                writer_epoch: HubWriterEpoch(1),
-                state,
-            }))),
+            inner: Arc::new(Mutex::new(MemoryHubStateStoreInner {
+                current: Some(current),
+                fail_next_commit: false,
+            })),
         }
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_commit(&self) {
+        self.inner
+            .lock()
+            .expect("memory Hub state store lock")
+            .fail_next_commit = true;
     }
 }
 
@@ -230,35 +394,38 @@ impl HubAuthoritativeStateStore for MemoryHubStateStore {
             .inner
             .lock()
             .map_err(|_| HubStateStoreError::InvalidState)?
+            .current
             .clone())
     }
 
-    fn acquire_writer(&self) -> Result<Option<HubWriterLease>, HubStateStoreError> {
+    fn acquire_writer(
+        &self,
+        initial_state: &HubPersistentState,
+    ) -> Result<DurableHubState, HubStateStoreError> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| HubStateStoreError::InvalidState)?;
-        let Some(current) = guard.as_mut() else {
-            return Ok(None);
+        let (revision, epoch, state) = match guard.current.as_ref() {
+            Some(current) => (
+                current
+                    .revision
+                    .0
+                    .checked_add(1)
+                    .ok_or(HubStateStoreError::RevisionOverflow)?,
+                current
+                    .writer_epoch
+                    .0
+                    .checked_add(1)
+                    .ok_or(HubStateStoreError::EpochOverflow)?,
+                current.state.clone(),
+            ),
+            None => (1, 1, initial_state.clone()),
         };
-        current.revision = HubStateRevision(
-            current
-                .revision
-                .0
-                .checked_add(1)
-                .ok_or(HubStateStoreError::RevisionOverflow)?,
-        );
-        current.writer_epoch = HubWriterEpoch(
-            current
-                .writer_epoch
-                .0
-                .checked_add(1)
-                .ok_or(HubStateStoreError::EpochOverflow)?,
-        );
-        Ok(Some(HubWriterLease {
-            epoch: current.writer_epoch,
-            revision: current.revision,
-        }))
+        let committed =
+            DurableHubState::committed(HubStateRevision(revision), HubWriterEpoch(epoch), state)?;
+        guard.current = Some(committed.clone());
+        Ok(committed)
     }
 
     fn compare_and_commit(
@@ -270,22 +437,29 @@ impl HubAuthoritativeStateStore for MemoryHubStateStore {
             .inner
             .lock()
             .map_err(|_| HubStateStoreError::InvalidState)?;
-        let current = guard.as_mut().ok_or(HubStateStoreError::RevisionConflict)?;
+        let current = guard
+            .current
+            .as_ref()
+            .ok_or(HubStateStoreError::RevisionConflict)?;
         if current.writer_epoch != lease.epoch {
             return Err(HubStateStoreError::StaleWriter);
         }
         if current.revision != lease.revision {
             return Err(HubStateStoreError::RevisionConflict);
         }
-        current.revision = HubStateRevision(
-            current
-                .revision
-                .0
-                .checked_add(1)
-                .ok_or(HubStateStoreError::RevisionOverflow)?,
-        );
-        current.state = state.clone();
-        Ok(current.clone())
+        if guard.fail_next_commit {
+            guard.fail_next_commit = false;
+            return Err(HubStateStoreError::Unavailable);
+        }
+        let revision = current
+            .revision
+            .0
+            .checked_add(1)
+            .ok_or(HubStateStoreError::RevisionOverflow)?;
+        let committed =
+            DurableHubState::committed(HubStateRevision(revision), lease.epoch, state.clone())?;
+        guard.current = Some(committed.clone());
+        Ok(committed)
     }
 }
 
@@ -296,7 +470,9 @@ mod tests {
         v2_execution_safety::AuthoritativeOperationController,
         v2_m0::{DeviceIdentity, DeviceRegistry},
         v2_m0_execution::AdmissionLimits,
+        v2_m1_persistence::M1_STATE_SCHEMA_VERSION,
     };
+    use std::thread;
 
     fn state() -> HubPersistentState {
         let identity = DeviceIdentity::generate();
@@ -310,67 +486,177 @@ mod tests {
         HubPersistentState::capture(&registry, &execution)
     }
 
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cumg-hub-store-{name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
+    }
+
     fn conformance(store: &dyn HubAuthoritativeStateStore) {
-        let first = store.load_current().unwrap().unwrap();
-        let lease = store.acquire_writer().unwrap().unwrap();
-        assert!(lease.epoch.0 > first.writer_epoch.0);
-        assert!(lease.revision.0 > first.revision.0);
+        let initial = state();
+        let first = store.acquire_writer(&initial).unwrap();
+        assert!(first.revision.0 > 0);
+        assert!(first.writer_epoch.0 > 0);
 
-        let current = store.load_current().unwrap().unwrap();
-        assert_eq!(current.writer_epoch, lease.epoch);
-        assert_eq!(current.revision, lease.revision);
-
-        let committed = store.compare_and_commit(lease, &current.state).unwrap();
-        assert_eq!(committed.writer_epoch, lease.epoch);
-        assert_eq!(committed.revision.0, lease.revision.0 + 1);
+        let second = store
+            .compare_and_commit(first.lease(), &first.state)
+            .unwrap();
+        assert_eq!(second.writer_epoch, first.writer_epoch);
+        assert_eq!(second.revision.0, first.revision.0 + 1);
 
         assert!(matches!(
-            store.compare_and_commit(lease, &committed.state),
+            store.compare_and_commit(first.lease(), &second.state),
             Err(HubStateStoreError::RevisionConflict)
+        ));
+
+        let replacement = store.acquire_writer(&initial).unwrap();
+        assert!(replacement.writer_epoch.0 > first.writer_epoch.0);
+        assert!(replacement.revision.0 > second.revision.0);
+        assert!(matches!(
+            store.compare_and_commit(second.lease(), &replacement.state),
+            Err(HubStateStoreError::StaleWriter)
         ));
     }
 
     #[test]
     fn memory_backend_conforms_to_revision_cas_and_writer_epoch_contract() {
-        let store = MemoryHubStateStore::seeded(state());
-        conformance(&store);
+        conformance(&MemoryHubStateStore::default());
     }
 
     #[test]
-    fn second_writer_fences_first_writer_before_commit() {
-        let store = MemoryHubStateStore::seeded(state());
-        let first = store.acquire_writer().unwrap().unwrap();
-        let second = store.acquire_writer().unwrap().unwrap();
-        assert!(second.epoch.0 > first.epoch.0);
-        let state = store.load_current().unwrap().unwrap().state;
+    fn conditional_write_race_has_exactly_one_winner() {
+        let store = MemoryHubStateStore::default();
+        let current = store.acquire_writer(&state()).unwrap();
+        let left = store.clone();
+        let right = store.clone();
+        let lease = current.lease();
+        let candidate = current.state.clone();
+        let left_candidate = candidate.clone();
+        let a = thread::spawn(move || left.compare_and_commit(lease, &left_candidate));
+        let b = thread::spawn(move || right.compare_and_commit(lease, &candidate));
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(HubStateStoreError::RevisionConflict)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unavailable_commit_does_not_publish_candidate() {
+        let store = MemoryHubStateStore::default();
+        let current = store.acquire_writer(&state()).unwrap();
+        let before = store.load_current().unwrap().unwrap();
+        store.fail_next_commit();
         assert!(matches!(
-            store.compare_and_commit(first, &state),
-            Err(HubStateStoreError::StaleWriter)
+            store.compare_and_commit(current.lease(), &current.state),
+            Err(HubStateStoreError::Unavailable)
         ));
-        assert!(store.compare_and_commit(second, &state).is_ok());
+        assert_eq!(store.load_current().unwrap().unwrap(), before);
     }
 
     #[test]
-    fn local_backend_migrates_legacy_checkpoint_before_first_mutation() {
-        let root = std::env::temp_dir().join(format!("cumg-hub-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn local_backend_conforms_to_revision_cas_and_writer_epoch_contract() {
+        let root = temp_root("conformance");
+        let store = LocalCheckpointHubStateStore::new(root.clone()).unwrap();
+        conformance(&store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn current_schema_without_fence_is_rejected_instead_of_reinterpreted_as_legacy() {
+        let root = temp_root("missing-fence");
         let checkpoint = CheckpointStore::new(root.clone(), "hub").unwrap();
         checkpoint.save(&state()).unwrap();
+        let store = LocalCheckpointHubStateStore::new(root.clone()).unwrap();
+        assert!(matches!(
+            store.load_current(),
+            Err(HubStateStoreError::InvalidState)
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_backend_migrates_legacy_checkpoint_and_keeps_old_reader_shape() {
+        let root = temp_root("legacy");
+        let checkpoint = CheckpointStore::new(root.clone(), "hub").unwrap();
+        let mut legacy = state();
+        legacy.schema_version = M1_STATE_SCHEMA_VERSION;
+        legacy.durable_fence = None;
+        let legacy_path = checkpoint.save(&legacy).unwrap();
+        let legacy_bytes = std::fs::read(&legacy_path).unwrap();
 
         let store = LocalCheckpointHubStateStore::new(root.clone()).unwrap();
-        let legacy = store.load_current().unwrap().unwrap();
-        assert_eq!(legacy.revision, HubStateRevision(0));
-        assert_eq!(legacy.writer_epoch, HubWriterEpoch(0));
-        let lease = store.acquire_writer().unwrap().unwrap();
-        assert_eq!(lease.revision, HubStateRevision(1));
-        assert_eq!(lease.epoch, HubWriterEpoch(1));
-        let migrated = store.load_current().unwrap().unwrap();
-        assert_eq!(migrated.revision, HubStateRevision(1));
-        assert_eq!(migrated.writer_epoch, HubWriterEpoch(1));
+        let loaded = store.load_current().unwrap().unwrap();
+        assert!(loaded.is_legacy_unfenced());
+        let acquired = store.acquire_writer(&legacy).unwrap();
+        assert_eq!(acquired.revision, HubStateRevision(1));
+        assert_eq!(acquired.writer_epoch, HubWriterEpoch(1));
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+
+        let direct: HubPersistentState = checkpoint.load_latest().unwrap();
+        assert_eq!(direct.schema_version, HUB_M1_STATE_SCHEMA_VERSION);
         assert_eq!(
-            migrated.store_schema_version,
-            HUB_DURABLE_RECORD_SCHEMA_VERSION
+            direct.durable_fence,
+            Some(HubPersistenceFenceSnapshot {
+                schema_version: HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+                revision: 1,
+                writer_epoch: 1,
+            })
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_backend_cross_instance_compare_and_commit_race_has_one_winner() {
+        let root = temp_root("local-race");
+        let left = LocalCheckpointHubStateStore::new(root.clone()).unwrap();
+        let right = LocalCheckpointHubStateStore::new(root.clone()).unwrap();
+        let current = left.acquire_writer(&state()).unwrap();
+        let lease = current.lease();
+        let left_candidate = current.state.clone();
+        let right_candidate = current.state.clone();
+        let a = thread::spawn(move || left.compare_and_commit(lease, &left_candidate));
+        let b = thread::spawn(move || right.compare_and_commit(lease, &right_candidate));
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(HubStateStoreError::RevisionConflict)))
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_backend_does_not_fall_back_from_malformed_latest_commit() {
+        let root = temp_root("malformed-latest");
+        let checkpoint = CheckpointStore::new(root.clone(), "hub").unwrap();
+        let store = LocalCheckpointHubStateStore::new(root.clone()).unwrap();
+        store.acquire_writer(&state()).unwrap();
+        checkpoint
+            .save(&serde_json::json!({"malformed_committed_candidate": true}))
+            .unwrap();
+        assert!(matches!(
+            store.load_current(),
+            Err(HubStateStoreError::Persistence(
+                PersistenceError::Serialization(_)
+            ))
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

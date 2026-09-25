@@ -62,6 +62,8 @@ Agent state includes:
 
 The workflow copies the committed checkpoint history as files; it does not deserialize and rewrite checkpoint JSON. The latest checkpoint must be readable under the supported compatibility contract before backup and before activation.
 
+For Hub M1 schema 7 and later, the durable writer fence is part of the authoritative checkpoint: its fence schema, monotonic revision, and writer epoch must survive backup/restore byte-for-byte. Restore must never synthesize, decrement, strip, or reuse that metadata to create new authority. A restored current-schema Hub checkpoint without its fence is invalid. Offline local maintenance may advance the state revision under the same writer epoch only while it holds the exclusive state-directory maintenance lock, commits with the local checkpoint CAS primitive, and verifies the exact read-back; the next Hub process must still acquire a strictly newer writer epoch before serving.
+
 The following are explicitly non-authoritative and excluded even when they exist below a state directory:
 
 - `.cumg-v2-state.lock` and pending checkpoint files;
