@@ -1,6 +1,6 @@
 # V2 Cloud Run Hub support gate
 
-Status: Issue #215 の **design complete / #282 ingress merge済み / #283 durable-state・writer-fence coreはv0.9.0 candidate branchで実装済み / hosted provider・deployment/physical acceptance pending**。
+Status: Issue #215 の **design complete / #282 ingress merge済み / #283 durable-state・writer-fence coreはPR #388でmerge済み / hosted provider・deployment/physical acceptance pending**。
 
 Cloud Run はまだ CUMG Hub の supported deployment ではありません。既存 single-host / VM Hub profile が引き続き supported model です。この文書は、Cloud Run support claim を出す前に必要な architecture と evidence を固定します。
 
