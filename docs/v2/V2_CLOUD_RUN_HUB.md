@@ -131,7 +131,7 @@ The exact tested Cloud Run concurrency value must be recorded in the acceptance 
 
 A supported profile must also document and accept:
 
-- managed secret/key provisioning without secret-value logging;
+- managed secret/key provisioning without secret-value logging, following [`acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.md`](acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.md);
 - coarse health plus alerting for persistence failure, writer-fence loss, Agent disconnect, quarantine, and repeated failed stream rotation;
 - OTLP behavior under instance replacement;
 - durable-state backup/restore and schema migration;
@@ -153,6 +153,7 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 | <=8s hosted drain plus forced-kill fail-closed acceptance | Pending |
 | Concurrent old/new revision fencing test | Deterministic two-writer core green; real hosted revision A/B acceptance pending |
 | Durable quarantine/replay-barrier restore after replacement | Core replacement/restart regression green; hosted backup/restore acceptance pending |
+| Hosted secret/key revision-rollout safety | #353 deterministic rotation composition green; real managed-secret revision A/B + log/OTLP acceptance pending under #284 |
 | Hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
 | Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation/acceptance pending |
 | Physical Agent + real Cua interrupted-effect acceptance | Pending |
