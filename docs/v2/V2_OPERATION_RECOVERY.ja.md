@@ -42,6 +42,18 @@ public state は次のとおりです。
 
 `original_retry_safe` は常に `false` です。mutating command の blind retry ではなく recovery を使います。northbound error が `device_indeterminate` の場合は、bounded な actionable guidance として `execution_may_have_occurred=true`、`blind_replay_safe=false`、`next_action=get_operation_then_reconcile`、`follow_up_effectful_operation=new_operation_id_required` を返します。exact `get_operation` がまだ `indeterminate` の場合は `next_action=reconcile_indeterminate` へ進みます。これらは authoritative operation state から導出し、command text の heuristic 解析は行いません。reconciliation 後に effectful work を続ける場合も fresh operation ID の新規operationとして実行し、quarantine中のold operationをreplayしません。
 
+### Hub-authoritative pre-enqueue non-delivery (v0.8 / #377)
+
+execution-safety schema **v15** は、Hubがeffectful operationをすでにdurable `Dispatched`としてcommitした後でも、exact first outbound attemptが **per-session Hub→Agent queueにencoded commandをacceptされる前** に失敗したことをHub自身が証明できる狭いケースだけをautomatic non-execution proofとして追加します。対象は `encode_hub_frame()` がenqueue前に失敗した場合、またはTokio `mpsc::Sender::send()` がreceiver closedによりunsent frameを返した場合だけです。provider log、Agent evidenceの欠落、timeout、successful enqueue後のtransport/writer failure、silenceは同じ証拠として扱いません。
+
+Hubはproofをexact operation / owner / device generation / capability revision / one-shot dispatch grantへbindし、`hub_encode_failed_before_enqueue` または `hub_outbound_closed_before_enqueue` のpayload-free terminal `Cancelled` receiptとbounded auto-resolution audit recordを作り、candidate checkpointを **live state置換より先に** commitします。checkpoint saveに失敗した場合はterminal proofをmemory上だけでpublishせず、既にdurableな`Dispatched` recordをfail-closedのまま残し、通常のsession cleanup/restart ruleでambiguityを維持します。
+
+northboundはimmediate failureを `confirmed_not_executed`、`execution_may_have_occurred=false` として返し、後から `get_operation` した場合も `state=cancelled` に加えて `resolution=confirmed_not_executed` と同じbounded guidanceを返します。どちらも `retry_safe=false` / `blind_replay_safe=false` を維持します。old operation IDはterminal replay tombstoneのままです。effectがまだ必要なら `next_action=retry_with_new_operation_id_if_still_needed`、`follow_up_effectful_operation=new_operation_id_required` に従いfresh operation identityを使います。outbound queueがframeをacceptした後のfailureはこのpathを使えず、既存 `Indeterminate` / quarantine / reconciliation contractに従います。
+
+historical schema-v14 checkpointは引き続きreadableです。v15 pre-enqueue non-delivery evidenceを含むcheckpointは、そのevidence classを失うv14へのlossy downgradeを拒否します。
+
+operator surfaceもboundedのままです。`inspect-quarantine` はactive quarantineが消えた後もrecent automatic resolutionを併記し、`audit-reconciliation <operation_id>` はAgent stateを参照せずこのsettled proofを `authoritative_hub_protocol` / `no_recovery_required` として表示し、`get_operation` は `resolution=confirmed_not_executed` を返します。incident briefは意図的に未解決quarantine incident専用のままです。
+
 ## Durable result boundary
 
 `execute_process` / `shell` では、Hub が保存するのは recovery に必要な bounded caller-visible terminal result のみです。既存 `ProcessOutput` field または stable `DeviceErrorCode` を保存し、stdout / stderr は既存の streamごと 16 KiB bound と truncation flag を維持します。それ以外の effectful Desktop/Browser capability では、already-authoritative な terminal state / execution receipt と payload-free `effectful_status` marker だけを durable recovery record に保存します。status lookup のために screenshot、typed text、URL、clipboard content、browser/backend result payload、GUI state をコピーしません。
@@ -70,7 +82,7 @@ receipt provenance は意図的に provider-specific です。default の `Compu
 
 receipt は payload-free で、bounded な operation/dispatch/provider provenance、sequence、target binding、terminal outcome/evidence class だけを持ちます。raw argv、typed text、URL、clipboard、credential、screenshot、GUI payload、provider response text、stdout、stderr は保存しません。generic MCP result、`get_operation`、`cumg_status`、log、metric、ordinary telemetry は receipt payload や private recovery target を公開しません。local operator 向け `v2_maint audit-reconciliation` / `incident-brief` は bounded receipt provenance（provider/version/contract schema/sequence/target-match status）を explicit な CUMG-authority label 付きで表示できますが、external diagnostic は `observational_only` のままです。
 
-#290 が変更するのは Agent-local durable state だけです。M1 checkpoint schema **v6** は bounded receipt journal を追加し、historical schema v5 は receipt state を含まない場合に引き続き readable です。receipt を持つ v6 checkpoint は v5 で表現できないため lossy downgrade は fail closed します。authoritative Hub execution-safety schema は **v14** のまま、live signed reconciliation message も既存 `AgentTerminalEvidence` shape を使うため、`CONTROL_SCHEMA_VERSION`、capability-advertisement schema、Hub-Agent wire schema は変更しません。
+#290 が変更するのは Agent-local durable state だけです。M1 checkpoint schema **v6** は bounded receipt journal を追加し、historical schema v5 は receipt state を含まない場合に引き続き readable です。receipt を持つ v6 checkpoint は v5 で表現できないため lossy downgrade は fail closed します。authoritative Hub execution-safety schema は、#377のHub-local pre-enqueue non-delivery evidence追加によりv0.8 developmentでは **v15** です。#290自体が変更するのは引き続きAgent-local durable stateだけで、live signed reconciliation message も既存 `AgentTerminalEvidence` shape を使うため、`CONTROL_SCHEMA_VERSION`、capability-advertisement schema、Hub-Agent wire schema は変更しません。
 
 ## Failure / ambiguity rules
 

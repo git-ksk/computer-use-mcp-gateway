@@ -4,11 +4,11 @@
 //! No network entrypoint is provided.
 
 use crate::v2_execution_safety::{
-    AuthoritativeOperationController, EXECUTION_SAFETY_SCHEMA_VERSION, ExecutionEvidence,
-    ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner, OperationRecoveryTarget,
-    ReconciliationStatus, RequestFingerprintComparison, ResolutionRecord, RetirementAuthority,
-    RetirementCapacity, RetirementDisposition, RetirementPolicy, RetirementRecord,
-    TextInputTargetEvidence, compare_request_fingerprint,
+    AuthoritativeOperationController, AutoResolutionRecord, EXECUTION_SAFETY_SCHEMA_VERSION,
+    ExecutionEvidence, ExecutionReceipt, OperationEvidenceEnvelope, OperationOwner,
+    OperationRecoveryTarget, ReconciliationStatus, RequestFingerprintComparison, ResolutionRecord,
+    RetirementAuthority, RetirementCapacity, RetirementDisposition, RetirementPolicy,
+    RetirementRecord, TextInputTargetEvidence, compare_request_fingerprint,
     current_state_acceptance_policy_for_capability, fingerprint_process_request,
     fingerprint_shell_request, fingerprint_text_input_candidate, retirement_policy_for_capability,
 };
@@ -133,6 +133,10 @@ pub struct QuarantineRecoveryGuidance {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuarantineInspectionReport {
     pub quarantines: Vec<QuarantineInspection>,
+    /// Recently committed automatic settlements are included so an operator can
+    /// distinguish "no active quarantine" from "Hub-authoritative non-delivery"
+    /// without opening a second checkpoint or reading raw payloads.
+    pub auto_resolved: Vec<AutoResolutionInspection>,
     pub recovery_guidance: QuarantineRecoveryGuidance,
 }
 
@@ -196,6 +200,7 @@ pub enum BackendExecutionReceiptStatus {
 pub enum ReconciliationEvidenceAuthority {
     AuthoritativeBackendReceipt,
     AuthoritativeTerminalEvidence,
+    AuthoritativeHubProtocol,
     LegacyNonAuthoritativeMarker,
     ObservationalCorrelationOnly,
     Missing,
@@ -216,6 +221,7 @@ pub enum ReconciliationEvidenceStatus {
 pub enum ReconciliationResolutionReadiness {
     ConfirmedCompletedSupported,
     ConfirmedNotExecutedSupported,
+    AlreadyResolvedConfirmedNotExecuted,
     AuthoritativeTerminalSettlementSupported,
     InsufficientEvidenceKeepQuarantine,
     UnrecoverableEvidenceGap,
@@ -234,6 +240,7 @@ pub enum ReconciliationSupportedDecision {
 pub enum ReconciliationRecommendedAction {
     AuthorizedRecoverySupported,
     AwaitAuthoritativeSelfReconciliation,
+    NoRecoveryRequired,
     KeepQuarantine,
 }
 
@@ -242,6 +249,7 @@ pub enum ReconciliationRecommendedAction {
 pub enum ReconciliationAuditReason {
     AuthoritativeTerminalEvidenceAvailable,
     AuthoritativeBackendReceiptAvailable,
+    AuthoritativeHubNonDeliveryProofAvailable,
     BackendReceiptMismatch,
     BackendReceiptTargetMismatch,
     LegacyAgentTerminalMarkerOnly,
@@ -317,6 +325,21 @@ pub struct RetirementInspection {
 /// Checkpoint publication is append-only/atomic, so this inspection may run while
 /// the Hub owns the state lock. The result intentionally excludes owner identity
 /// and every raw command/browser/GUI/result payload.
+fn auto_resolution_inspection(resolution: &AutoResolutionRecord) -> AutoResolutionInspection {
+    AutoResolutionInspection {
+        operation_id: resolution.operation.operation_id.clone(),
+        device_id: resolution.operation.device_id.clone(),
+        device_generation: resolution.operation.device_generation,
+        capability: crate::v2_observability::capability_name(resolution.capability).to_owned(),
+        terminal_state: hub_operation_state_name(resolution.terminal_state).to_owned(),
+        evidence_class: evidence_name(resolution.evidence).to_owned(),
+        reconciliation_status: "auto_resolved".to_owned(),
+        dispatch_binding_present: true,
+        resolved_at_ms: resolution.resolved_at_ms,
+        replayed: false,
+    }
+}
+
 pub fn inspect_quarantines_read_only(
     state_dir: &Path,
     device_id: Option<&str>,
@@ -457,8 +480,15 @@ pub fn inspect_quarantines_read_only(
             }
         })
         .collect();
+    let auto_resolved = execution
+        .auto_resolutions()
+        .iter()
+        .filter(|resolution| device_id.is_none_or(|id| resolution.operation.device_id == id))
+        .map(auto_resolution_inspection)
+        .collect();
     Ok(QuarantineInspectionReport {
         quarantines: inspections,
+        auto_resolved,
         recovery_guidance: QuarantineRecoveryGuidance {
             confirmed_not_executed:
                 "requires independent evidence that the side effect did not occur".into(),
@@ -492,18 +522,7 @@ pub fn inspect_auto_resolutions_read_only(
         .auto_resolutions()
         .iter()
         .filter(|resolution| device_id.is_none_or(|id| resolution.operation.device_id == id))
-        .map(|resolution| AutoResolutionInspection {
-            operation_id: resolution.operation.operation_id.clone(),
-            device_id: resolution.operation.device_id.clone(),
-            device_generation: resolution.operation.device_generation,
-            capability: crate::v2_observability::capability_name(resolution.capability).to_owned(),
-            terminal_state: hub_operation_state_name(resolution.terminal_state).to_owned(),
-            evidence_class: evidence_name(resolution.evidence).to_owned(),
-            reconciliation_status: "auto_resolved".to_owned(),
-            dispatch_binding_present: true,
-            resolved_at_ms: resolution.resolved_at_ms,
-            replayed: false,
-        })
+        .map(auto_resolution_inspection)
         .collect();
     let retired_indeterminate = execution
         .retirements()
@@ -565,8 +584,61 @@ pub fn audit_reconciliation_read_only(
         .quarantine_inspections()
         .map_err(MaintenanceError::Execution)?
         .into_iter()
-        .find(|inspection| inspection.operation.operation_id == operation_id)
-        .ok_or(MaintenanceError::AuditOperationNotQuarantined)?;
+        .find(|inspection| inspection.operation.operation_id == operation_id);
+
+    if inspection.is_none() {
+        if let Some(resolution) = execution
+            .auto_resolutions()
+            .iter()
+            .find(|resolution| resolution.operation.operation_id == operation_id)
+            .filter(|resolution| {
+                resolution.terminal_state == HubOperationState::Cancelled
+                    && matches!(
+                        resolution.evidence,
+                        ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                            | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+                    )
+            })
+        {
+            return Ok(ReconciliationReadinessAudit {
+                operation_id: resolution.operation.operation_id.clone(),
+                hub_execution_schema_version: hub_state.execution.schema_version,
+                device_id: resolution.operation.device_id.clone(),
+                device_generation: resolution.operation.device_generation,
+                capability: crate::v2_observability::capability_name(resolution.capability)
+                    .to_owned(),
+                dispatch_recorded: true,
+                dispatch_binding_present: true,
+                hub_terminal_evidence: evidence_name(resolution.evidence).to_owned(),
+                hub_reconciliation_status: "auto_resolved".to_owned(),
+                agent_evidence_source: ReconciliationEvidenceSource::Unavailable,
+                agent_device_match: None,
+                agent_replay_generation: None,
+                agent_terminal_marker: AgentTerminalMarkerStatus::Unavailable,
+                agent_terminal_marker_authoritative: false,
+                agent_terminal_evidence: AgentTerminalEvidenceStatus::Unavailable,
+                backend_execution_receipt: BackendExecutionReceiptStatus::Unavailable,
+                backend_receipt_provider: None,
+                backend_receipt_provider_version: None,
+                backend_receipt_contract_schema_version: None,
+                backend_receipt_sequence: None,
+                backend_receipt_target_bound: None,
+                authoritative_terminal_state: Some("cancelled".to_owned()),
+                authoritative_evidence_class: Some(evidence_name(resolution.evidence).to_owned()),
+                evidence_authority: ReconciliationEvidenceAuthority::AuthoritativeHubProtocol,
+                evidence_status: ReconciliationEvidenceStatus::Sufficient,
+                resolution_readiness:
+                    ReconciliationResolutionReadiness::AlreadyResolvedConfirmedNotExecuted,
+                supported_decisions: Vec::new(),
+                manual_audit_required: false,
+                recommended_action: ReconciliationRecommendedAction::NoRecoveryRequired,
+                reasons: vec![ReconciliationAuditReason::AuthoritativeHubNonDeliveryProofAvailable],
+                replay_old_operation: false,
+            });
+        }
+        return Err(MaintenanceError::AuditOperationNotQuarantined);
+    }
+    let inspection = inspection.expect("quarantine presence checked above");
     let hub_record = hub_state
         .execution
         .operations
@@ -1284,6 +1356,8 @@ const fn evidence_name(evidence: ExecutionEvidence) -> &'static str {
         ExecutionEvidence::CancelledBeforeDispatch => "cancelled_before_dispatch",
         ExecutionEvidence::OperatorResolution => "operator_resolution",
         ExecutionEvidence::RecoveryReadInterrupted => "recovery_read_interrupted",
+        ExecutionEvidence::HubEncodeFailedBeforeEnqueue => "hub_encode_failed_before_enqueue",
+        ExecutionEvidence::HubOutboundClosedBeforeEnqueue => "hub_outbound_closed_before_enqueue",
     }
 }
 
@@ -2854,6 +2928,41 @@ mod tests {
                 130,
             )
             .unwrap();
+
+        let pre_enqueue_operation_id = "op_hub_pre_enqueue_history".to_owned();
+        let pre_enqueue_binding =
+            OperationDispatchBinding::new(22, "grant-pre-enqueue-fence-fixture").unwrap();
+        execution
+            .prepare(
+                OperationRef {
+                    device_id: device_id.clone(),
+                    device_generation: 3,
+                    operation_id: pre_enqueue_operation_id.clone(),
+                },
+                OperationOwner::new("https://issuer.example", "alice").unwrap(),
+                DeviceCapability::Shell,
+                140,
+            )
+            .unwrap();
+        execution
+            .mark_dispatched_with_binding(
+                &pre_enqueue_operation_id,
+                &OperationOwner::new("https://issuer.example", "alice").unwrap(),
+                3,
+                Some(pre_enqueue_binding.clone()),
+                150,
+            )
+            .unwrap();
+        execution
+            .resolve_hub_pre_enqueue_non_delivery(
+                &pre_enqueue_operation_id,
+                &OperationOwner::new("https://issuer.example", "alice").unwrap(),
+                3,
+                &pre_enqueue_binding,
+                ExecutionEvidence::HubOutboundClosedBeforeEnqueue,
+                160,
+            )
+            .unwrap();
         CheckpointStore::new(dir.clone(), "hub")
             .unwrap()
             .save(&HubPersistentState::capture(&registry, &execution))
@@ -2861,14 +2970,80 @@ mod tests {
         let checkpoint_count = std::fs::read_dir(&dir).unwrap().count();
 
         let report = inspect_auto_resolutions_read_only(&dir, Some(&device_id)).unwrap();
-        assert_eq!(report.auto_resolved.len(), 1);
-        let entry = &report.auto_resolved[0];
-        assert_eq!(entry.operation_id, operation_id);
+        assert_eq!(report.auto_resolved.len(), 2);
+        let entry = report
+            .auto_resolved
+            .iter()
+            .find(|entry| entry.operation_id == operation_id)
+            .unwrap();
         assert_eq!(entry.reconciliation_status, "auto_resolved");
         assert!(entry.dispatch_binding_present);
         assert!(!entry.replayed);
+        let pre_enqueue = report
+            .auto_resolved
+            .iter()
+            .find(|entry| entry.operation_id == pre_enqueue_operation_id)
+            .unwrap();
+        assert_eq!(pre_enqueue.terminal_state, "cancelled");
+        assert_eq!(
+            pre_enqueue.evidence_class,
+            "hub_outbound_closed_before_enqueue"
+        );
+        assert_eq!(pre_enqueue.reconciliation_status, "auto_resolved");
+        assert!(pre_enqueue.dispatch_binding_present);
+        assert!(!pre_enqueue.replayed);
+
+        let quarantine_view = inspect_quarantines_read_only(&dir, Some(&device_id)).unwrap();
+        assert!(quarantine_view.quarantines.is_empty());
+        assert_eq!(quarantine_view.auto_resolved.len(), 2);
+        let surfaced = quarantine_view
+            .auto_resolved
+            .iter()
+            .find(|entry| entry.operation_id == pre_enqueue_operation_id)
+            .unwrap();
+        assert_eq!(
+            surfaced.evidence_class,
+            "hub_outbound_closed_before_enqueue"
+        );
+        assert!(!surfaced.replayed);
+
+        let audit = audit_reconciliation_read_only(
+            &dir,
+            &dir.join("agent-not-required-for-hub-proof"),
+            &pre_enqueue_operation_id,
+        )
+        .unwrap();
+        assert_eq!(
+            audit.evidence_authority,
+            ReconciliationEvidenceAuthority::AuthoritativeHubProtocol
+        );
+        assert_eq!(
+            audit.resolution_readiness,
+            ReconciliationResolutionReadiness::AlreadyResolvedConfirmedNotExecuted
+        );
+        assert_eq!(
+            audit.recommended_action,
+            ReconciliationRecommendedAction::NoRecoveryRequired
+        );
+        assert_eq!(
+            audit.authoritative_terminal_state.as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(
+            audit.authoritative_evidence_class.as_deref(),
+            Some("hub_outbound_closed_before_enqueue")
+        );
+        assert!(!audit.manual_audit_required);
+        assert!(!audit.replay_old_operation);
+        assert!(
+            audit
+                .reasons
+                .contains(&ReconciliationAuditReason::AuthoritativeHubNonDeliveryProofAvailable)
+        );
+
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(!serialized.contains("grant_private_dispatch_fence"));
+        assert!(!serialized.contains("grant-pre-enqueue-fence-fixture"));
         assert!(!serialized.contains("https://issuer.example"));
         assert!(!serialized.contains("alice"));
         assert!(!serialized.contains("owner"));

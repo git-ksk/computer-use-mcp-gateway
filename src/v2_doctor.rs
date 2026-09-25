@@ -1909,6 +1909,7 @@ mod tests {
     ) -> crate::v2_maintenance::QuarantineInspectionReport {
         crate::v2_maintenance::QuarantineInspectionReport {
             quarantines,
+            auto_resolved: Vec::new(),
             recovery_guidance: crate::v2_maintenance::QuarantineRecoveryGuidance {
                 confirmed_not_executed: "independent evidence".into(),
                 confirmed_effect_applied_uncommitted: "independent evidence".into(),

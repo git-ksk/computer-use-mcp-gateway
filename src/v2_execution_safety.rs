@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 
-pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 14;
+pub const EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 15;
+const RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 14;
 const MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 13;
 const SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 12;
 const REPLAY_TOMBSTONE_EXECUTION_SAFETY_SCHEMA_VERSION: u16 = 11;
@@ -133,6 +134,8 @@ pub enum ExecutionEvidence {
     CancelledBeforeDispatch,
     OperatorResolution,
     RecoveryReadInterrupted,
+    HubEncodeFailedBeforeEnqueue,
+    HubOutboundClosedBeforeEnqueue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,7 +522,11 @@ impl AutoResolutionRecord {
             && !self.operation.operation_id.trim().is_empty()
             && self.operation.operation_id.len() <= MAX_RECONCILIATION_OPERATION_ID_BYTES
             && self.dispatch_binding.validate().is_ok()
-            && authoritative_agent_terminal_pair(self.terminal_state, self.evidence)
+            && (authoritative_agent_terminal_pair(self.terminal_state, self.evidence)
+                || authoritative_hub_pre_enqueue_non_delivery_pair(
+                    self.terminal_state,
+                    self.evidence,
+                ))
     }
 }
 
@@ -540,6 +547,18 @@ fn authoritative_agent_terminal_pair(
             ExecutionEvidence::ProvenProcessTermination
         )
     )
+}
+
+fn authoritative_hub_pre_enqueue_non_delivery_pair(
+    terminal_state: HubOperationState,
+    evidence: ExecutionEvidence,
+) -> bool {
+    terminal_state == HubOperationState::Cancelled
+        && matches!(
+            evidence,
+            ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+        )
 }
 
 pub fn terminal_evidence_for_device_result(
@@ -1787,6 +1806,84 @@ impl AuthoritativeOperationController {
         Ok((next, receipt))
     }
 
+    /// Resolve a command that was durably committed as Dispatched but whose
+    /// exact first Hub outbound attempt was authoritatively proven to fail
+    /// before the per-session channel accepted the encoded frame.
+    ///
+    /// This is not replay authority. The old operation becomes a terminal
+    /// non-executed tombstone and any follow-up effectful attempt requires a new
+    /// operation id.
+    pub(crate) fn resolve_hub_pre_enqueue_non_delivery(
+        &mut self,
+        operation_id: &str,
+        owner: &OperationOwner,
+        device_generation: u64,
+        dispatch_binding: &OperationDispatchBinding,
+        evidence: ExecutionEvidence,
+        now_ms: u64,
+    ) -> Result<(CompletionDecision, ExecutionReceipt), ExecutionError> {
+        if !authoritative_hub_pre_enqueue_non_delivery_pair(HubOperationState::Cancelled, evidence)
+        {
+            return Err(ExecutionError::InvalidOperation);
+        }
+
+        let record = self.checked(operation_id, owner, device_generation)?;
+        if record.execution_lane != OperationExecutionLane::Normal
+            || record.dispatch_binding.as_ref() != Some(dispatch_binding)
+        {
+            return Err(ExecutionError::OwnershipFenceMismatch);
+        }
+
+        if record.state == HubOperationState::Cancelled
+            && record.reconciliation_status == Some(ReconciliationStatus::AutoResolved)
+            && record
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.evidence == evidence)
+        {
+            let receipt = record
+                .receipt
+                .clone()
+                .ok_or(ExecutionError::InvalidTransition)?;
+            return Ok((CompletionDecision::Idle, receipt));
+        }
+
+        if record.state != HubOperationState::Dispatched
+            || record.reconciliation_status.is_some()
+            || self.quarantines.contains_key(&record.operation.device_id)
+        {
+            return Err(ExecutionError::InvalidTransition);
+        }
+
+        let next = self
+            .admission
+            .finalize_terminal(operation_id, HubOperationState::Cancelled)?;
+        let record = self
+            .operations
+            .get_mut(operation_id)
+            .ok_or(ExecutionError::UnknownOperation)?;
+        record.state = HubOperationState::Cancelled;
+        record.indeterminate_reason = None;
+        record.reconciliation_status = Some(ReconciliationStatus::AutoResolved);
+        record.recoverable_result = None;
+        let receipt = Self::receipt_for(record, HubOperationState::Cancelled, evidence, now_ms);
+        record.receipt = Some(receipt.clone());
+        self.auto_resolutions.push(AutoResolutionRecord {
+            operation: record.operation.clone(),
+            capability: record.capability,
+            terminal_state: HubOperationState::Cancelled,
+            evidence,
+            dispatch_binding: dispatch_binding.clone(),
+            resolved_at_ms: now_ms,
+        });
+        if self.auto_resolutions.len() > MAX_AUTO_RESOLUTION_RECORDS {
+            let excess = self.auto_resolutions.len() - MAX_AUTO_RESOLUTION_RECORDS;
+            self.auto_resolutions.drain(..excess);
+        }
+        self.activate_next(&next);
+        Ok((next, receipt))
+    }
+
     pub fn mark_indeterminate(
         &mut self,
         operation_id: &str,
@@ -2892,8 +2989,42 @@ impl AuthoritativeOperationController {
             record.disposition == RetirementDisposition::CurrentStateAccepted
                 || record.authority == RetirementAuthority::LocalUserPresence
         });
+        let has_v15_hub_pre_enqueue_non_delivery_state =
+            snapshot.operations.iter().any(|record| {
+                record.receipt.as_ref().is_some_and(|receipt| {
+                    matches!(
+                        receipt.evidence,
+                        ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                            | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+                    )
+                })
+            }) || snapshot.auto_resolutions.iter().any(|record| {
+                matches!(
+                    record.evidence,
+                    ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                        | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+                )
+            });
+        if target_schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && has_v15_hub_pre_enqueue_non_delivery_state
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
         match target_schema_version {
             EXECUTION_SAFETY_SCHEMA_VERSION => Ok(snapshot),
+            RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION => {
+                for record in &mut snapshot.operations {
+                    if let Some(receipt) = &mut record.receipt {
+                        receipt.schema_version = RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION;
+                    }
+                }
+                for archived in &mut snapshot.recoveries {
+                    archived.receipt.schema_version =
+                        RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION;
+                }
+                snapshot.schema_version = RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION;
+                Ok(snapshot)
+            }
             MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION => {
                 if has_v14_recovery_target_state {
                     return Err(ExecutionError::InvalidSnapshot);
@@ -3232,6 +3363,7 @@ impl AuthoritativeOperationController {
                 | REPLAY_TOMBSTONE_EXECUTION_SAFETY_SCHEMA_VERSION
                 | SEMANTIC_CONSTRAINT_EXECUTION_SAFETY_SCHEMA_VERSION
                 | MUTATION_RESUME_EXECUTION_SAFETY_SCHEMA_VERSION
+                | RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION
                 | EXECUTION_SAFETY_SCHEMA_VERSION
         ) {
             return Err(ExecutionError::InvalidSnapshot);
@@ -3288,11 +3420,30 @@ impl AuthoritativeOperationController {
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
-        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+        if snapshot.schema_version < RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION
             && snapshot
                 .operations
                 .iter()
                 .any(|record| record.recovery_target_required || record.recovery_target.is_some())
+        {
+            return Err(ExecutionError::InvalidSnapshot);
+        }
+        if snapshot.schema_version < EXECUTION_SAFETY_SCHEMA_VERSION
+            && (snapshot.operations.iter().any(|record| {
+                record.receipt.as_ref().is_some_and(|receipt| {
+                    matches!(
+                        receipt.evidence,
+                        ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                            | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+                    )
+                })
+            }) || snapshot.auto_resolutions.iter().any(|record| {
+                matches!(
+                    record.evidence,
+                    ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                        | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+                )
+            }))
         {
             return Err(ExecutionError::InvalidSnapshot);
         }
@@ -3425,9 +3576,18 @@ impl AuthoritativeOperationController {
                         || record.dispatch_binding.is_some()
                         || record.reconciliation_status.is_some()))
                 || record.receipt.as_ref().is_some_and(|receipt| {
-                    receipt.evidence == ExecutionEvidence::RecoveryReadInterrupted
+                    (receipt.evidence == ExecutionEvidence::RecoveryReadInterrupted
                         && (record.execution_lane != OperationExecutionLane::RecoveryEvidenceRead
-                            || record.state != HubOperationState::Failed)
+                            || record.state != HubOperationState::Failed))
+                        || (matches!(
+                            receipt.evidence,
+                            ExecutionEvidence::HubEncodeFailedBeforeEnqueue
+                                | ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+                        ) && (record.execution_lane != OperationExecutionLane::Normal
+                            || record.state != HubOperationState::Cancelled
+                            || record.reconciliation_status
+                                != Some(ReconciliationStatus::AutoResolved)
+                            || record.dispatch_binding.is_none()))
                 })
             {
                 return Err(ExecutionError::InvalidSnapshot);
@@ -7129,6 +7289,197 @@ mod tests {
             Some(HubOperationState::Indeterminate)
         );
         assert!(ledger.quarantine("desktop-a").is_some());
+    }
+
+    #[test]
+    fn hub_pre_enqueue_non_delivery_is_terminal_idempotent_and_v15_only() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 8,
+        };
+        let mut ledger = controller();
+        let binding = OperationDispatchBinding::new(7, "grant-pre-enqueue").unwrap();
+        ledger
+            .prepare(op("op-pre-enqueue", 4), alice(), DeviceCapability::Shell, 1)
+            .unwrap();
+        ledger
+            .mark_dispatched_with_binding("op-pre-enqueue", &alice(), 4, Some(binding.clone()), 2)
+            .unwrap();
+
+        let (next, receipt) = ledger
+            .resolve_hub_pre_enqueue_non_delivery(
+                "op-pre-enqueue",
+                &alice(),
+                4,
+                &binding,
+                ExecutionEvidence::HubOutboundClosedBeforeEnqueue,
+                3,
+            )
+            .unwrap();
+        assert_eq!(next, CompletionDecision::Idle);
+        assert_eq!(receipt.terminal_state, HubOperationState::Cancelled);
+        assert_eq!(
+            receipt.evidence,
+            ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+        );
+        assert_eq!(
+            ledger.state("op-pre-enqueue"),
+            Some(HubOperationState::Cancelled)
+        );
+        assert!(ledger.quarantine("desktop-a").is_none());
+        assert_eq!(ledger.auto_resolutions().len(), 1);
+
+        let (_, duplicate) = ledger
+            .resolve_hub_pre_enqueue_non_delivery(
+                "op-pre-enqueue",
+                &alice(),
+                4,
+                &binding,
+                ExecutionEvidence::HubOutboundClosedBeforeEnqueue,
+                4,
+            )
+            .unwrap();
+        assert_eq!(duplicate, receipt);
+        assert_eq!(ledger.auto_resolutions().len(), 1);
+
+        let snapshot = ledger.snapshot_for_restart();
+        assert_eq!(snapshot.schema_version, EXECUTION_SAFETY_SCHEMA_VERSION);
+        assert_eq!(
+            ledger.snapshot_for_restart_compatible_with(
+                RECOVERY_TARGET_EXECUTION_SAFETY_SCHEMA_VERSION,
+            ),
+            Err(ExecutionError::InvalidSnapshot)
+        );
+
+        let restored =
+            AuthoritativeOperationController::restore_after_restart(limits, snapshot).unwrap();
+        assert_eq!(
+            restored.state("op-pre-enqueue"),
+            Some(HubOperationState::Cancelled)
+        );
+        assert_eq!(
+            restored.receipt("op-pre-enqueue").unwrap().evidence,
+            ExecutionEvidence::HubOutboundClosedBeforeEnqueue
+        );
+        assert_eq!(restored.auto_resolutions().len(), 1);
+    }
+
+    #[test]
+    fn failed_pre_enqueue_checkpoint_commit_leaves_live_dispatch_fail_closed() {
+        let limits = AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 8,
+        };
+        let mut live = controller();
+        let binding = OperationDispatchBinding::new(7, "grant-pre-enqueue-persist").unwrap();
+        live.prepare(
+            op("op-pre-enqueue-persist", 4),
+            alice(),
+            DeviceCapability::Shell,
+            1,
+        )
+        .unwrap();
+        live.mark_dispatched_with_binding(
+            "op-pre-enqueue-persist",
+            &alice(),
+            4,
+            Some(binding.clone()),
+            2,
+        )
+        .unwrap();
+
+        // The Hub resolves a clone and persists it before swapping live state.
+        // If checkpoint publication fails, this candidate is discarded.
+        let mut candidate = live.clone();
+        candidate
+            .resolve_hub_pre_enqueue_non_delivery(
+                "op-pre-enqueue-persist",
+                &alice(),
+                4,
+                &binding,
+                ExecutionEvidence::HubEncodeFailedBeforeEnqueue,
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            candidate.state("op-pre-enqueue-persist"),
+            Some(HubOperationState::Cancelled)
+        );
+        assert_eq!(
+            live.state("op-pre-enqueue-persist"),
+            Some(HubOperationState::Dispatched)
+        );
+        assert!(live.auto_resolutions().is_empty());
+
+        // A restart from the last durable live snapshot remains conservative.
+        let restored = AuthoritativeOperationController::restore_after_restart(
+            limits,
+            live.snapshot_for_restart(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.state("op-pre-enqueue-persist"),
+            Some(HubOperationState::Indeterminate)
+        );
+        let quarantine = restored.quarantine("desktop-a").unwrap();
+        assert_eq!(quarantine.operation_id, "op-pre-enqueue-persist");
+        assert_eq!(
+            quarantine.reason,
+            IndeterminateReason::HubRestartAfterDispatch
+        );
+        assert!(restored.auto_resolutions().is_empty());
+    }
+
+    #[test]
+    fn hub_pre_enqueue_non_delivery_rejects_wrong_fence_or_non_hub_evidence() {
+        let mut ledger = controller();
+        let binding = OperationDispatchBinding::new(7, "grant-pre-enqueue").unwrap();
+        ledger
+            .prepare(
+                op("op-pre-enqueue-fence", 4),
+                alice(),
+                DeviceCapability::Shell,
+                1,
+            )
+            .unwrap();
+        ledger
+            .mark_dispatched_with_binding(
+                "op-pre-enqueue-fence",
+                &alice(),
+                4,
+                Some(binding.clone()),
+                2,
+            )
+            .unwrap();
+
+        let wrong_binding = OperationDispatchBinding::new(8, "grant-pre-enqueue-other").unwrap();
+        assert_eq!(
+            ledger.resolve_hub_pre_enqueue_non_delivery(
+                "op-pre-enqueue-fence",
+                &alice(),
+                4,
+                &wrong_binding,
+                ExecutionEvidence::HubEncodeFailedBeforeEnqueue,
+                3,
+            ),
+            Err(ExecutionError::OwnershipFenceMismatch)
+        );
+        assert_eq!(
+            ledger.resolve_hub_pre_enqueue_non_delivery(
+                "op-pre-enqueue-fence",
+                &alice(),
+                4,
+                &binding,
+                ExecutionEvidence::VerifiedRemoteError,
+                3,
+            ),
+            Err(ExecutionError::InvalidOperation)
+        );
+        assert_eq!(
+            ledger.state("op-pre-enqueue-fence"),
+            Some(HubOperationState::Dispatched)
+        );
+        assert!(ledger.auto_resolutions().is_empty());
     }
 
     proptest! {
