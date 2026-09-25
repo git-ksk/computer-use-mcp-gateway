@@ -9,6 +9,7 @@ use crate::v2_m1_persistence::{
     HubPersistenceFenceSnapshot, HubPersistentState, PersistenceError,
 };
 use crate::v2_observability::SafeErrorCode;
+use async_trait::async_trait;
 use std::{
     fmt,
     path::PathBuf,
@@ -32,7 +33,7 @@ pub struct DurableHubState {
 }
 
 impl DurableHubState {
-    fn committed(
+    pub(crate) fn committed(
         revision: HubStateRevision,
         writer_epoch: HubWriterEpoch,
         mut state: HubPersistentState,
@@ -65,7 +66,7 @@ impl DurableHubState {
         }
     }
 
-    fn validate_committed(&self) -> Result<(), HubStateStoreError> {
+    pub(crate) fn validate_committed(&self) -> Result<(), HubStateStoreError> {
         if self.store_schema_version != HUB_DURABLE_RECORD_SCHEMA_VERSION
             || self.revision.0 == 0
             || self.writer_epoch.0 == 0
@@ -134,6 +135,26 @@ pub trait HubAuthoritativeStateStore: Send + Sync {
     ) -> Result<DurableHubState, HubStateStoreError>;
 }
 
+#[async_trait]
+pub trait AsyncHubAuthoritativeStateStore: Send + Sync {
+    /// Async hosted equivalent of `HubAuthoritativeStateStore::load_current`.
+    async fn load_current_async(&self) -> Result<Option<DurableHubState>, HubStateStoreError>;
+
+    /// Acquire and durably publish a strictly newer writer epoch without blocking a Tokio worker.
+    async fn acquire_writer_async(
+        &self,
+        initial_state: &HubPersistentState,
+    ) -> Result<DurableHubState, HubStateStoreError>;
+
+    /// Compare-and-commit through an external provider. A returned success must already include
+    /// provider read-after-commit verification; ambiguous publication must fail closed.
+    async fn compare_and_commit_async(
+        &self,
+        lease: HubWriterLease,
+        state: &HubPersistentState,
+    ) -> Result<DurableHubState, HubStateStoreError>;
+}
+
 #[derive(Debug)]
 pub enum HubStateStoreError {
     Persistence(PersistenceError),
@@ -143,6 +164,8 @@ pub enum HubStateStoreError {
     RevisionOverflow,
     EpochOverflow,
     InvalidState,
+    InvalidConfiguration,
+    ProviderSchemaMismatch,
     ReadAfterCommitMismatch,
 }
 
@@ -154,6 +177,7 @@ impl HubStateStoreError {
                 | Self::StaleWriter
                 | Self::RevisionOverflow
                 | Self::InvalidState
+                | Self::ProviderSchemaMismatch
                 | Self::ReadAfterCommitMismatch
         )
     }
@@ -167,6 +191,8 @@ impl HubStateStoreError {
             Self::RevisionOverflow => "hub_state_store_revision_overflow",
             Self::EpochOverflow => "hub_state_store_epoch_overflow",
             Self::InvalidState => "hub_state_store_invalid_state",
+            Self::InvalidConfiguration => "hub_state_store_invalid_configuration",
+            Self::ProviderSchemaMismatch => "hub_state_store_provider_schema_mismatch",
             Self::ReadAfterCommitMismatch => "hub_state_store_read_after_commit_mismatch",
         }
     }

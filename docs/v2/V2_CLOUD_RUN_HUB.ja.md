@@ -145,8 +145,8 @@ supported profile は以下も document / accept します。
 | Gate | Current status |
 | --- | --- |
 | 現行 Cloud Run limit 再確認 | Design evidence complete (2026-09-03) |
-| ephemeral filesystem を authoritative state から排除 | core seam complete。hosted external durable providerはpending |
-| provider-neutral durable Hub-state backend | #283 core実装済み: trait + local adapter + deterministic conformance provider。hosted external providerはpending |
+| ephemeral filesystem を authoritative state から排除 | #391 PostgreSQL external provider candidate実装。real Cloud SQL deployment acceptanceは#284でpending |
+| provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate。real Cloud SQL acceptanceは#284でpending |
 | monotonic writer fencing + stale-writer dispatch denial | #283 automated core green。hosted revision-overlap acceptanceはpending |
 | one-port h2c gRPC + MCP + hosted Handoff ingress / separate auth boundary | PR #285 merge済み。local h2c integration green、real hosted acceptanceはpending |
 | 3300s proactive Agent stream rotation acceptance | Pending |
@@ -154,7 +154,7 @@ supported profile は以下も document / accept します。
 | concurrent old/new revision fencing test | deterministic two-writer core green。real hosted revision A/B acceptanceはpending |
 | replacement後 durable quarantine/replay-barrier restore | core replacement/restart regression green。hosted backup/restore acceptanceはpending |
 | hosted secret/key revision-rollout safety | #353 deterministic rotation composition green。real managed-secret revision A/B + log/OTLP acceptanceは#284でpending |
-| hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
+| hosted deploy/upgrade/rollback/backup/alerting runbook | #391 PostgreSQL migration/bootstrap/rollback contractをdocument。real backup/restore/alerting acceptanceは#284でpending |
 | Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation・acceptance pending |
 | physical Agent + real Cua interrupted-effect acceptance | Pending |
 
