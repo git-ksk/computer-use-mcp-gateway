@@ -4800,6 +4800,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_backend_session_fence_rejects_stale_generation_or_revision_without_dispatch() {
+        let state_dir = test_state_dir("second-backend-session-fence");
+        let device = DeviceIdentity::generate();
+        let (_hub, handle) = SingleDeviceHub::new(
+            HubServiceConfig {
+                state_dir: state_dir.clone(),
+                heartbeat_timeout: Duration::from_secs(5),
+                max_agent_session_lifetime: Duration::from_secs(60 * 60),
+                agent_session_reauth_drain: Duration::from_secs(30),
+                checkpoint_generation_rollover_bytes: 512 * 1024,
+                max_queued_per_device: 1,
+                max_agent_sessions: 2,
+                max_agent_session_starts_per_minute: 30,
+            },
+            HubProvisionedMaterial {
+                hub_identity: HubIdentity::generate(),
+                grant_signer: GrantAuthority::generate().into(),
+                device_verifier: device.verifying_key(),
+                device_rotation: None,
+            },
+        )
+        .unwrap();
+
+        let second_backend = CapabilityAdvertisement {
+            backend: "macos-mcp".into(),
+            backend_version: "0.4.0".into(),
+            platform: "macos".into(),
+            capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+            revision: 41,
+            supported: vec![
+                DeviceCapability::ListApplications,
+                DeviceCapability::PointerClick,
+                DeviceCapability::MovePointer,
+            ],
+        };
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let (supersede, _supersede_rx) = watch::channel(false);
+        {
+            let mut live = handle.inner.live.lock().await;
+            *live = Some(LiveSession {
+                generation: 7,
+                capability_revision: second_backend.revision,
+                command_tx,
+                supersede,
+            });
+        }
+
+        for (operation_id, expected_session) in [
+            (
+                "op-second-backend-stale-generation",
+                (6, second_backend.revision),
+            ),
+            (
+                "op-second-backend-stale-revision",
+                (7, second_backend.revision - 1),
+            ),
+        ] {
+            let result = handle
+                .start_command_as_with_id_and_metadata_for_session(
+                    OperationOwner::local_hub(),
+                    operation_id.to_owned(),
+                    DeviceCommand::PointerClick {
+                        x: 10,
+                        y: 20,
+                        button: crate::v2_m0::PointerButton::Left,
+                    },
+                    OperationAdmissionMetadata::empty(),
+                    expected_session,
+                )
+                .await;
+            assert!(matches!(result, Err(HubCommandError::SessionSuperseded)));
+            assert!(matches!(
+                command_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        drop(handle);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn second_backend_post_dispatch_unproven_result_is_durable_quarantine_without_replay() {
+        let state_dir = test_state_dir("second-backend-post-dispatch-unproven");
+        let device = DeviceIdentity::generate();
+        let hub_identity = HubIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: hub_identity.clone(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+        let config = HubServiceConfig {
+            state_dir: state_dir.clone(),
+            heartbeat_timeout: Duration::from_secs(5),
+            max_agent_session_lifetime: Duration::from_secs(60 * 60),
+            agent_session_reauth_drain: Duration::from_secs(30),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 1,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        };
+        let (hub, handle) = SingleDeviceHub::new(config.clone(), material.clone()).unwrap();
+        let device_id = hub.inner.device_id.clone();
+        let capability_revision = 41;
+        let hello = AgentHello::new(
+            device_id.clone(),
+            CapabilityAdvertisement {
+                backend: "macos-mcp".into(),
+                backend_version: "0.4.0".into(),
+                platform: "macos".into(),
+                capability_schema_version: crate::v2_m0::CAPABILITY_SCHEMA_VERSION,
+                revision: capability_revision,
+                supported: vec![
+                    DeviceCapability::ListApplications,
+                    DeviceCapability::PointerClick,
+                    DeviceCapability::MovePointer,
+                ],
+            },
+        );
+        let challenge = hub_identity.challenge(&hello).unwrap();
+        let owner = OperationOwner::local_hub();
+        let operation_id = "op-second-backend-unproven".to_owned();
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            persistent
+                .execution
+                .prepare(
+                    OperationRef {
+                        device_id: device_id.clone(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::PointerClick,
+                    1,
+                )
+                .unwrap();
+            persist_locked(&handle.inner, &persistent).unwrap();
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            operation_id.clone(),
+            PendingOperation {
+                owner: owner.clone(),
+                command: DeviceCommand::PointerClick {
+                    x: 10,
+                    y: 20,
+                    button: crate::v2_m0::PointerButton::Left,
+                },
+                expected_semantic_constraint_snapshot: None,
+                handoff: None,
+                envelope: None,
+                reply: reply_tx,
+            },
+        )]);
+        let mut queue_order = VecDeque::new();
+        let (outbound, mut outbound_rx) = mpsc::channel(4);
+        assert!(matches!(
+            hub.dispatch_operation(
+                &outbound,
+                &hello,
+                &challenge,
+                1,
+                capability_revision,
+                &TrustedSessionClock::new(10),
+                &operation_id,
+                &mut pending,
+            )
+            .await
+            .unwrap(),
+            DispatchOutcome::Sent
+        ));
+        assert!(
+            outbound_rx.recv().await.is_some(),
+            "effectful command must be accepted by the Hub outbound queue before ambiguity"
+        );
+
+        let remote = crate::v2_m0_transport::build_remote_result(
+            &device,
+            &hello,
+            &challenge,
+            crate::v2_m0::CommandResultEnvelope {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                device_id: device_id.clone(),
+                device_generation: 1,
+                capability_revision,
+                operation_id: operation_id.clone(),
+                result: DeviceResult::Error {
+                    code: DeviceErrorCode::BackendOutcomeIndeterminate,
+                },
+            },
+        )
+        .unwrap();
+        hub.handle_result(
+            remote,
+            &outbound,
+            &hello,
+            &challenge,
+            1,
+            capability_revision,
+            &TrustedSessionClock::new(10),
+            &mut pending,
+            &mut queue_order,
+        )
+        .await
+        .unwrap();
+
+        assert!(pending.is_empty());
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(HubCommandError::DeviceIndeterminate { operation_id: id }) if id == operation_id
+        ));
+        {
+            let mut persistent = handle.inner.persistent.lock().await;
+            assert_eq!(
+                persistent.execution.state(&operation_id),
+                Some(HubOperationState::Indeterminate)
+            );
+            let quarantine = persistent.execution.quarantine(&device_id).unwrap();
+            assert_eq!(
+                quarantine.reason,
+                IndeterminateReason::BackendOutcomeUnproven
+            );
+            assert!(persistent.execution.auto_resolutions().is_empty());
+            assert!(matches!(
+                persistent.execution.prepare(
+                    OperationRef {
+                        device_id: device_id.clone(),
+                        device_generation: 1,
+                        operation_id: operation_id.clone(),
+                    },
+                    owner.clone(),
+                    DeviceCapability::PointerClick,
+                    3,
+                ),
+                Err(crate::v2_m0_execution::ExecutionError::OperationReplay)
+            ));
+        }
+
+        // Restart/reconnect cannot reinterpret the missing provider proof as
+        // non-execution, and the old operation is never re-enqueued.
+        drop(hub);
+        drop(handle);
+        let (restarted, restarted_handle) = SingleDeviceHub::new(config, material).unwrap();
+        let persistent = restarted_handle.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(&operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+        let quarantine = persistent.execution.quarantine(&device_id).unwrap();
+        assert_eq!(
+            quarantine.reason,
+            IndeterminateReason::BackendOutcomeUnproven
+        );
+        assert!(persistent.execution.auto_resolutions().is_empty());
+        drop(persistent);
+        drop(restarted);
+        drop(restarted_handle);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
     async fn semantic_constraint_snapshot_is_immutable_and_stale_admission_cancels_before_dispatch()
     {
         use crate::v2_execution_safety::{

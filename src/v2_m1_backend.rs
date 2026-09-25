@@ -156,6 +156,324 @@ pub trait ComputerUseBackendAdapter: Send + Sync {
     }
 }
 
+/// Narrow second real-backend adapter used to prove that CUMG semantic
+/// authority/recovery does not depend on Cua-specific tool names or result
+/// shapes. macos-mcp remains a provider below this boundary; only reviewed
+/// CUMG capabilities are advertised.
+#[derive(Clone)]
+pub struct MacosMcpAdapter {
+    backend: CuaBackend,
+    backend_version: String,
+    revision: u64,
+}
+
+impl std::fmt::Debug for MacosMcpAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacosMcpAdapter")
+            .field("backend_version", &self.backend_version)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MacosMcpAdapter {
+    pub fn new(
+        command: impl Into<String>,
+        backend_version: impl Into<String>,
+        revision: u64,
+        connect_timeout: Duration,
+        tool_timeout: Duration,
+        reconnect_attempts: u32,
+        reconnect_backoff: Duration,
+    ) -> Self {
+        let backend_version = backend_version.into();
+        Self {
+            backend: CuaBackend::new(
+                command,
+                vec!["serve".into(), "--transport".into(), "stdio".into()],
+                connect_timeout,
+                tool_timeout,
+                reconnect_attempts,
+                reconnect_backoff,
+            ),
+            backend_version,
+            revision,
+        }
+    }
+
+    pub fn with_expected_server_version(mut self) -> Self {
+        self.backend = self
+            .backend
+            .clone()
+            .with_expected_server_version(self.backend_version.clone());
+        self
+    }
+
+    fn map_command(
+        command: &DeviceCommand,
+    ) -> Result<(&'static str, Option<JsonObject>), M1BackendError> {
+        match command {
+            DeviceCommand::ListApplications => Ok((
+                "Snapshot",
+                serde_json::json!({"use_vision": false})
+                    .as_object()
+                    .cloned(),
+            )),
+            DeviceCommand::PointerClick { x, y, button } => Ok((
+                "Click",
+                serde_json::json!({
+                    "loc": [x, y],
+                    "button": pointer_button_name(*button),
+                    "clicks": 1,
+                })
+                .as_object()
+                .cloned(),
+            )),
+            DeviceCommand::PointerClickAdvanced {
+                target: PointerTarget::DesktopPhysical { x, y },
+                button,
+                click_count,
+                action,
+                modifiers,
+                delivery,
+                ..
+            } if action.is_none()
+                && modifiers.is_empty()
+                && *delivery == InputDeliveryMode::Foreground
+                && (1..=2).contains(click_count) =>
+            {
+                Ok((
+                    "Click",
+                    serde_json::json!({
+                        "loc": [x, y],
+                        "button": pointer_button_name(*button),
+                        "clicks": click_count,
+                    })
+                    .as_object()
+                    .cloned(),
+                ))
+            }
+            DeviceCommand::PointerClickAdvanced { .. } => Err(M1BackendError::InvalidRequest(
+                "macos-mcp portability adapter supports only foreground desktop-physical click without modifiers or semantic action",
+            )),
+            DeviceCommand::MovePointer { x, y, .. } => Ok((
+                "Move",
+                serde_json::json!({"loc": [x, y], "drag": false})
+                    .as_object()
+                    .cloned(),
+            )),
+            _ => Err(M1BackendError::UnsupportedCommand(command.capability())),
+        }
+    }
+
+    fn normalize_result(
+        command: &DeviceCommand,
+        raw: &CallToolResult,
+    ) -> Result<DeviceResult, M1BackendError> {
+        match command {
+            DeviceCommand::ListApplications => Ok(DeviceResult::Applications {
+                count: u64::try_from(macos_mcp_application_count(raw)?)
+                    .map_err(|_| M1BackendError::NumericOverflow)?,
+            }),
+            DeviceCommand::PointerClick { .. } | DeviceCommand::PointerClickAdvanced { .. } => {
+                Ok(DeviceResult::PointerClickCompleted)
+            }
+            DeviceCommand::MovePointer { .. } => Ok(DeviceResult::PointerMoveCompleted),
+            _ => Err(M1BackendError::UnsupportedCommand(command.capability())),
+        }
+    }
+}
+
+#[async_trait]
+impl ComputerUseBackendAdapter for MacosMcpAdapter {
+    fn advertisement(&self) -> CapabilityAdvertisement {
+        CapabilityAdvertisement {
+            backend: "macos-mcp".into(),
+            backend_version: self.backend_version.clone(),
+            platform: "macos".into(),
+            capability_schema_version: CAPABILITY_SCHEMA_VERSION,
+            revision: self.revision,
+            supported: vec![
+                DeviceCapability::ListApplications,
+                DeviceCapability::PointerClick,
+                DeviceCapability::MovePointer,
+            ],
+        }
+    }
+
+    async fn connect(&self) -> Result<(), M1BackendError> {
+        self.backend.connect().await.map_err(map_backend_error)
+    }
+
+    async fn shutdown(&self) -> Result<(), M1BackendError> {
+        self.backend.shutdown().await.map_err(map_backend_error)
+    }
+
+    async fn execute(
+        &self,
+        command: &DeviceCommand,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<BackendExecutionOutcome, M1BackendError> {
+        let (tool, arguments) = Self::map_command(command)?;
+        let raw = match self.backend.call_tool(tool, arguments, cancellation).await {
+            Ok(result) => result,
+            Err(error) => return macos_mcp_call_failure(command, error),
+        };
+
+        if raw.is_error == Some(true) {
+            crate::v2_observability::backend_failure(if command.is_read_only() {
+                crate::v2_observability::BackendFailureReason::Tool
+            } else {
+                crate::v2_observability::BackendFailureReason::AmbiguousOutcome
+            });
+            if command.is_read_only() {
+                return Err(M1BackendError::BackendToolError);
+            }
+            return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
+        }
+
+        match Self::normalize_result(command, &raw) {
+            Ok(result) => Ok(BackendExecutionOutcome::Completed(result)),
+            Err(_error) if !command.is_read_only() => {
+                // A malformed/missing provider completion after an effectful
+                // provider call is not proof that the side effect did not occur.
+                crate::v2_observability::backend_failure(
+                    crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
+                );
+                Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn macos_mcp_call_failure(
+    command: &DeviceCommand,
+    error: AnyError,
+) -> Result<BackendExecutionOutcome, M1BackendError> {
+    if error.downcast_ref::<BackendCallCancelled>().is_some() {
+        if command.is_read_only() {
+            return Err(map_backend_error(error));
+        }
+        return Ok(BackendExecutionOutcome::CancellationPropagatedIndeterminate);
+    }
+    if error.downcast_ref::<BackendCallTimedOut>().is_some() {
+        if command.is_read_only() {
+            return Err(map_backend_error(error));
+        }
+        crate::v2_observability::backend_failure(
+            crate::v2_observability::BackendFailureReason::Timeout,
+        );
+        return Ok(BackendExecutionOutcome::TimedOutIndeterminate);
+    }
+    if error.downcast_ref::<BackendCallResponseLost>().is_some() {
+        if command.is_read_only() {
+            return Err(map_backend_error(error));
+        }
+        crate::v2_observability::backend_failure(
+            crate::v2_observability::BackendFailureReason::AmbiguousOutcome,
+        );
+        return Ok(BackendExecutionOutcome::BackendOutcomeIndeterminate);
+    }
+    crate::v2_observability::backend_failure(crate::v2_observability::BackendFailureReason::Tool);
+    Err(map_backend_error(error))
+}
+
+fn macos_mcp_snapshot_text(result: &CallToolResult) -> Result<String, M1BackendError> {
+    let mut text = String::new();
+    for content in &result.content {
+        let Some(block) = content.as_text() else {
+            continue;
+        };
+        if block.text.len() > MACOS_MCP_MAX_SNAPSHOT_TEXT_BYTES {
+            return Err(M1BackendError::MalformedResponse(
+                "macos-mcp Snapshot text exceeds bounded parser size",
+            ));
+        }
+
+        // FastMCP serializes a Python list[str] return value as one JSON text
+        // block over stdio. Accept that exact provider representation without
+        // making provider ids/payloads part of the public CUMG contract.
+        let decoded = serde_json::from_str::<Vec<String>>(block.text.trim())
+            .ok()
+            .filter(|items| !items.is_empty());
+
+        match decoded {
+            Some(items) => {
+                for item in items {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    if text.len().saturating_add(item.len()) > MACOS_MCP_MAX_SNAPSHOT_TEXT_BYTES {
+                        return Err(M1BackendError::MalformedResponse(
+                            "macos-mcp Snapshot text exceeds bounded parser size",
+                        ));
+                    }
+                    text.push_str(&item);
+                }
+            }
+            None => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                if text.len().saturating_add(block.text.len()) > MACOS_MCP_MAX_SNAPSHOT_TEXT_BYTES {
+                    return Err(M1BackendError::MalformedResponse(
+                        "macos-mcp Snapshot text exceeds bounded parser size",
+                    ));
+                }
+                text.push_str(&block.text);
+            }
+        }
+    }
+
+    if text.is_empty() {
+        return Err(M1BackendError::MalformedResponse(
+            "macos-mcp Snapshot returned no text",
+        ));
+    }
+    Ok(text)
+}
+
+fn macos_mcp_application_count(result: &CallToolResult) -> Result<usize, M1BackendError> {
+    let text = macos_mcp_snapshot_text(result)?;
+
+    let mut in_apps = false;
+    let mut count = 0usize;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if !in_apps {
+            if line == "Open Applications:" {
+                in_apps = true;
+            }
+            continue;
+        }
+        if line == "List of Interactive Elements:"
+            || line == "List of Scrollable Elements:"
+            || line.ends_with(':') && !line.contains(" - ")
+        {
+            break;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line.contains(" - ") {
+            count = count.saturating_add(1);
+            if count > MACOS_MCP_MAX_APPLICATIONS {
+                return Err(M1BackendError::MalformedResponse(
+                    "macos-mcp Snapshot application count exceeds bound",
+                ));
+            }
+        }
+    }
+
+    if !in_apps {
+        return Err(M1BackendError::MalformedResponse(
+            "macos-mcp Snapshot missing Open Applications section",
+        ));
+    }
+    Ok(count)
+}
+
 #[derive(Clone)]
 pub struct CuaMcpAdapter {
     backend: CuaBackend,
@@ -183,6 +501,8 @@ const CUA_MACOS_PHYSICAL_BASE_MS: u64 = 24;
 const CUA_MACOS_MIN_DELAY_MS: u64 = 8;
 const CUA_WINDOWS_WORST_CHAR_BASE_MS: u64 = 28;
 const CUA_LINUX_KEY_BASE_MS: u64 = 10;
+const MACOS_MCP_MAX_SNAPSHOT_TEXT_BYTES: usize = 64 * 1024;
+const MACOS_MCP_MAX_APPLICATIONS: usize = 256;
 
 fn duration_millis_saturating(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -2856,6 +3176,255 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::time::{sleep, timeout};
 
+    #[test]
+    fn macos_mcp_advertises_only_reviewed_portability_slice() {
+        let adapter = MacosMcpAdapter::new(
+            "/nonexistent/macos-mcp",
+            "0.4.0",
+            7,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            Duration::from_millis(1),
+        );
+        let advertisement = adapter.advertisement();
+        assert_eq!(advertisement.backend, "macos-mcp");
+        assert_eq!(advertisement.backend_version, "0.4.0");
+        assert_eq!(advertisement.platform, "macos");
+        assert_eq!(advertisement.revision, 7);
+        assert_eq!(
+            advertisement.supported,
+            vec![
+                DeviceCapability::ListApplications,
+                DeviceCapability::PointerClick,
+                DeviceCapability::MovePointer,
+            ]
+        );
+        for unsupported in [
+            DeviceCapability::Screenshot,
+            DeviceCapability::TypeText,
+            DeviceCapability::PointerDrag,
+            DeviceCapability::InspectWindow,
+            DeviceCapability::BrowserClick,
+        ] {
+            assert!(!advertisement.supports(unsupported));
+        }
+    }
+
+    #[test]
+    fn macos_mcp_maps_only_exact_reviewed_command_shapes() {
+        let (tool, args) = MacosMcpAdapter::map_command(&DeviceCommand::ListApplications).unwrap();
+        assert_eq!(tool, "Snapshot");
+        assert_eq!(args.unwrap()["use_vision"], false);
+
+        let (tool, args) = MacosMcpAdapter::map_command(&DeviceCommand::PointerClick {
+            x: 120,
+            y: 240,
+            button: crate::v2_m0::PointerButton::Right,
+        })
+        .unwrap();
+        assert_eq!(tool, "Click");
+        let args = args.unwrap();
+        assert_eq!(args["loc"], serde_json::json!([120, 240]));
+        assert_eq!(args["button"], "right");
+        assert_eq!(args["clicks"], 1);
+
+        let (tool, args) = MacosMcpAdapter::map_command(&DeviceCommand::PointerClickAdvanced {
+            context_id: Some("ctx_portability".into()),
+            target: PointerTarget::DesktopPhysical { x: 10, y: 20 },
+            button: crate::v2_m0::PointerButton::Left,
+            click_count: 2,
+            action: None,
+            modifiers: vec![],
+            delivery: InputDeliveryMode::Foreground,
+        })
+        .unwrap();
+        assert_eq!(tool, "Click");
+        assert_eq!(args.unwrap()["clicks"], 2);
+
+        assert!(matches!(
+            MacosMcpAdapter::map_command(&DeviceCommand::PointerClickAdvanced {
+                context_id: Some("ctx_portability".into()),
+                target: PointerTarget::DesktopPhysical { x: 10, y: 20 },
+                button: crate::v2_m0::PointerButton::Left,
+                click_count: 1,
+                action: None,
+                modifiers: vec![],
+                delivery: InputDeliveryMode::Background,
+            }),
+            Err(M1BackendError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            MacosMcpAdapter::map_command(&DeviceCommand::PointerClickAdvanced {
+                context_id: Some("ctx_portability".into()),
+                target: PointerTarget::WindowPhysical {
+                    process_id: 1,
+                    window_id: 2,
+                    x: 10,
+                    y: 20,
+                },
+                button: crate::v2_m0::PointerButton::Left,
+                click_count: 1,
+                action: None,
+                modifiers: vec![],
+                delivery: InputDeliveryMode::Foreground,
+            }),
+            Err(M1BackendError::InvalidRequest(_))
+        ));
+
+        let (tool, args) = MacosMcpAdapter::map_command(&DeviceCommand::MovePointer {
+            context_id: "ctx_portability".into(),
+            x: 33,
+            y: 44,
+        })
+        .unwrap();
+        assert_eq!(tool, "Move");
+        let args = args.unwrap();
+        assert_eq!(args["loc"], serde_json::json!([33, 44]));
+        assert_eq!(args["drag"], false);
+
+        assert!(matches!(
+            MacosMcpAdapter::map_command(&DeviceCommand::Screenshot),
+            Err(M1BackendError::UnsupportedCommand(
+                DeviceCapability::Screenshot
+            ))
+        ));
+    }
+
+    #[test]
+    fn macos_mcp_snapshot_parser_is_bounded_and_payload_reducing() {
+        let raw = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            r#"
+Focused Window:
+Preview - Active
+
+Open Applications:
+Chrome (com.google.Chrome) - Visible
+Finder (com.apple.finder) - Windowless
+Preview (com.apple.Preview) - Visible
+
+List of Interactive Elements:
+0|Dock|AXDockItem|Finder|(1,2)|{}
+
+List of Scrollable Elements:
+No elements found
+"#,
+        )]);
+        assert_eq!(macos_mcp_application_count(&raw).unwrap(), 3);
+
+        let wrapped = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            serde_json::to_string(&vec![
+                r#"
+Focused Window:
+Preview - Active
+
+Open Applications:
+Chrome (com.google.Chrome) - Visible
+Finder (com.apple.finder) - Windowless
+
+List of Interactive Elements:
+No interactive elements found.
+
+List of Scrollable Elements:
+No elements found
+"#,
+            ])
+            .unwrap(),
+        )]);
+        assert_eq!(macos_mcp_application_count(&wrapped).unwrap(), 2);
+        let result =
+            MacosMcpAdapter::normalize_result(&DeviceCommand::ListApplications, &raw).unwrap();
+        assert_eq!(result, DeviceResult::Applications { count: 3 });
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("Chrome"));
+        assert!(!serialized.contains("Finder"));
+        assert!(!serialized.contains("Preview"));
+
+        let missing = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "Focused Window:\nnone\n",
+        )]);
+        assert!(matches!(
+            macos_mcp_application_count(&missing),
+            Err(M1BackendError::MalformedResponse(_))
+        ));
+
+        let huge = format!(
+            "Open Applications:\n{}\nList of Interactive Elements:\nnone",
+            "X".repeat(MACOS_MCP_MAX_SNAPSHOT_TEXT_BYTES)
+        );
+        let oversized = CallToolResult::success(vec![rmcp::model::ContentBlock::text(huge)]);
+        assert!(matches!(
+            macos_mcp_application_count(&oversized),
+            Err(M1BackendError::MalformedResponse(_))
+        ));
+    }
+
+    #[test]
+    fn macos_mcp_post_dispatch_failures_are_indeterminate_only_for_effectful_work() {
+        let click = DeviceCommand::PointerClick {
+            x: 10,
+            y: 20,
+            button: crate::v2_m0::PointerButton::Left,
+        };
+        assert_eq!(
+            macos_mcp_call_failure(&click, AnyError::new(BackendCallResponseLost)).unwrap(),
+            BackendExecutionOutcome::BackendOutcomeIndeterminate
+        );
+        assert_eq!(
+            macos_mcp_call_failure(
+                &click,
+                AnyError::new(BackendCallTimedOut { timeout_secs: 1 }),
+            )
+            .unwrap(),
+            BackendExecutionOutcome::TimedOutIndeterminate
+        );
+        assert_eq!(
+            macos_mcp_call_failure(&click, AnyError::new(BackendCallCancelled)).unwrap(),
+            BackendExecutionOutcome::CancellationPropagatedIndeterminate
+        );
+
+        for error in [
+            AnyError::new(BackendCallResponseLost),
+            AnyError::new(BackendCallTimedOut { timeout_secs: 1 }),
+            AnyError::new(BackendCallCancelled),
+        ] {
+            assert!(matches!(
+                macos_mcp_call_failure(&DeviceCommand::ListApplications, error),
+                Err(M1BackendError::Backend(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn macos_mcp_effectful_normalization_never_exposes_provider_payload() {
+        let raw = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "Single left clicked at (10,20). provider-private-details",
+        )]);
+        let click = DeviceCommand::PointerClick {
+            x: 10,
+            y: 20,
+            button: crate::v2_m0::PointerButton::Left,
+        };
+        let result = MacosMcpAdapter::normalize_result(&click, &raw).unwrap();
+        assert_eq!(result, DeviceResult::PointerClickCompleted);
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("provider-private-details")
+        );
+
+        let move_result = MacosMcpAdapter::normalize_result(
+            &DeviceCommand::MovePointer {
+                context_id: "ctx_portability".into(),
+                x: 10,
+                y: 20,
+            },
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(move_result, DeviceResult::PointerMoveCompleted);
+    }
+
     fn fixture_python() -> String {
         std::env::var("CUMG_TEST_PYTHON").unwrap_or_else(|_| "python3".into())
     }
@@ -3907,6 +4476,130 @@ mod tests {
         );
 
         adapter.end_interaction_session(&context).await.unwrap();
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_mcp_fixture_control_point(
+        snapshot: &str,
+        window: &str,
+        control_type: &str,
+        label: &str,
+    ) -> Option<(i32, i32)> {
+        for line in snapshot.lines() {
+            let fields = line.split('|').collect::<Vec<_>>();
+            if fields.len() < 6
+                || fields[1].trim() != window
+                || fields[2].trim() != control_type
+                || fields[3].trim() != label
+            {
+                continue;
+            }
+            let coords = fields[4]
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')');
+            let (x, y) = coords.split_once(',')?;
+            let x = x.trim().parse::<i32>().ok()?;
+            let y = y.trim().parse::<i32>().ok()?;
+            return Some((x, y));
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "trusted-mac macos-mcp 0.4.0 portability acceptance"]
+    async fn real_macos_mcp_portability_acceptance() {
+        assert_eq!(
+            std::env::var("CUMG_V2_MACOS_MCP_E2E_ACK").as_deref(),
+            Ok("1"),
+            "explicit trusted-Mac acknowledgement required"
+        );
+        let command = std::env::var("CUMG_V2_MACOS_MCP_COMMAND").unwrap_or_else(|_| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("~"))
+                .join(".local/bin/macos-mcp")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let version = std::env::var("CUMG_V2_MACOS_MCP_VERSION").unwrap_or_else(|_| "0.4.0".into());
+        let adapter = MacosMcpAdapter::new(
+            command,
+            version.clone(),
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+            1,
+            Duration::from_millis(50),
+        );
+        assert_eq!(adapter.advertisement().backend_version, version);
+        adapter.connect().await.unwrap();
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let observed = adapter
+            .execute(&DeviceCommand::ListApplications, cancel_rx.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            observed,
+            BackendExecutionOutcome::Completed(DeviceResult::Applications { count }) if count > 0
+        ));
+
+        // Use the real Finder Dock item as a harmless provider-backed GUI
+        // fixture. macos-mcp intentionally omits bundle-less helper processes
+        // such as osascript dialogs from Snapshot, while Dock AX items are a
+        // stable part of the reviewed physical acceptance surface.
+        let raw = adapter
+            .backend
+            .call_tool(
+                "Snapshot",
+                serde_json::json!({"use_vision": false})
+                    .as_object()
+                    .cloned(),
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(raw.is_error, Some(true));
+        let snapshot = macos_mcp_snapshot_text(&raw).unwrap();
+        let finder_point =
+            macos_mcp_fixture_control_point(&snapshot, "Dock", "AXDockItem", "Finder")
+                .expect("Finder Dock item must be observable on the trusted Mac");
+
+        let moved = adapter
+            .execute(
+                &DeviceCommand::MovePointer {
+                    context_id: "ctx_portability_physical".into(),
+                    x: finder_point.0,
+                    y: finder_point.1,
+                },
+                cancel_rx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            moved,
+            BackendExecutionOutcome::Completed(DeviceResult::PointerMoveCompleted)
+        );
+
+        let clicked = adapter
+            .execute(
+                &DeviceCommand::PointerClick {
+                    x: finder_point.0,
+                    y: finder_point.1,
+                    button: crate::v2_m0::PointerButton::Left,
+                },
+                cancel_rx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            clicked,
+            BackendExecutionOutcome::Completed(DeviceResult::PointerClickCompleted)
+        );
+
         adapter.shutdown().await.unwrap();
     }
 

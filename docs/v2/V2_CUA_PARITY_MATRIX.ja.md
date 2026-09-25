@@ -29,6 +29,18 @@ cutover gate は、レビュー対象の Cua 0.19.3 tool がすべて分類さ�
 9. recording/replay は通常の production northbound operation ではありません。replay が CUMG の operation identity、generation fence、quarantine、no-auto-replay invariant を迂回してはなりません。
 10. operator setup/configuration は通常の device capability ではなく、別 control plane です。
 
+## Second-backend portability slice
+
+以下のCua tableは引き続きdefault-backend parity targetです。v0.8 Issue #222はmacos-mcp provider toolをこのtableへ混ぜず、feature parityも主張しません。代わりにmacos-mcp 0.4.0が同じ `ComputerUseBackendAdapter` seamを通じてreview済みsubsetを実装します。
+
+| CUMG semantic | macos-mcp private tool | Status |
+| --- | --- | --- |
+| `ListApplications` | `Snapshot` | portability slice, implemented |
+| `MovePointer` | `Move` | portability slice, implemented |
+| `PointerClick` | `Click` | portability slice, implemented |
+
+現時点でその他のCUMG semanticは `MacosMcpAdapter` ではunsupportedです。stale generation/revision fencingとambiguous post-dispatch settlementは引き続きHub-ownedで、Cuaと同一です。real-provider evidenceは [`acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md`](acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md) に記録します。
+
 ## Cua 0.19.3 の分類
 
 | # | Cua tool | V2 disposition | Planned/Current CUMG semantic |

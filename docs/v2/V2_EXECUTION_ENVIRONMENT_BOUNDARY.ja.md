@@ -56,6 +56,12 @@ CUMG は次の project-owned semantics を引き続き強化します。
 
 これらは、既存 login state、local application、device-bound credential、user-presence mechanism、OS permission、置き換え不能な interactive state など、computer/session 自体に継続的な価値がある場合に特に重要です。
 
+### v0.8 second-backend evidence
+
+Issue #222では、このseamをtrusted Mac上のmacos-mcp 0.4.0というsecond real native macOS providerで明示的にexerciseします。このintegrationは **execution-environment provisioningではなく**、provider discovery、scheduling、fleet lifecycleも追加しません。`MacosMcpAdapter` はreview済みの3 capability (`ListApplications`, `MovePointer`, `PointerClick`) だけを既存CUMG semanticsへmapし、provider固有名とresult formatはprivate adapter detailのままです。
+
+real-provider acceptanceにより、physical/native execution backendを交換しても、CUMG-owned operation identity、generation/revision fencing、post-dispatch ambiguity、durable quarantine、restart behavior、no-auto-replayが変わらないことを証明します。[`acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md`](acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md) を参照してください。
+
 ## 再利用する隣接レイヤー
 
 managed agent-computer provider や sandbox system は、次のような責務を所有できます。

@@ -33,6 +33,18 @@ method escape hatch.
    CUMG's operation identity, generation fences, quarantine, or no-auto-replay invariant.
 10. Operator setup/configuration is a separate control plane, not a normal device capability.
 
+## Second-backend portability slice
+
+The Cua table below remains the default-backend parity target. v0.8 Issue #222 does not add macos-mcp provider tools to that table or claim feature parity. Instead, macos-mcp 0.4.0 implements a reviewed subset through the same `ComputerUseBackendAdapter` seam:
+
+| CUMG semantic | macos-mcp private tool | Status |
+| --- | --- | --- |
+| `ListApplications` | `Snapshot` | portability slice, implemented |
+| `MovePointer` | `Move` | portability slice, implemented |
+| `PointerClick` | `Click` | portability slice, implemented |
+
+Every other CUMG semantic is unsupported by `MacosMcpAdapter` today. Stale generation/revision fencing and ambiguous post-dispatch settlement remain Hub-owned and identical to Cua. Real-provider evidence is recorded in [`acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md`](acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md).
+
 ## Cua 0.19.3 classification
 
 | # | Cua tool | V2 disposition | Planned/Current CUMG semantic |

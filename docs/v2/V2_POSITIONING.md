@@ -335,6 +335,8 @@ Prove the core is not accidentally Cua-specific by integrating at least one seco
 
 The backend must adapt to the CUMG state machine; the CUMG state machine must not be weakened to fit the backend.
 
+The v0.8 #222 portability candidate now adds a **second real provider-backed proof** with macos-mcp 0.4.0 on a trusted Mac. The adapter exposes only `ListApplications`, `MovePointer`, and `PointerClick`; provider `Snapshot`/`Move`/`Click` names and payloads terminate below `ComputerUseBackendAdapter`. Real observation plus two real GUI effects passed, stale generation/revision is rejected before dispatch, and an already-dispatched unproven provider result enters the unchanged durable `Indeterminate`/quarantine/no-replay path. This evidence supplements rather than replaces the earlier deterministic reference-executor proof. See [`acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md`](acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md).
+
 ## Decision rule for future subsystems
 
 Before implementing a new subsystem, ask in this order:
