@@ -56,6 +56,12 @@ CUMG should keep strengthening the following project-owned semantics:
 
 These properties matter most when the computer/session itself has durable value: existing login state, local applications, device-bound credentials, user-presence mechanisms, OS permissions, or an interactive state that cannot safely be replaced.
 
+### v0.8 second-backend evidence
+
+Issue #222 deliberately exercises this seam with macos-mcp 0.4.0 as a second real native macOS provider. The integration is **not** execution-environment provisioning and does not add provider discovery, scheduling, or fleet lifecycle. `MacosMcpAdapter` maps only a reviewed three-capability slice (`ListApplications`, `MovePointer`, `PointerClick`) into existing CUMG semantics. Provider names and result formats remain private adapter details.
+
+The real-provider acceptance proves that physical/native execution can change while CUMG-owned operation identity, generation/revision fencing, post-dispatch ambiguity, durable quarantine, restart behavior, and no-auto-replay remain unchanged. See [`acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md`](acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md).
+
 ## Adjacent layers to reuse
 
 Managed agent-computer providers and sandbox systems may own capabilities such as:

@@ -335,6 +335,8 @@ core が偶然 Cua-specific になっていないことを、cancellation/result
 
 backend が CUMG state machine に adapt するのであり、backend に合わせて CUMG state machine を弱めてはいけません。
 
+v0.8 #222 portability candidateでは、trusted Mac上のmacos-mcp 0.4.0を使う **second real provider-backed proof** も追加しました。adapterが公開するのは `ListApplications`、`MovePointer`、`PointerClick` だけで、providerの `Snapshot` / `Move` / `Click` 名とpayloadは `ComputerUseBackendAdapter` より下で終端します。real observationと2つのreal GUI effectが成功し、stale generation/revisionはdispatch前に拒否され、dispatch済みでprovider outcomeを証明できない場合はunchangedなdurable `Indeterminate` / quarantine / no-replay pathへ入ることを確認しています。このevidenceは既存deterministic reference-executor proofを置き換えず補完します。[`acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md`](acceptance/V2_SECOND_BACKEND_PORTABILITY_ACCEPTANCE.md) を参照してください。
+
 ## 将来 subsystem の decision rule
 
 新 subsystem を実装する前に、次の順で確認します。
