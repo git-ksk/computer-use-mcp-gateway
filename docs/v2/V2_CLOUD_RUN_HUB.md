@@ -145,8 +145,8 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 | Gate | Current status |
 | --- | --- |
 | Current Cloud Run limits re-verified | Design evidence complete (2026-09-03) |
-| Ephemeral filesystem excluded from authoritative state | Core seam complete; hosted external durable provider pending |
-| Provider-neutral durable Hub-state backend | #283 core implemented: trait + local adapter + deterministic conformance provider; hosted external provider pending |
+| Ephemeral filesystem excluded from authoritative state | #391 PostgreSQL external provider candidate implemented; real Cloud SQL deployment acceptance pending under #284 |
+| Provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate; real Cloud SQL acceptance pending under #284 |
 | Monotonic writer fencing and stale-writer dispatch denial | #283 automated core green; hosted revision-overlap acceptance pending |
 | One-port h2c gRPC + MCP + hosted Handoff ingress with separate auth boundaries | PR #285 merged; local h2c integration green, real hosted acceptance pending |
 | 3300s proactive Agent stream rotation acceptance | Pending |
@@ -154,7 +154,7 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 | Concurrent old/new revision fencing test | Deterministic two-writer core green; real hosted revision A/B acceptance pending |
 | Durable quarantine/replay-barrier restore after replacement | Core replacement/restart regression green; hosted backup/restore acceptance pending |
 | Hosted secret/key revision-rollout safety | #353 deterministic rotation composition green; real managed-secret revision A/B + log/OTLP acceptance pending under #284 |
-| Hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
+| Hosted deploy/upgrade/rollback/backup/alerting runbook | #391 PostgreSQL migration/bootstrap/rollback contract documented; real backup/restore/alerting acceptance pending under #284 |
 | Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation/acceptance pending |
 | Physical Agent + real Cua interrupted-effect acceptance | Pending |
 

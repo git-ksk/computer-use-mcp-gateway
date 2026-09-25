@@ -48,6 +48,7 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 portable-pty = "0.9.0"
 cap-std = "=4.0.3"
+tokio-postgres = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

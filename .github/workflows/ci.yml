@@ -11,6 +11,22 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: cumg
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d cumg"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CUMG_TEST_POSTGRES_URL: postgresql://postgres@127.0.0.1:5432/cumg
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

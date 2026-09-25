@@ -181,7 +181,7 @@ async fn signed_online_resolution_is_persistence_gated_idempotent_and_never_repl
                 12,
             )
             .unwrap();
-        persist_locked(&hub.inner, &mut persistent).unwrap();
+        persist_locked(&hub.inner, &mut persistent).await.unwrap();
     }
     assert_eq!(
         handle.desktop_quarantine().await.unwrap().operation_id,
@@ -367,7 +367,7 @@ async fn signed_current_state_acceptance_is_persistence_gated_restart_safe_and_n
                 12,
             )
             .unwrap();
-        persist_locked(&hub.inner, &mut persistent).unwrap();
+        persist_locked(&hub.inner, &mut persistent).await.unwrap();
     }
 
     let quarantine = handle.desktop_quarantine().await.unwrap();
@@ -606,7 +606,7 @@ async fn signed_current_state_acceptance_fails_closed_for_shell_and_equal_genera
                     12,
                 )
                 .unwrap();
-            persist_locked(&hub.inner, &mut persistent).unwrap();
+            persist_locked(&hub.inner, &mut persistent).await.unwrap();
         }
         let quarantine = handle.desktop_quarantine().await.unwrap();
         let challenge =

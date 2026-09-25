@@ -27,6 +27,7 @@ use computer_use_mcp_gateway::{
     },
     v2_oidc_jwt::{OidcJwtAlgorithm, OidcJwtConfig, OidcJwtVerifier},
     v2_operator_handoff::UnixOperatorHandoffAuthority,
+    v2_postgres_hub_state_store::{PostgresHubStateStore, PostgresHubStateStoreConfig},
     v2_semantic_constraints::SemanticConstraintPolicy,
     v2_status_collector::{CollectedOperatorStatusProvider, OperatorStatusCollectionConfig},
 };
@@ -45,6 +46,7 @@ const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_HOSTED_HANDOFF_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SEMANTIC_CONSTRAINT_POLICY_BYTES: u64 = 64 * 1024;
+const MAX_POSTGRES_PASSWORD_BYTES: u64 = 4 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "v2_hub")]
@@ -85,6 +87,30 @@ struct Args {
     hosted_port: Option<u16>,
     #[arg(long, env = "CUMG_V2_HUB_STATE_DIR")]
     state_dir: PathBuf,
+    /// PostgreSQL host for the hosted authoritative state store. A leading slash selects a Unix
+    /// socket directory, including the Cloud SQL /cloudsql/PROJECT:REGION:INSTANCE mount.
+    #[arg(long, env = "CUMG_V2_POSTGRES_HOST")]
+    postgres_host: Option<String>,
+    #[arg(long, env = "CUMG_V2_POSTGRES_PORT", default_value_t = 5432)]
+    postgres_port: u16,
+    #[arg(long, env = "CUMG_V2_POSTGRES_DATABASE")]
+    postgres_database: Option<String>,
+    #[arg(long, env = "CUMG_V2_POSTGRES_USER")]
+    postgres_user: Option<String>,
+    /// Optional private file containing the PostgreSQL password.
+    #[arg(long, env = "CUMG_V2_POSTGRES_PASSWORD_FILE")]
+    postgres_password_file: Option<PathBuf>,
+    /// Stable deployment-owned key for the single authoritative Hub row.
+    #[arg(long, env = "CUMG_V2_POSTGRES_STATE_KEY")]
+    postgres_state_key: Option<String>,
+    #[arg(
+        long,
+        env = "CUMG_V2_POSTGRES_CONNECT_TIMEOUT_SECS",
+        default_value_t = 5
+    )]
+    postgres_connect_timeout_secs: u64,
+    #[arg(long, env = "CUMG_V2_POSTGRES_QUERY_TIMEOUT_SECS", default_value_t = 5)]
+    postgres_query_timeout_secs: u64,
     /// Install root used only by the read-only unified MCP status collector.
     #[arg(long, env = "CUMG_V2_STATUS_INSTALL_ROOT")]
     status_install_root: Option<PathBuf>,
@@ -401,20 +427,29 @@ async fn main() -> Result<()> {
             .expect("validated non-hosted TLS key");
         Some(load_tls_server_identity(cert, key).context("failed to load TLS server identity")?)
     };
-    let (hub, handle) = SingleDeviceHub::new(
-        HubServiceConfig {
-            state_dir: args.state_dir.clone(),
-            heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
-            max_agent_session_lifetime: Duration::from_secs(args.max_agent_session_lifetime_secs),
-            agent_session_reauth_drain: Duration::from_secs(args.agent_session_reauth_drain_secs),
-            checkpoint_generation_rollover_bytes: args.checkpoint_generation_rollover_bytes,
-            max_queued_per_device: args.max_queued_per_device,
-            max_agent_sessions: args.max_agent_sessions,
-            max_agent_session_starts_per_minute: args.max_agent_session_starts_per_minute,
-        },
-        material,
-    )
-    .context("failed to initialize V2 Hub state")?;
+    let hub_config = HubServiceConfig {
+        state_dir: args.state_dir.clone(),
+        heartbeat_timeout: Duration::from_secs(args.heartbeat_timeout_secs),
+        max_agent_session_lifetime: Duration::from_secs(args.max_agent_session_lifetime_secs),
+        agent_session_reauth_drain: Duration::from_secs(args.agent_session_reauth_drain_secs),
+        checkpoint_generation_rollover_bytes: args.checkpoint_generation_rollover_bytes,
+        max_queued_per_device: args.max_queued_per_device,
+        max_agent_sessions: args.max_agent_sessions,
+        max_agent_session_starts_per_minute: args.max_agent_session_starts_per_minute,
+    };
+    let (hub, handle) = if args.hosted_profile {
+        let store_config = build_hosted_postgres_state_config(&args)?;
+        let state_store = Arc::new(
+            PostgresHubStateStore::connect(store_config)
+                .await
+                .context("failed to connect hosted PostgreSQL Hub state")?,
+        );
+        SingleDeviceHub::new_with_async_state_store(hub_config, material, state_store)
+            .await
+            .context("failed to initialize hosted V2 Hub state")?
+    } else {
+        SingleDeviceHub::new(hub_config, material).context("failed to initialize V2 Hub state")?
+    };
     let device_id = hub.device_id().to_owned();
     let shutdown_handle = handle.clone();
     let handoff_coordinator = build_handoff_coordinator(&args, handle.clone()).await?;
@@ -1145,6 +1180,32 @@ fn build_hosted_handoff_runtime(
     }))
 }
 
+fn build_hosted_postgres_state_config(args: &Args) -> Result<PostgresHubStateStoreConfig> {
+    let mut config = PostgresHubStateStoreConfig::new(
+        required(&args.postgres_host, "CUMG_V2_POSTGRES_HOST")?,
+        required(&args.postgres_database, "CUMG_V2_POSTGRES_DATABASE")?,
+        required(&args.postgres_user, "CUMG_V2_POSTGRES_USER")?,
+        required(&args.postgres_state_key, "CUMG_V2_POSTGRES_STATE_KEY")?,
+    )
+    .context("invalid hosted PostgreSQL Hub-state configuration")?
+    .with_port(args.postgres_port)
+    .context("invalid hosted PostgreSQL port")?
+    .with_timeouts(
+        Duration::from_secs(args.postgres_connect_timeout_secs),
+        Duration::from_secs(args.postgres_query_timeout_secs),
+    )
+    .context("invalid hosted PostgreSQL timeout configuration")?;
+
+    if let Some(path) = args.postgres_password_file.as_ref() {
+        let password = load_secret_text(path, MAX_POSTGRES_PASSWORD_BYTES)
+            .context("failed to load hosted PostgreSQL password")?;
+        config = config
+            .with_password(password)
+            .context("invalid hosted PostgreSQL password")?;
+    }
+    Ok(config)
+}
+
 fn validate_profile_configuration(args: &Args) -> Result<()> {
     let hosted_handoff_configured = args.hosted_handoff_resource.is_some()
         || args.hosted_handoff_required_scopes.is_some()
@@ -1164,6 +1225,19 @@ fn validate_profile_configuration(args: &Args) -> Result<()> {
         ensure!(
             args.hosted_port.is_some_and(|port| port > 0),
             "hosted profile requires Cloud Run PORT"
+        );
+        ensure!(
+            args.postgres_host.is_some()
+                && args.postgres_database.is_some()
+                && args.postgres_user.is_some()
+                && args.postgres_state_key.is_some(),
+            "hosted profile requires complete external PostgreSQL Hub-state configuration"
+        );
+        ensure!(
+            args.postgres_port > 0
+                && args.postgres_connect_timeout_secs > 0
+                && args.postgres_query_timeout_secs > 0,
+            "hosted profile requires positive PostgreSQL port/timeouts"
         );
         ensure!(
             args.drain_timeout_secs <= 8,
@@ -1226,6 +1300,14 @@ fn validate_profile_configuration(args: &Args) -> Result<()> {
         ensure!(
             args.tls_cert_pem_file.is_some() && args.tls_key_pem_file.is_some(),
             "non-hosted profile requires CUMG_V2_TLS_CERT_PEM_FILE and CUMG_V2_TLS_KEY_PEM_FILE"
+        );
+        ensure!(
+            args.postgres_host.is_none()
+                && args.postgres_database.is_none()
+                && args.postgres_user.is_none()
+                && args.postgres_password_file.is_none()
+                && args.postgres_state_key.is_none(),
+            "PostgreSQL hosted Hub-state settings require CUMG_V2_HOSTED_PROFILE=true"
         );
         ensure!(
             !hosted_handoff_configured,
@@ -1399,6 +1481,14 @@ mod auth_mode_tests {
             "8080",
             "--drain-timeout-secs",
             "8",
+            "--postgres-host",
+            "/cloudsql/project:region:instance",
+            "--postgres-database",
+            "cumg",
+            "--postgres-user",
+            "cumg_runtime",
+            "--postgres-state-key",
+            "hosted-device-a",
             "--mcp-resource",
             "https://hub.example/mcp",
             "--northbound-policy-file",
@@ -1433,6 +1523,14 @@ mod auth_mode_tests {
             "--hosted-profile",
             "--hosted-port",
             "8080",
+            "--postgres-host",
+            "/cloudsql/project:region:instance",
+            "--postgres-database",
+            "cumg",
+            "--postgres-user",
+            "cumg_runtime",
+            "--postgres-state-key",
+            "hosted-device-a",
             "--tls-cert-pem-file",
             "/tmp/cert.pem",
             "--tls-key-pem-file",
