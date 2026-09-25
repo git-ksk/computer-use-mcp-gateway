@@ -5332,8 +5332,8 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_EXECUTE_PROCESS,
-            "Execute a bounded structured local process. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; this is not a persistent service launcher. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the process.",
-            object_schema(
+            "Execute a bounded structured local process. The child environment is cleared, then only the Agent service's allowlisted environment is inherited; PATH can therefore differ from an interactive/login shell and caller env cannot override PATH. Use an absolute executable path when a program is outside the Agent service PATH. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; this is not a persistent service launcher. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the process.",
+            execution_environment_object_schema(
                 vec![
                     ("operation_id", operation_id_schema()),
                     ("program", string_schema()),
@@ -5348,8 +5348,8 @@ fn all_tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::new().destructive(true).idempotent(false)),
         Tool::new(
             TOOL_SHELL,
-            "Execute a bounded free-form shell command. On Windows the dialect is exactly cmd.exe /D /S /C (use %NAME% for available environment variables; do not wrap the entire command in an extra quote pair); on Unix it is /bin/sh -c. The child environment is intentionally allowlisted rather than a full login shell environment. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; nohup/backgrounding is not a supported persistence mechanism. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the shell command.",
-            object_schema(
+            "Execute a bounded free-form shell command. On Windows the dialect is exactly cmd.exe /D /S /C (use %NAME% for available environment variables; do not wrap the entire command in an extra quote pair); on Unix it is /bin/sh -c. The child environment is cleared, then only the Agent service's allowlisted environment is inherited; no login/interactive profile is sourced, PATH can differ from a terminal session, and caller env cannot override PATH. Use an absolute executable path when a command is outside the Agent service PATH. Ordinary descendants remaining in the supervised process group/Job Object are cleaned when the operation ends; nohup/backgrounding is not a supported persistence mechanism. Supply operation_id before long-running or mutating work so a lost response can be recovered with get_operation; lookup never replays the shell command.",
+            execution_environment_object_schema(
                 vec![
                     ("operation_id", operation_id_schema()),
                     ("command", string_schema()),
@@ -5901,8 +5901,38 @@ fn array_schema(items: Value) -> Value {
     json!({ "type": "array", "items": items })
 }
 
+fn execution_environment_contract_schema() -> Value {
+    json!({
+        "profile": "constrained",
+        "child_environment_reset": true,
+        "environment_inheritance": "allowlisted_agent_service_environment",
+        "path_inheritance": "agent_service_environment_if_present",
+        "caller_path_override": false,
+        "login_profile_loading": false,
+        "missing_executable_next_action": "use_absolute_executable_path",
+        "authority": "non_authoritative"
+    })
+}
+
+fn execution_environment_object_schema(
+    properties: Vec<(&str, Value)>,
+    required: &[&str],
+) -> Arc<JsonObject> {
+    let schema = object_schema(properties, required);
+    let mut schema = (*schema).clone();
+    schema.insert(
+        "x-cumg-execution-environment".into(),
+        execution_environment_contract_schema(),
+    );
+    Arc::new(schema)
+}
+
 fn string_map_schema() -> Value {
-    json!({ "type": "object", "additionalProperties": { "type": "string" } })
+    json!({
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Caller-supplied environment is allowlisted. PATH is inherited only from the Agent service environment and cannot be overridden through this map."
+    })
 }
 
 fn bounded_text_schema() -> Value {
@@ -8798,6 +8828,60 @@ mod tests {
                 .clone(),
         );
         assert!(extract_audit_metadata(&mut invalid).is_err());
+    }
+
+    #[test]
+    fn process_and_shell_schemas_expose_bounded_execution_environment_contract() {
+        let tools = all_tools();
+        for name in [TOOL_EXECUTE_PROCESS, TOOL_SHELL] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap();
+            let contract = tool
+                .input_schema
+                .get("x-cumg-execution-environment")
+                .unwrap();
+            assert_eq!(contract["profile"], "constrained", "{name}");
+            assert_eq!(contract["child_environment_reset"], true, "{name}");
+            assert_eq!(
+                contract["environment_inheritance"], "allowlisted_agent_service_environment",
+                "{name}"
+            );
+            assert_eq!(
+                contract["path_inheritance"], "agent_service_environment_if_present",
+                "{name}"
+            );
+            assert_eq!(contract["caller_path_override"], false, "{name}");
+            assert_eq!(contract["login_profile_loading"], false, "{name}");
+            assert_eq!(
+                contract["missing_executable_next_action"], "use_absolute_executable_path",
+                "{name}"
+            );
+            assert_eq!(contract["authority"], "non_authoritative", "{name}");
+
+            let env_description = tool.input_schema["properties"]["env"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(env_description.contains("PATH"));
+            assert!(env_description.contains("cannot be overridden"));
+
+            let serialized = serde_json::to_string(&tool.input_schema).unwrap();
+            assert!(!serialized.contains("/opt/homebrew"));
+            assert!(!serialized.contains("/Users/"));
+            assert!(!serialized.contains("AWS_SECRET_ACCESS_KEY"));
+        }
+
+        let observe = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == TOOL_READ_FILE)
+            .unwrap();
+        assert!(
+            observe
+                .input_schema
+                .get("x-cumg-execution-environment")
+                .is_none()
+        );
     }
 
     #[test]
