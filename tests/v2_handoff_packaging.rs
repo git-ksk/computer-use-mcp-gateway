@@ -271,3 +271,23 @@ fn v05_packaging_keeps_workspace_mutation_explicit_and_ephemeral_state_non_autho
     assert!(!upgrade.contains(r#"cp -R "$EPHEMERAL_DATA_PARENT""#));
     assert!(!upgrade.contains(r#"cp -p "$EPHEMERAL_DATA_PARENT""#));
 }
+
+#[test]
+fn reviewed_handoff_manifest_matches_release_workflow_identity_and_version_guard() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../packaging/release/single-mac-handoff.json")).unwrap();
+    let workflow = include_str!("../.github/workflows/release-candidate.yml");
+
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["repository"], "git-ksk/mcp-execution-handoff");
+    let source_commit = manifest["source_commit"].as_str().unwrap();
+    assert_eq!(source_commit.len(), 40);
+    assert!(source_commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let package_version = manifest["package_version"].as_str().unwrap();
+    assert!(!package_version.is_empty());
+
+    assert!(workflow.contains(&format!("HANDOFF_SOURCE_COMMIT: {source_commit}")));
+    assert!(workflow.contains("pinned_version="));
+    assert!(workflow.contains("handoff_version="));
+    assert!(workflow.contains("Handoff package version differs from reviewed package manifest"));
+}
