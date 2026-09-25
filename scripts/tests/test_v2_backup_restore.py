@@ -283,6 +283,17 @@ class BackupRestoreTests(unittest.TestCase):
 
 
     def test_round_trip_preserves_quarantine_replay_and_authority(self):
+        hub_path = self.root / "v2/state/hub/hub-00000000000000000042.json"
+        hub_state = json.loads(hub_path.read_text())
+        hub_state["schema_version"] = 7
+        hub_state["durable_fence"] = {
+            "schema_version": 1,
+            "revision": 23,
+            "writer_epoch": 9,
+        }
+        hub_path.write_text(json.dumps(hub_state) + "\n")
+        hub_path.chmod(0o600)
+
         digest = self._backup()
         manifest = mod.verify_backup(
             self.backup,
@@ -293,6 +304,9 @@ class BackupRestoreTests(unittest.TestCase):
         self.assertEqual(manifest["hub_state"]["quarantine_count"], 1)
         self.assertEqual(manifest["hub_state"]["operations_count"], 1)
         self.assertEqual(manifest["hub_state"]["retirements_count"], 1)
+        self.assertEqual(manifest["hub_state"]["schema_version"], 7)
+        self.assertEqual(manifest["hub_state"]["state_revision"], 23)
+        self.assertEqual(manifest["hub_state"]["writer_epoch"], 9)
         self.assertEqual(manifest["mutation_authority"], {
             "schema_version": 1,
             "owner": "v2",
@@ -328,10 +342,10 @@ class BackupRestoreTests(unittest.TestCase):
             mod.collect_state(stage / "root", "hub")[0]["execution_sha256"],
             original_execution,
         )
-        self.assertEqual(
-            mod.collect_state(stage / "root", "hub")[0]["quarantine_count"],
-            1,
-        )
+        staged_hub = mod.collect_state(stage / "root", "hub")[0]
+        self.assertEqual(staged_hub["quarantine_count"], 1)
+        self.assertEqual(staged_hub["state_revision"], 23)
+        self.assertEqual(staged_hub["writer_epoch"], 9)
 
         result = mod.activate_restore(
             self.backup,
@@ -385,11 +399,47 @@ class BackupRestoreTests(unittest.TestCase):
     def test_newer_checkpoint_schema_is_refused(self):
         path = self.root / "v2/state/hub/hub-00000000000000000042.json"
         value = json.loads(path.read_text())
-        value["schema_version"] = 7
+        value["schema_version"] = 8
         path.write_text(json.dumps(value) + "\n")
         path.chmod(0o600)
         with self.assertRaisesRegex(mod.BackupRestoreError, "checkpoint_schema_unsupported"):
             self._backup()
+
+    def test_hub_schema7_requires_and_summarizes_durable_writer_fence(self):
+        path = self.root / "v2/state/hub/hub-00000000000000000042.json"
+        value = json.loads(path.read_text())
+        value["schema_version"] = 7
+        value["durable_fence"] = {
+            "schema_version": 1,
+            "revision": 17,
+            "writer_epoch": 4,
+        }
+        path.write_text(json.dumps(value) + "\n")
+        path.chmod(0o600)
+
+        summary, _ = mod.collect_state(self.root, "hub")
+        self.assertEqual(summary["schema_version"], 7)
+        self.assertEqual(summary["state_revision"], 17)
+        self.assertEqual(summary["writer_epoch"], 4)
+
+        del value["durable_fence"]
+        path.write_text(json.dumps(value) + "\n")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(mod.BackupRestoreError, "hub_writer_fence_invalid"):
+            mod.collect_state(self.root, "hub")
+
+    def test_legacy_hub_schema_rejects_injected_writer_fence(self):
+        path = self.root / "v2/state/hub/hub-00000000000000000042.json"
+        value = json.loads(path.read_text())
+        value["durable_fence"] = {
+            "schema_version": 1,
+            "revision": 1,
+            "writer_epoch": 1,
+        }
+        path.write_text(json.dumps(value) + "\n")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(mod.BackupRestoreError, "hub_writer_fence_invalid"):
+            mod.collect_state(self.root, "hub")
 
     def test_unknown_state_entry_is_refused(self):
         self._write(self.root / "v2/state/agent/future-authority.json", b'{"schema_version":1}\n')

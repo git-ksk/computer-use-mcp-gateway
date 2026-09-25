@@ -20,8 +20,8 @@ use crate::v2_m0_execution::{
     AdmissionLimits, ExecutionError, HubOperationState, IndeterminateResolution,
 };
 use crate::v2_m1_persistence::{
-    AgentPersistentState, CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION,
-    PersistenceError,
+    AgentPersistentState, CheckpointStore, HUB_M1_STATE_SCHEMA_VERSION,
+    HubPersistenceFenceSnapshot, HubPersistentState, PersistenceError,
 };
 use crate::v2_state_lock::{StateDirectoryLock, StateDirectoryLockError};
 use serde::{Deserialize, Serialize};
@@ -1455,6 +1455,7 @@ fn resolve_indeterminate_offline_at(
     let source_state_schema = state.schema_version;
     let source_registry = state.registry.clone();
     let source_execution_schema = state.execution.schema_version;
+    let source_durable_fence = state.durable_fence;
     // Checkpoints are restart-normalized before serialization, so queue capacity
     // is irrelevant to this single offline transition. V2 remains single-active.
     let limits = AdmissionLimits {
@@ -1488,6 +1489,7 @@ fn resolve_indeterminate_offline_at(
         source_state_schema,
         source_registry,
         source_execution_schema,
+        next_offline_maintenance_fence(source_state_schema, source_durable_fence)?,
         &execution,
     )?;
     // Return the same receipt schema that is actually persisted. The CLI does
@@ -1501,8 +1503,7 @@ fn resolve_indeterminate_offline_at(
         .clone()
         .restore(limits)
         .map_err(MaintenanceError::Persistence)?;
-    let checkpoint_path = checkpoint
-        .save(&candidate)
+    let checkpoint_path = commit_offline_hub_candidate(&checkpoint, &candidate)
         .map_err(MaintenanceError::Persistence)?;
     Ok(OfflineResolutionResult {
         receipt,
@@ -1540,7 +1541,7 @@ fn retire_indeterminate_offline_at(
         policy,
         reason,
         now_ms,
-        |checkpoint, candidate| checkpoint.save(candidate),
+        commit_offline_hub_candidate,
     )
 }
 
@@ -1565,10 +1566,11 @@ where
     let source_state_schema = state.schema_version;
     let source_registry = state.registry.clone();
     let source_execution_schema = state.execution.schema_version;
-    if source_state_schema != M1_STATE_SCHEMA_VERSION {
+    let source_durable_fence = state.durable_fence;
+    if source_state_schema != HUB_M1_STATE_SCHEMA_VERSION {
         return Err(MaintenanceError::RetirementRequiresCurrentStateSchema {
             checkpoint_state_schema: source_state_schema,
-            maintenance_state_schema: M1_STATE_SCHEMA_VERSION,
+            maintenance_state_schema: HUB_M1_STATE_SCHEMA_VERSION,
         });
     }
     if source_execution_schema < MIN_RETIREMENT_SOURCE_EXECUTION_SCHEMA_VERSION {
@@ -1641,6 +1643,7 @@ where
         schema_version: source_state_schema,
         registry: source_registry,
         execution: execution.snapshot_for_restart(),
+        durable_fence: next_offline_maintenance_fence(source_state_schema, source_durable_fence)?,
     };
     candidate
         .clone()
@@ -1654,10 +1657,80 @@ where
     })
 }
 
+fn next_offline_maintenance_fence(
+    source_state_schema: u16,
+    source: Option<HubPersistenceFenceSnapshot>,
+) -> Result<Option<HubPersistenceFenceSnapshot>, MaintenanceError> {
+    if source_state_schema == HUB_M1_STATE_SCHEMA_VERSION {
+        let mut fence = source.ok_or(MaintenanceError::Persistence(
+            PersistenceError::InvalidState,
+        ))?;
+        fence.validate().map_err(MaintenanceError::Persistence)?;
+        fence.revision = fence
+            .revision
+            .checked_add(1)
+            .ok_or(MaintenanceError::Persistence(
+                PersistenceError::InvalidState,
+            ))?;
+        Ok(Some(fence))
+    } else if source.is_some() {
+        Err(MaintenanceError::Persistence(
+            PersistenceError::InvalidState,
+        ))
+    } else {
+        // Historical schema 5/6 maintenance remains representation-preserving:
+        // no fencing fields are manufactured merely by running a newer helper.
+        Ok(None)
+    }
+}
+
+fn commit_offline_hub_candidate(
+    checkpoint: &CheckpointStore,
+    candidate: &HubPersistentState,
+) -> Result<PathBuf, PersistenceError> {
+    let (expected_sequence, current) =
+        checkpoint.load_latest_with_sequence::<HubPersistentState>()?;
+
+    match (current.durable_fence, candidate.durable_fence) {
+        (Some(current_fence), Some(candidate_fence)) => {
+            current_fence.validate()?;
+            candidate_fence.validate()?;
+            if current.schema_version != HUB_M1_STATE_SCHEMA_VERSION
+                || candidate.schema_version != HUB_M1_STATE_SCHEMA_VERSION
+                || candidate_fence.writer_epoch != current_fence.writer_epoch
+                || candidate_fence.revision
+                    != current_fence
+                        .revision
+                        .checked_add(1)
+                        .ok_or(PersistenceError::InvalidState)?
+            {
+                return Err(PersistenceError::InvalidState);
+            }
+        }
+        (None, None) => {
+            if current.schema_version == HUB_M1_STATE_SCHEMA_VERSION
+                || candidate.schema_version == HUB_M1_STATE_SCHEMA_VERSION
+            {
+                return Err(PersistenceError::InvalidState);
+            }
+        }
+        _ => return Err(PersistenceError::InvalidState),
+    }
+
+    let (path, _) =
+        checkpoint.save_if_latest_sequence_with_size(Some(expected_sequence), candidate)?;
+    let (_, verified) = checkpoint.load_latest_with_sequence::<HubPersistentState>()?;
+    if verified != *candidate {
+        return Err(PersistenceError::InvalidState);
+    }
+    Ok(path)
+}
+
 fn compatible_checkpoint(
     source_state_schema: u16,
     source_registry: DeviceRegistrySnapshot,
     source_execution_schema: u16,
+    source_durable_fence: Option<crate::v2_m1_persistence::HubPersistenceFenceSnapshot>,
     execution: &AuthoritativeOperationController,
 ) -> Result<HubPersistentState, MaintenanceError> {
     let execution = execution
@@ -1673,6 +1746,7 @@ fn compatible_checkpoint(
         schema_version: source_state_schema,
         registry: source_registry,
         execution,
+        durable_fence: source_durable_fence,
     })
 }
 
@@ -1893,9 +1967,15 @@ mod tests {
             .mark_dispatched(&operation_id, &owner, 1, 110)
             .unwrap();
         execution.mark_connection_lost(&operation_id, 120).unwrap();
+        let mut state = HubPersistentState::capture(&registry, &execution);
+        state.durable_fence = Some(HubPersistenceFenceSnapshot {
+            schema_version: crate::v2_m1_persistence::HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+            revision: 1,
+            writer_epoch: 1,
+        });
         CheckpointStore::new(state_dir.to_path_buf(), "hub")
             .unwrap()
-            .save(&HubPersistentState::capture(&registry, &execution))
+            .save(&state)
             .unwrap();
         (device_id, operation_id)
     }
@@ -1943,13 +2023,18 @@ mod tests {
             .unwrap()
             .generation = current_device_generation;
         let state = HubPersistentState {
-            schema_version: M1_STATE_SCHEMA_VERSION,
+            schema_version: HUB_M1_STATE_SCHEMA_VERSION,
             registry: registry_snapshot,
             execution: execution
                 .snapshot_for_restart_compatible_with(
                     MIN_RETIREMENT_SOURCE_EXECUTION_SCHEMA_VERSION,
                 )
                 .unwrap(),
+            durable_fence: Some(HubPersistenceFenceSnapshot {
+                schema_version: crate::v2_m1_persistence::HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+                revision: 1,
+                writer_epoch: 1,
+            }),
         };
         CheckpointStore::new(state_dir.to_path_buf(), "hub")
             .unwrap()
@@ -3101,6 +3186,14 @@ mod tests {
             latest.execution.schema_version,
             EXECUTION_SAFETY_SCHEMA_VERSION
         );
+        assert_eq!(
+            latest.durable_fence,
+            Some(HubPersistenceFenceSnapshot {
+                schema_version: crate::v2_m1_persistence::HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+                revision: 2,
+                writer_epoch: 1,
+            })
+        );
         let (_registry, mut execution) = latest
             .restore(AdmissionLimits {
                 max_global_active: 1,
@@ -3363,6 +3456,14 @@ mod tests {
             .unwrap()
             .load_latest::<HubPersistentState>()
             .unwrap();
+        assert_eq!(
+            latest.durable_fence,
+            Some(HubPersistenceFenceSnapshot {
+                schema_version: crate::v2_m1_persistence::HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+                revision: 2,
+                writer_epoch: 1,
+            })
+        );
         let (registry, mut execution) = latest
             .restore(AdmissionLimits {
                 max_global_active: 1,
@@ -3418,6 +3519,8 @@ mod tests {
         legacy.execution.auto_resolutions.clear();
         // Exercise preservation of the registry writer contract too. Maintenance
         // does not own a registry transition and must not incidentally migrate it.
+        legacy.schema_version = crate::v2_m1_persistence::M1_STATE_SCHEMA_VERSION;
+        legacy.durable_fence = None;
         legacy.registry.schema_version = 5;
         let legacy_registry = legacy.registry.clone();
         store.save(&legacy).unwrap();
@@ -3449,6 +3552,7 @@ mod tests {
         assert_eq!(after_count, before_count + 1);
         let resolved = store.load_latest::<HubPersistentState>().unwrap();
         assert_eq!(resolved.schema_version, legacy.schema_version);
+        assert_eq!(resolved.durable_fence, None);
         assert_eq!(resolved.registry, legacy_registry);
         assert_eq!(resolved.execution.schema_version, 1);
         assert_eq!(
@@ -3546,9 +3650,10 @@ mod tests {
         let before_count = std::fs::read_dir(&dir).unwrap().count();
 
         let error = compatible_checkpoint(
-            crate::v2_m1_persistence::M1_STATE_SCHEMA_VERSION,
+            crate::v2_m1_persistence::HUB_M1_STATE_SCHEMA_VERSION,
             registry.snapshot(),
             1,
+            None,
             &execution,
         )
         .unwrap_err();

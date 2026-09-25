@@ -7,7 +7,8 @@ use crate::v2_m0::{
 use crate::v2_m0_transport::HUB_AGENT_SCHEMA_VERSION;
 use crate::v2_m1_backend::{effective_execution_budget_ms, minimum_paced_type_text_budget_ms};
 use crate::v2_m1_persistence::{
-    AgentPersistentState, CheckpointStore, HubPersistentState, M1_STATE_SCHEMA_VERSION,
+    AgentPersistentState, CheckpointStore, HUB_M1_STATE_SCHEMA_VERSION, HubPersistentState,
+    M1_STATE_SCHEMA_VERSION,
 };
 use crate::v2_maintenance::inspect_quarantines_read_only;
 #[cfg(target_os = "macos")]
@@ -686,7 +687,22 @@ fn inspect_checkpoint_reader_compatibility(
         .and_then(|value| value.get("schema_version"))
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u16::try_from(value).ok());
-    if state_schema != Some(M1_STATE_SCHEMA_VERSION)
+    let current_hub_fence_valid = if state_schema == Some(HUB_M1_STATE_SCHEMA_VERSION) {
+        raw.get("durable_fence")
+            .and_then(|value| {
+                serde_json::from_value::<crate::v2_m1_persistence::HubPersistenceFenceSnapshot>(
+                    value.clone(),
+                )
+                .ok()
+            })
+            .is_some_and(|fence| fence.validate().is_ok())
+    } else {
+        true
+    };
+    if !matches!(
+        state_schema,
+        Some(M1_STATE_SCHEMA_VERSION | HUB_M1_STATE_SCHEMA_VERSION)
+    ) || !current_hub_fence_valid
         || execution_schema.is_some_and(|value| value > EXECUTION_SAFETY_SCHEMA_VERSION)
     {
         push(
@@ -2224,7 +2240,6 @@ mod tests {
         };
         use crate::v2_m0::{DeviceCapability, DeviceIdentity, DeviceRegistry};
         use crate::v2_m0_execution::{AdmissionLimits, OperationRef};
-        use crate::v2_m1_persistence::M1_STATE_SCHEMA_VERSION;
 
         let root = temp_dir("self-observation-checkpoint");
         std::fs::create_dir_all(&root).unwrap();
@@ -2268,9 +2283,14 @@ mod tests {
             )
             .unwrap();
         let state = HubPersistentState {
-            schema_version: M1_STATE_SCHEMA_VERSION,
+            schema_version: HUB_M1_STATE_SCHEMA_VERSION,
             registry: registry_snapshot,
             execution: execution.snapshot_for_restart(),
+            durable_fence: Some(crate::v2_m1_persistence::HubPersistenceFenceSnapshot {
+                schema_version: crate::v2_m1_persistence::HUB_PERSISTENCE_FENCE_SCHEMA_VERSION,
+                revision: 1,
+                writer_epoch: 1,
+            }),
         };
         CheckpointStore::new(root.clone(), "hub")
             .unwrap()

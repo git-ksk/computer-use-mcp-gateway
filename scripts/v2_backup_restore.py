@@ -27,7 +27,9 @@ BACKUP_PROFILE = "single-mac-v2-verified-v1"
 RUNTIME_MANIFEST_SCHEMA_VERSION = 4
 HANDOFF_MANIFEST_SCHEMA_VERSION = 1
 MUTATION_AUTHORITY_SCHEMA_VERSION = 1
-SUPPORTED_M1_STATE_SCHEMAS = {5, 6}
+SUPPORTED_HUB_M1_STATE_SCHEMAS = {5, 6, 7}
+SUPPORTED_AGENT_M1_STATE_SCHEMAS = {5, 6}
+HUB_PERSISTENCE_FENCE_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_STATE_BYTES = 1024 * 1024
 MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -615,7 +617,12 @@ def _state_entry_excluded(role: str, name: str, is_dir: bool) -> bool:
 def _checkpoint_summary(path: Path, role: str, sequence: int) -> dict[str, object]:
     data = _read_json(path, max_bytes=MAX_STATE_BYTES)
     schema = data.get("schema_version")
-    if schema not in SUPPORTED_M1_STATE_SCHEMAS:
+    supported = (
+        SUPPORTED_HUB_M1_STATE_SCHEMAS
+        if role == "hub"
+        else SUPPORTED_AGENT_M1_STATE_SCHEMAS
+    )
+    if schema not in supported:
         _fail("checkpoint_schema_unsupported")
     summary: dict[str, object] = {
         "latest_sequence": sequence,
@@ -623,6 +630,24 @@ def _checkpoint_summary(path: Path, role: str, sequence: int) -> dict[str, objec
         "latest_sha256": _sha256_file(path),
     }
     if role == "hub":
+        fence = data.get("durable_fence")
+        if schema == 7:
+            if (
+                not isinstance(fence, dict)
+                or set(fence) != {"schema_version", "revision", "writer_epoch"}
+                or fence.get("schema_version") != HUB_PERSISTENCE_FENCE_SCHEMA_VERSION
+                or not isinstance(fence.get("revision"), int)
+                or isinstance(fence.get("revision"), bool)
+                or fence["revision"] <= 0
+                or not isinstance(fence.get("writer_epoch"), int)
+                or isinstance(fence.get("writer_epoch"), bool)
+                or fence["writer_epoch"] <= 0
+            ):
+                _fail("hub_writer_fence_invalid")
+            summary["state_revision"] = fence["revision"]
+            summary["writer_epoch"] = fence["writer_epoch"]
+        elif fence is not None:
+            _fail("hub_writer_fence_invalid")
         execution = data.get("execution")
         if not isinstance(execution, dict):
             _fail("hub_execution_state_missing")

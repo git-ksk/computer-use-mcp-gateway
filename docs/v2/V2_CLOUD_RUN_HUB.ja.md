@@ -1,6 +1,6 @@
 # V2 Cloud Run Hub support gate
 
-Status: Issue #215 の **design complete / implementation・acceptance pending**。
+Status: Issue #215 の **design complete / #282 ingress merge済み / #283 durable-state・writer-fence coreはv0.9.0 candidate branchで実装済み / hosted provider・deployment/physical acceptance pending**。
 
 Cloud Run はまだ CUMG Hub の supported deployment ではありません。既存 single-host / VM Hub profile が引き続き supported model です。この文書は、Cloud Run support claim を出す前に必要な architecture と evidence を固定します。
 
@@ -24,13 +24,13 @@ Authoritative reference:
 - <https://docs.cloud.google.com/run/docs/configuring/min-instances>
 - <https://docs.cloud.google.com/run/docs/configuring/max-instances-limits>
 
-## 現行 CUMG との非互換点
+## 残る hosted gap
 
-現在の Hub は deployment flag の変更だけでは Cloud Run ready になりません。
+deployment flag の変更だけではまだ Cloud Run ready になりませんが、#282 と #283 automated core により以前のarchitecture blockerの一部は解消しています。
 
-1. `CheckpointStore` は local filesystem 前提で、private pending file、flush/fsync、no-clobber publication、directory fsync に commit proof を依存します。
-2. `v2_hub` は Agent gRPC/TLS と northbound MCP HTTP を別 listener で公開します。Cloud Run ingress は1 portです。
-3. 現行 Hub authority は1つの `HubHandle` と process-local coordination に依存し、pending operation も memory 上で管理します。session affinity は replacement / concurrent instance 間の authority になりません。
+1. #283でauthoritative persistenceをprovider-neutral state-store/CAS contractへ分離し、`CheckpointStore`はlocal backendとして維持します。hosted profile用production external durable providerは未選定で、同じconformance contractを満たす必要があります。
+2. #282はmerge済みで、hosted modeはAgent gRPC / MCP / hosted Handoffをexact h2c `PORT` 1つで処理できます。VM/single-host listener layoutは変更しません。real Cloud Run ingress acceptanceは未完です。
+3. #283 coreではsession affinity/process ownershipではなくdurable writer epoch/revisionをauthorityにします。selected external providerでのreal concurrent hosted revision acceptanceはまだ必要です。
 4. planned shutdown drain default 30秒は、Cloud Run の documented 10秒 shutdown grace より長いです。
 5. Agent session lifetime default 3600秒は Cloud Run maximum request timeout と同値で、controlled rotation の platform headroom がありません。
 
@@ -57,6 +57,10 @@ backend は device generation、operation ownership、dispatch state、terminal 
 - persistence unavailable / ambiguous / partial failure を fail closed。
 
 Cloud Storage / mounted filesystem を自動的に equivalent と見なしません。採用する場合は別途 proof が必要です。
+
+#283 core では provider-neutral な `HubAuthoritativeStateStore` contract、local `CheckpointStore` adapter、deterministic in-memory conformance provider を実装しています。contract は monotonic state revision + writer epoch を持ち、両方に対する compare-and-commit と、live authority を進める前の complete committed snapshot read-back verification を必須にします。local publication は append-only checkpoint sequence を physical CAS boundary として使用します。historical Hub M1 schema 5/6 は unfenced migration input としてreadableのまま、最初のHub writer acquisitionでexplicit durable fence付きHub M1 schema 7をpublishします。schema 7なのにfenceが欠落したcheckpointはlegacy扱いせず拒否します。
+
+automated coreでは two-writer replacement、local cross-instance CAS race、provider unavailable時のpre-dispatch fail-closed、old live Agent streamを保持するstale writerのdispatch拒否、durable dispatch後のrestartでexact `Indeterminate` quarantine復元、stale recoveryからのquarantine clear拒否も証明します。これはcore semanticsの証拠であり、#283でCloud Run/database固有durable providerを選定しません。real hosted revision overlap / backup / physical acceptanceは#284/#215に残ります。
 
 ### 2. Effect dispatch 直前の fencing
 
@@ -97,7 +101,7 @@ extra quarantine はacceptable conservative failureですが、ambiguity loss �
 
 ### 5. One-port protocol multiplexing
 
-PR #285ではcandidate hosted profileをCloud Run `PORT`上の1つのapplication-level HTTP/2/h2c listenerとして実装します。explicit `CUMG_V2_HOSTED_PROFILE=true` の場合だけ有効で、通常のVM/single-host listener layoutは変更しません。
+merge済みPR #285ではhosted profile candidateをCloud Run `PORT`上の1つのapplication-level HTTP/2/h2c listenerとして実装します。explicit `CUMG_V2_HOSTED_PROFILE=true` の場合だけ有効で、通常のVM/single-host listener layoutは変更しません。
 
 shared listenerは `HostedIngressClassifier` が許可するclosed surfaceだけへrouteします。
 
@@ -141,14 +145,14 @@ supported profile は以下も document / accept します。
 | Gate | Current status |
 | --- | --- |
 | 現行 Cloud Run limit 再確認 | Design evidence complete (2026-09-03) |
-| ephemeral filesystem を authoritative state から排除 | Design decision complete / implementation pending |
-| provider-neutral durable Hub-state backend | Pending |
-| monotonic writer fencing + stale-writer dispatch denial | Pending |
-| one-port h2c gRPC + MCP + hosted Handoff ingress / separate auth boundary | PR #285 candidate implementation・local h2c integration green、merge/hosted acceptance pending |
+| ephemeral filesystem を authoritative state から排除 | core seam complete。hosted external durable providerはpending |
+| provider-neutral durable Hub-state backend | #283 core実装済み: trait + local adapter + deterministic conformance provider。hosted external providerはpending |
+| monotonic writer fencing + stale-writer dispatch denial | #283 automated core green。hosted revision-overlap acceptanceはpending |
+| one-port h2c gRPC + MCP + hosted Handoff ingress / separate auth boundary | PR #285 merge済み。local h2c integration green、real hosted acceptanceはpending |
 | 3300s proactive Agent stream rotation acceptance | Pending |
 | <=8s hosted drain + forced-kill fail-closed acceptance | Pending |
-| concurrent old/new revision fencing test | Pending |
-| replacement後 durable quarantine/replay-barrier restore | Pending |
+| concurrent old/new revision fencing test | deterministic two-writer core green。real hosted revision A/B acceptanceはpending |
+| replacement後 durable quarantine/replay-barrier restore | core replacement/restart regression green。hosted backup/restore acceptanceはpending |
 | hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
 | Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation・acceptance pending |
 | physical Agent + real Cua interrupted-effect acceptance | Pending |

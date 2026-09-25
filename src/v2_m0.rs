@@ -990,7 +990,7 @@ pub struct DeviceRegistrySnapshot {
     pub revoked_device_ids: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeviceRegistry {
     devices: HashMap<String, EnrolledDevice>,
     revoked: HashSet<String>,
