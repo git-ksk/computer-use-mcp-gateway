@@ -14,10 +14,11 @@ use computer_use_mcp_gateway::{
         TrustedHubIdentity, apply_device_key_rotation, build_device_key_rotation,
         build_hub_key_rotation,
     },
+    v2_m1_hub::{HubProvisionedMaterial, HubServiceConfig, SingleDeviceHub},
     v2_m1_northbound::OAuthIntrospectionConfig,
     v2_m1_persistence::HubPersistentState,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 fn enrolled_registry() -> (DeviceRegistry, DeviceIdentity, String) {
     let mut registry = DeviceRegistry::default();
@@ -249,32 +250,41 @@ fn hosted_rotation_checkpoint_contains_no_private_key_material() {
     let grant_secret = [0xc3; 32];
 
     let device = DeviceIdentity::from_secret_key_bytes(device_secret);
-    let _hub = HubIdentity::from_secret_key_bytes(hub_secret);
-    let _grant = GrantAuthority::from_secret_key_bytes(grant_secret);
+    let hub = HubIdentity::from_secret_key_bytes(hub_secret);
+    let grant = GrantAuthority::from_secret_key_bytes(grant_secret);
+    let device_public = device.verifying_key().to_bytes();
+    let store = Arc::new(MemoryHubStateStore::default());
 
-    let mut registry = DeviceRegistry::default();
-    let challenge = DeviceRegistry::enrollment_challenge();
-    registry
-        .enroll(
-            device.verifying_key().as_bytes(),
-            &challenge,
-            &device.enrollment_proof(&challenge),
-        )
-        .unwrap();
-    let execution = AuthoritativeOperationController::new(AdmissionLimits {
-        max_global_active: 1,
-        max_queued_per_device: 1,
-    })
+    let (_hub, _handle) = SingleDeviceHub::new_with_state_store(
+        HubServiceConfig {
+            state_dir: std::env::temp_dir().join("cumg-hosted-rotation-checkpoint-unused"),
+            heartbeat_timeout: Duration::from_secs(5),
+            max_agent_session_lifetime: Duration::from_secs(60),
+            agent_session_reauth_drain: Duration::from_secs(10),
+            checkpoint_generation_rollover_bytes: 512 * 1024,
+            max_queued_per_device: 1,
+            max_agent_sessions: 2,
+            max_agent_session_starts_per_minute: 30,
+        },
+        HubProvisionedMaterial {
+            hub_identity: hub,
+            grant_signer: grant.into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        },
+        store.clone(),
+    )
     .unwrap();
 
-    let encoded =
-        serde_json::to_string(&HubPersistentState::capture(&registry, &execution)).unwrap();
-    for private_byte in [0xa1_u8, 0xb2, 0xc3] {
-        let repeated = format!(
-            "{private_byte},{private_byte},{private_byte},{private_byte},{private_byte},{private_byte},{private_byte},{private_byte}"
-        );
+    let durable = store.load_current().unwrap().unwrap();
+    let encoded = serde_json::to_string(&durable.state).unwrap();
+    assert!(
+        encoded.contains(&serde_json::to_string(&device_public).unwrap()),
+        "checkpoint must contain the reviewed public device trust anchor"
+    );
+    for secret in [device_secret, hub_secret, grant_secret] {
         assert!(
-            !encoded.contains(&repeated),
+            !encoded.contains(&serde_json::to_string(&secret).unwrap()),
             "authoritative checkpoint exposed private key material"
         );
     }
