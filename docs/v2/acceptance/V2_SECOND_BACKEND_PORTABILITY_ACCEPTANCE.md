@@ -1,6 +1,6 @@
 # V2 second-backend portability acceptance
 
-Status: **v0.8 candidate evidence complete on 2026-09-25** for Issue #222. Final release admission still requires the branch to merge with repository CI green.
+Status: **accepted for v0.8.0 on 2026-09-25** for Issue #222. PR #385 is merged and all required protected CI, including Linux/macOS/Windows Cua smoke and release-candidate bundle checks, is green. Final publication follows the normal release-PR/tag procedure.
 
 ## Provider selection
 

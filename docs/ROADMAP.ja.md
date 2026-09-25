@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-22 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.7.0` Operator Ergonomics & Recovery Evidence が released baseline です。現在OPENのbacklogは `v0.10.0` まで明示的にversion割当済みで、unfinishedなv0.6.1 support-claim evidence trackは別枠で保持します。**
+2026-09-25 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.8.0` Backend Portability & Recovery Safety が released baseline です。現在OPENのbacklogは `v0.10.0` まで明示的にversion割当済みで、unfinishedなv0.6.1 support-claim evidence trackは別枠で保持します。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -34,9 +34,9 @@ completion provable?
 
 完了済みの V1/V2 implementation history と acceptance evidence は [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md)、[`v2/STATUS.md`](v2/STATUS.md)、[`v2/acceptance/`](v2/acceptance/)、[`archive/`](archive/) に残しています。この file は V2 closeout 後も relevant な work に意図的に絞ります。
 
-## Released baseline: `0.7.x`
+## Released baseline: `0.8.x`
 
-`v0.7.0` が released **Operator Ergonomics & Recovery Evidence** baseline です。admitted scopeは #342 operation-ID guidance、#295 bounded `--version` identity、#304 unified read-only runtime status、#289 privacy-bounded ambiguous-target identity、#290 durable backend execution receipt、#347 verified single-Mac backup/restore を完了します。exact release scope / durable-state migration・rollback / withheld support claim は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md) に記録します。historical `v0.6.0` Managed Developer Execution scope は [`v2/V2_060_RELEASE_SCOPE.ja.md`](v2/V2_060_RELEASE_SCOPE.ja.md) に残します。
+`v0.8.0` が released **Backend Portability & Recovery Safety** baseline です。admitted scopeは #377 authoritative Hub pre-enqueue non-delivery settlement、#379 structured semantic-refusal remediation、#380 explicit constrained execution-environment/PATH semantics、#222 second-real-backend portability evidence を完了します。exact release scope / durable-state migration・rollback / withheld support claim は [`v2/V2_080_RELEASE_SCOPE.ja.md`](v2/V2_080_RELEASE_SCOPE.ja.md) に記録します。historical `v0.7.0` / `v0.6.0` scope は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md) / [`v2/V2_060_RELEASE_SCOPE.ja.md`](v2/V2_060_RELEASE_SCOPE.ja.md) に残します。
 
 `0.4.0` release は、これまで旧 `0.4.0 Recovery & Reconciliation` と `0.5.0 Multi-principal Identity` に分けていた work を統合しました。accepted support boundary は release-scope / status docs に記録します。
 
@@ -83,24 +83,22 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 
 ## Post-v0.6 の numbered release boundary
 
-`v0.7.0` は released / frozen の **Operator Ergonomics & Recovery Evidence** baseline です。これらのversion assignmentはscope boundaryでありcalendar promiseではありません。still-openのv0.6.1 support-claim evidence trackは独立しておりv0.7.0のprerequisiteではなく、unfinished claimをnewer releaseへ暗黙importしません。そのtrack完了がv0.7以降にadvertised support contractを新しく広げる場合は [`VERSIONING.ja.md`](VERSIONING.ja.md) に従い、obsoleteなpatch numberを強制せずappropriate later MINORへpublicationを再割当します。
+`v0.8.0` は released / frozen の **Backend Portability & Recovery Safety** baseline です。これらのversion assignmentはscope boundaryでありcalendar promiseではありません。still-openのv0.6.1 support-claim evidence trackは独立しておりv0.7.0のprerequisiteではなく、unfinished claimをnewer releaseへ暗黙importしません。そのtrack完了がv0.7以降にadvertised support contractを新しく広げる場合は [`VERSIONING.ja.md`](VERSIONING.ja.md) に従い、obsoleteなpatch numberを強制せずappropriate later MINORへpublicationを再割当します。
 
 1. **`v0.6.1 — Support Claim Expansion` evidence track** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、final gate #346。open / withheldのままで、v0.6.0やv0.7.0を遡及拡大しません。
 2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence` — released。** #342 / #295 / #304 / #289 / #290 / #347 はcomplete。詳細は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md)。
-3. **`v0.8.0 — Backend Portability & Recovery Safety`** — #377でHubがauthoritativeに証明できる狭いpre-enqueue non-deliveryをreplayなしでauto-resolveできるようにし、#379でsemantic refusalのcaller-facing diagnosis/remediationをauthorityやreplay permissionに変えず統一し、#380でambient host authorityを継承せずconstrained shell/process environmentとPATH contractを明示し、その上で#222によりGUI authority / ambiguity / recovery semanticsをmaterially differentなsecond real backendへ実証します。#222と#377をcore portability/safety release gateとし、#379/#380もv0.8 admitted scopeとしてrelease前にcloseまたはexplicit re-scopeします。generic provider / VM / fleet productには拡張せず、authorization / privacy / quarantine / no-auto-replay semanticsも弱めません。
+3. **`v0.8.0 — Backend Portability & Recovery Safety` — released。** #377 / #379 / #380 / #222 はcomplete。詳細は [`v2/V2_080_RELEASE_SCOPE.ja.md`](v2/V2_080_RELEASE_SCOPE.ja.md)。generic provider / VM / fleet productには拡張せず、authorization / privacy / quarantine / no-auto-replay semanticsも弱めません。
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
 5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
 
 各patch/minorは引き続きstanding [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateを満たす必要があります。optional provider/platform supportはassigned releaseでrequired evidenceが揃うまでwithholdし、version割当を理由にquarantine/no-auto-replay semanticsを弱めません。
 
-### v0.8.0 working order
+### v0.8.0 released closeout record
 
-1. **#377 — authoritative recovery boundaryを先に固める。** operationがdelivery pathに受理されなかったことをexactに証明できるHub-local pre-enqueue non-delivery evidenceだけを追加し、commit-before-dispatch、uncertainty時quarantine、permanent no-auto-replayを維持します。
-2. **#379 / #380 — caller ergonomicsはnon-authoritative mappingを守る限り並行可能。** existing safe error/status taxonomyを再利用し、remediationとreplay safetyを分離し、host shell stateのimplicit sourceやcapability拡張をせずconstrained execution environmentを文書化します。
-3. **#222 — safety/caller contractが十分stableになってからmaterially differentなreal backendでportabilityを実証する。** second backendはCUMG-owned semantic capabilityを使い、ambiguous post-dispatch branchも意図的にexerciseします。provider-specific identity/errorはadapter boundaryより下に留めます。
-4. **v0.8.0 closeout — 4 issueすべてをstanding Product Readiness gateと照合する。** existing Cua regressionをgreenに保ち、#222のphysical/provider-backed evidenceを必須とし、#377のunsafe-neighbor testをfail-closedのまま維持し、#379/#380でimplicit fallback / authority escalation / ambient environment inheritance / replay semanticsを導入しません。
-
-#222でrequired real-backend acceptance evidenceを得られない場合はsupport claimをwithholdし、v0.8.0 completeとはしません。#379/#380をre-scopeする場合はmilestoneとこのroadmapを両方explicitに更新し、staleなadmitted scopeをsilentにshipしません。
+1. **#377でauthoritative recovery boundaryを先に完成しました。** exact Hub-local pre-enqueue non-delivery evidenceだけをautomatic no-execution settlementへ追加し、post-enqueue uncertaintyはquarantine、old operationはreplayしません。
+2. **#379 / #380でnew authorityなしにcaller ergonomicsを完成しました。** refusal remediationはnon-authoritativeのまま、execution-environment contractはambient login-shell stateをinheritしないservice-bounded contractです。
+3. **#222でmaterially differentなreal backend proofを完成しました。** macos-mcp 0.4.0でCUMG-owned observationと2つのeffectful GUI capability、ambiguous post-dispatch branchをexerciseし、provider-specific identity/errorはadapter boundaryより下に維持します。
+4. **v0.8.0 closeoutはstanding Product Readiness gateをPASSしました。** Linux/macOS/Windowsのexisting Cua regressionはgreen、trusted-Mac provider-backed acceptanceもPASSし、#377 unsafe-neighborはfail closed、#379/#380はimplicit fallback / authority escalation / ambient environment inheritance / replay semanticsを導入しません。
 
 ### v0.6.0 released working order
 
@@ -194,7 +192,6 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、#346 final support-claim gate。
-- **`v0.8.0 — Backend Portability & Recovery Safety`:** #377 authoritative Hub pre-delivery non-execution auto-reconciliation、#379 structured semantic-refusal diagnosis/remediation、#380 constrained execution-environment/PATH ergonomics、#222 second-real-backend semantic-neutrality proof。
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#284 final replacement / partition / physical-Handoff acceptance。
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。
 

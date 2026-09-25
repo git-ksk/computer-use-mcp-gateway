@@ -4,7 +4,7 @@
 
 CUMG は Semantic Versioning を採用し、pre-1.0 policy を明示します。
 
-現在の released line は **0.7.x** です。`v0.7.0` が released Operator Ergonomics & Recovery Evidence baseline です。
+現在の released line は **0.8.x** です。`v0.8.0` が released Backend Portability & Recovery Safety baseline です。
 
 ## Version format
 
@@ -52,7 +52,7 @@ compatibility を維持すること自体が vulnerability を残す security em
 
 ## Schema version は独立管理
 
-project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。released v0.7 baseline は live pairing を CONTROL_SCHEMA_VERSION = 12、capability schema 8、DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8、HUB_AGENT_SCHEMA_VERSION = 6 のまま維持し、released v0.6 と live protocol boundary は同じです。一方で v0.7 は durable execution-safety state を schema v14、Agent M1 persistence を schema v6 へ進めます。released v0.5 は control 10 / capability 6 / registry 8 / Hub-Agent 6、historical #106 v0.6 development pairing は control 11 / capability 7 でした。outer signed envelope は変わらないため HUB_AGENT_SCHEMA_VERSION は6のままです。mixed live version は fail closed です。 現在のv0.8 developmentでは #377 のHub-authoritative pre-enqueue non-delivery evidenceのためHub durable execution-safety stateだけをschema v15へ進めます。released v0.7のschema-v14 baselineは変更せず、live control/capability/registry/Hub-Agent pairingも12/8/8/6のままです。
+project/crate version、wire protocol schema、capability-advertisement schema、durable-state schema はそれぞれ目的が異なります。released v0.7 baseline は live pairing を CONTROL_SCHEMA_VERSION = 12、capability schema 8、DEVICE_REGISTRY_SNAPSHOT_SCHEMA_VERSION = 8、HUB_AGENT_SCHEMA_VERSION = 6 のまま維持し、released v0.6 と live protocol boundary は同じです。一方で v0.7 は durable execution-safety state を schema v14、Agent M1 persistence を schema v6 へ進めます。released v0.5 は control 10 / capability 6 / registry 8 / Hub-Agent 6、historical #106 v0.6 development pairing は control 11 / capability 7 でした。outer signed envelope は変わらないため HUB_AGENT_SCHEMA_VERSION は6のままです。mixed live version は fail closed です。 released v0.8では #377 のHub-authoritative pre-enqueue non-delivery evidenceのためHub durable execution-safety stateだけをschema v15へ進めます。historical v0.7 schema-v14 stateはreadableのまま、live control/capability/registry/Hub-Agent pairingも12/8/8/6のままです。
 
 - `CONTROL_SCHEMA_VERSION` は live control-schema compatibility boundary が変わるときに変更;
 - capability-advertisement schema version は live advertisement boundary が変わるときに変更;
@@ -101,7 +101,7 @@ feature count は 1.0 gate ではありません。product boundary を先に変
 
 ## Release-candidate artifact
 
-`v0.7.0` GitHub Release は **source-only** です。verified CI archive は release evidence のままで official binary Release asset にはせず、supported distribution へ暗黙昇格させません。
+`v0.8.0` GitHub Release は **source-only** です。verified CI archive は release evidence のままで official binary Release asset にはせず、supported distribution へ暗黙昇格させません。
 
 `Release Candidate Artifacts` workflow は引き続き Linux / macOS / Windows の bounded native candidate を build します。manifest schema v3 は package version、exact CUMG source commit、exact Hub/Agent・control・capability schema version、platform/architecture、exact allowlisted file、size、SHA-256 identity を記録します。Linux / Windows candidate は distribution evidence のままです。
 

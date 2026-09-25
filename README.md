@@ -4,7 +4,7 @@
 
 `computer-use-mcp-gateway` (CUMG) is a Rust MCP gateway for policy-controlled computer use. The recommended V2 runtime separates a remotely reachable **Hub** from a desktop-side **Agent** and exposes bounded, backend-neutral semantic capabilities instead of making raw backend tool names or identifiers part of the northbound contract.
 
-> **Runtime status:** V2 Hub + Agent is the recommended development/runtime path. `v0.7.0` Operator Ergonomics & Recovery Evidence is the current released baseline. V1 remains available as `v1_gateway` for regression/reference and existing production operation.
+> **Runtime status:** V2 Hub + Agent is the recommended development/runtime path. `v0.8.0` Backend Portability & Recovery Safety is the current released baseline. V1 remains available as `v1_gateway` for regression/reference and existing production operation.
 
 ## Overview
 
