@@ -43,6 +43,7 @@ pub mod v2_hosted_handoff_control;
 pub mod v2_hosted_handoff_http;
 pub mod v2_hosted_handoff_routing;
 pub mod v2_hosted_ingress;
+pub mod v2_hub_state_store;
 pub mod v2_incident_brief;
 pub mod v2_interaction_context;
 pub mod v2_limits;
