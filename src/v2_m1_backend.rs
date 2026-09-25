@@ -4479,6 +4479,7 @@ No elements found
         adapter.shutdown().await.unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn macos_mcp_fixture_control_point(
         snapshot: &str,
         window: &str,
