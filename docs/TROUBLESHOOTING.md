@@ -158,6 +158,41 @@ This is separate from backend desktop serialization and separate from reverse-pr
 ## V2 returns `device_indeterminate`
 
 `device_indeterminate` means an **earlier state-changing operation has an unproven outcome and is already quarantining the device**. The operation may already have executed. The returned `blocking_operation_id` names that earlier ambiguous operation; it is not a new retry ID for the request that was just refused. Northbound tool errors therefore return `execution_may_have_occurred=true`, `retry_safe=false`, `blind_replay_safe=false`, `next_action=get_operation_then_reconcile` when the exact blocking ID is available, and `follow_up_effectful_operation=new_operation_id_required`. Do not replay the old operation or clear state merely because the Agent reconnects. Use `get_operation(blocking_operation_id)` first when available; if it remains indeterminate, reconcile with the reviewed recovery path or independent read-only observation before creating any new effectful operation.
+### V2 structured refusal remediation
+
+V2 semantic refusals keep the existing stable `code` as the canonical reason. For refusal classes with a safe deterministic recovery path, the error data adds bounded remediation metadata instead of requiring callers to parse the human-readable message:
+
+- `remediation_available=true`
+- `required_actor=caller|local_user|operator`
+- `next_action=<bounded semantic action>`
+- `same_operation_replay_safe=false`
+- `remediation_is_authority=false`
+- `fresh_call_required=true` when the intended effect, after remediation, must be attempted as a new call
+
+These fields are guidance only. They never expand authorization, interaction scope, consent, browser route trust, mutation authority, or replay permission. Every follow-up call is revalidated normally. CUMG never interprets a hint as permission to switch trusted input to DOM, background to foreground, one browser target to another, or window scope to desktop scope automatically.
+
+| Existing refusal code/class | Required actor | Bounded `next_action` |
+| --- | --- | --- |
+| `interaction_context_required` | caller | `open_interaction_context` |
+| `interaction_context_stale`, `session_closed`, `session_superseded` | caller | `open_fresh_interaction_context` |
+| `interaction_scope_expansion_required` | caller | `expand_interaction_scope_explicitly` |
+| `window_scope_context_required` | caller | `open_fresh_window_scoped_context` |
+| `ui_element_ref_stale`, `scoped_ref_stale` | caller | `refresh_window_snapshot_and_ref` |
+| `browser_route_unavailable`, `browser_requires_setup` | caller | `browser_prepare` |
+| browser binding/target/endpoint mismatch refusals | caller | `refresh_browser_binding` |
+| `browser_tab_required`, `browser_tab_not_found` | caller | `inspect_or_bind_browser_tab` |
+| `browser_ref_stale` | caller | `refresh_browser_snapshot_and_ref` |
+| `browser_input_trust_unavailable` | caller | `inspect_trusted_input_route` |
+| `browser_consent_required`, `browser_consent_revoked` | local user | `obtain_browser_consent` |
+| `browser_reconnect_exhausted` | operator | `inspect_browser_runtime` |
+| `browser_input_incomplete`, `browser_action_unavailable` | caller | `refresh_browser_snapshot_and_action` |
+| `browser_origin_outside_scope` | caller | `open_allowed_origin_context` |
+| `browser_refused` | operator | `inspect_browser_refusal` |
+| `capability_not_authorized` | operator | `inspect_capability_or_policy` |
+| `mutation_resume_required` | local user | `local_user_resume_mutations` |
+
+`device_indeterminate` retains its stronger execution-ambiguity contract above rather than being reduced to this generic table. Unknown/future refusal codes receive no inferred remediation metadata; clients must fail safe instead of guessing from message text.
+
 
 For the normal single-Mac operator path, use the guided recovery workflow instead of memorizing the individual inspection/resolution commands:
 

@@ -1431,7 +1431,7 @@ impl V2NorthboundMcp {
             .hub
             .current_session_binding()
             .await
-            .ok_or_else(|| McpError::invalid_request("Agent is offline", None))?;
+            .ok_or_else(|| semantic_refusal_error("Agent is offline", "agent_offline"))?;
         if !self.context_access_allowed(principal, Some(&capabilities)) {
             return Err(McpError::invalid_request(
                 "No authorized live Computer Use capability is available",
@@ -1556,7 +1556,10 @@ impl V2NorthboundMcp {
         };
         self.cleanup_backend_sessions(invalidated).await;
         result.map_err(|_| {
-            McpError::invalid_request("Interaction context is invalid, stale, or expired", None)
+            semantic_refusal_error(
+                "Interaction context is invalid, stale, or expired",
+                "interaction_context_stale",
+            )
         })
     }
 
@@ -1583,9 +1586,9 @@ impl V2NorthboundMcp {
                 | DeviceCommand::PointerDrag { .. }
                 | DeviceCommand::TypeText { .. }
         ) {
-            return Err(McpError::invalid_params(
+            return Err(semantic_refusal_params_error(
                 "Desktop-scoped northbound input requires an interaction context",
-                None,
+                "interaction_context_required",
             ));
         }
         let context_id = command_interaction_context_id(&command).map(ToOwned::to_owned);
@@ -1598,17 +1601,17 @@ impl V2NorthboundMcp {
         if command_requires_desktop_scope(&command)
             && binding.scope != InteractionScope::DesktopScoped
         {
-            return Err(McpError::invalid_request(
+            return Err(semantic_refusal_error(
                 "Interaction context has not been explicitly expanded to desktop scope",
-                None,
+                "interaction_scope_expansion_required",
             ));
         }
         if command_requires_window_scope(&command)
             && binding.scope != InteractionScope::WindowScoped
         {
-            return Err(McpError::invalid_request(
+            return Err(semantic_refusal_error(
                 "Window-scoped interaction is unavailable after desktop scope expansion; close the context and open a fresh one",
-                None,
+                "window_scope_context_required",
             ));
         }
         if let Some(element_ref) = command_scoped_ui_element_ref_mut(&mut command) {
@@ -1619,9 +1622,9 @@ impl V2NorthboundMcp {
                     .resolve(element_ref, &binding, ScopedRefKind::Element)
                     .map(str::to_owned)
                     .map_err(|_| {
-                        McpError::invalid_request(
+                        semantic_refusal_error(
                             "UI element ref is stale or belongs to another context",
-                            None,
+                            "ui_element_ref_stale",
                         )
                     })?
             };
@@ -4309,9 +4312,9 @@ fn require_browser_window_scope(
     binding: InteractionContextBinding,
 ) -> Result<InteractionContextBinding, McpError> {
     if binding.scope != InteractionScope::WindowScoped {
-        return Err(McpError::invalid_request(
+        return Err(semantic_refusal_error(
             "Browser interaction is unavailable after desktop scope expansion; close the context and open a fresh one",
-            None,
+            "window_scope_context_required",
         ));
     }
     Ok(binding)
@@ -4338,16 +4341,16 @@ fn browser_contract_error_to_mcp(_: BrowserContractError) -> McpError {
 }
 
 fn browser_ref_error_to_mcp(_: BrowserRefError) -> McpError {
-    McpError::invalid_request(
+    semantic_refusal_error(
         "Browser ref is stale, invalid, or unavailable for this action",
-        None,
+        "browser_ref_stale",
     )
 }
 
 fn scoped_ref_error_to_mcp(_: ScopedRefError) -> McpError {
-    McpError::invalid_request(
+    semantic_refusal_error(
         "Scoped ref is stale, invalid, or unavailable for this action",
-        None,
+        "scoped_ref_stale",
     )
 }
 
@@ -4489,6 +4492,110 @@ fn mcp_error_with_operation_id(mut error: McpError, operation_id: &str) -> McpEr
     error
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RefusalRemediation {
+    required_actor: &'static str,
+    next_action: &'static str,
+    fresh_call_required: bool,
+}
+
+fn refusal_remediation(code: &str) -> Option<RefusalRemediation> {
+    let caller = |next_action, fresh_call_required| RefusalRemediation {
+        required_actor: "caller",
+        next_action,
+        fresh_call_required,
+    };
+    let local_user = |next_action, fresh_call_required| RefusalRemediation {
+        required_actor: "local_user",
+        next_action,
+        fresh_call_required,
+    };
+    let operator = |next_action, fresh_call_required| RefusalRemediation {
+        required_actor: "operator",
+        next_action,
+        fresh_call_required,
+    };
+
+    Some(match code {
+        "agent_offline" => operator("inspect_status_or_reconnect_agent", true),
+        "busy" => caller("inspect_status_then_retry_new_call", true),
+        "session_superseded" | "session_closed" => caller("open_fresh_interaction_context", true),
+        "semantic_constraint_snapshot_stale" => {
+            caller("refresh_semantic_authorization_snapshot", true)
+        }
+        "capability_not_authorized" => operator("inspect_capability_or_policy", true),
+        "operation_replay" => caller("use_new_operation_id_if_new_work_is_intended", true),
+        "interaction_context_required" => caller("open_interaction_context", true),
+        "interaction_context_stale" => caller("open_fresh_interaction_context", true),
+        "interaction_scope_expansion_required" => {
+            caller("expand_interaction_scope_explicitly", true)
+        }
+        "window_scope_context_required" => caller("open_fresh_window_scoped_context", true),
+        "ui_element_ref_stale" | "scoped_ref_stale" => {
+            caller("refresh_window_snapshot_and_ref", true)
+        }
+        "browser_route_unavailable" | "browser_requires_setup" => caller("browser_prepare", true),
+        "browser_binding_ambiguous"
+        | "browser_binding_stale"
+        | "browser_wrong_target_refused"
+        | "browser_endpoint_owner_mismatch" => caller("refresh_browser_binding", true),
+        "browser_tab_required" | "browser_tab_not_found" => {
+            caller("inspect_or_bind_browser_tab", true)
+        }
+        "browser_ref_stale" => caller("refresh_browser_snapshot_and_ref", true),
+        "browser_input_trust_unavailable" => caller("inspect_trusted_input_route", true),
+        "browser_consent_required" | "browser_consent_revoked" => {
+            local_user("obtain_browser_consent", true)
+        }
+        "browser_reconnect_exhausted" => operator("inspect_browser_runtime", true),
+        "browser_input_incomplete" | "browser_action_unavailable" => {
+            caller("refresh_browser_snapshot_and_action", true)
+        }
+        "browser_origin_outside_scope" => caller("open_allowed_origin_context", true),
+        "browser_refused" => operator("inspect_browser_refusal", true),
+        "mutation_resume_required" => local_user("local_user_resume_mutations", true),
+        _ => return None,
+    })
+}
+
+fn add_refusal_remediation(payload: &mut Value, code: &str) {
+    let Some(remediation) = refusal_remediation(code) else {
+        return;
+    };
+    payload["remediation_available"] = json!(true);
+    payload["required_actor"] = json!(remediation.required_actor);
+    payload["same_operation_replay_safe"] = json!(false);
+    payload["remediation_is_authority"] = json!(false);
+    if payload.get("next_action").is_none() {
+        payload["next_action"] = json!(remediation.next_action);
+    }
+    if remediation.fresh_call_required {
+        payload["fresh_call_required"] = json!(true);
+    }
+}
+
+fn refusal_data(code: &'static str) -> Value {
+    let mut data = json!({"code": code});
+    add_refusal_remediation(&mut data, code);
+    data
+}
+
+fn semantic_refusal_error(message: &'static str, code: &'static str) -> McpError {
+    McpError::invalid_request(message, Some(refusal_data(code)))
+}
+
+fn semantic_refusal_params_error(message: &'static str, code: &'static str) -> McpError {
+    McpError::invalid_params(message, Some(refusal_data(code)))
+}
+
+fn add_mutation_resume_guidance(payload: &mut Value) {
+    payload["historical_outcome"] = json!("indeterminate");
+    payload["blind_replay_safe"] = json!(false);
+    payload["effectful_execution_fenced"] = json!(true);
+    payload["next_action"] = json!("local_user_resume_mutations");
+    add_refusal_remediation(payload, "mutation_resume_required");
+}
+
 fn add_indeterminate_guidance(payload: &mut Value, next_action: &'static str) {
     payload["execution_may_have_occurred"] = json!(true);
     payload["blind_replay_safe"] = json!(false);
@@ -4579,7 +4686,8 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
                 code if code.is_browser_refusal() => "Browser operation was refused",
                 _ => "Device operation was rejected or could not be completed",
             };
-            return McpError::invalid_request(message, Some(json!({"code": code.safe_code()})));
+            let safe_code = code.safe_code();
+            return McpError::invalid_request(message, Some(refusal_data(safe_code)));
         }
         HubCommandError::SessionSuperseded => {
             ("Device session was superseded", "session_superseded", None)
@@ -4614,20 +4722,18 @@ fn hub_error_to_mcp(error: HubCommandError) -> McpError {
             },
         );
     } else if code == "mutation_resume_required" {
-        data["historical_outcome"] = json!("indeterminate");
-        data["blind_replay_safe"] = json!(false);
-        data["effectful_execution_fenced"] = json!(true);
-        data["next_action"] = json!("local_user_resume_mutations");
+        add_mutation_resume_guidance(&mut data);
     } else if code == "confirmed_not_executed" {
         add_confirmed_not_executed_guidance(&mut data);
     }
+    add_refusal_remediation(&mut data, code);
     McpError::invalid_request(message, Some(data))
 }
 
 fn capability_not_authorized_error() -> McpError {
-    McpError::invalid_request(
+    semantic_refusal_error(
         "Device capability is not authorized",
-        Some(json!({"code": "capability_not_authorized"})),
+        "capability_not_authorized",
     )
 }
 
@@ -4668,9 +4774,12 @@ fn execution_error_response(error: McpError) -> CallToolResponse {
                 "inspect_reconciliation_status"
             },
         );
+    } else if code == "mutation_resume_required" {
+        add_mutation_resume_guidance(&mut payload);
     } else if code == "confirmed_not_executed" {
         add_confirmed_not_executed_guidance(&mut payload);
     }
+    add_refusal_remediation(&mut payload, code);
     CallToolResult::error(vec![ContentBlock::text(payload.to_string())]).into()
 }
 
@@ -8827,6 +8936,213 @@ mod tests {
         };
         assert!(serialized.contains("browser_consent_required"));
         assert!(!serialized.contains("provider"));
+    }
+
+    #[test]
+    fn semantic_refusal_remediation_is_bounded_deterministic_and_non_authoritative() {
+        let cases = [
+            (
+                "interaction_context_stale",
+                "caller",
+                "open_fresh_interaction_context",
+            ),
+            (
+                "interaction_scope_expansion_required",
+                "caller",
+                "expand_interaction_scope_explicitly",
+            ),
+            (
+                "ui_element_ref_stale",
+                "caller",
+                "refresh_window_snapshot_and_ref",
+            ),
+            ("browser_binding_stale", "caller", "refresh_browser_binding"),
+            (
+                "browser_ref_stale",
+                "caller",
+                "refresh_browser_snapshot_and_ref",
+            ),
+            (
+                "browser_input_trust_unavailable",
+                "caller",
+                "inspect_trusted_input_route",
+            ),
+            (
+                "browser_consent_required",
+                "local_user",
+                "obtain_browser_consent",
+            ),
+            (
+                "browser_reconnect_exhausted",
+                "operator",
+                "inspect_browser_runtime",
+            ),
+            (
+                "capability_not_authorized",
+                "operator",
+                "inspect_capability_or_policy",
+            ),
+            (
+                "mutation_resume_required",
+                "local_user",
+                "local_user_resume_mutations",
+            ),
+        ];
+
+        for (code, actor, action) in cases {
+            let mut data = json!({"code": code});
+            add_refusal_remediation(&mut data, code);
+            assert_eq!(data["remediation_available"], true, "{code}");
+            assert_eq!(data["required_actor"], actor, "{code}");
+            assert_eq!(data["next_action"], action, "{code}");
+            assert_eq!(data["same_operation_replay_safe"], false, "{code}");
+            assert_eq!(data["remediation_is_authority"], false, "{code}");
+            assert_eq!(data["fresh_call_required"], true, "{code}");
+        }
+
+        let mut unknown = json!({"code": "future_refusal_code"});
+        add_refusal_remediation(&mut unknown, "future_refusal_code");
+        assert_eq!(unknown, json!({"code": "future_refusal_code"}));
+    }
+
+    #[test]
+    fn every_closed_browser_refusal_has_remediation_metadata() {
+        let codes = [
+            crate::v2_m0::DeviceErrorCode::BrowserRouteUnavailable,
+            crate::v2_m0::DeviceErrorCode::BrowserRequiresSetup,
+            crate::v2_m0::DeviceErrorCode::BrowserBindingAmbiguous,
+            crate::v2_m0::DeviceErrorCode::BrowserBindingStale,
+            crate::v2_m0::DeviceErrorCode::BrowserWrongTargetRefused,
+            crate::v2_m0::DeviceErrorCode::BrowserTabRequired,
+            crate::v2_m0::DeviceErrorCode::BrowserTabNotFound,
+            crate::v2_m0::DeviceErrorCode::BrowserRefStale,
+            crate::v2_m0::DeviceErrorCode::BrowserInputTrustUnavailable,
+            crate::v2_m0::DeviceErrorCode::BrowserEndpointOwnerMismatch,
+            crate::v2_m0::DeviceErrorCode::BrowserConsentRequired,
+            crate::v2_m0::DeviceErrorCode::BrowserConsentRevoked,
+            crate::v2_m0::DeviceErrorCode::BrowserReconnectExhausted,
+            crate::v2_m0::DeviceErrorCode::BrowserInputIncomplete,
+            crate::v2_m0::DeviceErrorCode::BrowserActionUnavailable,
+            crate::v2_m0::DeviceErrorCode::BrowserOriginOutsideScope,
+            crate::v2_m0::DeviceErrorCode::BrowserRefused,
+        ];
+        for code in codes {
+            assert!(code.is_browser_refusal());
+            let remediation = refusal_remediation(code.safe_code())
+                .unwrap_or_else(|| panic!("missing remediation for {}", code.safe_code()));
+            assert!(!remediation.next_action.is_empty());
+            assert!(matches!(
+                remediation.required_actor,
+                "caller" | "local_user" | "operator"
+            ));
+            assert!(remediation.fresh_call_required);
+        }
+    }
+
+    #[test]
+    fn browser_refusals_surface_machine_readable_remediation_without_fallback() {
+        let cases = [
+            (
+                crate::v2_m0::DeviceErrorCode::BrowserRouteUnavailable,
+                "browser_prepare",
+                "caller",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::BrowserRefStale,
+                "refresh_browser_snapshot_and_ref",
+                "caller",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::BrowserConsentRequired,
+                "obtain_browser_consent",
+                "local_user",
+            ),
+            (
+                crate::v2_m0::DeviceErrorCode::BrowserReconnectExhausted,
+                "inspect_browser_runtime",
+                "operator",
+            ),
+        ];
+        for (code, next_action, actor) in cases {
+            let error = hub_error_to_mcp(HubCommandError::Remote(code));
+            let data = error.data.as_ref().unwrap();
+            assert_eq!(data["code"], code.safe_code());
+            assert_eq!(data["next_action"], next_action);
+            assert_eq!(data["required_actor"], actor);
+            assert_eq!(data["same_operation_replay_safe"], false);
+            assert_eq!(data["remediation_is_authority"], false);
+
+            let response = execution_error_response(error);
+            let serialized = match response {
+                CallToolResponse::Complete(result) => {
+                    assert_eq!(result.is_error, Some(true));
+                    serde_json::to_string(&result).unwrap()
+                }
+                other => panic!("unexpected tool response: {other:?}"),
+            };
+            assert!(serialized.contains(next_action));
+            assert!(serialized.contains(actor));
+            assert!(!serialized.contains("auto_fallback"));
+            assert!(!serialized.contains("auto_escalate"));
+            assert!(!serialized.contains("provider_message"));
+        }
+    }
+
+    #[test]
+    fn interaction_refusals_use_codes_not_message_parsing() {
+        let stale = semantic_refusal_error(
+            "Interaction context is invalid, stale, or expired",
+            "interaction_context_stale",
+        );
+        let stale_data = stale.data.as_ref().unwrap();
+        assert_eq!(stale_data["code"], "interaction_context_stale");
+        assert_eq!(stale_data["next_action"], "open_fresh_interaction_context");
+        assert_eq!(stale_data["required_actor"], "caller");
+
+        let scope = semantic_refusal_error(
+            "Interaction context has not been explicitly expanded to desktop scope",
+            "interaction_scope_expansion_required",
+        );
+        let scope_data = scope.data.as_ref().unwrap();
+        assert_eq!(scope_data["code"], "interaction_scope_expansion_required");
+        assert_eq!(
+            scope_data["next_action"],
+            "expand_interaction_scope_explicitly"
+        );
+        assert_eq!(scope_data["same_operation_replay_safe"], false);
+
+        let browser = browser_ref_error_to_mcp(BrowserRefError::UnknownRef);
+        let browser_data = browser.data.as_ref().unwrap();
+        assert_eq!(browser_data["code"], "browser_ref_stale");
+        assert_eq!(
+            browser_data["next_action"],
+            "refresh_browser_snapshot_and_ref"
+        );
+    }
+
+    #[test]
+    fn mutation_resume_guidance_survives_tool_result_projection() {
+        let response =
+            execution_error_response(hub_error_to_mcp(HubCommandError::MutationResumeRequired {
+                operation_id: "op_0123456789abcdef0123456789abcdef".into(),
+            }));
+        let serialized = match response {
+            CallToolResponse::Complete(result) => {
+                assert_eq!(result.is_error, Some(true));
+                serde_json::to_string(&result).unwrap()
+            }
+            other => panic!("unexpected tool response: {other:?}"),
+        };
+        for expected in [
+            "mutation_resume_required",
+            "local_user_resume_mutations",
+            "local_user",
+            "same_operation_replay_safe",
+            "remediation_is_authority",
+            "effectful_execution_fenced",
+        ] {
+            assert!(serialized.contains(expected), "missing {expected}");
+        }
     }
 
     #[test]
