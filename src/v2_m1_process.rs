@@ -1777,6 +1777,109 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn developer_environment_inherits_service_path_but_rejects_caller_path_override() {
+        let root = temp_root("path-contract");
+        let policy = ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap();
+        assert!(policy.inherited_env_keys.contains("PATH"));
+        assert!(!policy.explicit_env_keys.contains("PATH"));
+
+        let executor = ProcessExecutor::new(policy);
+        let mut req = request("/usr/bin/env", &root, &[]);
+        req.env = vec![ProcessEnvVar {
+            key: "PATH".into(),
+            value: root.to_string_lossy().into_owned(),
+        }];
+        let error = executor
+            .execute(&req, &ProcessCancellation::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProcessError::EnvironmentKeyDenied(ref key) if key == "PATH"
+        ));
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        assert_eq!(debug, "process_environment_key_denied");
+        assert_eq!(display, "process_environment_key_denied");
+        assert!(!debug.contains(root.to_string_lossy().as_ref()));
+        assert!(!display.contains(root.to_string_lossy().as_ref()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricted_path_does_not_discover_unlisted_tool_but_absolute_path_works() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_root("absolute-executable");
+        let fake = root.join("cumg_fake_tool_for_absolute_path_test");
+        fs::write(&fake, "#!/bin/sh\nprintf 'absolute-ok\\n'\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // This custom policy allows PATH only so the test can deterministically
+        // model a bounded service PATH without mutating the test runner's
+        // process environment. developer_defaults separately proves that
+        // caller-supplied PATH is rejected in production policy.
+        let policy = ProcessPolicy::new(
+            vec![root.clone()],
+            HashSet::new(),
+            ["PATH".to_owned()].into_iter().collect(),
+            HashSet::new(),
+        )
+        .unwrap();
+        let executor = ProcessExecutor::new(policy);
+        let restricted_path = ProcessEnvVar {
+            key: "PATH".into(),
+            value: "/usr/bin:/bin".into(),
+        };
+
+        let bare = ShellRequest {
+            command: "cumg_fake_tool_for_absolute_path_test".into(),
+            cwd: root.to_string_lossy().into_owned(),
+            env: vec![restricted_path.clone()],
+            timeout_ms: 5_000,
+        };
+        let bare_output = executor
+            .execute_shell(&bare, &ProcessCancellation::default())
+            .unwrap();
+        assert_ne!(bare_output.exit_code, Some(0));
+        assert!(!bare_output.stdout.contains("absolute-ok"));
+
+        let absolute = ShellRequest {
+            command: fake.to_string_lossy().into_owned(),
+            cwd: root.to_string_lossy().into_owned(),
+            env: vec![restricted_path],
+            timeout_ms: 5_000,
+        };
+        let absolute_output = executor
+            .execute_shell(&absolute, &ProcessCancellation::default())
+            .unwrap();
+        assert_eq!(absolute_output.exit_code, Some(0));
+        assert_eq!(absolute_output.stdout.trim(), "absolute-ok");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn caller_path_override_cannot_bypass_structured_program_deny_policy() {
+        let root = temp_root("path-deny-policy");
+        let executor =
+            ProcessExecutor::new(ProcessPolicy::developer_defaults(vec![root.clone()]).unwrap());
+        let mut req = request("bash", &root, &["-c", "true"]);
+        req.env = vec![ProcessEnvVar {
+            key: "PATH".into(),
+            value: root.to_string_lossy().into_owned(),
+        }];
+        assert!(matches!(
+            executor.execute(&req, &ProcessCancellation::default()),
+            Err(ProcessError::ShellProgramDenied)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn explicit_environment_is_allowlisted_and_environment_is_cleared() {
         let root = temp_root("env");
         let mut inherited = HashSet::new();

@@ -37,6 +37,17 @@ cua-driver doctor
 
 On Windows, open a new PowerShell window so the updated User `Path` is loaded.
 
+## V2 `shell` / `execute_process`: command is not found even though Terminal can run it
+
+The V2 Agent deliberately does **not** run a login or interactive shell profile. Before launching a child it clears the environment, then inherits only an allowlisted subset from the Agent **service environment**. `PATH` is part of that bounded service inheritance, so a launchd/systemd/scheduled-task Agent can see a different `PATH` from an interactive Terminal or PowerShell session.
+
+This distinction is visible without exposing the raw host environment: the `shell` and `execute_process` input schemas carry `x-cumg-execution-environment` with `profile=constrained`, `path_inheritance=agent_service_environment_if_present`, `caller_path_override=false`, and `missing_executable_next_action=use_absolute_executable_path`.
+
+If a known executable is outside that service `PATH`, use its reviewed absolute path. Do not work around the failure by sourcing `~/.zshrc`, `~/.zprofile`, `~/.bashrc`, adding Homebrew/user-local/version-manager paths automatically, or parsing `command not found` stderr as an authorization signal. Caller-provided `env.PATH` is rejected by the default process policy; other caller environment keys remain separately allowlisted. Executable/path discovery never expands capability, cwd, sandbox, Handoff, or mutation authority.
+
+For example, the 2026-09-25 macOS dogfood Agent had a service `PATH` of `/usr/bin:/bin:/usr/sbin:/sbin`: bare `gh` was not found, while the reviewed absolute `/opt/homebrew/bin/gh` worked. That observed string is diagnostic evidence, not a guaranteed macOS constant.
+
+
 ## Cua works poorly or `doctor` reports a problem
 
 Run:
