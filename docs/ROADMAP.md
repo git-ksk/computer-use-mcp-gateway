@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-09-22: **V1 remains a legacy/regression surface; V2 is the recommended runtime; `v0.7.0` Operator Ergonomics & Recovery Evidence is the released baseline. The currently open backlog is explicitly assigned through `v0.10.0`, with the unfinished v0.6.1 support-claim evidence track kept separate.**
+Status as of 2026-09-25: **V1 remains a legacy/regression surface; V2 is the recommended runtime; `v0.8.0` Backend Portability & Recovery Safety is the released baseline. The currently open backlog is explicitly assigned through `v0.10.0`, with the unfinished v0.6.1 support-claim evidence track kept separate.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -34,9 +34,9 @@ An ambiguous state-changing operation is never automatically retried or replayed
 
 The completed V1/V2 implementation history and acceptance evidence remain available through [`V1_ACCEPTANCE.md`](V1_ACCEPTANCE.md), [`v2/STATUS.md`](v2/STATUS.md), [`v2/acceptance/`](v2/acceptance/), and [`archive/`](archive/). This file intentionally focuses on work that is still relevant after the V2 closeout.
 
-## Released baseline: `0.7.x`
+## Released baseline: `0.8.x`
 
-`v0.7.0` is the released **Operator Ergonomics & Recovery Evidence** baseline. Its admitted scope completes #342 operation-ID guidance, #295 bounded `--version` identity, #304 unified read-only runtime status, #289 privacy-bounded ambiguous-target identity, #290 durable backend execution receipts, and #347 verified single-Mac backup/restore. The exact release scope, durable-state migration/rollback boundary, and withheld support claims are recorded in [`v2/V2_070_RELEASE_SCOPE.md`](v2/V2_070_RELEASE_SCOPE.md). The historical `v0.6.0` Managed Developer Execution scope remains recorded in [`v2/V2_060_RELEASE_SCOPE.md`](v2/V2_060_RELEASE_SCOPE.md).
+`v0.8.0` is the released **Backend Portability & Recovery Safety** baseline. Its admitted scope completes #377 authoritative Hub pre-enqueue non-delivery settlement, #379 structured semantic-refusal remediation, #380 explicit constrained execution-environment/PATH semantics, and #222 second-real-backend portability evidence. The exact release scope, durable-state migration/rollback boundary, and withheld support claims are recorded in [`v2/V2_080_RELEASE_SCOPE.md`](v2/V2_080_RELEASE_SCOPE.md). Historical `v0.7.0` and `v0.6.0` release scopes remain recorded in [`v2/V2_070_RELEASE_SCOPE.md`](v2/V2_070_RELEASE_SCOPE.md) and [`v2/V2_060_RELEASE_SCOPE.md`](v2/V2_060_RELEASE_SCOPE.md).
 
 The `0.4.0` release consolidates the work that had previously been split across the old `0.4.0 Recovery & Reconciliation` and `0.5.0 Multi-principal Identity` plans. Its accepted support boundary is recorded in the release-scope and status documents.
 
@@ -83,24 +83,22 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 
 ## Numbered post-v0.6 release boundaries
 
-`v0.7.0` is now the released and frozen **Operator Ergonomics & Recovery Evidence** baseline. These assignments are scope boundaries, not calendar promises. The still-open v0.6.1 support-claim evidence track is independent and is not a prerequisite for v0.7.0; unfinished claims are not imported into the newer release. If completing that track would newly widen the advertised support contract after v0.7, apply [`VERSIONING.md`](VERSIONING.md) and reassign publication to an appropriate later MINOR rather than forcing an obsolete patch number.
+`v0.8.0` is now the released and frozen **Backend Portability & Recovery Safety** baseline. These assignments are scope boundaries, not calendar promises. The still-open v0.6.1 support-claim evidence track is independent and is not a prerequisite for v0.7.0; unfinished claims are not imported into the newer release. If completing that track would newly widen the advertised support contract after v0.7, apply [`VERSIONING.md`](VERSIONING.md) and reassign publication to an appropriate later MINOR rather than forcing an obsolete patch number.
 
 1. **`v0.6.1 — Support Claim Expansion` evidence track** — #139 signed-token physical dogfood, #217 cross-platform recovery parity, #228 physical Linux FIDO2 UV acceptance, and final gate #346. It remains open and withheld; it does not retroactively widen v0.6.0 or v0.7.0.
 2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence` — released.** #342, #295, #304, #289, #290, and #347 are complete; see [`v2/V2_070_RELEASE_SCOPE.md`](v2/V2_070_RELEASE_SCOPE.md).
-3. **`v0.8.0 — Backend Portability & Recovery Safety`** — #377 adds authoritative Hub pre-delivery non-execution evidence for narrowly provable pre-enqueue failures; #379 unifies caller-facing semantic-refusal diagnosis/remediation without turning hints into authority or replay permission; #380 makes the constrained shell/process environment and PATH contract explicit without inheriting ambient host authority; and #222 proves the resulting GUI authority/ambiguity/recovery semantics against a second materially different real backend. #222 and #377 are the core portability/safety release gates; #379 and #380 are admitted v0.8 caller-ergonomics scope and must close or be explicitly re-scoped before release. This remains a bounded portability/recovery-safety release, not a generic provider, VM, or fleet product, and it does not weaken authorization, privacy, quarantine, or no-auto-replay semantics.
+3. **`v0.8.0 — Backend Portability & Recovery Safety` — released.** #377, #379, #380, and #222 are complete; see [`v2/V2_080_RELEASE_SCOPE.md`](v2/V2_080_RELEASE_SCOPE.md). This remains bounded portability/recovery-safety work rather than a generic provider, VM, or fleet product, and does not weaken authorization, privacy, quarantine, or no-auto-replay semantics.
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215, #275, #276, #277, #282, #283, and final acceptance #284. #276/#277 establish the reviewed Handoff dependency and hosted operator route; #282/#283 may then progress in parallel; #284 is the required replacement/partition/physical-Handoff acceptance gate before hosted support can be advertised.
 5. **`v0.10.0 — Legacy V1 Retirement`** — deliberate retirement of `v1_gateway`, including resolution/closure of V1-only upstream-blocked #14/#15. Removal remains conditional on confirming no supported deployment depends on V1 and intentionally migrating or archiving still-valuable regression fixtures.
 
 A patch/minor must still satisfy the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate. Optional provider/platform support stays withheld until its assigned release has the required evidence, and no version assignment weakens quarantine/no-auto-replay semantics.
 
-### v0.8.0 working order
+### v0.8.0 released closeout record
 
-1. **#377 — harden the authoritative recovery boundary first.** Add only exact Hub-local pre-enqueue non-delivery evidence that can prove an operation was not accepted for delivery; preserve commit-before-dispatch, quarantine on uncertainty, and permanent no-auto-replay semantics.
-2. **#379 and #380 — caller ergonomics may proceed in parallel once their mappings remain non-authoritative.** Reuse existing safe error/status taxonomies, distinguish remediation from replay safety, and document the constrained execution environment without implicitly sourcing host shell state or widening capability.
-3. **#222 — prove portability on a materially different real backend after the safety/caller contracts are stable enough to test.** The second backend must use CUMG-owned semantic capabilities and deliberately exercise an ambiguous post-dispatch branch; provider-specific identity and errors stay below the adapter boundary.
-4. **v0.8.0 closeout — reconcile all four issues against the standing Product Readiness gate.** Existing Cua regressions must remain green; physical/provider-backed #222 evidence is mandatory; #377 unsafe-neighbor tests must remain fail-closed; #379/#380 may not introduce implicit fallback, authority escalation, ambient environment inheritance, or replay semantics.
-
-If #222 cannot obtain the required real-backend acceptance evidence, the support claim stays withheld and v0.8.0 is not declared complete. If #379/#380 scope changes, update both the milestone and this roadmap explicitly rather than silently shipping stale admitted scope.
+1. **#377 completed the authoritative recovery boundary first.** Exact Hub-local pre-enqueue non-delivery evidence is the only new automatic no-execution settlement; post-enqueue uncertainty remains quarantined and no old operation is replayed.
+2. **#379 and #380 completed caller ergonomics without new authority.** Refusal remediation stays non-authoritative, and the execution-environment contract stays service-bounded without ambient login-shell inheritance.
+3. **#222 completed materially different real-backend proof.** macos-mcp 0.4.0 exercises CUMG-owned observation and two effectful GUI capabilities plus an ambiguous post-dispatch branch while provider-specific identity/errors stay below the adapter boundary.
+4. **v0.8.0 closeout passed the standing Product Readiness gate.** Existing Cua regression remained green on Linux/macOS/Windows, trusted-Mac provider-backed acceptance passed, #377 unsafe-neighbor tests remain fail closed, and #379/#380 introduce no implicit fallback, authority escalation, ambient environment inheritance, or replay semantics.
 
 ### v0.6.0 released working order
 
@@ -194,7 +192,6 @@ This queue records the practical result of continued Handoff integration and phy
 Every OPEN issue must appear in one of the buckets below or in another explicit roadmap section. The inventory describes admission and ordering; it does not imply that every open issue belongs to the next release.
 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, #228 physical Linux FIDO2 UV acceptance, and #346 final support-claim gate.
-- **`v0.8.0 — Backend Portability & Recovery Safety`:** #377 authoritative Hub pre-delivery non-execution auto-reconciliation, #379 structured semantic-refusal diagnosis/remediation, #380 constrained execution-environment/PATH ergonomics, and #222 second-real-backend semantic-neutrality proof.
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate, #275 Agent-owned Handoff topology, #276 reviewed Handoff consumer adoption, #277 hosted operator routing, #282 closed one-port ingress, #283 durable Hub state/writer-epoch fencing, and #284 final replacement/partition/physical-Handoff acceptance.
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 remain upstream-blocked while V1 exists; this release resolves or closes them as part of deliberate `v1_gateway` retirement rather than expanding V1.
 

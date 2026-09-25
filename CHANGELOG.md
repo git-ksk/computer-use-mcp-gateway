@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.8.0 — 2026-09-25
+
+Backend Portability & Recovery Safety release. This release narrows recovery ambiguity when the Hub can prove a command never entered the delivery queue, makes semantic refusal recovery machine-readable without turning hints into authority, documents the constrained process/shell execution environment, and proves the backend-neutral GUI safety contract against a second real provider. Live control/capability/registry/Hub-Agent schemas remain 12/8/8/6; durable execution-safety advances from v14 to v15 and Agent M1 persistence remains v6.
+
+### Authoritative pre-enqueue non-delivery (#377)
+
+- execution-safety schema **v15** adds exact Hub-local non-delivery evidence for encode-before-enqueue failure or a bounded Hub-to-Agent channel that returns the unsent frame;
+- only provable pre-enqueue failures settle as `confirmed_not_executed`; any failure after successful enqueue remains `Indeterminate` / quarantined;
+- settlement is durable before live release, appears through bounded status/audit surfaces, never authorizes old-operation replay, and requires a fresh operation ID for any later effectful attempt.
+
+### Structured semantic-refusal remediation (#379)
+
+- existing safe refusal/error codes remain canonical while reviewed refusal classes may add bounded `required_actor`, `next_action`, `same_operation_replay_safe=false`, `remediation_is_authority=false`, and `fresh_call_required` metadata;
+- caller, local-user, and operator actions are distinguished without parsing human-readable messages;
+- hints never authorize implicit trusted-input fallback, foreground switching, browser-route/target changes, scope expansion, consent, quarantine clearing, or replay.
+
+### Constrained execution environment and PATH contract (#380)
+
+- process/shell execution continues to `env_clear()` and inherit only the reviewed allowlisted subset of the Agent service environment;
+- `PATH` comes only from that service environment when present; login/interactive shell profiles are not sourced and caller `env.PATH` override remains denied;
+- reviewed absolute executable paths are the deterministic route for tools outside the service PATH, while tool schemas expose only payload-free policy metadata.
+
+### Second real-backend portability evidence (#222)
+
+- a narrow `MacosMcpAdapter` maps macos-mcp 0.4.0 `Snapshot`, `Move`, and `Click` below the existing adapter seam into CUMG `ListApplications`, `MovePointer`, and `PointerClick`;
+- provider identities/payloads remain below the adapter and unsupported capability shapes are rejected rather than emulated;
+- stale generation/capability revision is rejected before dispatch, while post-dispatch unproven provider outcomes become durable `Indeterminate` / `BackendOutcomeUnproven` quarantine that survives Hub restart and never auto-replays;
+- trusted-Mac physical acceptance passed real stdio initialization, real Snapshot, Finder Dock observation, real pointer movement, and a real click;
+- protected CI kept Rust, passthrough, CodeQL, release-candidate bundles, and native Cua smoke on Linux/macOS/Windows green.
+
+### Compatibility and migration
+
+- live 12/8/8/6 control/capability/registry/Hub-Agent pairing is unchanged from v0.7.0; Agent M1 persistence remains v6;
+- historical execution-safety v14 state remains readable by v0.8, but v15-only authoritative non-delivery state must not be handed to v0.7 writers;
+- upgrade as a reviewed version-paired runtime set. Rollback uses the captured pre-upgrade v0.7 checkpoint plus paired v0.7 runtime/configuration rather than an in-place schema downgrade;
+- macos-mcp is bounded portability evidence, not feature parity with Cua, a default-backend replacement, a generic MCP passthrough, or a VM/fleet product.
+
 ## v0.7.0 — 2026-09-22
 
 Operator Ergonomics & Recovery Evidence release. This release improves caller-safe operation recovery, packaged/runtime identity inspection, unified read-only status, privacy-bounded target recovery evidence, authoritative backend receipt plumbing, and verified single-Mac disaster-recovery backup/restore while preserving exact authorization and no-auto-replay semantics. Live control/capability/registry/Hub-Agent schemas remain 12/8/8/6.
