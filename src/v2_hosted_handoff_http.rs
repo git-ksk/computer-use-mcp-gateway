@@ -128,6 +128,10 @@ impl HostedHandoffHttpConfig {
         &self.resource
     }
 
+    pub fn authorization_server(&self) -> &str {
+        &self.authorization_server
+    }
+
     pub fn context_path(&self) -> &str {
         &self.context_path
     }

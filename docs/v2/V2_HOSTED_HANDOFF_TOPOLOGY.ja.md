@@ -125,7 +125,7 @@ hosted CUMG では次の lifetime を独立したものとして扱います。
 
 viewer reconnect / managed transport fallback では (4)/(5) だけを rotate でき、(3) を再生成したり、(2) を変えたり、(1) を advance してはいけません。Hub replacement による (6) の advance も Handoff authority change を意味しません。すべての stale generation は fail closed します。
 
-CUMG が upstream Handoff pin を更新した後、この model は v0.4.1 Desktop Session / Display Backend separation を利用します。
+CUMG が upstream Handoff pin を更新した後、この model は v0.4.5 Desktop Session / Display Backend separation を利用します。
 
 ## Hosted operator control
 
@@ -279,9 +279,9 @@ consumer update に必要な evidence:
 1. **この architecture を固定 (#275)。** Agent-owned canonical Handoff authority と non-authoritative hosted routing を維持する。
 2. **#276 で review 済み newer Handoff pin を別laneで採用。** v0.4.1-or-newer boundary を CUMG integration/acceptance evidence 付きでconsumeする。
 3. **upstream provider-neutral connectivity (#19) をconsume。** consumer-visible provider-specific relay assumption を除去する。
-4. **#277 で hosted operator/routing adapter を実装。** PR #281 で transport-neutral authorization core、principal/action-bound opaque context handle、MCP tool surface を持たない separate OAuth HTTP router、process-memory-only provider-blind routing fence（Agent/intervention/viewer/transport generation 分離、restart時 route 0件）まで実装済み。temporary な追加public portは作らず、production `v2_hub` listener composition は意図的に #215 one-port ingress へ残す。
-5. **#215 durable Hub/writer fencing + one-port hosted ingress を実装。** review 済み #277 router を one-port ingress にcomposeし、commit-before-dispatch boundary に Handoff check を合成する。
-6. **hosted failure / physical acceptance。** Hub replacement、stale writer、Agent reconnect/restart、viewer reconnect、WSS/WebRTC fallback、Human Done/verification/resume lifecycle を含める。
+4. **#277 hosted operator/routing adapter は実装済み。** PR #281 で transport-neutral authorization core、principal/action-bound opaque context handle、MCP tool surface を持たない separate OAuth HTTP router、process-memory-only provider-blind routing fence（Agent/intervention/viewer/transport generation 分離、restart時 route 0件）まで実装済み。
+5. **#282 hosted one-port ingress は candidate PR #285 で実装済み。** review 済み #277 router、protected MCP router、Agent gRPC service を exact-classified な Cloud Run `PORT` h2c 1 listener に同居させ、VM/single-host listener behavior は変更しません。durable Hub/writer fencing は #283 に残ります。
+6. **#283/#353 後に hosted failure / physical acceptance を実施。** Hub replacement、stale writer、Agent reconnect/restart、viewer reconnect、WSS/WebRTC fallback、Human Done/verification/resume lifecycle を #284 で検証します。
 
 interface が固定できている範囲では step 2-4 を並行実装できます。ただし hosted support claim が #215 durable-state/fencing gate を迂回することはできません。
 

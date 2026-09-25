@@ -97,15 +97,19 @@ extra quarantine はacceptable conservative failureですが、ambiguity loss �
 
 ### 5. One-port protocol multiplexing
 
-supported Cloud Run Hub は Cloud Run `PORT` 上の reviewed ingress service 1つを使います。recommended direction は application-level HTTP/2/h2c listener で closed protocol surface だけをrouteすることです。
+PR #285ではcandidate hosted profileをCloud Run `PORT`上の1つのapplication-level HTTP/2/h2c listenerとして実装します。explicit `CUMG_V2_HOSTED_PROFILE=true` の場合だけ有効で、通常のVM/single-host listener layoutは変更しません。
 
-- Agent gRPC service method -> existing Agent application authentication/device identity + signed protocol semantics;
-- northbound MCP path -> existing OAuth/trusted-proxy principal authentication + exact CUMG authorization;
-- documented health/metadata path -> existing coarse/read-only policy。
+shared listenerは `HostedIngressClassifier` が許可するclosed surfaceだけへrouteします。
 
- generic pass-through route は作りません。
+- exact Agent gRPC `OpenSession` -> 既存Tonic `AgentControlServer` と不変のapplication-level Ed25519/device protocol;
+- exact protected MCP resource + RFC 9728 metadata path -> 既存northbound OAuth/OIDC/introspection router と exact CUMG authorization;
+- exact hosted Handoff `/context` / `/control` / RFC 9728 metadata path -> #277 operator OAuth resource と exact principal/device/action authorization。
 
-Cloud Run が public TLS を terminate するため、hosted ingress は現在の private `v2_hub` TLS listener shape に依存できません。ただし Agent identity は弱まりません。Agent application-level Ed25519 identity/enrollment は transport TLS と独立したままです。hosted profile は Google frontend trust、service内 h2c、northbound HTTPS resource identity を明示します。
+hosted startupではGoogle frontendがpublic TLSを終端しcontainer内はh2cとするため、Hub TLS certificate/key fileと `CUMG_V2_MCP_BIND` の併用をfail closedで拒否します。public hosted profileではtrusted-proxy authも拒否します。MCPとhosted Handoffはdistinct protected resource URIを必須とし、OIDC modeではaudienceもdistinctにします。OAuth introspection modeでは各tokenをexact resource URIに対して検証します。Agent Ed25519 identityはtransport TLSから独立したままです。
+
+candidate startup contractは `CUMG_V2_HOSTED_PROFILE=true`、Cloud Run `PORT`、既存のcomplete MCP resource/policy/OAuth configurationに加え、`CUMG_V2_HOSTED_HANDOFF_RESOURCE`、`CUMG_V2_HOSTED_HANDOFF_REQUIRED_SCOPES`、`CUMG_V2_HOSTED_HANDOFF_POLICY_FILE` を必須とします。OIDC/JWT modeではさらに `CUMG_V2_HOSTED_HANDOFF_OIDC_AUDIENCE` を必須とし、`CUMG_V2_OIDC_AUDIENCE` とdistinctにします。introspection modeではHandoff OIDC audience設定を拒否します。
+
+generic pass-through/fallback proxyはありません。unknown/near-match path、unsupported method、cross-surfaceのwrong content typeはselected serviceへ入る前に拒否します。このcandidateはCUMG `/healthz` routeを公開しないため、healthはunauthenticated application endpointではありません。protected-resource metadataはexact GET-onlyです。`tests/v2_hosted_one_port.rs` でreal h2c listener上のTonic gRPC + MCP/Handoff HTTP/2同居とcross-surface delivery拒否を証明します。
 
 ### 6. Hosted Handoff composition
 
@@ -140,7 +144,7 @@ supported profile は以下も document / accept します。
 | ephemeral filesystem を authoritative state から排除 | Design decision complete / implementation pending |
 | provider-neutral durable Hub-state backend | Pending |
 | monotonic writer fencing + stale-writer dispatch denial | Pending |
-| one-port h2c gRPC + MCP ingress / separate auth boundary | Pending |
+| one-port h2c gRPC + MCP + hosted Handoff ingress / separate auth boundary | PR #285 candidate implementation・local h2c integration green、merge/hosted acceptance pending |
 | 3300s proactive Agent stream rotation acceptance | Pending |
 | <=8s hosted drain + forced-kill fail-closed acceptance | Pending |
 | concurrent old/new revision fencing test | Pending |
