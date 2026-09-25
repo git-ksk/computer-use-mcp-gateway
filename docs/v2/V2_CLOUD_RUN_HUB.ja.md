@@ -131,7 +131,7 @@ exact Cloud Run concurrency value は acceptance artifact に記録します。�
 
 supported profile は以下も document / accept します。
 
-- secret value をlogしない managed secret/key provisioning;
+- [`acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.ja.md`](acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.ja.md) に従う、secret value をlogしない managed secret/key provisioning;
 - persistence failure、writer-fence loss、Agent disconnect、quarantine、repeated stream-rotation failure の coarse health/alert;
 - instance replacement 時の OTLP behavior;
 - durable-state backup/restore + schema migration;
@@ -153,6 +153,7 @@ supported profile は以下も document / accept します。
 | <=8s hosted drain + forced-kill fail-closed acceptance | Pending |
 | concurrent old/new revision fencing test | deterministic two-writer core green。real hosted revision A/B acceptanceはpending |
 | replacement後 durable quarantine/replay-barrier restore | core replacement/restart regression green。hosted backup/restore acceptanceはpending |
+| hosted secret/key revision-rollout safety | #353 deterministic rotation composition green。real managed-secret revision A/B + log/OTLP acceptanceは#284でpending |
 | hosted deploy/upgrade/rollback/backup/alerting runbook | Pending |
 | Hosted Handoff operator/routing + Agent-owned authority composition | #275 design / #276 pin / #277 operator-routing; implementation・acceptance pending |
 | physical Agent + real Cua interrupted-effect acceptance | Pending |
