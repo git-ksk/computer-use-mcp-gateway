@@ -155,8 +155,8 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 | Provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate; selected external PostgreSQL acceptance pending under #284 |
 | Monotonic writer fencing and stale-writer dispatch denial | #283 automated core green; hosted revision-overlap acceptance pending |
 | One-port h2c gRPC + MCP + hosted Handoff ingress with separate auth boundaries | PR #285 merged; local h2c integration green, real hosted acceptance pending |
-| 3300s proactive Agent stream rotation acceptance | Pending |
-| <=8s hosted drain plus forced-kill fail-closed acceptance | Pending |
+| 3300s proactive Agent stream rotation acceptance | Accelerated core reauth/generation regression green; real Cloud Run long-request rotation acceptance pending |
+| <=8s hosted drain plus forced-kill fail-closed acceptance | Hosted <=8s config fence + planned-drain regression green; real SIGTERM/forced-kill acceptance pending |
 | Concurrent old/new revision fencing test | Deterministic two-writer core green; real hosted revision A/B acceptance pending |
 | Durable quarantine/replay-barrier restore after replacement | Core replacement/restart regression green; hosted backup/restore acceptance pending |
 | Hosted secret/key revision-rollout safety | #353 deterministic rotation composition green; real managed-secret revision A/B + log/OTLP acceptance pending under #284 |

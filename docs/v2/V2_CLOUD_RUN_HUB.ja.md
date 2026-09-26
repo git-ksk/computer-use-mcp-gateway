@@ -151,8 +151,8 @@ supported profile は以下も document / accept します。
 | provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate。selected external PostgreSQL acceptanceは#284でpending |
 | monotonic writer fencing + stale-writer dispatch denial | #283 automated core green。hosted revision-overlap acceptanceはpending |
 | one-port h2c gRPC + MCP + hosted Handoff ingress / separate auth boundary | PR #285 merge済み。local h2c integration green、real hosted acceptanceはpending |
-| 3300s proactive Agent stream rotation acceptance | Pending |
-| <=8s hosted drain + forced-kill fail-closed acceptance | Pending |
+| 3300s proactive Agent stream rotation acceptance | accelerated core reauth/generation regression green。real Cloud Run long-request rotation acceptanceはpending |
+| <=8s hosted drain + forced-kill fail-closed acceptance | hosted <=8s config fence + planned-drain regression green。real SIGTERM/forced-kill acceptanceはpending |
 | concurrent old/new revision fencing test | deterministic two-writer core green。real hosted revision A/B acceptanceはpending |
 | replacement後 durable quarantine/replay-barrier restore | core replacement/restart regression green。hosted backup/restore acceptanceはpending |
 | hosted secret/key revision-rollout safety | #353 deterministic rotation composition green。real managed-secret revision A/B + log/OTLP acceptanceは#284でpending |
