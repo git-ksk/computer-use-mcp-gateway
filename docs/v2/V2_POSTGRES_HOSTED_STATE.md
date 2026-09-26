@@ -28,10 +28,20 @@ The hosted v2_hub requires the PostgreSQL settings when CUMG_V2_HOSTED_PROFILE=t
 - CUMG_V2_POSTGRES_USER: runtime DB role.
 - CUMG_V2_POSTGRES_PASSWORD_FILE: optional private password file. Password bytes are never accepted as an inline CUMG environment variable.
 - CUMG_V2_POSTGRES_STATE_KEY: stable deployment-owned row key. It must remain unchanged across Hub revision rollout and Agent key rotation.
+- CUMG_V2_POSTGRES_TLS_MODE: `disable` or `verify-full`. Unix sockets and local trust-authenticated fixtures use explicit `disable`; remote TCP PostgreSQL should use `verify-full`.
+- CUMG_V2_POSTGRES_TLS_CA_PEM_FILE: optional bounded PEM CA bundle for `verify-full`. The bundle supplements the built-in public WebPKI roots and is never emitted through Debug/error/log output.
 - CUMG_V2_POSTGRES_CONNECT_TIMEOUT_SECS: bounded connect timeout.
 - CUMG_V2_POSTGRES_QUERY_TIMEOUT_SECS: bounded statement and lock timeout.
 
 The serving process does not create or migrate the database schema.
+
+### Remote TCP TLS
+
+Remote TCP providers use the same PostgreSQL state contract; CUMG does not accept provider-specific project identifiers or raw DSNs. `verify-full` uses rustls and validates both the certificate chain and the configured PostgreSQL host name. Public WebPKI roots are trusted by default; deployments using a private database CA may add that CA through the bounded file-backed `CUMG_V2_POSTGRES_TLS_CA_PEM_FILE`.
+
+CUMG deliberately exposes no insecure "encrypt without verification" mode. An untrusted CA, malformed CA bundle, or hostname mismatch fails the provider connection closed as unavailable before schema access. The CA file is trust material, not an application principal or writer identity.
+
+Unix-socket transports, including the Cloud SQL mounted `/cloudsql/...` path, remain `disable`: the database TLS layer is not stacked onto the Unix socket, and contradictory `verify-full` configuration is rejected.
 
 ## Migration and least privilege
 
@@ -92,6 +102,7 @@ A restore must preserve the complete row payload, revision, writer epoch, quaran
 - async ambiguous-commit tests prove writer fencing plus replacement restoration to Indeterminate quarantine;
 - tests/v2_postgres_hub_state.rs runs against a real PostgreSQL service and proves successive epochs, stale writer rejection, exact one-winner CAS race, schema-7 durable fence round-trip, and oversize rejection before mutation;
 - CI provisions a PostgreSQL 17 service for the Rust job;
+- Issue #396 upgrades that fixture to TLS with ephemeral CI-only CA/server keys and proves `verify-full` success for a trusted matching certificate, rejection of an untrusted CA and hostname mismatch, and fail-closed TLS provider loss followed by verified reconnect;
 - local CheckpointStore behavior and VM/single-host startup remain unchanged.
 
 ## Cloud SQL acceptance boundary
