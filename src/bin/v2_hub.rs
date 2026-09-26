@@ -17,8 +17,8 @@ use computer_use_mcp_gateway::{
         SingleDeviceHub,
     },
     v2_m1_keys::{
-        load_grant_authority, load_hub_identity, load_secret_text, load_tls_server_identity,
-        load_trusted_text, load_verifying_key,
+        load_grant_authority, load_hub_identity, load_public_trust_bytes, load_secret_text,
+        load_tls_server_identity, load_trusted_text, load_verifying_key,
     },
     v2_m1_northbound::{
         AccessTokenVerifier, NorthboundMcpConfig, NorthboundPolicyDocument,
@@ -27,7 +27,9 @@ use computer_use_mcp_gateway::{
     },
     v2_oidc_jwt::{OidcJwtAlgorithm, OidcJwtConfig, OidcJwtVerifier},
     v2_operator_handoff::UnixOperatorHandoffAuthority,
-    v2_postgres_hub_state_store::{PostgresHubStateStore, PostgresHubStateStoreConfig},
+    v2_postgres_hub_state_store::{
+        PostgresHubStateStore, PostgresHubStateStoreConfig, PostgresTlsMode,
+    },
     v2_semantic_constraints::SemanticConstraintPolicy,
     v2_status_collector::{CollectedOperatorStatusProvider, OperatorStatusCollectionConfig},
 };
@@ -47,6 +49,7 @@ const MAX_NORTHBOUND_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_HOSTED_HANDOFF_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SEMANTIC_CONSTRAINT_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_POSTGRES_PASSWORD_BYTES: u64 = 4 * 1024;
+const MAX_POSTGRES_CA_BUNDLE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "v2_hub")]
@@ -103,6 +106,13 @@ struct Args {
     /// Stable deployment-owned key for the single authoritative Hub row.
     #[arg(long, env = "CUMG_V2_POSTGRES_STATE_KEY")]
     postgres_state_key: Option<String>,
+    /// PostgreSQL transport security: disable for local/Unix-socket paths, verify-full for
+    /// remote TCP with certificate-chain and hostname verification.
+    #[arg(long, env = "CUMG_V2_POSTGRES_TLS_MODE", default_value = "disable")]
+    postgres_tls_mode: String,
+    /// Optional PEM CA bundle added to the public trust roots for verify-full mode.
+    #[arg(long, env = "CUMG_V2_POSTGRES_TLS_CA_PEM_FILE")]
+    postgres_tls_ca_pem_file: Option<PathBuf>,
     #[arg(
         long,
         env = "CUMG_V2_POSTGRES_CONNECT_TIMEOUT_SECS",
@@ -1196,6 +1206,22 @@ fn build_hosted_postgres_state_config(args: &Args) -> Result<PostgresHubStateSto
     )
     .context("invalid hosted PostgreSQL timeout configuration")?;
 
+    let tls_mode = args
+        .postgres_tls_mode
+        .parse::<PostgresTlsMode>()
+        .context("invalid hosted PostgreSQL TLS mode")?;
+    config = config
+        .with_tls_mode(tls_mode)
+        .context("invalid hosted PostgreSQL TLS configuration")?;
+
+    if let Some(path) = args.postgres_tls_ca_pem_file.as_ref() {
+        let pem = load_public_trust_bytes(path, MAX_POSTGRES_CA_BUNDLE_BYTES)
+            .context("failed to load hosted PostgreSQL TLS CA bundle")?;
+        config = config
+            .with_custom_ca_pem(pem)
+            .context("invalid hosted PostgreSQL TLS CA bundle")?;
+    }
+
     if let Some(path) = args.postgres_password_file.as_ref() {
         let password = load_secret_text(path, MAX_POSTGRES_PASSWORD_BYTES)
             .context("failed to load hosted PostgreSQL password")?;
@@ -1238,6 +1264,23 @@ fn validate_profile_configuration(args: &Args) -> Result<()> {
                 && args.postgres_connect_timeout_secs > 0
                 && args.postgres_query_timeout_secs > 0,
             "hosted profile requires positive PostgreSQL port/timeouts"
+        );
+        let postgres_tls_mode = args
+            .postgres_tls_mode
+            .parse::<PostgresTlsMode>()
+            .map_err(|_| anyhow::anyhow!("invalid CUMG_V2_POSTGRES_TLS_MODE"))?;
+        ensure!(
+            !args
+                .postgres_host
+                .as_deref()
+                .is_some_and(|host| host.starts_with('/'))
+                || postgres_tls_mode == PostgresTlsMode::Disable,
+            "PostgreSQL Unix-socket transport requires TLS mode disable"
+        );
+        ensure!(
+            args.postgres_tls_ca_pem_file.is_none()
+                || postgres_tls_mode == PostgresTlsMode::VerifyFull,
+            "PostgreSQL custom CA requires TLS mode verify-full"
         );
         ensure!(
             args.drain_timeout_secs <= 8,
@@ -1306,7 +1349,9 @@ fn validate_profile_configuration(args: &Args) -> Result<()> {
                 && args.postgres_database.is_none()
                 && args.postgres_user.is_none()
                 && args.postgres_password_file.is_none()
-                && args.postgres_state_key.is_none(),
+                && args.postgres_state_key.is_none()
+                && args.postgres_tls_mode == "disable"
+                && args.postgres_tls_ca_pem_file.is_none(),
             "PostgreSQL hosted Hub-state settings require CUMG_V2_HOSTED_PROFILE=true"
         );
         ensure!(
@@ -1583,6 +1628,24 @@ mod auth_mode_tests {
         let mut excessive_drain = hosted_oidc_args();
         excessive_drain.drain_timeout_secs = 9;
         assert!(validate_profile_configuration(&excessive_drain).is_err());
+
+        let mut unix_verify_full = hosted_oidc_args();
+        unix_verify_full.postgres_tls_mode = "verify-full".into();
+        assert!(validate_profile_configuration(&unix_verify_full).is_err());
+
+        let mut remote_verify_full = hosted_oidc_args();
+        remote_verify_full.postgres_host = Some("db.example.test".into());
+        remote_verify_full.postgres_tls_mode = "verify-full".into();
+        assert!(validate_profile_configuration(&remote_verify_full).is_ok());
+
+        let mut ca_without_verify = hosted_oidc_args();
+        ca_without_verify.postgres_tls_ca_pem_file = Some("/tmp/postgres-ca.pem".into());
+        assert!(validate_profile_configuration(&ca_without_verify).is_err());
+
+        let mut invalid_tls_mode = hosted_oidc_args();
+        invalid_tls_mode.postgres_host = Some("db.example.test".into());
+        invalid_tls_mode.postgres_tls_mode = "require".into();
+        assert!(validate_profile_configuration(&invalid_tls_mode).is_err());
     }
 
     #[test]
@@ -1607,6 +1670,10 @@ mod auth_mode_tests {
             "https://hub.example/operator/v1/handoff",
         ]);
         assert!(validate_profile_configuration(&with_hosted_resource).is_err());
+
+        let mut with_postgres_tls = args;
+        with_postgres_tls.postgres_tls_mode = "verify-full".into();
+        assert!(validate_profile_configuration(&with_postgres_tls).is_err());
     }
 
     #[test]

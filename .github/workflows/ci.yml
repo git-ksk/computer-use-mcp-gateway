@@ -73,6 +73,54 @@ jobs:
           echo "CUMG_TEST_CGROUP_V2_ROOT=$writable" >> "$GITHUB_ENV"
           echo "CUMG_TEST_CGROUP_V2_UNWRITABLE_ROOT=$unwritable" >> "$GITHUB_ENV"
 
+      - name: Enable PostgreSQL verify-full TLS fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          tls_root="$RUNNER_TEMP/cumg-postgres-tls"
+          mkdir -p "$tls_root"
+
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$tls_root/ca.key" -out "$tls_root/ca.crt" -days 1 \
+            -subj "/CN=CUMG CI Test CA" >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "$tls_root/server.key" -out "$tls_root/server.csr" \
+            -subj "/CN=localhost" >/dev/null 2>&1
+          printf 'subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\n' \
+            > "$tls_root/server.ext"
+          openssl x509 -req -in "$tls_root/server.csr" \
+            -CA "$tls_root/ca.crt" -CAkey "$tls_root/ca.key" -CAcreateserial \
+            -out "$tls_root/server.crt" -days 1 -sha256 \
+            -extfile "$tls_root/server.ext" >/dev/null 2>&1
+
+          postgres_container="$(
+            docker ps --format '{{.ID}} {{.Image}}' |
+              awk '$2 ~ /^postgres:17-alpine/ {print $1; exit}'
+          )"
+          test -n "$postgres_container"
+
+          docker cp "$tls_root/server.crt" \
+            "$postgres_container:/var/lib/postgresql/data/server.crt"
+          docker cp "$tls_root/server.key" \
+            "$postgres_container:/var/lib/postgresql/data/server.key"
+          docker exec -u root "$postgres_container" sh -c \
+            'chown postgres:postgres /var/lib/postgresql/data/server.crt /var/lib/postgresql/data/server.key && chmod 644 /var/lib/postgresql/data/server.crt && chmod 600 /var/lib/postgresql/data/server.key'
+          docker exec "$postgres_container" \
+            psql -U postgres -d cumg -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET ssl = 'on';"
+          docker restart "$postgres_container" >/dev/null
+          for _ in $(seq 1 30); do
+            if docker exec "$postgres_container" pg_isready -U postgres -d cumg >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec "$postgres_container" pg_isready -U postgres -d cumg >/dev/null
+
+          echo "CUMG_TEST_POSTGRES_TLS_CA_FILE=$tls_root/ca.crt" >> "$GITHUB_ENV"
+          echo "CUMG_TEST_POSTGRES_TLS_HOST=localhost" >> "$GITHUB_ENV"
+          echo "CUMG_TEST_POSTGRES_TLS_MISMATCH_HOST=127.0.0.1" >> "$GITHUB_ENV"
+
       - name: Test
         shell: bash
         run: |

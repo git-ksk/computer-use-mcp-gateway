@@ -12,11 +12,13 @@ use crate::{
     v2_m1_persistence::{HubPersistentState, MAX_CHECKPOINT_BYTES, PersistenceError},
 };
 use async_trait::async_trait;
+use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
 #[cfg(unix)]
 use std::path::Path;
-use std::{fmt, future::Future, time::Duration};
+use std::{fmt, future::Future, io::Cursor, str::FromStr, time::Duration};
 use tokio::sync::{Mutex, MutexGuard};
-use tokio_postgres::{Client, GenericClient, NoTls, Row};
+use tokio_postgres::{Client, GenericClient, NoTls, Row, config::SslMode};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 const SELECT_CURRENT_SQL: &str = r#"
 SELECT store_schema_version, revision, writer_epoch, state_payload
@@ -60,6 +62,35 @@ const MAX_STATE_KEY_BYTES: usize = 256;
 const MAX_CONNECTION_FIELD_BYTES: usize = 1024;
 const MAX_ACQUIRE_RETRIES: usize = 4;
 const MAX_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CUSTOM_CA_BUNDLE_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PostgresTlsMode {
+    #[default]
+    Disable,
+    VerifyFull,
+}
+
+impl FromStr for PostgresTlsMode {
+    type Err = HubStateStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "disable" => Ok(Self::Disable),
+            "verify-full" => Ok(Self::VerifyFull),
+            _ => Err(HubStateStoreError::InvalidConfiguration),
+        }
+    }
+}
+
+impl PostgresTlsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PostgresHubStateStoreConfig {
@@ -69,6 +100,8 @@ pub struct PostgresHubStateStoreConfig {
     user: String,
     password: Option<String>,
     state_key: String,
+    tls_mode: PostgresTlsMode,
+    custom_ca_pem: Option<Vec<u8>>,
     connect_timeout: Duration,
     query_timeout: Duration,
 }
@@ -89,6 +122,8 @@ impl fmt::Debug for PostgresHubStateStoreConfig {
             .field("user_configured", &!self.user.is_empty())
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field("state_key_present", &!self.state_key.is_empty())
+            .field("tls_mode", &self.tls_mode.as_str())
+            .field("custom_ca_configured", &self.custom_ca_pem.is_some())
             .field("connect_timeout", &self.connect_timeout)
             .field("query_timeout", &self.query_timeout)
             .finish()
@@ -109,6 +144,8 @@ impl PostgresHubStateStoreConfig {
             user: user.into(),
             password: None,
             state_key: state_key.into(),
+            tls_mode: PostgresTlsMode::Disable,
+            custom_ca_pem: None,
             connect_timeout: Duration::from_secs(5),
             query_timeout: Duration::from_secs(5),
         };
@@ -125,6 +162,21 @@ impl PostgresHubStateStoreConfig {
             return Err(HubStateStoreError::InvalidConfiguration);
         }
         self.password = Some(password);
+        Ok(self)
+    }
+
+    pub fn with_tls_mode(mut self, tls_mode: PostgresTlsMode) -> Result<Self, HubStateStoreError> {
+        self.tls_mode = tls_mode;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_custom_ca_pem(mut self, pem: Vec<u8>) -> Result<Self, HubStateStoreError> {
+        if pem.is_empty() || pem.len() > MAX_CUSTOM_CA_BUNDLE_BYTES {
+            return Err(HubStateStoreError::InvalidConfiguration);
+        }
+        parse_ca_certificates(&pem)?;
+        self.custom_ca_pem = Some(pem);
         Ok(self)
     }
 
@@ -160,6 +212,8 @@ impl PostgresHubStateStoreConfig {
             || self.password.as_ref().is_some_and(|password| {
                 password.is_empty() || password.len() > MAX_CONNECTION_FIELD_BYTES
             })
+            || (self.host.starts_with('/') && self.tls_mode != PostgresTlsMode::Disable)
+            || (self.custom_ca_pem.is_some() && self.tls_mode != PostgresTlsMode::VerifyFull)
         {
             return Err(HubStateStoreError::InvalidConfiguration);
         }
@@ -173,6 +227,8 @@ pub struct PostgresHubStateStore {
     state_key: String,
     connect_timeout: Duration,
     query_timeout: Duration,
+    tls_mode: PostgresTlsMode,
+    tls_config: Option<ClientConfig>,
 }
 
 impl fmt::Debug for PostgresHubStateStore {
@@ -180,6 +236,7 @@ impl fmt::Debug for PostgresHubStateStore {
         f.debug_struct("PostgresHubStateStore")
             .field("state_key_present", &true)
             .field("query_timeout", &self.query_timeout)
+            .field("tls_mode", &self.tls_mode.as_str())
             .finish_non_exhaustive()
     }
 }
@@ -197,6 +254,10 @@ impl PostgresHubStateStore {
         } else {
             postgres.host(&config.host).port(config.port);
         }
+        postgres.ssl_mode(match config.tls_mode {
+            PostgresTlsMode::Disable => SslMode::Disable,
+            PostgresTlsMode::VerifyFull => SslMode::Require,
+        });
         postgres
             .dbname(&config.database)
             .user(&config.user)
@@ -206,34 +267,55 @@ impl PostgresHubStateStore {
             postgres.password(password);
         }
 
+        let tls_config = match config.tls_mode {
+            PostgresTlsMode::Disable => None,
+            PostgresTlsMode::VerifyFull => {
+                Some(build_tls_client_config(config.custom_ca_pem.as_deref())?)
+            }
+        };
         let store = Self {
             postgres,
             client: Mutex::new(None),
             state_key: config.state_key,
             connect_timeout: config.connect_timeout,
             query_timeout: config.query_timeout,
+            tls_mode: config.tls_mode,
+            tls_config,
         };
         store.verify_schema().await?;
         Ok(store)
     }
 
     async fn open_client(&self) -> Result<Client, HubStateStoreError> {
-        let (client, connection) =
-            match tokio::time::timeout(self.connect_timeout, self.postgres.connect(NoTls)).await {
-                Ok(Ok(value)) => value,
-                Ok(Err(_)) | Err(_) => return Err(HubStateStoreError::Unavailable),
-            };
-        tokio::spawn(async move {
-            if connection.await.is_err() {
-                tracing::error!(
-                    event = "v2_hosted_state_provider_connection_lost",
-                    provider = "postgres",
-                    outcome = "failed_closed",
-                    error_code = "hub_state_store_unavailable",
-                    "hosted Hub-state provider connection ended"
-                );
+        let client = match self.tls_mode {
+            PostgresTlsMode::Disable => {
+                let (client, connection) =
+                    match tokio::time::timeout(self.connect_timeout, self.postgres.connect(NoTls))
+                        .await
+                    {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(_)) | Err(_) => return Err(HubStateStoreError::Unavailable),
+                    };
+                spawn_connection_driver(connection);
+                client
             }
-        });
+            PostgresTlsMode::VerifyFull => {
+                let tls = MakeRustlsConnect::new(
+                    self.tls_config
+                        .clone()
+                        .ok_or(HubStateStoreError::InvalidConfiguration)?,
+                );
+                let (client, connection) =
+                    match tokio::time::timeout(self.connect_timeout, self.postgres.connect(tls))
+                        .await
+                    {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(_)) | Err(_) => return Err(HubStateStoreError::Unavailable),
+                    };
+                spawn_connection_driver(connection);
+                client
+            }
+        };
 
         let timeout_ms = u64::try_from(self.query_timeout.as_millis())
             .map_err(|_| HubStateStoreError::InvalidConfiguration)?;
@@ -532,6 +614,53 @@ impl AsyncHubAuthoritativeStateStore for PostgresHubStateStore {
     }
 }
 
+fn spawn_connection_driver<S, T>(connection: tokio_postgres::Connection<S, T>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    T: tokio_postgres::tls::TlsStream + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if connection.await.is_err() {
+            tracing::error!(
+                event = "v2_hosted_state_provider_connection_lost",
+                provider = "postgres",
+                outcome = "failed_closed",
+                error_code = "hub_state_store_unavailable",
+                "hosted Hub-state provider connection ended"
+            );
+        }
+    });
+}
+
+fn build_tls_client_config(
+    custom_ca_pem: Option<&[u8]>,
+) -> Result<ClientConfig, HubStateStoreError> {
+    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = custom_ca_pem {
+        for certificate in parse_ca_certificates(pem)? {
+            roots
+                .add(certificate)
+                .map_err(|_| HubStateStoreError::InvalidConfiguration)?;
+        }
+    }
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
+fn parse_ca_certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, HubStateStoreError> {
+    if pem.is_empty() || pem.len() > MAX_CUSTOM_CA_BUNDLE_BYTES {
+        return Err(HubStateStoreError::InvalidConfiguration);
+    }
+    let certificates = rustls_pemfile::certs(&mut Cursor::new(pem))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| HubStateStoreError::InvalidConfiguration)?;
+    if certificates.is_empty() {
+        return Err(HubStateStoreError::InvalidConfiguration);
+    }
+    Ok(certificates)
+}
+
 fn valid_connection_field(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_CONNECTION_FIELD_BYTES
@@ -643,6 +772,12 @@ mod tests {
         assert!(!rendered.contains("private-project"));
         assert!(!rendered.contains("private_database"));
         assert!(!rendered.contains("private_user"));
+
+        let mut with_ca = config;
+        with_ca.custom_ca_pem = Some(b"private-test-ca-contents".to_vec());
+        let rendered = format!("{with_ca:?}");
+        assert!(rendered.contains("custom_ca_configured"));
+        assert!(!rendered.contains("private-test-ca-contents"));
     }
 
     #[test]
@@ -660,6 +795,46 @@ mod tests {
             PostgresHubStateStoreConfig::new("localhost", "db", "user", "safe-key")
                 .unwrap()
                 .with_timeouts(Duration::from_secs(1), Duration::from_secs(31))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tls_mode_is_closed_and_unix_socket_rejects_verify_full() {
+        assert_eq!(
+            "disable".parse::<PostgresTlsMode>().unwrap(),
+            PostgresTlsMode::Disable
+        );
+        assert_eq!(
+            "verify-full".parse::<PostgresTlsMode>().unwrap(),
+            PostgresTlsMode::VerifyFull
+        );
+        assert!("require".parse::<PostgresTlsMode>().is_err());
+        assert!(
+            PostgresHubStateStoreConfig::new(
+                "/cloudsql/project:region:instance",
+                "db",
+                "user",
+                "state-key",
+            )
+            .unwrap()
+            .with_tls_mode(PostgresTlsMode::VerifyFull)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_ca_is_bounded_parsed_and_requires_verify_full_at_final_validation() {
+        assert!(
+            PostgresHubStateStoreConfig::new("db.example", "db", "user", "state-key")
+                .unwrap()
+                .with_custom_ca_pem(b"not a PEM certificate".to_vec())
+                .is_err()
+        );
+        assert!(
+            PostgresHubStateStoreConfig::new("db.example", "db", "user", "state-key")
+                .unwrap()
+                .with_custom_ca_pem(vec![b'x'; MAX_CUSTOM_CA_BUNDLE_BYTES + 1])
                 .is_err()
         );
     }
