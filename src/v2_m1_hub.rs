@@ -6101,8 +6101,10 @@ mod tests {
         }
     }
 
-    fn postgres_test_config(
+    fn postgres_test_config_for_credentials(
         state_key: &str,
+        user: &str,
+        password: Option<&str>,
     ) -> Option<crate::v2_postgres_hub_state_store::PostgresHubStateStoreConfig> {
         std::env::var("CUMG_TEST_POSTGRES_URL").ok()?;
         let host = std::env::var("CUMG_TEST_POSTGRES_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -6111,7 +6113,6 @@ mod tests {
             .and_then(|value| value.parse().ok())
             .unwrap_or(5432);
         let database = std::env::var("CUMG_TEST_POSTGRES_DB").unwrap_or_else(|_| "cumg".into());
-        let user = std::env::var("CUMG_TEST_POSTGRES_USER").unwrap_or_else(|_| "postgres".into());
         let mut config = crate::v2_postgres_hub_state_store::PostgresHubStateStoreConfig::new(
             host, database, user, state_key,
         )
@@ -6120,10 +6121,29 @@ mod tests {
         .unwrap()
         .with_timeouts(Duration::from_secs(5), Duration::from_secs(5))
         .unwrap();
-        if let Ok(password) = std::env::var("CUMG_TEST_POSTGRES_PASSWORD") {
+        if let Some(password) = password {
             config = config.with_password(password).unwrap();
         }
         Some(config)
+    }
+
+    fn postgres_test_config(
+        state_key: &str,
+    ) -> Option<crate::v2_postgres_hub_state_store::PostgresHubStateStoreConfig> {
+        let user = std::env::var("CUMG_TEST_POSTGRES_USER").unwrap_or_else(|_| "postgres".into());
+        let password = std::env::var("CUMG_TEST_POSTGRES_PASSWORD").ok();
+        postgres_test_config_for_credentials(state_key, &user, password.as_deref())
+    }
+
+    async fn postgres_admin_client() -> Option<tokio_postgres::Client> {
+        let url = std::env::var("CUMG_TEST_POSTGRES_URL").ok()?;
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("CUMG_TEST_POSTGRES_URL is set but PostgreSQL is unavailable");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Some(client)
     }
 
     async fn prepare_postgres_test_schema() -> bool {
@@ -6409,6 +6429,148 @@ mod tests {
 
         drop(persistent);
         drop(handle_b);
+        let _ = std::fs::remove_dir_all(state_dir_a);
+        let _ = std::fs::remove_dir_all(state_dir_b);
+    }
+
+    #[tokio::test]
+    async fn postgres_provider_outage_before_dispatch_never_enqueues_and_recovers_not_dispatched() {
+        if !prepare_postgres_test_schema().await {
+            return;
+        }
+
+        let admin = postgres_admin_client().await.unwrap();
+        let role = format!("cumg_outage_{}", rand::random::<u64>());
+        let password = format!("p{}", rand::random::<u128>());
+        admin
+            .batch_execute(&format!(
+                "CREATE ROLE {role} LOGIN PASSWORD '{password}';                  GRANT USAGE ON SCHEMA public TO {role};                  GRANT SELECT, INSERT, UPDATE ON TABLE cumg_hub_state TO {role};"
+            ))
+            .await
+            .unwrap();
+
+        let state_key = format!("hub-provider-outage-{}", rand::random::<u64>());
+        let device = DeviceIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+
+        let config_a = hosted_test_config("postgres-provider-outage-a");
+        let state_dir_a = config_a.state_dir.clone();
+        let store_a = Arc::new(
+            crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
+                postgres_test_config_for_credentials(&state_key, &role, Some(&password)).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (hub_a, handle_a) =
+            SingleDeviceHub::new_with_async_state_store(config_a, material.clone(), store_a)
+                .await
+                .unwrap();
+
+        let operation_id = "op-postgres-provider-outage";
+        let (hello, challenge, _owner, mut pending) =
+            prepare_type_text_for_dispatch(&hub_a, &handle_a, operation_id).await;
+
+        admin
+            .batch_execute(&format!("ALTER ROLE {role} NOLOGIN;"))
+            .await
+            .unwrap();
+        let terminated = admin
+            .query(
+                "SELECT pg_terminate_backend(pid)                  FROM pg_stat_activity                  WHERE usename = $1 AND application_name = 'cumg-v2-hub' AND pid <> pg_backend_pid()",
+                &[&role],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !terminated.is_empty(),
+            "the dedicated Hub provider connection must be terminated"
+        );
+
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        assert!(matches!(
+            hub_a
+                .dispatch_operation(
+                    &outbound,
+                    &hello,
+                    &challenge,
+                    1,
+                    1,
+                    &TrustedSessionClock::new(10),
+                    operation_id,
+                    &mut pending,
+                )
+                .await,
+            Err(HubServiceError::StateStore(HubStateStoreError::Unavailable))
+        ));
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!hub_a.inner.writer_fenced.load(Ordering::Acquire));
+        {
+            let persistent = handle_a.inner.persistent.lock().await;
+            assert_eq!(
+                persistent.execution.state(operation_id),
+                Some(HubOperationState::ActiveNotDispatched)
+            );
+        }
+
+        admin
+            .batch_execute(&format!("ALTER ROLE {role} LOGIN;"))
+            .await
+            .unwrap();
+
+        let config_b = hosted_test_config("postgres-provider-outage-b");
+        let state_dir_b = config_b.state_dir.clone();
+        let store_b = Arc::new(
+            crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
+                postgres_test_config_for_credentials(&state_key, &role, Some(&password)).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (_hub_b, handle_b) =
+            SingleDeviceHub::new_with_async_state_store(config_b, material, store_b)
+                .await
+                .unwrap();
+
+        {
+            let persistent = handle_b.inner.persistent.lock().await;
+            assert_eq!(
+                persistent.execution.state(operation_id),
+                Some(HubOperationState::Cancelled)
+            );
+            assert_eq!(
+                persistent.execution.receipt(operation_id).unwrap().evidence,
+                ExecutionEvidence::CancelledBeforeDispatch
+            );
+            assert!(
+                persistent
+                    .execution
+                    .quarantine(handle_b.device_id())
+                    .is_none()
+            );
+        }
+
+        drop(handle_b);
+        drop(handle_a);
+        drop(hub_a);
+        let _ = admin
+            .query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1",
+                &[&role],
+            )
+            .await;
+        admin
+            .batch_execute(&format!("DROP OWNED BY {role}; DROP ROLE {role};"))
+            .await
+            .unwrap();
         let _ = std::fs::remove_dir_all(state_dir_a);
         let _ = std::fs::remove_dir_all(state_dir_b);
     }
