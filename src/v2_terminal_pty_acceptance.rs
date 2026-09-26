@@ -564,7 +564,10 @@ async fn physical_webrtc_terminal_human_acceptance() {
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
     let checkpoint = temp.join("checkpoint.json");
     let env_file = temp.join("managed-runtime.env");
-    let mut managed_env = format!(
+    // This is a consumer-lifecycle acceptance, not a relay-provider acceptance. CUMG deliberately
+    // knows no STUN/TURN provider names and forwards no relay credential material. Provider-neutral
+    // discovery/relay acceptance belongs to the Handoff source revision under test.
+    let managed_env = format!(
         "CUMG_V2_HANDOFF_ROOT={}\nCUMG_V2_HANDOFF_CHECKPOINT_FILE={}\nCUMG_V2_HANDOFF_CHECKPOINT_KEY_FILE={}\nCUMG_V2_HANDOFF_WEBRTC_HTTP_BIND={}\nCUMG_V2_HANDOFF_WEBRTC_PUBLIC_ORIGIN={}\nCUMG_V2_HANDOFF_TERMINAL_WEBRTC_ONLY=1\n",
         handoff_root.display(),
         checkpoint.display(),
@@ -572,21 +575,6 @@ async fn physical_webrtc_terminal_human_acceptance() {
         web_rtc_bind,
         public_origin,
     );
-    for name in [
-        "MCP_HANDOFF_CLOUDFLARE_TURN_KEY_ID",
-        "MCP_HANDOFF_CLOUDFLARE_TURN_KEY_API_TOKEN",
-        "MCP_HANDOFF_COTURN_SHARED_SECRET",
-        "MCP_HANDOFF_COTURN_TURN_URLS",
-        "MCP_HANDOFF_COTURN_STUN_URLS",
-    ] {
-        if let Ok(value) = env::var(name) {
-            assert!(!value.contains(['\r', '\n']));
-            managed_env.push_str(name);
-            managed_env.push('=');
-            managed_env.push_str(&value);
-            managed_env.push('\n');
-        }
-    }
     fs::write(&env_file, managed_env).unwrap();
     fs::set_permissions(&env_file, fs::Permissions::from_mode(0o600)).unwrap();
 
