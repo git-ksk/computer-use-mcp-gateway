@@ -6305,6 +6305,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_replacement_after_durable_dispatch_restores_indeterminate_no_replay() {
+        if !prepare_postgres_test_schema().await {
+            return;
+        }
+
+        let state_key = format!("hub-dispatch-restart-{}", rand::random::<u64>());
+        let device = DeviceIdentity::generate();
+        let material = HubProvisionedMaterial {
+            hub_identity: HubIdentity::generate(),
+            grant_signer: GrantAuthority::generate().into(),
+            device_verifier: device.verifying_key(),
+            device_rotation: None,
+        };
+
+        let config_a = hosted_test_config("postgres-dispatch-crash-a");
+        let state_dir_a = config_a.state_dir.clone();
+        let store_a = Arc::new(
+            crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
+                postgres_test_config(&state_key).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (hub_a, handle_a) =
+            SingleDeviceHub::new_with_async_state_store(config_a, material.clone(), store_a)
+                .await
+                .unwrap();
+
+        let operation_id = "op-postgres-dispatch-crash-replacement";
+        let (hello, challenge, owner, mut pending) =
+            prepare_type_text_for_dispatch(&hub_a, &handle_a, operation_id).await;
+        let (outbound, mut outbound_rx) = mpsc::channel(1);
+        assert!(matches!(
+            hub_a
+                .dispatch_operation(
+                    &outbound,
+                    &hello,
+                    &challenge,
+                    1,
+                    1,
+                    &TrustedSessionClock::new(10),
+                    operation_id,
+                    &mut pending,
+                )
+                .await
+                .unwrap(),
+            DispatchOutcome::Sent
+        ));
+        assert!(
+            outbound_rx.recv().await.is_some(),
+            "dispatch must reach the outbound queue after the PostgreSQL commit"
+        );
+
+        drop(pending);
+        drop(outbound);
+        drop(outbound_rx);
+        drop(handle_a);
+        drop(hub_a);
+
+        let config_b = hosted_test_config("postgres-dispatch-crash-b");
+        let state_dir_b = config_b.state_dir.clone();
+        let store_b = Arc::new(
+            crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
+                postgres_test_config(&state_key).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (_hub_b, handle_b) =
+            SingleDeviceHub::new_with_async_state_store(config_b, material, store_b)
+                .await
+                .unwrap();
+
+        let quarantine = handle_b
+            .desktop_quarantine()
+            .await
+            .expect("replacement Hub must restore post-dispatch ambiguity");
+        assert_eq!(quarantine.operation_id, operation_id);
+        assert_eq!(
+            quarantine.reason,
+            IndeterminateReason::HubRestartAfterDispatch
+        );
+
+        let mut persistent = handle_b.inner.persistent.lock().await;
+        assert_eq!(
+            persistent.execution.state(operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
+        assert!(matches!(
+            persistent.execution.prepare(
+                OperationRef {
+                    device_id: handle_b.device_id().to_owned(),
+                    device_generation: 1,
+                    operation_id: operation_id.to_owned(),
+                },
+                owner,
+                DeviceCapability::TypeText,
+                20,
+            ),
+            Err(crate::v2_m0_execution::ExecutionError::OperationReplay)
+        ));
+
+        drop(persistent);
+        drop(handle_b);
+        let _ = std::fs::remove_dir_all(state_dir_a);
+        let _ = std::fs::remove_dir_all(state_dir_b);
+    }
+
+    #[tokio::test]
     async fn async_replacement_writer_fences_old_live_dispatch_before_enqueue() {
         let store = Arc::new(AsyncMemoryHubStateStore::default());
         let device = DeviceIdentity::generate();
