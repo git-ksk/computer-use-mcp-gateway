@@ -162,6 +162,8 @@ supported profile は以下も document / accept します。
 
 これらがopenの間、既存 VM/single-host deployment は unchanged / supported のままです。
 
+Public acceptance record: [`acceptance/V2_HOSTED_CLOUD_RUN_ACCEPTANCE.ja.md`](acceptance/V2_HOSTED_CLOUD_RUN_ACCEPTANCE.ja.md)
+
 ## Acceptance scenario
 
 #215 close 前に最低限以下を実施します。

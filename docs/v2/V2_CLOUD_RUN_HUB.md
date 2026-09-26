@@ -166,6 +166,8 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 
 The existing VM/single-host deployment remains unchanged and supported while these hosted gates are open.
 
+Public acceptance record: [`acceptance/V2_HOSTED_CLOUD_RUN_ACCEPTANCE.md`](acceptance/V2_HOSTED_CLOUD_RUN_ACCEPTANCE.md)
+
 ## Acceptance scenarios
 
 Before #215 can close, acceptance must include at least:
