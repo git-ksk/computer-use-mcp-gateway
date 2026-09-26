@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!src/**
+!proto/
+!proto/**
+!packaging/
+!packaging/cloud-run/
+!packaging/cloud-run/Dockerfile
+!packaging/cloud-run/cloudbuild.yaml
