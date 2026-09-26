@@ -6441,10 +6441,9 @@ mod tests {
 
         let admin = postgres_admin_client().await.unwrap();
         let role = format!("cumg_outage_{}", rand::random::<u64>());
-        let password = format!("p{}", rand::random::<u128>());
         admin
             .batch_execute(&format!(
-                "CREATE ROLE {role} LOGIN PASSWORD '{password}';                  GRANT USAGE ON SCHEMA public TO {role};                  GRANT SELECT, INSERT, UPDATE ON TABLE cumg_hub_state TO {role};"
+                "CREATE ROLE {role} LOGIN;                  GRANT USAGE ON SCHEMA public TO {role};                  GRANT SELECT, INSERT, UPDATE ON TABLE cumg_hub_state TO {role};"
             ))
             .await
             .unwrap();
@@ -6462,7 +6461,7 @@ mod tests {
         let state_dir_a = config_a.state_dir.clone();
         let store_a = Arc::new(
             crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
-                postgres_test_config_for_credentials(&state_key, &role, Some(&password)).unwrap(),
+                postgres_test_config_for_credentials(&state_key, &role, None).unwrap(),
             )
             .await
             .unwrap(),
@@ -6530,7 +6529,7 @@ mod tests {
         let state_dir_b = config_b.state_dir.clone();
         let store_b = Arc::new(
             crate::v2_postgres_hub_state_store::PostgresHubStateStore::connect(
-                postgres_test_config_for_credentials(&state_key, &role, Some(&password)).unwrap(),
+                postgres_test_config_for_credentials(&state_key, &role, None).unwrap(),
             )
             .await
             .unwrap(),
