@@ -6,7 +6,7 @@ Cloud Run はまだ CUMG Hub の supported deployment ではありません。�
 
 ## Cloud Run 現行仕様の再確認
 
-以下は 2026-09-03 時点で Google Cloud 公式 documentation を再確認した platform fact です。CUMG invariant ではないため、physical acceptance 時にも再確認します。
+以下は 2026-09-26 時点で Google Cloud 公式 documentation を再確認した platform fact です。CUMG invariant ではないため、実際の physical hosted acceptance 実行時にも再確認します。
 
 - Cloud Run service request timeout は default 5分、最大60分です。timeout 到達時は network request が切断されますが、serving container instance 自体が必ず terminate されるわけではありません。reconnect は新しい request であり、同じ instance に戻る保証はありません。
 - service instance shutdown 前に `SIGTERM` が送られ、公式 contract は `SIGKILL` まで10秒の graceful-shutdown window を示します。minimum instance も restart され得ます。
@@ -14,6 +14,8 @@ Cloud Run はまだ CUMG Hub の supported deployment ではありません。�
 - service は configured `PORT` をlistenする single ingress container を持ちます。native gRPC は HTTP/2 が必要で、end-to-end HTTP/2 では Google frontend が public TLS を terminate した後、container は `h2c` を受け取ります。
 - session affinity は best effort であり、instance termination / unavailable により切れます。execution-safety authority には使えません。
 - min/max instance は capacity control であり fencing ではありません。minimum instance はrestartされ得て、revision rollout では old/new revision instance が同時に生存し得るため、「authoritative writer が1つ」の証明にはなりません。
+
+今回の再確認では provider 固有の hosted database を選定していません。#391 の PostgreSQL backend は Cloud SQL に限定せず、#284 の real acceptance では TLS / durability / backup-restore / revision-overlap 条件を満たす selected external PostgreSQL provider と exact deployment identity を acceptance artifact に記録します。
 
 Authoritative reference:
 
@@ -144,9 +146,9 @@ supported profile は以下も document / accept します。
 
 | Gate | Current status |
 | --- | --- |
-| 現行 Cloud Run limit 再確認 | Design evidence complete (2026-09-03) |
-| ephemeral filesystem を authoritative state から排除 | #391 PostgreSQL external provider candidate実装。real Cloud SQL deployment acceptanceは#284でpending |
-| provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate。real Cloud SQL acceptanceは#284でpending |
+| 現行 Cloud Run limit 再確認 | Official-doc evidence refreshed (2026-09-26); physical hosted run時に再確認 |
+| ephemeral filesystem を authoritative state から排除 | #391 PostgreSQL external provider candidate実装。selected external PostgreSQL deployment acceptanceは#284でpending |
+| provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate。selected external PostgreSQL acceptanceは#284でpending |
 | monotonic writer fencing + stale-writer dispatch denial | #283 automated core green。hosted revision-overlap acceptanceはpending |
 | one-port h2c gRPC + MCP + hosted Handoff ingress / separate auth boundary | PR #285 merge済み。local h2c integration green、real hosted acceptanceはpending |
 | 3300s proactive Agent stream rotation acceptance | Pending |

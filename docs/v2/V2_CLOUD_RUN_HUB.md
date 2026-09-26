@@ -6,7 +6,7 @@ Cloud Run is **not a supported CUMG Hub deployment** yet. The existing single-ho
 
 ## Re-verified Cloud Run facts
 
-The platform assumptions below were re-verified against current Google Cloud documentation on 2026-09-03. They are deployment facts, not CUMG invariants, and must be re-checked again at physical acceptance time.
+The platform assumptions below were re-verified against current Google Cloud documentation on 2026-09-26. They are deployment facts, not CUMG invariants, and must be re-checked again when the physical hosted acceptance is actually executed.
 
 - Cloud Run service request timeout defaults to 5 minutes and can be configured up to 60 minutes. When the request timeout expires, the network request is closed and the caller receives a timeout; the serving container instance is **not necessarily terminated**. A reconnect is a new request and is not guaranteed to reach the same instance.
 - Before service-instance shutdown, Cloud Run sends `SIGTERM` and documents a 10-second graceful-shutdown window before `SIGKILL`. Even minimum instances can be restarted.
@@ -14,6 +14,8 @@ The platform assumptions below were re-verified against current Google Cloud doc
 - A service has one ingress container listening on the configured `PORT`. Native gRPC requires HTTP/2; for end-to-end HTTP/2 the container receives `h2c` after Google's frontend terminates public TLS.
 - Session affinity is best effort and can break when an instance terminates or becomes unavailable. It is not execution-safety authority.
 - Minimum/maximum instance settings are capacity controls, not fencing. Minimum instances can restart, and revision rollout can leave old and new revision instances alive concurrently; maximum-instance settings must not be treated as proof that only one authoritative writer exists.
+
+This refresh does not select a hosted database vendor. The #391 PostgreSQL backend is not Cloud-SQL-specific; the real #284 acceptance must record the exact selected external PostgreSQL deployment identity and prove its TLS, durability, backup/restore, and revision-overlap behavior.
 
 Authoritative references:
 
@@ -148,9 +150,9 @@ Cloud Run remains **NO-GO for support** until all rows below have evidence.
 
 | Gate | Current status |
 | --- | --- |
-| Current Cloud Run limits re-verified | Design evidence complete (2026-09-03) |
-| Ephemeral filesystem excluded from authoritative state | #391 PostgreSQL external provider candidate implemented; real Cloud SQL deployment acceptance pending under #284 |
-| Provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate; real Cloud SQL acceptance pending under #284 |
+| Current Cloud Run limits re-verified | Official-doc evidence refreshed (2026-09-26); re-check at the physical hosted run |
+| Ephemeral filesystem excluded from authoritative state | #391 PostgreSQL external provider candidate implemented; selected external PostgreSQL deployment acceptance pending under #284 |
+| Provider-neutral durable Hub-state backend | #283 contract + #391 async PostgreSQL provider candidate; selected external PostgreSQL acceptance pending under #284 |
 | Monotonic writer fencing and stale-writer dispatch denial | #283 automated core green; hosted revision-overlap acceptance pending |
 | One-port h2c gRPC + MCP + hosted Handoff ingress with separate auth boundaries | PR #285 merged; local h2c integration green, real hosted acceptance pending |
 | 3300s proactive Agent stream rotation acceptance | Pending |
