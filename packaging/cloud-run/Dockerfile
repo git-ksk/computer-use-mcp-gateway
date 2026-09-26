@@ -20,6 +20,8 @@ RUN apt-get update \
     && chown -R 65532:65532 /var/lib/cumg /run/cumg
 
 COPY --from=builder /src/target/release/v2_hub /usr/local/bin/v2_hub
+COPY packaging/cloud-run/entrypoint.sh /usr/local/bin/cumg-cloud-run-entrypoint
+RUN chmod 0555 /usr/local/bin/cumg-cloud-run-entrypoint
 
 USER 65532:65532
 
@@ -29,4 +31,5 @@ ENV CUMG_V2_HOSTED_PROFILE=true \
     CUMG_V2_AGENT_SESSION_REAUTH_DRAIN_SECS=30 \
     CUMG_V2_DRAIN_TIMEOUT_SECS=8
 
-ENTRYPOINT ["/usr/local/bin/v2_hub"]
+ENTRYPOINT ["/usr/local/bin/cumg-cloud-run-entrypoint"]
+CMD ["/usr/local/bin/v2_hub"]

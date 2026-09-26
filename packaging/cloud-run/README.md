@@ -6,6 +6,8 @@ The image contains the v2_hub binary and CA certificates only. Deployment-specif
 
 Required private inputs remain file-backed through the existing *_FILE interfaces. Do not bake Hub, Agent, grant-signing, PostgreSQL, OAuth, or Handoff secret bytes into the image, Docker build arguments, environment variables, revision labels, or this repository.
 
+Cloud Run Secret Manager volumes are platform-owned and may be mounted with permissions that are intentionally broader than CUMG accepts for private key/password inputs. The image entrypoint therefore copies only the explicit hosted input allowlist from generic mount paths into the container-owned private runtime directory with mode 0600, then points the existing *_FILE variables at those copies. Missing or unsafe mounted inputs fail before v2_hub starts; the core file-permission checks are not relaxed.
+
 The image defaults only the platform-independent hosted safety profile:
 
 - hosted one-port mode enabled;

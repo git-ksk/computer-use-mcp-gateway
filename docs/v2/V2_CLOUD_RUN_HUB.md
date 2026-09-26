@@ -131,6 +131,8 @@ The exact tested Cloud Run concurrency value must be recorded in the acceptance 
 
 A provider-neutral container packaging candidate lives under packaging/cloud-run/. The image contains only v2_hub plus runtime CA certificates, runs as a non-root user, and carries only the 3300s/30s/8s hosted safety defaults. Deployment-specific project/provider identifiers, resource URIs, policies, database credentials, and application keys remain outside source control and are supplied through deployment-time configuration or file-backed managed secrets. The Docker and Cloud Build contexts use deny-all allowlists so unrelated repository files are not uploaded for image construction.
 
+Cloud Run secret volumes must not weaken the local file-security invariant. The packaging entrypoint materializes only the reviewed hosted input allowlist from platform-mounted read-only files into a container-owned 0700 directory, writes each runtime copy as 0600, exports the existing *_FILE paths, and fails closed before Hub startup if any required mount is absent or unsafe. CUMG does not relax FileSensitivity::Secret checks for the hosted profile.
+
 A supported profile must also document and accept:
 
 - managed secret/key provisioning without secret-value logging, following [`acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.md`](acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.md);

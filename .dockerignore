@@ -9,3 +9,4 @@
 !packaging/
 !packaging/cloud-run/
 !packaging/cloud-run/Dockerfile
+!packaging/cloud-run/entrypoint.sh
