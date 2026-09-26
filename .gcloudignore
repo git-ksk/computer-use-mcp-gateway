@@ -9,4 +9,5 @@
 !packaging/
 !packaging/cloud-run/
 !packaging/cloud-run/Dockerfile
+!packaging/cloud-run/entrypoint.sh
 !packaging/cloud-run/cloudbuild.yaml
