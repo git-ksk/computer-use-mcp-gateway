@@ -22,7 +22,7 @@ PostgreSQL backendは#283と同じcontractを実装します。
 
 CUMG_V2_HOSTED_PROFILE=trueではv2_hubにPostgreSQL設定が必須です。
 
-- CUMG_V2_POSTGRES_HOST: TCP hostまたはUnix socket directory。Cloud SQLはmounted /cloudsql/PROJECT:REGION:INSTANCE directoryを使用。
+- CUMG_V2_POSTGRES_HOST: TCP hostまたはUnix socket directory。Cloud SQLではmounted `/cloudsql/PROJECT:REGION:INSTANCE` directoryを利用でき、remote PostgreSQL serviceではreview済みDNS hostnameと `CUMG_V2_POSTGRES_TLS_MODE=verify-full` を使用します。
 - CUMG_V2_POSTGRES_PORT: default 5432。
 - CUMG_V2_POSTGRES_DATABASE: database名。
 - CUMG_V2_POSTGRES_USER: runtime DB role。
@@ -81,7 +81,7 @@ CUMG 1 MiB checkpoint payload ceilingはDB mutation前に強制し、migration�
 
 ## Backup / restore boundary
 
-#391はdurable providerを提供しますが#284 backup/restore acceptanceをclaimしません。hosted supportには、writerがconcurrent overwriteできない状態でreal Cloud SQL backup/restoreまたはequivalent PostgreSQL backup procedureを#284で証明します。
+#391はdurable providerを提供しますが#284 backup/restore acceptanceをclaimしません。hosted supportには、writerがconcurrent overwriteできない状態でreal provider backup/restoreまたはequivalent PostgreSQL backup procedureを#284で証明します。
 
 restoreではcomplete row payload、revision、writer epoch、quarantine、replay barrierを保持します。restore後最初のHubはserve前にnewer writer epochを取得します。
 
@@ -94,11 +94,11 @@ restoreではcomplete row payload、revision、writer epoch、quarantine、repla
 - CI Rust jobでPostgreSQL 17 serviceをprovision;
 - local CheckpointStore / VM single-host startupは変更しない。
 
-## Cloud SQL acceptance boundary
+## External PostgreSQL acceptance boundary
 
-#284が引き続きreal Cloud Run / Cloud SQL evidenceを所有します。
+#284が引き続きreal Cloud Run / external PostgreSQL evidenceを所有します。
 
-- exact Cloud SQL instance/version/region / connection mode;
+- exact PostgreSQL provider/deployment identity / version / region / connection mode;
 - runtime service-account/IAM boundary;
 - managed-secret passwordまたはreview済みalternative auth;
 - concurrent Cloud Run revision A/B overlap;

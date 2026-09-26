@@ -105,7 +105,7 @@ A restore must preserve the complete row payload, revision, writer epoch, quaran
 - Issue #396 upgrades that fixture to TLS with ephemeral CI-only CA/server keys and proves `verify-full` success for a trusted matching certificate, rejection of an untrusted CA and hostname mismatch, and fail-closed TLS provider loss followed by verified reconnect;
 - local CheckpointStore behavior and VM/single-host startup remain unchanged.
 
-## Cloud SQL acceptance boundary
+## External PostgreSQL acceptance boundary
 
 #284 still owns the real Cloud Run / Cloud SQL deployment evidence:
 
