@@ -22,7 +22,7 @@ The PostgreSQL backend implements the same #283 contract:
 
 The hosted v2_hub requires the PostgreSQL settings when CUMG_V2_HOSTED_PROFILE=true.
 
-- CUMG_V2_POSTGRES_HOST: TCP host or Unix socket directory. Cloud SQL uses the mounted /cloudsql/PROJECT:REGION:INSTANCE directory.
+- CUMG_V2_POSTGRES_HOST: TCP host or Unix socket directory. Cloud SQL may use the mounted `/cloudsql/PROJECT:REGION:INSTANCE` directory; a remote PostgreSQL service uses its reviewed DNS hostname with `CUMG_V2_POSTGRES_TLS_MODE=verify-full`.
 - CUMG_V2_POSTGRES_PORT: defaults to 5432.
 - CUMG_V2_POSTGRES_DATABASE: database name.
 - CUMG_V2_POSTGRES_USER: runtime DB role.
@@ -91,7 +91,7 @@ The backend enforces the CUMG 1 MiB checkpoint payload ceiling before database m
 
 ## Backup and restore boundary
 
-#391 provides the durable provider but does not claim #284 backup/restore acceptance. For hosted support, #284 must prove a real Cloud SQL backup/restore or equivalent PostgreSQL backup procedure while no writer can concurrently overwrite restored authority.
+#391 provides the durable provider but does not claim #284 backup/restore acceptance. For hosted support, #284 must prove a real provider backup/restore or equivalent PostgreSQL backup procedure while no writer can concurrently overwrite restored authority.
 
 A restore must preserve the complete row payload, revision, writer epoch, quarantine, and replay barriers. After restoration, the first Hub must acquire a newer writer epoch before serving.
 
@@ -105,11 +105,11 @@ A restore must preserve the complete row payload, revision, writer epoch, quaran
 - Issue #396 upgrades that fixture to TLS with ephemeral CI-only CA/server keys and proves `verify-full` success for a trusted matching certificate, rejection of an untrusted CA and hostname mismatch, and fail-closed TLS provider loss followed by verified reconnect;
 - local CheckpointStore behavior and VM/single-host startup remain unchanged.
 
-## Cloud SQL acceptance boundary
+## External PostgreSQL acceptance boundary
 
-#284 still owns the real Cloud Run / Cloud SQL deployment evidence:
+#284 still owns the real Cloud Run / external PostgreSQL deployment evidence:
 
-- exact Cloud SQL instance/version/region and connection mode;
+- exact PostgreSQL provider/deployment identity, version, region, and connection mode;
 - runtime service-account/IAM boundary;
 - managed-secret password or reviewed alternative authentication;
 - concurrent Cloud Run revision A/B overlap;
