@@ -181,3 +181,11 @@ Public acceptance record: [`acceptance/V2_HOSTED_CLOUD_RUN_ACCEPTANCE.ja.md`](ac
 11. hosted operator/routing path で Handoff を有効化し、Hub replacement / viewer reconnect / transport fallback が Agent/Human authority を復元できないことを証明したうえで、physical Agent 上で Human active -> Agent deny -> Done -> fresh verification -> explicit resume を完了する。
 
 hosted availability 改善を理由に commit-before-authority-change、`Indeterminate`、quarantine、no-auto-replay contract を弱めてはいけません。
+
+## Hosted quarantine recovery
+
+real hosted deploymentでは、expected fail-closedな `Indeterminate` quarantineから抜けるsupported pathが必要です。Issue #409はversion-pairedな `v2_maint hosted-inspect-quarantine` / `hosted-resolve` とconfigured authoritative PostgreSQL storeを使ってこのpathを提供します。
+
+hosted resolutionはin-band MCP operationでもCloud Run capacity機能でもありません。requested resolutionをpreflightした後、mutation前にdedicated newer maintenance writer epochを取得し、serving Hubのold writer epochをfenceします。quarantineをclearできるのはCAS commit + exact read-back verification済みstateだけです。direct DB edit、state-key reset、row replacement、operation replayはsupported recoveryではありません。
+
+maintenance後はHubをdeploy/restartし、serving authorityをさらにstrictly newerなwriter epochで再取得します。successful maintenance epochはconsumed recovery authorityとして扱い、serving authorityとして再利用しません。

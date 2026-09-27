@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use computer_use_mcp_gateway::{
     mutation_authority::{
         MutationAuthorityRole, initialize_mutation_authority, inspect_mutation_authority,
@@ -9,20 +9,26 @@ use computer_use_mcp_gateway::{
     v2_handoff_control::{LocalHandoffControlRequest, exchange_unix_handoff_control},
     v2_incident_brief::{build_incident_brief_read_only, render_incident_brief_text},
     v2_m0_execution::IndeterminateResolution,
-    v2_m1_keys::load_secret_text,
+    v2_m1_keys::{load_public_trust_bytes, load_secret_text},
     v2_maintenance::{
         audit_reconciliation_read_only, clear_managed_job_fail_closed_offline,
         compare_quarantined_request_read_only, inspect_auto_resolutions_read_only,
-        inspect_managed_job_safety_read_only, inspect_quarantines_read_only,
-        resolve_indeterminate_offline, retire_indeterminate_offline,
+        inspect_managed_job_safety_read_only, inspect_quarantines_hosted_read_only,
+        inspect_quarantines_read_only, resolve_indeterminate_hosted, resolve_indeterminate_offline,
+        retire_indeterminate_offline,
+    },
+    v2_postgres_hub_state_store::{
+        PostgresHubStateStore, PostgresHubStateStoreConfig, PostgresTlsMode,
     },
     v2_upgrade_transaction::{read_upgrade_transaction, upgrade_transaction_path},
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 const MAX_AUDIT_FINGERPRINT_SECRET_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_REQUEST_BYTES: u64 = 256 * 1024;
 const MAX_INCIDENT_DIAGNOSTICS_BYTES: u64 = 64 * 1024;
+const MAX_POSTGRES_PASSWORD_BYTES: u64 = 4 * 1024;
+const MAX_POSTGRES_CA_BUNDLE_BYTES: u64 = 256 * 1024;
 const MIN_AUDIT_FINGERPRINT_SECRET_BYTES: usize = 32;
 
 fn handoff_is_idle(socket: &std::path::Path) -> bool {
@@ -35,6 +41,83 @@ fn handoff_is_idle(socket: &std::path::Path) -> bool {
         }),
         _ => false,
     }
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct HostedPostgresArgs {
+    #[arg(long, env = "CUMG_V2_POSTGRES_HOST")]
+    postgres_host: String,
+    #[arg(long, env = "CUMG_V2_POSTGRES_PORT", default_value_t = 5432)]
+    postgres_port: u16,
+    #[arg(long, env = "CUMG_V2_POSTGRES_DATABASE")]
+    postgres_database: String,
+    #[arg(long, env = "CUMG_V2_POSTGRES_USER")]
+    postgres_user: String,
+    #[arg(long, env = "CUMG_V2_POSTGRES_PASSWORD_FILE")]
+    postgres_password_file: Option<PathBuf>,
+    #[arg(long, env = "CUMG_V2_POSTGRES_STATE_KEY")]
+    postgres_state_key: String,
+    #[arg(long, env = "CUMG_V2_POSTGRES_TLS_MODE", default_value = "disable")]
+    postgres_tls_mode: String,
+    #[arg(long, env = "CUMG_V2_POSTGRES_TLS_CA_PEM_FILE")]
+    postgres_tls_ca_pem_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "CUMG_V2_POSTGRES_CONNECT_TIMEOUT_SECS",
+        default_value_t = 5
+    )]
+    postgres_connect_timeout_secs: u64,
+    #[arg(long, env = "CUMG_V2_POSTGRES_QUERY_TIMEOUT_SECS", default_value_t = 5)]
+    postgres_query_timeout_secs: u64,
+}
+
+async fn connect_hosted_store(args: &HostedPostgresArgs) -> Result<PostgresHubStateStore> {
+    ensure!(
+        args.postgres_connect_timeout_secs > 0,
+        "hosted PostgreSQL connect timeout must be greater than zero"
+    );
+    ensure!(
+        args.postgres_query_timeout_secs > 0,
+        "hosted PostgreSQL query timeout must be greater than zero"
+    );
+    let mut config = PostgresHubStateStoreConfig::new(
+        args.postgres_host.clone(),
+        args.postgres_database.clone(),
+        args.postgres_user.clone(),
+        args.postgres_state_key.clone(),
+    )
+    .context("invalid hosted PostgreSQL maintenance configuration")?
+    .with_port(args.postgres_port)
+    .context("invalid hosted PostgreSQL maintenance port")?
+    .with_timeouts(
+        Duration::from_secs(args.postgres_connect_timeout_secs),
+        Duration::from_secs(args.postgres_query_timeout_secs),
+    )
+    .context("invalid hosted PostgreSQL maintenance timeouts")?;
+    let tls_mode = args
+        .postgres_tls_mode
+        .parse::<PostgresTlsMode>()
+        .context("invalid hosted PostgreSQL maintenance TLS mode")?;
+    config = config
+        .with_tls_mode(tls_mode)
+        .context("invalid hosted PostgreSQL maintenance TLS configuration")?;
+    if let Some(path) = args.postgres_tls_ca_pem_file.as_ref() {
+        let pem = load_public_trust_bytes(path, MAX_POSTGRES_CA_BUNDLE_BYTES)
+            .context("failed to load hosted PostgreSQL maintenance TLS CA bundle")?;
+        config = config
+            .with_custom_ca_pem(pem)
+            .context("invalid hosted PostgreSQL maintenance TLS CA bundle")?;
+    }
+    if let Some(path) = args.postgres_password_file.as_ref() {
+        let password = load_secret_text(path, MAX_POSTGRES_PASSWORD_BYTES)
+            .context("failed to load hosted PostgreSQL maintenance password")?;
+        config = config
+            .with_password(password)
+            .context("invalid hosted PostgreSQL maintenance password")?;
+    }
+    PostgresHubStateStore::connect(config)
+        .await
+        .context("failed to connect hosted PostgreSQL authoritative state store")
 }
 
 #[derive(Debug, Parser)]
@@ -81,6 +164,27 @@ enum Command {
         /// Optionally restrict output to one stable device ID.
         #[arg(long)]
         device_id: Option<String>,
+    },
+
+    /// Inspect hosted PostgreSQL-backed quarantine state without acquiring writer authority.
+    HostedInspectQuarantine {
+        #[command(flatten)]
+        postgres: HostedPostgresArgs,
+        /// Optionally restrict output to one stable device ID.
+        #[arg(long)]
+        device_id: Option<String>,
+    },
+    /// Resolve one hosted PostgreSQL-backed indeterminate operation through a dedicated maintenance writer epoch.
+    HostedResolve {
+        #[command(flatten)]
+        postgres: HostedPostgresArgs,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long, value_enum)]
+        decision: ResolutionDecision,
+        /// Audit metadata only; never include commands, results, desktop content, URLs, credentials, or secrets.
+        #[arg(long)]
+        evidence: String,
     },
     /// Inspect Agent-local managed-job termination safety without changing state.
     InspectManagedJobSafety {
@@ -261,7 +365,8 @@ impl From<ResolutionDecision> for IndeterminateResolution {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let _observability = computer_use_mcp_gateway::v2_observability::init("cumg-v2-maint")?;
     let args = Args::parse();
     match args.command {
@@ -330,6 +435,52 @@ fn main() -> Result<()> {
             let report = inspect_quarantines_read_only(&state_dir, device_id.as_deref())
                 .context("read-only quarantine inspection failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+
+        Command::HostedInspectQuarantine {
+            postgres,
+            device_id,
+        } => {
+            let store = connect_hosted_store(&postgres).await?;
+            let report = inspect_quarantines_hosted_read_only(&store, device_id.as_deref())
+                .await
+                .context("read-only hosted quarantine inspection failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::HostedResolve {
+            postgres,
+            operation_id,
+            decision,
+            evidence,
+        } => {
+            let store = connect_hosted_store(&postgres).await?;
+            let result =
+                resolve_indeterminate_hosted(&store, &operation_id, decision.into(), evidence)
+                    .await
+                    .context("hosted quarantine resolution failed")?;
+            computer_use_mcp_gateway::v2_observability::quarantine_resolved();
+            tracing::info!(
+                event = "v2_hosted_quarantine_resolved",
+                generation = result.receipt.operation.device_generation,
+                capability = computer_use_mcp_gateway::v2_observability::capability_name(
+                    result.receipt.capability
+                ),
+                outcome = computer_use_mcp_gateway::v2_observability::resolution_name(
+                    &result.resolution.decision
+                ),
+                writer_epoch = result.writer_epoch,
+                state_revision = result.revision,
+                resolver = "hosted_maintenance_operator",
+                replayed = false,
+                "hosted indeterminate operation explicitly resolved through fenced maintenance authority"
+            );
+            println!(
+                "resolved hosted_quarantine generation={} terminal_state={:?} revision={} writer_epoch={} replayed=false",
+                result.receipt.operation.device_generation,
+                result.receipt.terminal_state,
+                result.revision,
+                result.writer_epoch,
+            );
         }
         Command::InspectManagedJobSafety { agent_state_dir } => {
             let report = inspect_managed_job_safety_read_only(&agent_state_dir)

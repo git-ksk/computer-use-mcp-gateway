@@ -109,3 +109,23 @@ restoreではcomplete row payload、revision、writer epoch、quarantine、repla
 - rollback/recovery / alerting。
 
 #284/#215がgreenになるまでCloud Runはunsupportedです。
+
+## Hosted quarantine maintenance / recovery
+
+Issue #409では、hosted Hubと同じPostgreSQL rowに対するoperator recovery pathを追加します。quarantine解除のために `state_payload` を直接編集したり、stable state keyを変更したり、rowを削除したり、古いrowをcurrent rowへ上書きしてはいけません。
+
+`v2_maint hosted-inspect-quarantine` はread-onlyです。Hubと同じbounded PostgreSQL / TLS / file-backed secret contractで接続し、exact current authoritative recordから既存のpayload-free quarantine inspectionを返します。writer authorityは取得せず、revision / epochも進めません。
+
+`v2_maint hosted-resolve` はauthority-bearingです。既存resolution decisionのいずれかを裏付けるindependent operator evidenceがある場合にだけ使用します。hosted専用の緩いdecisionやautomatic retryは追加しません。このcommandは以下の順序を守ります。
+
+1. current recordを読み、writer authorityを変更する前にrequested transitionをmemory上でpreflight;
+2. strictly newerなmaintenance writer epochを取得し、older epochを持つstill-live serving Hubをfence;
+3. newly acquired authoritative stateに対してresolutionを再検証;
+4. normal revision/epoch compare-and-commit contractでcomplete candidate stateをpublish;
+5. backendのexact read-after-commit verification成功後だけsuccessを返す。
+
+writer acquisition、provider access、CAS、commit verification、read-backのいずれかがunavailable/ambiguousならfail closedです。resolution commitが失敗した場合quarantineはauthoritativeのまま残りますが、maintenance epoch取得自体が成功していればprevious serving writerはfenceされたままです。old operationをreconstruct / resend / replayしません。
+
+hosted maintenance成功後はnormal operationへ戻す前にserving Hubをrestart/redeployします。そのHubはmaintenance epochよりstrictly newerなwriter epochを取得しなければなりません。maintenance epochをserving authorityとして再利用しません。Hubと同じreview済みrelease lineのversion-paired `v2_maint`を使用し、older hosted stateへarbitrary newer sourceを当てないでください。
+
+initial hosted maintenance surfaceはread-only inspectionとexplicit resolutionだけを公開します。hosted retirementはseparate operator-authorization / acceptance boundaryがreviewされるまで提供しません。hosted recoveryを既存local recoveryよりpermissiveにしないためです。

@@ -120,3 +120,23 @@ A restore must preserve the complete row payload, revision, writer epoch, quaran
 - rollback/recovery and alerting.
 
 Until #284/#215 are green, Cloud Run remains unsupported.
+
+## Hosted quarantine maintenance and recovery
+
+Issue #409 adds the operator recovery path for the same PostgreSQL row used by the hosted Hub. Do not edit `state_payload`, change the stable state key, delete the row, or copy an older row over the current row to clear quarantine.
+
+`v2_maint hosted-inspect-quarantine` is read-only. It connects through the same bounded PostgreSQL/TLS/file-backed-secret configuration contract as the Hub, reads the exact current authoritative record, and renders the existing payload-free quarantine inspection. It does not acquire writer authority or advance revision/epoch.
+
+`v2_maint hosted-resolve` is authority-bearing and must be used only after independent operator evidence supports one of the existing resolution decisions. It intentionally does not add a hosted-only decision or automatic retry path. The command:
+
+1. reads the current record and validates the requested transition in memory before changing writer authority;
+2. acquires a strictly newer maintenance writer epoch, which fences every still-live serving Hub holding an older epoch;
+3. revalidates the resolution against the newly acquired authoritative state;
+4. publishes the complete candidate state with the normal revision/epoch compare-and-commit contract;
+5. requires the backend's exact read-after-commit verification before reporting success.
+
+If writer acquisition, provider access, CAS, commit verification, or read-back is unavailable or ambiguous, maintenance fails closed. A failed resolution commit leaves the quarantine authoritative, although the successfully acquired maintenance epoch still fences the previous serving writer. The old operation is never reconstructed, resent, or replayed.
+
+After successful hosted maintenance, restart/redeploy the serving Hub before normal operation. That Hub must acquire a writer epoch strictly newer than the maintenance epoch. A maintenance epoch is never reused as serving authority. Use a version-paired `v2_maint` from the same reviewed release line as the Hub; do not use arbitrary newer source against an older hosted state.
+
+The initial hosted maintenance surface intentionally exposes read-only inspection and explicit resolution only. Hosted retirement remains unavailable until its separate operator-authorization and acceptance boundary is reviewed; this prevents the hosted path from becoming more permissive than existing local recovery.
