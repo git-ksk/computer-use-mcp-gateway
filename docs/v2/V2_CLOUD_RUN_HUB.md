@@ -185,3 +185,11 @@ Before #215 can close, acceptance must include at least:
 11. enable Handoff through the hosted operator/routing path and prove Hub replacement, viewer reconnect, and transport fallback cannot restore Agent/Human authority; then complete Human active -> Agent deny -> Done -> fresh verification -> explicit resume on a physical Agent.
 
 No hosted availability improvement may weaken the existing commit-before-authority-change, `Indeterminate`, quarantine, or no-auto-replay contracts.
+
+## Hosted quarantine recovery
+
+A real hosted deployment must have a supported path out of an expected fail-closed `Indeterminate` quarantine. Issue #409 provides that path through version-paired `v2_maint hosted-inspect-quarantine` and `hosted-resolve` over the configured authoritative PostgreSQL store.
+
+Hosted resolution is not an in-band MCP operation and is not a Cloud Run capacity feature. It first validates the requested resolution, then acquires a dedicated newer maintenance writer epoch before mutation. This fences the serving Hub's old writer epoch. Only a CAS-committed, exactly read-verified state may clear quarantine. Direct database edits, state-key reset, row replacement, or operation replay are unsupported recovery mechanisms.
+
+After maintenance, deploy/restart the Hub so serving authority is reacquired on another strictly newer writer epoch. Treat a successful maintenance epoch as consumed recovery authority, never as reusable serving authority.

@@ -12,6 +12,7 @@ use crate::v2_execution_safety::{
     current_state_acceptance_policy_for_capability, fingerprint_process_request,
     fingerprint_shell_request, fingerprint_text_input_candidate, retirement_policy_for_capability,
 };
+use crate::v2_hub_state_store::{AsyncHubAuthoritativeStateStore, HubStateStoreError};
 use crate::v2_m0::{
     CapabilityClass, DeviceCapability, DeviceRegistrySnapshot, ProcessEnvVar, ProcessRequest,
     ShellRequest,
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESOLVER_ISSUER: &str = "cumg://local-maintenance";
+const HOSTED_RESOLVER_ISSUER: &str = "cumg://hosted-maintenance";
 const RESOLVER_SUBJECT: &str = "operator";
 const MIN_RETIREMENT_SOURCE_EXECUTION_SCHEMA_VERSION: u16 = 4;
 
@@ -46,6 +48,14 @@ pub struct OfflineResolutionResult {
 pub struct OfflineRetirementResult {
     pub retirement: RetirementRecord,
     pub checkpoint: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedResolutionResult {
+    pub receipt: ExecutionReceipt,
+    pub resolution: ResolutionRecord,
+    pub revision: u64,
+    pub writer_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -349,6 +359,13 @@ pub fn inspect_quarantines_read_only(
     let state = checkpoint
         .load_latest::<HubPersistentState>()
         .map_err(MaintenanceError::Persistence)?;
+    quarantine_report_from_state(&state, device_id)
+}
+
+fn quarantine_report_from_state(
+    state: &HubPersistentState,
+    device_id: Option<&str>,
+) -> Result<QuarantineInspectionReport, MaintenanceError> {
     let registry_generations: BTreeMap<_, _> = state
         .registry
         .devices
@@ -360,6 +377,7 @@ pub fn inspect_quarantines_read_only(
         max_queued_per_device: 1,
     };
     let (_registry, execution) = state
+        .clone()
         .restore(limits)
         .map_err(MaintenanceError::Persistence)?;
     let inspections = execution
@@ -500,6 +518,18 @@ pub fn inspect_quarantines_read_only(
             replay_old_operation: false,
         },
     })
+}
+
+pub async fn inspect_quarantines_hosted_read_only(
+    state_store: &dyn AsyncHubAuthoritativeStateStore,
+    device_id: Option<&str>,
+) -> Result<QuarantineInspectionReport, MaintenanceError> {
+    let current = state_store
+        .load_current_async()
+        .await
+        .map_err(MaintenanceError::StateStore)?
+        .ok_or(MaintenanceError::HostedStateMissing)?;
+    quarantine_report_from_state(&current.state, device_id)
 }
 
 pub fn inspect_auto_resolutions_read_only(
@@ -1452,12 +1482,38 @@ fn resolve_indeterminate_offline_at(
     let state = checkpoint
         .load_latest::<HubPersistentState>()
         .map_err(MaintenanceError::Persistence)?;
+    let candidate_fence =
+        next_offline_maintenance_fence(state.schema_version, state.durable_fence)?;
+    let (candidate, receipt, resolution) = build_resolution_candidate(
+        state,
+        operation_id,
+        decision,
+        evidence,
+        now_ms,
+        RESOLVER_ISSUER,
+        candidate_fence,
+    )?;
+    let checkpoint_path = commit_offline_hub_candidate(&checkpoint, &candidate)
+        .map_err(MaintenanceError::Persistence)?;
+    Ok(OfflineResolutionResult {
+        receipt,
+        resolution,
+        checkpoint: checkpoint_path,
+    })
+}
+
+fn build_resolution_candidate(
+    state: HubPersistentState,
+    operation_id: &str,
+    decision: IndeterminateResolution,
+    evidence: String,
+    now_ms: u64,
+    resolver_issuer: &str,
+    candidate_durable_fence: Option<HubPersistenceFenceSnapshot>,
+) -> Result<(HubPersistentState, ExecutionReceipt, ResolutionRecord), MaintenanceError> {
     let source_state_schema = state.schema_version;
     let source_registry = state.registry.clone();
     let source_execution_schema = state.execution.schema_version;
-    let source_durable_fence = state.durable_fence;
-    // Checkpoints are restart-normalized before serialization, so queue capacity
-    // is irrelevant to this single offline transition. V2 remains single-active.
     let limits = AdmissionLimits {
         max_global_active: 1,
         max_queued_per_device: 1,
@@ -1465,17 +1521,13 @@ fn resolve_indeterminate_offline_at(
     let (_registry, mut execution) = state
         .restore(limits)
         .map_err(MaintenanceError::Persistence)?;
-    // Prove the restored state can still be represented by the source writer
-    // contract before applying even the in-memory authority-bearing transition.
-    // A second check below validates the post-resolution candidate before bytes
-    // are published, protecting this invariant if resolution gains new fields.
     execution
         .snapshot_for_restart_compatible_with(source_execution_schema)
         .map_err(|_| MaintenanceError::PersistenceCompatibility {
             checkpoint_execution_schema: source_execution_schema,
             maintenance_execution_schema: EXECUTION_SAFETY_SCHEMA_VERSION,
         })?;
-    let resolver = OperationOwner::new(RESOLVER_ISSUER, RESOLVER_SUBJECT)
+    let resolver = OperationOwner::new(resolver_issuer, RESOLVER_SUBJECT)
         .map_err(MaintenanceError::Execution)?;
     let (_next, mut receipt) = execution
         .resolve_indeterminate(operation_id, resolver, decision, evidence, now_ms)
@@ -1489,26 +1541,102 @@ fn resolve_indeterminate_offline_at(
         source_state_schema,
         source_registry,
         source_execution_schema,
-        next_offline_maintenance_fence(source_state_schema, source_durable_fence)?,
+        candidate_durable_fence,
         &execution,
     )?;
-    // Return the same receipt schema that is actually persisted. The CLI does
-    // not expose the schema today, but keeping the in-memory result aligned with
-    // durable evidence avoids a split audit contract for future callers.
     receipt.schema_version = source_execution_schema;
-    // Validate the complete candidate through the current restore path before
-    // publishing any bytes. This is deliberately non-destructive: a failed
-    // compatibility/preflight check leaves the authoritative checkpoint intact.
     candidate
         .clone()
         .restore(limits)
         .map_err(MaintenanceError::Persistence)?;
-    let checkpoint_path = commit_offline_hub_candidate(&checkpoint, &candidate)
-        .map_err(MaintenanceError::Persistence)?;
-    Ok(OfflineResolutionResult {
+    Ok((candidate, receipt, resolution))
+}
+
+pub async fn resolve_indeterminate_hosted(
+    state_store: &dyn AsyncHubAuthoritativeStateStore,
+    operation_id: &str,
+    decision: IndeterminateResolution,
+    evidence: impl Into<String>,
+) -> Result<HostedResolutionResult, MaintenanceError> {
+    let evidence = evidence.into();
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MaintenanceError::SystemClockBeforeEpoch)?
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+
+    let current = state_store
+        .load_current_async()
+        .await
+        .map_err(MaintenanceError::StateStore)?
+        .ok_or(MaintenanceError::HostedStateMissing)?;
+
+    // Validate the requested transition before fencing the serving writer. This preflight mutates
+    // only an in-memory clone; a concurrent state change is revalidated after maintenance acquires
+    // its own writer epoch.
+    let _ = build_resolution_candidate(
+        current.state.clone(),
+        operation_id,
+        decision.clone(),
+        evidence.clone(),
+        now_ms,
+        HOSTED_RESOLVER_ISSUER,
+        current.state.durable_fence,
+    )?;
+
+    // Maintenance becomes a distinct authoritative writer before changing quarantine state. Any
+    // still-live serving Hub retains an older epoch and therefore fails its next persistence gate
+    // before it can enqueue new effectful work.
+    let acquired = state_store
+        .acquire_writer_async(&current.state)
+        .await
+        .map_err(MaintenanceError::StateStore)?;
+    if acquired.writer_epoch.0 <= current.writer_epoch.0 {
+        return Err(MaintenanceError::HostedWriterFenceNotAdvanced);
+    }
+
+    let lease = acquired.lease();
+    let (candidate, receipt, resolution) = build_resolution_candidate(
+        acquired.state.clone(),
+        operation_id,
+        decision,
+        evidence,
+        now_ms,
+        HOSTED_RESOLVER_ISSUER,
+        acquired.state.durable_fence,
+    )?;
+    let committed = state_store
+        .compare_and_commit_async(lease, &candidate)
+        .await
+        .map_err(MaintenanceError::StateStore)?;
+    if committed.writer_epoch != acquired.writer_epoch
+        || committed.revision.0 != acquired.revision.0.saturating_add(1)
+    {
+        return Err(MaintenanceError::HostedCommitFenceMismatch);
+    }
+
+    // Treat the commit acknowledgement as provisional until an independent durable read-back
+    // confirms the exact revision, writer fence, and checkpoint. A provider disconnect or
+    // ambiguous acknowledgement must never clear quarantine based only on the write response.
+    let read_back = state_store
+        .load_current_async()
+        .await
+        .map_err(MaintenanceError::StateStore)?
+        .ok_or(MaintenanceError::HostedStateMissing)?;
+    if read_back.revision != committed.revision
+        || read_back.writer_epoch != committed.writer_epoch
+        || read_back.state != committed.state
+    {
+        return Err(MaintenanceError::HostedCommitFenceMismatch);
+    }
+
+    Ok(HostedResolutionResult {
         receipt,
         resolution,
-        checkpoint: checkpoint_path,
+        revision: committed.revision.0,
+        writer_epoch: committed.writer_epoch.0,
     })
 }
 
@@ -1754,6 +1882,10 @@ fn compatible_checkpoint(
 pub enum MaintenanceError {
     StateLock(StateDirectoryLockError),
     Persistence(PersistenceError),
+    StateStore(HubStateStoreError),
+    HostedStateMissing,
+    HostedWriterFenceNotAdvanced,
+    HostedCommitFenceMismatch,
     Execution(ExecutionError),
     MissingResolutionRecord,
     MissingRetirementRecord,
@@ -1781,6 +1913,14 @@ impl fmt::Display for MaintenanceError {
         match self {
             Self::StateLock(error) => write!(f, "{error}"),
             Self::Persistence(error) => write!(f, "checkpoint maintenance failed: {error}"),
+            Self::StateStore(error) => write!(f, "hosted state maintenance failed: {error}"),
+            Self::HostedStateMissing => f.write_str("hosted authoritative state is missing"),
+            Self::HostedWriterFenceNotAdvanced => {
+                f.write_str("hosted maintenance writer epoch did not advance")
+            }
+            Self::HostedCommitFenceMismatch => {
+                f.write_str("hosted maintenance commit returned an unexpected writer fence")
+            }
             Self::Execution(error) => write!(f, "quarantine transition rejected: {error}"),
             Self::MissingResolutionRecord => {
                 f.write_str("quarantine resolution produced no audit record")
@@ -2738,6 +2878,290 @@ mod tests {
         assert_eq!(checkpoint_count(&hub_dir, "hub"), hub_before);
         assert_eq!(checkpoint_count(&agent_dir, "agent"), 0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone, Default)]
+    struct AsyncMaintenanceStore {
+        inner: crate::v2_hub_state_store::MemoryHubStateStore,
+        corrupt_readback_after_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        corrupt_next_load: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsyncMaintenanceStore {
+        fn seeded(state: HubPersistentState) -> Self {
+            Self {
+                inner: crate::v2_hub_state_store::MemoryHubStateStore::seeded(state),
+                ..Self::default()
+            }
+        }
+
+        fn corrupt_readback_after_commit(&self) {
+            self.corrupt_readback_after_commit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::v2_hub_state_store::AsyncHubAuthoritativeStateStore for AsyncMaintenanceStore {
+        async fn load_current_async(
+            &self,
+        ) -> Result<
+            Option<crate::v2_hub_state_store::DurableHubState>,
+            crate::v2_hub_state_store::HubStateStoreError,
+        > {
+            let mut current =
+                crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&self.inner)?;
+            if self
+                .corrupt_next_load
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(value) = current.as_mut() {
+                    value.revision.0 = value.revision.0.saturating_add(1);
+                }
+            }
+            Ok(current)
+        }
+
+        async fn acquire_writer_async(
+            &self,
+            initial_state: &HubPersistentState,
+        ) -> Result<
+            crate::v2_hub_state_store::DurableHubState,
+            crate::v2_hub_state_store::HubStateStoreError,
+        > {
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::acquire_writer(
+                &self.inner,
+                initial_state,
+            )
+        }
+
+        async fn compare_and_commit_async(
+            &self,
+            lease: crate::v2_hub_state_store::HubWriterLease,
+            state: &HubPersistentState,
+        ) -> Result<
+            crate::v2_hub_state_store::DurableHubState,
+            crate::v2_hub_state_store::HubStateStoreError,
+        > {
+            let committed =
+                crate::v2_hub_state_store::HubAuthoritativeStateStore::compare_and_commit(
+                    &self.inner,
+                    lease,
+                    state,
+                )?;
+            if self
+                .corrupt_readback_after_commit
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.corrupt_next_load
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(committed)
+        }
+    }
+
+    fn hosted_quarantine_store(name: &str) -> (AsyncMaintenanceStore, String, String) {
+        let dir = test_dir(name);
+        let (device_id, operation_id) = seed_quarantine(&dir);
+        let state = CheckpointStore::new(dir.clone(), "hub")
+            .unwrap()
+            .load_latest::<HubPersistentState>()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        (
+            AsyncMaintenanceStore::seeded(state),
+            device_id,
+            operation_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn hosted_quarantine_inspection_is_read_only_and_does_not_advance_writer_fence() {
+        let (store, device_id, operation_id) = hosted_quarantine_store("hosted-inspect");
+        let before =
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&store.inner)
+                .unwrap()
+                .unwrap();
+
+        let report = inspect_quarantines_hosted_read_only(&store, Some(&device_id))
+            .await
+            .unwrap();
+
+        assert_eq!(report.quarantines.len(), 1);
+        assert_eq!(report.quarantines[0].blocking_operation_id, operation_id);
+        assert!(!report.quarantines[0].retry_safe);
+        let after =
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&store.inner)
+                .unwrap()
+                .unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.writer_epoch, before.writer_epoch);
+    }
+
+    #[tokio::test]
+    async fn hosted_resolution_preflight_rejects_unknown_operation_without_fencing_writer() {
+        let (store, _, _) = hosted_quarantine_store("hosted-preflight");
+        let before =
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&store.inner)
+                .unwrap()
+                .unwrap();
+
+        let error = resolve_indeterminate_hosted(
+            &store,
+            "op_missing",
+            IndeterminateResolution::ConfirmedNotExecuted,
+            "independent non-delivery evidence",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MaintenanceError::Execution(ExecutionError::UnknownOperation)
+        ));
+
+        let after =
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&store.inner)
+                .unwrap()
+                .unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.writer_epoch, before.writer_epoch);
+    }
+
+    #[tokio::test]
+    async fn hosted_resolution_acquires_maintenance_epoch_commits_and_fences_old_writer() {
+        let (store, device_id, operation_id) = hosted_quarantine_store("hosted-resolve");
+        let before =
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&store.inner)
+                .unwrap()
+                .unwrap();
+        let old_lease = before.lease();
+        let old_state = before.state.clone();
+
+        let result = resolve_indeterminate_hosted(
+            &store,
+            &operation_id,
+            IndeterminateResolution::ConfirmedNotExecuted,
+            "independent non-delivery evidence",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.writer_epoch, before.writer_epoch.0 + 1);
+        assert_eq!(result.revision, before.revision.0 + 2);
+        assert_eq!(result.receipt.terminal_state, HubOperationState::Cancelled);
+
+        let current =
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&store.inner)
+                .unwrap()
+                .unwrap();
+        let (_registry, execution) = current
+            .state
+            .clone()
+            .restore(AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 2,
+            })
+            .unwrap();
+        assert!(execution.quarantine(&device_id).is_none());
+        assert_eq!(
+            execution.state(&operation_id),
+            Some(HubOperationState::Cancelled)
+        );
+        assert!(matches!(
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::compare_and_commit(
+                &store.inner,
+                old_lease,
+                &old_state,
+            ),
+            Err(crate::v2_hub_state_store::HubStateStoreError::StaleWriter)
+        ));
+
+        let next_serving =
+            crate::v2_hub_state_store::AsyncHubAuthoritativeStateStore::acquire_writer_async(
+                &store,
+                &current.state,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_serving.writer_epoch.0, result.writer_epoch + 1);
+        assert_eq!(next_serving.revision.0, result.revision + 1);
+
+        let (_registry, mut restarted_execution) = next_serving
+            .state
+            .clone()
+            .restore(AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 2,
+            })
+            .unwrap();
+        let replay = restarted_execution
+            .prepare(
+                OperationRef {
+                    device_id,
+                    device_generation: result.receipt.operation.device_generation,
+                    operation_id,
+                },
+                OperationOwner::new("https://issuer.example", "operator").unwrap(),
+                result.receipt.capability,
+                500,
+            )
+            .unwrap_err();
+        assert!(matches!(replay, ExecutionError::OperationReplay));
+    }
+
+    #[tokio::test]
+    async fn hosted_resolution_readback_mismatch_fails_closed() {
+        let (store, _, operation_id) = hosted_quarantine_store("hosted-readback-mismatch");
+        store.corrupt_readback_after_commit();
+
+        let error = resolve_indeterminate_hosted(
+            &store,
+            &operation_id,
+            IndeterminateResolution::ConfirmedCompleted,
+            "independent postcondition evidence",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, MaintenanceError::HostedCommitFenceMismatch));
+    }
+
+    #[tokio::test]
+    async fn hosted_resolution_commit_failure_keeps_quarantine_authoritative() {
+        let (store, device_id, operation_id) = hosted_quarantine_store("hosted-failed-commit");
+        store.inner.fail_next_commit();
+
+        let error = resolve_indeterminate_hosted(
+            &store,
+            &operation_id,
+            IndeterminateResolution::ConfirmedNotExecuted,
+            "independent non-delivery evidence",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MaintenanceError::StateStore(
+                crate::v2_hub_state_store::HubStateStoreError::Unavailable
+            )
+        ));
+
+        let current =
+            crate::v2_hub_state_store::HubAuthoritativeStateStore::load_current(&store.inner)
+                .unwrap()
+                .unwrap();
+        let (_registry, execution) = current
+            .state
+            .clone()
+            .restore(AdmissionLimits {
+                max_global_active: 1,
+                max_queued_per_device: 2,
+            })
+            .unwrap();
+        assert!(execution.quarantine(&device_id).is_some());
+        assert_eq!(
+            execution.state(&operation_id),
+            Some(HubOperationState::Indeterminate)
+        );
     }
 
     #[test]

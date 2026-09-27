@@ -1,9 +1,13 @@
 use computer_use_mcp_gateway::{
-    v2_execution_safety::AuthoritativeOperationController,
+    v2_execution_safety::{AuthoritativeOperationController, OperationOwner},
     v2_hub_state_store::{AsyncHubAuthoritativeStateStore, HubStateStoreError, HubWriterEpoch},
-    v2_m0::{DeviceIdentity, DeviceRegistry},
-    v2_m0_execution::AdmissionLimits,
+    v2_m0::{DeviceCapability, DeviceIdentity, DeviceRegistry},
+    v2_m0_execution::{
+        AdmissionDecision, AdmissionLimits, HubOperationState, IndeterminateResolution,
+        OperationRef,
+    },
     v2_m1_persistence::{HubPersistentState, MAX_CHECKPOINT_BYTES},
+    v2_maintenance::{inspect_quarantines_hosted_read_only, resolve_indeterminate_hosted},
     v2_postgres_hub_state_store::{
         PostgresHubStateStore, PostgresHubStateStoreConfig, PostgresTlsMode,
     },
@@ -20,6 +24,38 @@ fn initial_state() -> HubPersistentState {
     })
     .unwrap();
     HubPersistentState::capture(&registry, &execution)
+}
+
+fn quarantined_state() -> (HubPersistentState, String, String) {
+    let mut registry = DeviceRegistry::default();
+    let device_id = registry.provision_trusted_device(DeviceIdentity::generate().verifying_key());
+    let operation_id = format!("op-hosted-maint-{}", rand::random::<u64>());
+    let operation = OperationRef {
+        device_id: device_id.clone(),
+        device_generation: 1,
+        operation_id: operation_id.clone(),
+    };
+    let owner = OperationOwner::new("https://issuer.example", "operator").unwrap();
+    let mut execution = AuthoritativeOperationController::new(AdmissionLimits {
+        max_global_active: 1,
+        max_queued_per_device: 1,
+    })
+    .unwrap();
+    assert!(matches!(
+        execution
+            .prepare(operation, owner.clone(), DeviceCapability::PointerDrag, 100)
+            .unwrap(),
+        AdmissionDecision::StartNow(_)
+    ));
+    execution
+        .mark_dispatched(&operation_id, &owner, 1, 110)
+        .unwrap();
+    execution.mark_connection_lost(&operation_id, 120).unwrap();
+    (
+        HubPersistentState::capture(&registry, &execution),
+        device_id,
+        operation_id,
+    )
 }
 
 fn tls_test_material() -> Option<(String, String, Vec<u8>)> {
@@ -170,6 +206,65 @@ async fn postgres_backend_conforms_to_writer_epoch_and_cas_contract() {
         .expect("PostgreSQL round-trip must retain durable fence");
     assert_eq!(fence.revision, current.revision.0);
     assert_eq!(fence.writer_epoch, current.writer_epoch.0);
+}
+
+#[tokio::test]
+async fn hosted_maintenance_resolves_real_postgres_quarantine_and_fences_old_writer() {
+    if !prepare_schema().await {
+        return;
+    }
+    let state_key = format!("hosted-maint-{}", rand::random::<u64>());
+    let store = PostgresHubStateStore::connect(config(&state_key).unwrap())
+        .await
+        .unwrap();
+    let stale_writer = PostgresHubStateStore::connect(config(&state_key).unwrap())
+        .await
+        .unwrap();
+    let (initial, device_id, operation_id) = quarantined_state();
+    let serving = store.acquire_writer_async(&initial).await.unwrap();
+    assert_eq!(serving.writer_epoch, HubWriterEpoch(1));
+
+    let inspected = inspect_quarantines_hosted_read_only(&store, Some(&device_id))
+        .await
+        .unwrap();
+    assert_eq!(inspected.quarantines.len(), 1);
+    assert_eq!(inspected.quarantines[0].blocking_operation_id, operation_id);
+    let after_inspect = store.load_current_async().await.unwrap().unwrap();
+    assert_eq!(after_inspect.revision, serving.revision);
+    assert_eq!(after_inspect.writer_epoch, serving.writer_epoch);
+
+    let result = resolve_indeterminate_hosted(
+        &store,
+        &operation_id,
+        IndeterminateResolution::ConfirmedCompleted,
+        "independent_postcondition_verified_v1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.writer_epoch, 2);
+    assert_eq!(result.revision, 3);
+    assert_eq!(result.receipt.terminal_state, HubOperationState::Completed);
+
+    let current = store.load_current_async().await.unwrap().unwrap();
+    let (_registry, execution) = current
+        .state
+        .clone()
+        .restore(AdmissionLimits {
+            max_global_active: 1,
+            max_queued_per_device: 1,
+        })
+        .unwrap();
+    assert!(execution.quarantine(&device_id).is_none());
+    assert_eq!(
+        execution.state(&operation_id),
+        Some(HubOperationState::Completed)
+    );
+    assert!(matches!(
+        stale_writer
+            .compare_and_commit_async(serving.lease(), &serving.state)
+            .await,
+        Err(HubStateStoreError::StaleWriter)
+    ));
 }
 
 #[tokio::test]
