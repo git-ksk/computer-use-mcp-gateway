@@ -22,7 +22,7 @@ def manifest(count: int, *, service_shape: bool = False):
         volumes.append({
             "name": name,
             "secret": {
-                "secretName": f"private-secret-{index}",
+                "secretName": f"fixture-ref-{index}",
                 "items": [{"key": str(index + 1), "path": "value"}],
             },
         })
@@ -63,13 +63,13 @@ class SecretVolumeGuardTests(unittest.TestCase):
         document["spec"]["volumes"].append({
             "name": "do-not-print-orphan",
             "secret": {
-                "secretName": "do-not-print-secret-name",
+                "secretName": "do-not-print-fixture-ref",
                 "items": [{"key": "99", "path": "value"}],
             },
         })
         code, output = self.run_main(document, "oidc_jwt")
         self.assertEqual(code, 1)
-        self.assertIn("FAIL code=orphan_secret_volume count=1", output)
+        self.assertIn("FAIL code=orphan_secret_volume", output)
         self.assertNotIn("do-not-print", output)
 
     def test_missing_volume_binding_fails(self):
@@ -77,7 +77,7 @@ class SecretVolumeGuardTests(unittest.TestCase):
         document["spec"]["volumes"].pop()
         code, output = self.run_main(document, "oidc_jwt")
         self.assertEqual(code, 1)
-        self.assertIn("FAIL code=missing_volume_binding count=1", output)
+        self.assertIn("FAIL code=missing_volume_binding", output)
 
     def test_duplicate_mount_path_and_volume_name_fail(self):
         document = manifest(6)
@@ -87,27 +87,27 @@ class SecretVolumeGuardTests(unittest.TestCase):
         )
         code, output = self.run_main(document, "oidc_jwt")
         self.assertEqual(code, 1)
-        self.assertIn("FAIL code=duplicate_volume_name count=1", output)
-        self.assertIn("FAIL code=duplicate_mount_path count=1", output)
+        self.assertIn("FAIL code=duplicate_volume_name", output)
+        self.assertIn("FAIL code=duplicate_mount_path", output)
 
     def test_unpinned_latest_secret_version_fails(self):
         document = manifest(6)
         document["spec"]["volumes"][0]["secret"]["items"][0]["key"] = "latest"
         code, output = self.run_main(document, "oidc_jwt")
         self.assertEqual(code, 1)
-        self.assertIn("FAIL code=unpinned_secret_version count=1", output)
+        self.assertIn("FAIL code=unpinned_secret_version", output)
 
     def test_duplicate_secret_source_fails_even_when_volume_names_differ(self):
         document = manifest(6)
         document["spec"]["volumes"][1]["secret"] = dict(document["spec"]["volumes"][0]["secret"])
         code, output = self.run_main(document, "oidc_jwt")
         self.assertEqual(code, 1)
-        self.assertIn("FAIL code=duplicate_secret_source count=1", output)
+        self.assertIn("FAIL code=duplicate_secret_source", output)
 
     def test_wrong_auth_profile_mount_count_fails(self):
         code, output = self.run_main(manifest(6), "oauth_introspection")
         self.assertEqual(code, 1)
-        self.assertIn("FAIL code=secret_mount_count_mismatch count=1", output)
+        self.assertIn("FAIL code=secret_mount_count_mismatch", output)
 
 
 if __name__ == "__main__":

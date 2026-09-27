@@ -162,14 +162,19 @@ def main() -> int:
 
     found = failures(result)
     if found:
-        for code, count in found:
-            print(f"FAIL code={code} count={count}")
+        # Never reflect manifest-derived values, identifiers, or counts to stdout. The failure
+        # class is sufficient for the operator to remediate the private manifest.
+        for code, _count in found:
+            print(f"FAIL code={code}")
         return 1
 
+    # A successful inspection already proved the private manifest has exactly the reviewed
+    # profile count, so emit only the public profile constant rather than manifest-derived data.
+    expected = EXPECTED_SECRET_MOUNTS[args.auth_mode]
     print(
         "PASS "
-        f"secret_mounts={result['mounted_secret_volumes']} "
-        f"secret_volumes={result['secret_volumes']} "
+        f"secret_mounts={expected} "
+        f"secret_volumes={expected} "
         "pinned_versions=yes"
     )
     return 0
