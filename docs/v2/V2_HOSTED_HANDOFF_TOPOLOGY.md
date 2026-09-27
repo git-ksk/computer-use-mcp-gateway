@@ -125,7 +125,7 @@ Hosted CUMG must treat the following lifetimes as independent:
 
 A viewer reconnect or managed transport fallback may rotate (4) and (5) without recreating (3), changing (2), or advancing (1). Hub replacement may advance (6) without implying any Handoff authority change. Every stale generation fails closed.
 
-This model consumes the upstream v0.4.5 Desktop Session / Display Backend separation when CUMG updates its pinned Handoff revision.
+The current reviewed Handoff v0.6.0 pin consumes the existing Desktop Session / Display Backend separation plus provider-neutral connectivity and hosted worker topology. CUMG still keeps canonical mutation authority/checkpoint ownership on the Agent.
 
 ## Hosted operator control
 
@@ -257,7 +257,7 @@ The single-host/VM profile remains valid and does not need to adopt the hosted o
 
 ## Upstream Handoff adoption
 
-Issue #276 updates the CUMG artifact manifest candidate to the v0.4.5 release commit `523b547ff10696487095956ca0b8c3db628819c4` / package `0.4.5`, with exact workflow checkout identity and package-version matching.
+Historical #276 established the exact-pin verification mechanism. The current artifact manifest pins Handoff v0.6.0 release commit `507e6412b98b8a6505d1b500dbfe520093f551f9` / package `0.6.0`, with exact workflow checkout identity and package-version matching.
 
 Upstream v0.4.1 adds the Desktop Session / Display Backend boundary and later roadmap work separates provider-neutral connectivity (#19) from hosted worker topology (#12). CUMG should adopt a reviewed upstream release boundary separately from the current Windows #227 / CUMG `0.4.0` closeout.
 

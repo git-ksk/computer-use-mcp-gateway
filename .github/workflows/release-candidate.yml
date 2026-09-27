@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  HANDOFF_SOURCE_COMMIT: 523b547ff10696487095956ca0b8c3db628819c4
+  HANDOFF_SOURCE_COMMIT: 507e6412b98b8a6505d1b500dbfe520093f551f9
 
 jobs:
   bundle:

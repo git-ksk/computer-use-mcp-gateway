@@ -125,7 +125,7 @@ hosted CUMG では次の lifetime を独立したものとして扱います。
 
 viewer reconnect / managed transport fallback では (4)/(5) だけを rotate でき、(3) を再生成したり、(2) を変えたり、(1) を advance してはいけません。Hub replacement による (6) の advance も Handoff authority change を意味しません。すべての stale generation は fail closed します。
 
-CUMG が upstream Handoff pin を更新した後、この model は v0.4.5 Desktop Session / Display Backend separation を利用します。
+CUMG のcurrent reviewed Handoff v0.6.0 pinは、既存Desktop Session / Display Backend separationに加えてprovider-neutral connectivityとhosted worker topologyをconsumeします。CUMG側のcanonical mutation authority/checkpoint ownershipは引き続きAgent-ownedです。
 
 ## Hosted operator control
 
@@ -257,7 +257,7 @@ single-host/VM profile は引き続き有効で、hosted operator adapter の採
 
 ## Upstream Handoff adoption
 
-Issue #276 candidate は CUMG artifact manifest の Handoff pin を v0.4.5 release commit `523b547ff10696487095956ca0b8c3db628819c4` / package `0.4.5` へ更新し、workflow checkout identity と package version の両方を exact match で検証します。
+historical #276でexact pin検証を確立しました。current artifact manifestはHandoff v0.6.0 release commit `507e6412b98b8a6505d1b500dbfe520093f551f9` / package `0.6.0` をpinし、workflow checkout identityとpackage versionの両方をexact matchで検証します。
 
 upstream v0.4.1 は Desktop Session / Display Backend boundary を追加し、その後の roadmap では provider-neutral connectivity (#19) と hosted worker topology (#12) を分離しています。CUMG は current Windows #227 / CUMG `0.4.0` closeout と分離した lane で reviewed upstream release boundary を採用します。
 
