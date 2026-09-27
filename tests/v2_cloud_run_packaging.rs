@@ -83,6 +83,7 @@ fn cloud_run_entrypoint_has_explicit_secret_allowlist() {
     assert!(ENTRYPOINT.contains("umask 077"));
     assert!(ENTRYPOINT.contains("chmod 700 \"$private_root\""));
     assert!(ENTRYPOINT.contains("chmod 600 \"$temp_path\""));
+    assert!(ENTRYPOINT.contains("materialize_optional \"oauth-introspection/value\""));
     assert!(ENTRYPOINT.contains("exec \"$@\""));
 }
 
@@ -178,6 +179,67 @@ mod unix {
             fs::read_to_string(private.join("hub.key")).unwrap(),
             "hub-secret"
         );
+    }
+
+    #[test]
+    fn oidc_mode_does_not_require_introspection_secret_mount() {
+        let root = fixture();
+        let mount = root.path().join("mount");
+        let private = root.path().join("private");
+        fs::remove_file(mount.join("oauth-introspection/value")).unwrap();
+
+        let output = Command::new("/bin/sh")
+            .arg(ENTRYPOINT_PATH)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("test -z \"${CUMG_V2_OAUTH_INTROSPECTION_CLIENT_SECRET_FILE+x}\"")
+            .env("CUMG_V2_CLOUD_RUN_SECRET_MOUNT_DIR", &mount)
+            .env("CUMG_V2_CLOUD_RUN_PRIVATE_DIR", &private)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!private.join("oauth-introspection.secret").exists());
+        for name in [
+            "hub.key",
+            "grant.key",
+            "device.pub",
+            "postgres.password",
+            "northbound-policy.json",
+            "handoff-policy.json",
+        ] {
+            assert!(private.join(name).is_file(), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn supplied_optional_introspection_symlink_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let root = fixture();
+        let mount = root.path().join("mount");
+        let private = root.path().join("private");
+        let optional = mount.join("oauth-introspection/value");
+        fs::remove_file(&optional).unwrap();
+        symlink(root.path().join("missing-secret"), &optional).unwrap();
+
+        let output = Command::new("/bin/sh")
+            .arg(ENTRYPOINT_PATH)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .env("CUMG_V2_CLOUD_RUN_SECRET_MOUNT_DIR", &mount)
+            .env("CUMG_V2_CLOUD_RUN_PRIVATE_DIR", &private)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(78));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("oauth-introspection/value"));
     }
 
     #[test]
