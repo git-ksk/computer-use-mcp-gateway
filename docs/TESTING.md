@@ -338,6 +338,8 @@ Issue #284 additionally composes the Hub runtime with the real PostgreSQL provid
 
 Issue #353 adds hosted secret/key rotation composition acceptance. `v2_hosted_secret_rotation` proves that revision overlap has exactly one current durable writer epoch, continuity-proven device-key replacement invalidates the old session while preserving `Indeterminate`/quarantine/no-replay state, Hub and grant-signing authorities rotate independently with a bounded verifier overlap, Handoff viewer/transport generations cannot mutate Agent/intervention authority, authoritative Hub checkpoints contain no private Hub/device/grant key material, and OAuth introspection client-secret values remain redacted from debug output. The provider-neutral automated core is not a Cloud Run support claim; real revision A/B + managed-secret + log/OTLP acceptance remains a required input to #284. See [`v2/acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.md`](v2/acceptance/V2_HOSTED_SECRET_ROTATION_ACCEPTANCE.md).
 
+Issue #410 adds the Cloud Run secret-volume graph guard. `test_v2_cloud_run_secret_volume_guard.py` covers the six-mount OIDC/JWT and seven-mount OAuth-introspection profiles plus orphan volumes, missing bindings, duplicate names/paths/sources, unpinned versions, and profile-count mismatch. The guard output is intentionally content-free: only bounded result codes and counts are emitted, never secret identities, versions, mount paths, or values.
+
 ## Running smoke locally
 
 After building the gateway and installing Cua:

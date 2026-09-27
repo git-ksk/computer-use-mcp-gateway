@@ -39,6 +39,8 @@ real hosted deploymentでは、既存`*_SECRET_FILE` interfaceと互換なreview
 
 revision Bはnew credentialを受け取り、authoritative mutation前にnewer durable writer epochを取得し、Aがold Agent streamを保持していても以後commit/dispatchできないことを証明します。old credential/sessionのexpire/revokeをcompletion/replayへ変換せず、`Indeterminate`、quarantine、replay barrierをreplacement越しに保持します。rollbackもfresh writer epochを取得し、old lease、Agent generation、Handoff route、retired grant signerを復活させません。
 
+Cloud Run acceptanceではraw secret-volume graphもrotation boundaryとして扱います。old managed-secret versionをretireする前に、private service/revision manifestへ`scripts/v2_cloud_run_secret_volume_guard.py`を実行し、orphan / duplicate / missing secret mount bindingがなく、全versionが明示pinされた1:1 graphを必須とします。`--update-secrets`や`--set-secrets`だけでobsoleteなgenerated volume definitionが消えるとは仮定しません。canonicalizationが必要な場合はserving trafficをaccepted revisionへ固定したまま、intended mountから参照されるvolumeだけを持つreview済みprivate manifestを適用し、guardを再実行してからold versionをretireします。old versionをdisabledにした状態でもfresh no-traffic revisionがReadyとなり同じguardを通ることを#410のpost-retirement deployability条件とします。
+
 ## Real hosted evidenceの残り
 
 #353は、#284でselected external durable-state provider / managed-secret mechanismを使ったreal revision A/B rollout、concurrent old/new revision、old credential/sessionのexpire/revoke、interrupted effectful operation、Handoff generation分離、rollback/recovery手順、sentinel secret valueがlog/OTLPへ出ないことを記録するまでopenのままです。
