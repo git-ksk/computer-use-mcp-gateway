@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, WebRtcHandoffSurface, handoffBeginFailureCode, serveStdio } from "../v2_operator_handoff_bridge.mjs";
+import { AppendOnlyAbandonmentAudit, HandoffBridge, TerminalPtyHandoffBridge, WebRtcHandoffSurface, handoffBeginFailureCode, parseManagedTransportOrder, serveStdio } from "../v2_operator_handoff_bridge.mjs";
 
 const HANDOFF_ROOT = process.env.CUMG_V2_HANDOFF_ROOT;
 const api = HANDOFF_ROOT
@@ -717,6 +717,34 @@ test("native Cancel after possible Human side effects enters verifying and never
   }
 });
 
+
+test("managed Handoff transport order is explicit, closed, and duplicate-free", () => {
+  assert.equal(parseManagedTransportOrder(undefined), undefined);
+  assert.deepEqual(parseManagedTransportOrder("webrtc_direct,websocket_relay,webrtc_relay"), [
+    "webrtc_direct", "websocket_relay", "webrtc_relay",
+  ]);
+  assert.throws(() => parseManagedTransportOrder("webrtc_direct,webrtc_direct"), /transport order invalid/);
+  assert.throws(() => parseManagedTransportOrder("provider_specific"), /transport order invalid/);
+});
+
+test("CUMG Window surface opts into upstream managed composition only when configured", () => {
+  let config;
+  class FakeWindowHandoffAdapter {
+    constructor(value) { config = structuredClone(value); }
+  }
+  new WebRtcHandoffSurface(
+    { WindowHandoffAdapter: FakeWindowHandoffAdapter },
+    {
+      publicBaseUrl: "https://handoff.example/",
+      hostExecutable: process.execPath,
+      transportOrder: Object.freeze(["webrtc_direct", "websocket_relay", "webrtc_relay"]),
+    },
+  );
+  assert.deepEqual(config.managedFallback, { platform: "auto" });
+  assert.deepEqual(config.transportPolicy, {
+    order: ["webrtc_direct", "websocket_relay", "webrtc_relay"],
+  });
+});
 
 test("CUMG WebRTC surface composes the first-class WindowHandoffAdapter with exact legacy-equivalent input policy", async () => {
   const calls = { config: undefined, start: undefined, handle: undefined, revoked: [], unclaimed: [] };

@@ -261,8 +261,22 @@ export class NativeHandoffSurface {
   }
 }
 
+const HANDOFF_TRANSPORT_ATTEMPTS = new Set(["webrtc_direct", "websocket_relay", "webrtc_relay"]);
+
+export function parseManagedTransportOrder(value) {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") throw new Error("Handoff transport order invalid");
+  const order = value.split(",");
+  if (order.length < 1 || order.length > HANDOFF_TRANSPORT_ATTEMPTS.size
+    || order.some((attempt) => !HANDOFF_TRANSPORT_ATTEMPTS.has(attempt))
+    || new Set(order).size !== order.length) {
+    throw new Error("Handoff transport order invalid");
+  }
+  return Object.freeze(order);
+}
+
 export class WebRtcHandoffSurface {
-  constructor(api, { publicBaseUrl, hostExecutable }) {
+  constructor(api, { publicBaseUrl, hostExecutable, transportOrder = undefined }) {
     const url = new URL(publicBaseUrl);
     if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
       throw new Error("WebRTC dogfood broker requires an explicit HTTPS public origin");
@@ -275,6 +289,8 @@ export class WebRtcHandoffSurface {
       throw new Error("Window Handoff adapter unavailable");
     }
     this.kind = "webrtc";
+    const managed = transportOrder !== undefined;
+    const needsWebSocket = transportOrder?.includes("websocket_relay") ?? false;
     this.adapter = new api.WindowHandoffAdapter({
       takeover: {
         enabled: true,
@@ -283,6 +299,8 @@ export class WebRtcHandoffSurface {
         reconnectIdleMs: 2_000,
       },
       runtime: { hostExecutable },
+      ...(needsWebSocket ? { managedFallback: { platform: "auto" } } : {}),
+      ...(managed ? { transportPolicy: { order: [...transportOrder] } } : {}),
     });
   }
 
@@ -1292,7 +1310,14 @@ export async function runCli(argv = process.argv) {
     webRtcPublicBaseUrl = new URL(publicBaseUrl).toString();
     if (!terminalOnly) {
       const hostExecutable = required(options, "webrtc-host-executable", "CUMG_V2_HANDOFF_WEBRTC_HOST_EXECUTABLE");
-      humanSurface = new WebRtcHandoffSurface(api, { publicBaseUrl: webRtcPublicBaseUrl, hostExecutable });
+      const transportOrder = parseManagedTransportOrder(
+        optional(options, "transport-order", "CUMG_V2_HANDOFF_TRANSPORT_ORDER"),
+      );
+      humanSurface = new WebRtcHandoffSurface(api, {
+        publicBaseUrl: webRtcPublicBaseUrl,
+        hostExecutable,
+        transportOrder,
+      });
     }
     requestBaseUrl = webRtcPublicBaseUrl;
   }
