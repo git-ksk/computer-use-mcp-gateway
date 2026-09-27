@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
   "repository": "git-ksk/mcp-execution-handoff",
-  "source_commit": "523b547ff10696487095956ca0b8c3db628819c4",
-  "package_version": "0.4.5"
+  "source_commit": "507e6412b98b8a6505d1b500dbfe520093f551f9",
+  "package_version": "0.6.0"
 }
