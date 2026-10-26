@@ -2,7 +2,7 @@
 
 > この日本語版は [`ROADMAP.md`](ROADMAP.md) の翻訳です。**英語版を canonical（正典）とし、解釈に差がある場合は英語版を優先します。**
 
-2026-09-25 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.8.0` Backend Portability & Recovery Safety が released baseline です。現在OPENのbacklogは `v0.10.0` まで明示的にversion割当済みで、unfinishedなv0.6.1 support-claim evidence trackは別枠で保持します。**
+2026-10-27 時点の status: **V1 は legacy/regression surface、推奨 runtime は V2、`v0.8.0` Backend Portability & Recovery Safety が引き続き released baseline です。numbered release planning は `v0.11.0` まで設定し、unfinished な `v0.6.1` support-claim evidence track は別枠です。optional な raw-command 暗号化保存の調査（#420）は release 未割当です。**
 
 この roadmap は、現在の maintenance priority、将来の public-contract work を採用するための rule、stable 1.x contract へ進む条件を定義します。candidate feature がすべて ship するという約束ではなく、roadmap section が存在するだけで release number を割り当てることもありません。
 
@@ -90,6 +90,17 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 3. **`v0.8.0 — Backend Portability & Recovery Safety` — released。** #377 / #379 / #380 / #222 はcomplete。詳細は [`v2/V2_080_RELEASE_SCOPE.ja.md`](v2/V2_080_RELEASE_SCOPE.ja.md)。generic provider / VM / fleet productには拡張せず、authorization / privacy / quarantine / no-auto-replay semanticsも弱めません。
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、#391、#353、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#353でhosted revision rolloutを跨ぐsecret/key rotationのfail-closed acceptanceを行い、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
 5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
+6. **`v0.11.0 — Privacy-safe Operation Auditability`** — #419 で operator が読める bounded な操作目的と、既存の keyed HMAC request 比較を incident review で実用化します。single-Mac packaging/readiness と connection-loss acceptance も対象です。これは実行結果の証明ではなく inspectability 改善であり、quarantine / recovery authority / no-replay は変更しません。#420 は **v0.11.0 に含めない、将来の release 未割当のセキュリティ調査**です。
+
+### v0.11.0: プライバシーを維持した incident inspectability
+
+**背景:** 2026-10-05 の `shell` dispatch が indeterminate となり、2026-10-27 に所有者が結果を確認できた一方、当時の incident record には目的ラベルも request fingerprint もありませんでした。#419 は生コマンド保存を導入せず、既存の `workflow_id` / `workflow_step_id` / `client_correlation_id` と `v2_maint compare-quarantine-request` を再利用します。
+
+- **標準:** versioned / allowlisted な intent・purpose code を保存し、operator 向けの説明に変換します。未設定は `unspecified` と明示します。LLM が入力する自由記述を ordinary audit にそのまま保存せず、ラベルを execution / settlement authority にしません。
+- **keyed request 照合:** 既存の HMAC-SHA256 を、owner-private key の provisioning / readiness / rotation runbook を含めて実運用可能にします。通常の inspection は fingerprint の有無のみ、ローカルの候補比較は `same_request` / `different_request` / `unavailable` のみ返し、鍵・HMAC値・コマンド本文は非公開です。鍵がない・世代が違う場合は `unavailable` とし、過去の未記録操作を後から補完しません。
+- **release gate:** 既存 client の互換性、EN/JA の security・deployment・runbook 整合、秘密情報非露出テスト、connection loss / restart 永続化、過去IDの replay 拒否、必要な schema / downgrade review、実機Mac / Product Readiness acceptance を要求します。
+
+**将来調査（#420）:** raw command のローカル暗号化保持は v0.11.0 の標準機能に含めません。threat model、本人認証での復号、鍵・保存期限・バックアップへの影響、明示的 opt-in を評価し、別の GO/NO-GO 判断を経てから version を割り当てます。
 
 各patch/minorは引き続きstanding [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateを満たす必要があります。optional provider/platform supportはassigned releaseでrequired evidenceが揃うまでwithholdし、version割当を理由にquarantine/no-auto-replay semanticsを弱めません。
 
@@ -194,6 +205,8 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、#346 final support-claim gate。
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#391 async PostgreSQL hosted Hub-state backend、#353 hosted secret/key rotation acceptance、#284 final replacement / partition / physical-Handoff acceptance。
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。
+- **`v0.11.0 — Privacy-safe Operation Auditability`:** #419 operator-readable な typed intent / keyed request 比較の実用化、fail-closed な incident runbook と acceptance。
+- **Post-v0.11、release 未割当の security research:** #420 ローカルでの raw command 暗号化保持は threat model と operator admission が完了するまで実装計画に含めません。
 
 Hosted sequencing も明示します。#276/#277 が reviewed Handoff dependency、interface が安定すれば #282/#283 は並行可能、#284 が deployment acceptance を閉じます。#215 を NO-GO から変更するのはその evidence が揃った後だけです。
 
