@@ -2,7 +2,7 @@
 
 > English is the canonical documentation. [日本語版 / Japanese translation](ROADMAP.ja.md)
 
-Status as of 2026-09-25: **V1 remains a legacy/regression surface; V2 is the recommended runtime; `v0.8.0` Backend Portability & Recovery Safety is the released baseline. The currently open backlog is explicitly assigned through `v0.10.0`, with the unfinished v0.6.1 support-claim evidence track kept separate.**
+Status as of 2026-10-27: **V1 remains a legacy/regression surface; V2 is the recommended runtime; `v0.8.0` Backend Portability & Recovery Safety remains the released baseline. Current numbered release planning extends through `v0.11.0`; the unfinished `v0.6.1` support-claim evidence track remains separate. Optional encrypted raw-command research (#420) is explicitly unassigned.**
 
 This roadmap describes current maintenance priorities, admission rules for future public-contract work, and the path toward a stable 1.x contract. It is not a promise that every candidate feature will ship, and release numbers are not assigned merely because a roadmap section exists.
 
@@ -90,6 +90,17 @@ Until those conditions are met, keep V1 narrow and regression-only; do not expan
 3. **`v0.8.0 — Backend Portability & Recovery Safety` — released.** #377, #379, #380, and #222 are complete; see [`v2/V2_080_RELEASE_SCOPE.md`](v2/V2_080_RELEASE_SCOPE.md). This remains bounded portability/recovery-safety work rather than a generic provider, VM, or fleet product, and does not weaken authorization, privacy, quarantine, or no-auto-replay semantics.
 4. **`v0.9.0 — Hosted Hub & Handoff`** — #215, #275, #276, #277, #282, #283, #391, #396, #353, and final acceptance #284. #276/#277 establish the reviewed Handoff dependency and hosted operator route; #282/#283 may then progress in parallel; #353 proves fail-closed secret/key rotation across hosted revision rollout; #284 is the required replacement/partition/physical-Handoff acceptance gate before hosted support can be advertised.
 5. **`v0.10.0 — Legacy V1 Retirement`** — deliberate retirement of `v1_gateway`, including resolution/closure of V1-only upstream-blocked #14/#15. Removal remains conditional on confirming no supported deployment depends on V1 and intentionally migrating or archiving still-valuable regression fixtures.
+6. **`v0.11.0 — Privacy-safe Operation Auditability`** — #419 makes bounded operator-readable operation intent and existing keyed HMAC request comparison practical for incident review, including single-Mac packaging/readiness and connection-loss acceptance. This is *inspectability*, not evidence of execution, and does not change quarantine, recovery authority, or replay. #420 is a **separate, uncommitted post-v0.11 security research candidate** for opt-in local encrypted plaintext retention; it is not admitted into v0.11.0.
+
+### v0.11.0: privacy-safe incident inspectability
+
+**Motivation:** On 2026-10-05 a `shell` dispatch became indeterminate; by 2026-10-27 the owner could confirm its outcome, but the incident record lacked both an operation-purpose label and a request fingerprint. #419 builds on existing `workflow_id` / `workflow_step_id` / `client_correlation_id` fields and `v2_maint compare-quarantine-request` rather than introducing raw command logs.
+
+- **Default:** a versioned, allowlisted intent/purpose code rendered as an operator-readable description (with an explicit `unspecified` fallback). Never persist arbitrary free-form agent descriptions in ordinary audit; labels remain untrusted and cannot justify settlement.
+- **Keyed request matching:** make the existing HMAC-SHA256 fingerprint path operational through private-key provisioning/readiness/rotation documentation for supported packaging; incident inspection exposes presence only and local candidate comparison exposes `same_request` / `different_request` / `unavailable`, never key, hash, or raw command. Missing/rotated keys stay `unavailable`. Historical operations without a fingerprint cannot be backfilled.
+- **Release gate:** existing clients remain compatible; EN/JA security/deployment/runbook parity, privacy/secret-negative tests, connection-loss and restart persistence, old-ID replay rejection, schema/downgrade review if needed, and physical-Mac/Product Readiness acceptance are required before publication.
+
+**Deferred research (#420):** Optional locally encrypted plaintext command retention is *not* the v0.11.0 default, and its threat model, user-presence decryption, key/expiry/backup implications and operator opt-in require a separate GO/NO-GO decision before any version assignment.
 
 A patch/minor must still satisfy the standing [`PRODUCT_READINESS.md`](PRODUCT_READINESS.md) gate. Optional provider/platform support stays withheld until its assigned release has the required evidence, and no version assignment weakens quarantine/no-auto-replay semantics.
 
@@ -194,6 +205,8 @@ Every OPEN issue must appear in one of the buckets below or in another explicit 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood, #217 cross-platform recovery parity, #228 physical Linux FIDO2 UV acceptance, and #346 final support-claim gate.
 - **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate, #275 Agent-owned Handoff topology, #276 reviewed Handoff consumer adoption, #277 hosted operator routing, #282 closed one-port ingress, #283 durable Hub state/writer-epoch fencing, #391 async PostgreSQL hosted Hub-state backend, #396 verified remote-PostgreSQL TLS, #353 hosted secret/key rotation acceptance, and #284 final replacement/partition/physical-Handoff acceptance.
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 remain upstream-blocked while V1 exists; this release resolves or closes them as part of deliberate `v1_gateway` retirement rather than expanding V1.
+- **`v0.11.0 — Privacy-safe Operation Auditability`:** #419 operator-readable typed intent, operational keyed request comparison, fail-closed incident documentation/acceptance.
+- **Post-v0.11, no release assigned — security research:** #420 opt-in local encrypted raw-command history, subject to independent threat-model and operator admission; not committed for implementation.
 
 Hosted sequencing is intentionally explicit: #276/#277 provide the reviewed Handoff dependency, #282 and #283 can progress in parallel once their interfaces are stable, and #284 closes deployment acceptance. #215 moves from NO-GO only after that evidence exists.
 
