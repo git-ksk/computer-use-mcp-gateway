@@ -1,6 +1,6 @@
 # V2 hosted Cloud Run acceptance
 
-Status: Issue #284 の **real hosted execution pending**。v0.9.0 Cloud Run support gate の bounded な公開evidence recordであり、作成しただけでは Cloud Run を supported にしません。
+Status: Issue #284 の **real hosted execution pending**。v0.11.0 Cloud Run support gate の bounded な公開evidence recordであり、作成しただけでは Cloud Run を supported にしません。
 
 Canonical design: [../V2_CLOUD_RUN_HUB.ja.md](../V2_CLOUD_RUN_HUB.ja.md)
 
