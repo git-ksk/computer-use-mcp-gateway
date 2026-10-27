@@ -88,11 +88,11 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 1. **`v0.6.1 — Support Claim Expansion` evidence track** — #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、final gate #346。open / withheldのままで、v0.6.0やv0.7.0を遡及拡大しません。
 2. **`v0.7.0 — Operator Ergonomics & Recovery Evidence` — released。** #342 / #295 / #304 / #289 / #290 / #347 はcomplete。詳細は [`v2/V2_070_RELEASE_SCOPE.ja.md`](v2/V2_070_RELEASE_SCOPE.ja.md)。
 3. **`v0.8.0 — Backend Portability & Recovery Safety` — released。** #377 / #379 / #380 / #222 はcomplete。詳細は [`v2/V2_080_RELEASE_SCOPE.ja.md`](v2/V2_080_RELEASE_SCOPE.ja.md)。generic provider / VM / fleet productには拡張せず、authorization / privacy / quarantine / no-auto-replay semanticsも弱めません。
-4. **`v0.9.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、#391、#353、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#353でhosted revision rolloutを跨ぐsecret/key rotationのfail-closed acceptanceを行い、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
+4. **`v0.9.0 — Privacy-safe Operation Auditability`** — #419 と release gate #422 で operator が読める bounded な操作目的と、既存の keyed HMAC request 比較を incident review で実用化します。single-Mac packaging/readiness と connection-loss acceptance も対象です。これは実行結果の証明ではなく inspectability 改善であり、quarantine / recovery authority / no-replay は変更しません。#420 は **v0.9.0 に含めない、将来の release 未割当のセキュリティ調査**です。
 5. **`v0.10.0 — Legacy V1 Retirement`** — `v1_gateway`をdeliberateにretireし、V1-only upstream-blocked #14/#15もresolve/closeします。supported deploymentがV1に依存しないこと、価値の残るregression fixtureを意図的にmigrate/archiveすることをremoval条件とします。
-6. **`v0.11.0 — Privacy-safe Operation Auditability`** — #419 で operator が読める bounded な操作目的と、既存の keyed HMAC request 比較を incident review で実用化します。single-Mac packaging/readiness と connection-loss acceptance も対象です。これは実行結果の証明ではなく inspectability 改善であり、quarantine / recovery authority / no-replay は変更しません。#420 は **v0.11.0 に含めない、将来の release 未割当のセキュリティ調査**です。
+6. **`v0.11.0 — Hosted Hub & Handoff`** — #215、#275、#276、#277、#282、#283、#391、#353、final acceptance #284。#276/#277でreviewed Handoff dependencyとhosted operator routeを固め、#282/#283はその後並行可能、#353でhosted revision rolloutを跨ぐsecret/key rotationのfail-closed acceptanceを行い、#284をreplacement / partition / physical-Handoffのrequired final gateとします。ここを通るまでhosted supportはadvertiseしません。
 
-### v0.11.0: プライバシーを維持した incident inspectability
+### v0.9.0: プライバシーを維持した incident inspectability
 
 **背景:** 2026-10-05 の `shell` dispatch が indeterminate となり、2026-10-27 に所有者が結果を確認できた一方、当時の incident record には目的ラベルも request fingerprint もありませんでした。#419 は生コマンド保存を導入せず、既存の `workflow_id` / `workflow_step_id` / `client_correlation_id` と `v2_maint compare-quarantine-request` を再利用します。
 
@@ -100,7 +100,13 @@ V1 retirement は今後の simplification candidate として妥当ですが、�
 - **keyed request 照合:** 既存の HMAC-SHA256 を、owner-private key の provisioning / readiness / rotation runbook を含めて実運用可能にします。通常の inspection は fingerprint の有無のみ、ローカルの候補比較は `same_request` / `different_request` / `unavailable` のみ返し、鍵・HMAC値・コマンド本文は非公開です。鍵がない・世代が違う場合は `unavailable` とし、過去の未記録操作を後から補完しません。
 - **release gate:** 既存 client の互換性、EN/JA の security・deployment・runbook 整合、秘密情報非露出テスト、connection loss / restart 永続化、過去IDの replay 拒否、必要な schema / downgrade review、実機Mac / Product Readiness acceptance を要求します。
 
-**将来調査（#420）:** raw command のローカル暗号化保持は v0.11.0 の標準機能に含めません。threat model、本人認証での復号、鍵・保存期限・バックアップへの影響、明示的 opt-in を評価し、別の GO/NO-GO 判断を経てから version を割り当てます。
+**将来調査（#420）:** raw command のローカル暗号化保持は v0.9.0 の標準機能に含めません。threat model、本人認証での復号、鍵・保存期限・バックアップへの影響、明示的 opt-in を評価し、別の GO/NO-GO 判断を経てから version を割り当てます。
+
+### リリース順序・Hosted 実装の境界
+
+- **v0.9.0:** #419 の監査改善だけを feature scope とし、release gate #422 の完了も必須です。`main` に既にマージされた Hosted 関連の schema / scaffold / backend の存在は、Cloud Run の support claim にはなりません。正式な packaged default、feature gate、状態互換性、migration / rollback を Product Readiness で確認します。
+- **v0.10.0:** V1 retirement は独立した互換性変更です。v0.11.0 で必要な recovery / Handoff / hosted 回帰テストを移行・保存してから、V1 fixture を削除します。
+- **v0.11.0:** 旧 v0.9.0 Hosted track の実装、完了済 Issue、未マージ PR、実環境検証履歴を維持します。post-v0.10 の最終 release candidate で PostgreSQL writer fencing、Cloud Run、Handoff、secret rotation、隔離・no-replay、物理環境の #284 acceptance を再検証し、証拠が揃ってから support claim を有効にします。historical issue/PR の旧番号は過去の計画の記録です。
 
 各patch/minorは引き続きstanding [`PRODUCT_READINESS.ja.md`](PRODUCT_READINESS.ja.md) gateを満たす必要があります。optional provider/platform supportはassigned releaseでrequired evidenceが揃うまでwithholdし、version割当を理由にquarantine/no-auto-replay semanticsを弱めません。
 
@@ -203,10 +209,10 @@ Hosted extension は [`v2/V2_HOSTED_HANDOFF_TOPOLOGY.ja.md`](v2/V2_HOSTED_HANDOF
 すべての OPEN issue は、下記 bucket または別の explicit roadmap section のどこかに現れる必要があります。この inventory は admission / ordering を表し、すべての OPEN issue が次 release に入ることを意味しません。
 
 - **`v0.6.1 — Support Claim Expansion`:** #139 signed-token physical dogfood、#217 cross-platform recovery parity、#228 physical Linux FIDO2 UV acceptance、#346 final support-claim gate。
-- **`v0.9.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#391 async PostgreSQL hosted Hub-state backend、#353 hosted secret/key rotation acceptance、#284 final replacement / partition / physical-Handoff acceptance。
+- **`v0.9.0 — Privacy-safe Operation Auditability`:** #419 operator-readable な typed intent / keyed request 比較、#422 final Product Readiness と Hosted support claim の除外ゲート。
 - **`v0.10.0 — Legacy V1 Retirement`:** #14/#15 はV1が存在する間はupstream-blockedのまま扱い、V1を拡張するのではなくdeliberateな`v1_gateway` retirementの一部としてresolve/closeします。
-- **`v0.11.0 — Privacy-safe Operation Auditability`:** #419 operator-readable な typed intent / keyed request 比較の実用化、fail-closed な incident runbook と acceptance。
-- **Post-v0.11、release 未割当の security research:** #420 ローカルでの raw command 暗号化保持は threat model と operator admission が完了するまで実装計画に含めません。
+- **`v0.11.0 — Hosted Hub & Handoff`:** #215 Cloud Run support gate、#275 Agent-owned Handoff topology、#276 reviewed Handoff consumer adoption、#277 hosted operator routing、#282 closed one-port ingress、#283 durable Hub state / writer-epoch fencing、#391 async PostgreSQL hosted Hub-state backend、#353 hosted secret/key rotation acceptance、#284 final replacement / partition / physical-Handoff acceptance。#407 concurrency headroom、#408 managed WSS、#409 PostgreSQL maintenance、#410 secret volume graph も必須。
+- **Post-v0.9、release 未割当の security research:** #420 ローカルでの raw command 暗号化保持は threat model と operator admission が完了するまで実装計画に含めません。
 
 Hosted sequencing も明示します。#276/#277 が reviewed Handoff dependency、interface が安定すれば #282/#283 は並行可能、#284 が deployment acceptance を閉じます。#215 を NO-GO から変更するのはその evidence が揃った後だけです。
 

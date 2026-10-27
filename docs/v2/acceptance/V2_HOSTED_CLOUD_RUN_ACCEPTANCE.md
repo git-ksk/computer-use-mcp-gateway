@@ -1,6 +1,6 @@
 # V2 hosted Cloud Run acceptance
 
-Status: **pending real hosted execution** for Issue #284. This is the bounded public evidence record for the v0.9.0 Cloud Run support gate; creating it does not make Cloud Run supported.
+Status: **pending real hosted execution** for Issue #284. This is the bounded public evidence record for the v0.11.0 Cloud Run support gate; creating it does not make Cloud Run supported.
 
 Canonical design: [../V2_CLOUD_RUN_HUB.md](../V2_CLOUD_RUN_HUB.md)
 
